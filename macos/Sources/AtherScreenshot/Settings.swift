@@ -65,6 +65,8 @@ final class Settings: ObservableObject {
     }
 
     static var supportFolder: URL {
+        // Tests point this elsewhere so they never touch the real library.
+        if let o = ProcessInfo.processInfo.environment["ATHER_SUPPORT_DIR"] { return URL(fileURLWithPath: o, isDirectory: true) }
         let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent(kAppName, isDirectory: true)
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)

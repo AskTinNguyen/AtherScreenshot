@@ -77,7 +77,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .regionUpload, title: "Capture region and upload", keywords: "share link imgur s3 url", icon: "icloud.and.arrow.up", hotkey: "Ctrl+Alt+U", capture: true),
     CmdDef(cmd: .uploadLast, title: "Upload last capture", keywords: "share link imgur s3 url", icon: "icloud.and.arrow.up", hotkey: "", capture: false),
     CmdDef(cmd: .uploadFile, title: "Upload a file…", keywords: "share link imgur s3 url", icon: "doc.badge.arrow.up", hotkey: "", capture: false),
-    CmdDef(cmd: .history, title: "Capture history", keywords: "browse gallery recent search thumbnails library", icon: "square.grid.2x2", hotkey: "Ctrl+Alt+H", capture: false),
+    CmdDef(cmd: .history, title: "Capture gallery", keywords: "history browse recent search thumbnails library tags collections organize", icon: "square.grid.2x2", hotkey: "Ctrl+Alt+H", capture: false),
     CmdDef(cmd: .scrolling, title: "Scrolling capture (long page)", keywords: "scroll stitch full page chat long", icon: "arrow.up.and.down.text.horizontal", hotkey: "Ctrl+Alt+S", capture: true),
     CmdDef(cmd: .editLast, title: "Annotate last capture", keywords: "edit editor draw markup", icon: "pencil.and.outline", hotkey: "", capture: false),
     CmdDef(cmd: .openImage, title: "Open image in editor…", keywords: "edit file annotate load", icon: "photo", hotkey: "", capture: false),

@@ -25,6 +25,7 @@ final class Palette: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTex
     private var shown: [PaletteItem] = []
     private var mruKey = "PaletteMRU"
     private var onSubmit: ((String) -> Void)?
+    private var creator: (label: String, run: (String) -> Void)?  // offers "Label “typed text”" as the last row
     private var previousApp: NSRunningApplication?
     var isVisible: Bool { panel?.isVisible ?? false }
 
@@ -107,11 +108,13 @@ final class Palette: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTex
         panel.contentView = root
     }
 
-    func show(_ items: [PaletteItem], placeholder: String = "Type a command…", mruKey: String = "PaletteMRU") {
+    func show(_ items: [PaletteItem], placeholder: String = "Type a command…", mruKey: String = "PaletteMRU",
+              create: (String, (String) -> Void)? = nil) {
         if panel == nil { build() }
         if isVisible && onSubmit == nil && self.mruKey == mruKey { return close() }  // the hotkey again closes it
         self.mruKey = mruKey
         onSubmit = nil
+        creator = create.map { (label: $0.0, run: $0.1) }
         all = items
         promptLabel.stringValue = ""
         promptLabel.isHidden = true
@@ -125,6 +128,7 @@ final class Palette: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTex
     func prompt(_ title: String, initial: String, done: @escaping (String) -> Void) {
         if panel == nil { build() }
         onSubmit = done
+        creator = nil
         all = []
         shown = []
         table.reloadData()
@@ -199,6 +203,10 @@ final class Palette: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTex
             }
         } else {
             shown = all.compactMap { i in score(i, q).map { (i, $0) } }.sorted { $0.1 > $1.1 }.map(\.0)
+            let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+            if let c = creator, !shown.contains(where: { $0.title.lowercased() == text.lowercased() }) {
+                shown.append(PaletteItem(id: "create", title: "\(c.label) “\(text)”", icon: "plus.circle", hint: "↩") { c.run(text) })
+            }
         }
         table.reloadData()
         heightC.constant = CGFloat(min(maxRows, max(1, shown.count))) * rowH
@@ -251,6 +259,11 @@ final class Palette: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTex
         let row = table.selectedRow
         guard row >= 0, row < shown.count else { return }
         let item = shown[row]
+        if item.id == "create" {
+            close()
+            restoreFocus()
+            return DispatchQueue.main.async { item.action() }
+        }
         var m = mru
         m.removeAll { $0 == item.id }
         m.insert(item.id, at: 0)

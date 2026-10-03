@@ -52,7 +52,9 @@ enum Output {
     }
 
     static func newCaptureURL(ext: String, info: NameInfo = NameInfo()) -> URL {
-        makeCaptureURL(base: Settings.shared.capturesFolder, ext: ext, info: info)
+        let u = makeCaptureURL(base: Settings.shared.capturesFolder, ext: ext, info: info)
+        Library.shared.noteCapture(u, info: info)  // the gallery shows which app a capture came from
+        return u
     }
 
     static func savePNG(_ img: CGImage, to url: URL, completion: @escaping (Bool) -> Void) {
@@ -75,13 +77,17 @@ enum Output {
         } catch { return nil }
     }
 
-    // Every capture under the captures folder, newest first.
+    // Every capture under the captures folder, newest first. Paths are built from the configured folder
+    // (the enumerator would hand back symlink-resolved paths like /private/var/…, which then miss lookups).
     static func listCaptures() -> [URL] {
         let base = Settings.shared.capturesFolder
-        guard let e = FileManager.default.enumerator(at: base, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-                                                     options: [.skipsHiddenFiles]) else { return [] }
+        guard let e = FileManager.default.enumerator(atPath: base.path) else { return [] }
         var items: [(URL, Date)] = []
-        for case let u as URL in e where mediaExtensions.contains(u.pathExtension.lowercased()) {
+        for case let rel as String in e {
+            let name = (rel as NSString).lastPathComponent
+            guard !name.hasPrefix("."), !rel.split(separator: "/").contains(where: { $0.hasPrefix(".") }),
+                  mediaExtensions.contains((rel as NSString).pathExtension.lowercased()) else { continue }
+            let u = base.appendingPathComponent(rel)
             let date = (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             items.append((u, date))
         }

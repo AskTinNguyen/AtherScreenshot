@@ -66,6 +66,7 @@ final class UISnapshotTests: XCTestCase {
     func testSettingsView() throws {
         try XCTSkipIf(out == nil)
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 900), styleMask: [.titled], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
         w.appearance = NSAppearance(named: .darkAqua)
         let h = NSHostingViewWrapper.make(SettingsView())
         w.contentView = h

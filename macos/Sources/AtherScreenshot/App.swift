@@ -265,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         for u in Output.listCaptures().prefix(5) {
             items.append(PaletteItem(id: "recent", title: "Open recent: \(u.lastPathComponent)", keywords: "recent last history file", icon: "clock",
-                                     hint: HistoryModel.dateFormat.string(from: HistoryModel.mtime(u))) {
+                                     hint: Library.dateFormat.string(from: (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date())) {
                 if ["mp4", "mov", "gif"].contains(u.pathExtension.lowercased()) { Output.open(u) } else { Editor.open(url: u) }
             })
         }
@@ -304,7 +304,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .stopRecording:
             if Recorder.isActive { Recorder.current?.stop() } else if ScrollCapture.active != nil { ScrollCapture.cancel() } else { Toast.shared.show("Not recording") }
         case .pauseRecording: Recorder.current?.togglePause()
-        case .history: HistoryWindow.show()
+        case .history: GalleryWindow.show()
         case .editLast:
             if let img = lastImage { Editor.open(img, scale: lastScale) } else if let u = lastImageURL { Editor.open(url: u) } else { Toast.shared.show("Nothing captured yet") }
         case .openImage: openImage()
@@ -607,6 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func promptRename(_ url: URL) {
         Palette.shared.prompt("Name this capture  ·  ↩ renames, ⎋ keeps the current name", initial: url.deletingPathExtension().lastPathComponent) { [weak self] name in
             guard let n = Output.rename(url, to: name) else { return Toast.shared.show("Rename failed", url.lastPathComponent) }
+            Library.shared.moved(from: url, to: n)
             if self?.lastURL == url { self?.lastURL = n }
             Toast.shared.show("Renamed", n.lastPathComponent)
         }
