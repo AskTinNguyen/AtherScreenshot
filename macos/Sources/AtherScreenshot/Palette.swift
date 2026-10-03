@@ -168,6 +168,7 @@ final class Palette: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTex
 
     func windowDidResignKey(_ notification: Notification) {
         if isVisible { close() }
+        previousApp = nil  // the user moved on; don't yank focus back later
     }
 
     // MARK: filtering

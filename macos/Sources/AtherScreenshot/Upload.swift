@@ -102,13 +102,17 @@ enum Upload {
 
     static func s3(_ file: URL, _ c: UploadConfig) async throws -> String {
         let data = try Data(contentsOf: file)
-        let region = c.s3Region.isEmpty ? "auto" : c.s3Region
-        let endpoint = c.s3Endpoint.isEmpty ? "https://s3.\(region == "auto" ? "us-east-1" : region).amazonaws.com" : c.s3Endpoint
+        var region = c.s3Region.isEmpty ? "auto" : c.s3Region
+        // "auto" is what R2 expects; AWS itself needs a real region, and the default endpoint is us-east-1.
+        if c.s3Endpoint.isEmpty && region == "auto" { region = "us-east-1" }
+        let endpoint = c.s3Endpoint.isEmpty ? "https://s3.\(region).amazonaws.com" : c.s3Endpoint
         guard let base = URL(string: endpoint.hasPrefix("http") ? endpoint : "https://" + endpoint), let host = base.host else {
             throw err("Invalid S3 endpoint")
         }
         let month: String = {
             let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.calendar = Calendar(identifier: .gregorian)
             f.dateFormat = "yyyy-MM"
             return f.string(from: Date())
         }()

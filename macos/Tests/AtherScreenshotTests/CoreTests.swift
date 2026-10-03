@@ -73,7 +73,7 @@ final class CoreTests: XCTestCase {
         let r = rects[0]
         XCTAssertGreaterThan(r.minX, 120)  // the box covers the email, not "Contact"
         XCTAssertTrue(r.minY < 90 && r.maxY > 60)
-        let red = OCR.pixelate(img, rects: rects)
+        let red = try OCR.pixelate(img, rects: rects)
         XCTAssertEqual(red.width, img.width)
         XCTAssertFalse(try OCR.text(red).contains("example.com"))
     }

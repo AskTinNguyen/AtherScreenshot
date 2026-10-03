@@ -247,6 +247,7 @@ final class GalleryModel: ObservableObject {
                 self.lib.moved(from: first, to: n)
                 self.selection = [n]
                 self.focus = n
+                if self.preview == first { self.preview = n }
                 self.lib.refresh()
             }
         } else {
@@ -259,6 +260,8 @@ final class GalleryModel: ObservableObject {
         Palette.shared.prompt("Rename \(ts.count) files  ·  {n} number · {name} current name · {date} · {app}", initial: "{name}") { tmpl in
             guard !tmpl.isEmpty else { return }
             let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.calendar = Calendar(identifier: .gregorian)
             df.dateFormat = "yyyy-MM-dd"
             var renamed: [URL] = []
             for (i, u) in ts.enumerated() {
@@ -270,6 +273,7 @@ final class GalleryModel: ObservableObject {
                 name = name.replacingOccurrences(of: "{app}", with: m.app.isEmpty ? "screen" : m.app)
                 if let n = Output.rename(u, to: name) {
                     self.lib.moved(from: u, to: n)
+                    if self.preview == u { self.preview = n }
                     renamed.append(n)
                 }
             }
@@ -285,12 +289,30 @@ final class GalleryModel: ObservableObject {
         let next = ts.last.flatMap { visible.firstIndex(of: $0) }.flatMap { i -> URL? in
             visible[(i + 1)...].first { !ts.contains($0) } ?? visible[..<i].last { !ts.contains($0) }
         }
-        NSWorkspace.shared.recycle(ts) { done, err in
+        NSWorkspace.shared.recycle(ts) { done, err in DispatchQueue.main.async {
             let gone = Array(done.keys)
             self.lib.removed(gone)
             if let n = next { self.selection = [n]; self.focus = n }
+            if let p = self.preview, gone.contains(p) { self.preview = next }
             if let err, gone.isEmpty { return Toast.shared.show("Couldn't move to Trash", err.localizedDescription) }
             Toast.shared.show("Moved to Trash", gone.count == 1 ? gone[0].lastPathComponent : "\(gone.count) files")
+        } }
+    }
+
+    // Files dropped on the gallery or a collection: our own tiles are filed, outside files are imported.
+    func handleDrop(_ providers: [NSItemProvider], into col: UUID?) {
+        let dragged = dragging
+        dragging = []
+        loadURLs(providers) { urls in
+            // The drag pasteboard only carries the tile that was grabbed; a multi-selection drag files them all.
+            let ours = !dragged.isEmpty && urls.contains(where: dragged.contains) ? dragged : urls.filter(self.lib.isInLibrary)
+            let outside = urls.filter { !self.lib.isInLibrary($0) }
+            if let col, !ours.isEmpty {
+                self.lib.add(ours, toCollection: col)
+                let name = self.lib.collections.first { $0.id == col }?.name ?? "collection"
+                Toast.shared.show("Added to \(name)", "\(ours.count) capture\(ours.count == 1 ? "" : "s")")
+            }
+            if !outside.isEmpty { self.importFiles(outside, into: col) }
         }
     }
 
@@ -562,8 +584,7 @@ private struct Browser: View {
             .onChange(of: geo.size.width) { model.columns = max(1, Int((width + spacing) / (model.thumbSize + spacing))) }
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            guard model.dragging.isEmpty else { model.dragging = []; return false }  // our own tiles
-            loadURLs(providers) { model.importFiles($0) }
+            model.handleDrop(providers, into: nil)
             return true
         }
     }
@@ -725,13 +746,7 @@ private struct Sidebar: View {
                 ForEach(lib.collections) { c in
                     row(.collection(c.id), c.name, c.autoTags.isEmpty ? "folder" : "folder.badge.gearshape", lib.count(in: c.id))
                         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                            if !model.dragging.isEmpty {
-                                lib.add(model.dragging, toCollection: c.id)
-                                Toast.shared.show("Added to \(c.name)", "\(model.dragging.count) capture\(model.dragging.count == 1 ? "" : "s")")
-                                model.dragging = []
-                            } else {
-                                loadURLs(providers) { model.importFiles($0, into: c.id) }
-                            }
+                            model.handleDrop(providers, into: c.id)
                             return true
                         }
                         .contextMenu {
@@ -1351,7 +1366,6 @@ private struct PreviewOverlay: View {
     @ObservedObject var model: GalleryModel
     let url: URL
     @State private var player: AVPlayer?
-    let tick = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     var body: some View {
         let idx = (model.visible.firstIndex(of: url) ?? 0) + 1
@@ -1384,7 +1398,14 @@ private struct PreviewOverlay: View {
                 Spacer()
             }
         }
-        .onReceive(tick) { _ in if model.slideshow { model.step(1) } }
+        .task(id: model.slideshow) {
+            // One loop per slideshow run; view updates (e.g. indexing progress) don't reset it.
+            while model.slideshow, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if model.slideshow && !Task.isCancelled { model.step(1) }
+            }
+        }
+        .onChange(of: url) { if MediaType.of(url) != .video { player?.pause(); player = nil } }
         .onDisappear { player?.pause() }
     }
 

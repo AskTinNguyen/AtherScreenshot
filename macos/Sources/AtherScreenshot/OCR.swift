@@ -137,7 +137,8 @@ enum OCR {
         return out
     }
 
-    static func pixelate(_ img: CGImage, rects: [CGRect]) -> CGImage {
+    // Throws instead of returning the original: callers must never mistake a failed redaction for a clean image.
+    static func pixelate(_ img: CGImage, rects: [CGRect]) throws -> CGImage {
         guard !rects.isEmpty else { return img }
         var ci = CIImage(cgImage: img)
         let H = CGFloat(img.height)
@@ -149,6 +150,9 @@ enum OCR {
                 .cropped(to: cr)
             ci = px.composited(over: ci)
         }
-        return sharedCIContext.createCGImage(ci, from: CGRect(x: 0, y: 0, width: img.width, height: img.height)) ?? img
+        guard let out = sharedCIContext.createCGImage(ci, from: CGRect(x: 0, y: 0, width: img.width, height: img.height)) else {
+            throw CaptureError.failed("Couldn't render the redacted image.")
+        }
+        return out
     }
 }

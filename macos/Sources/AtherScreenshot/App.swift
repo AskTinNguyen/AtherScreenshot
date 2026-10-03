@@ -34,7 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let absolute = args.map { a -> String in
                     a.hasPrefix("-") || !FileManager.default.fileExists(atPath: a) ? a : URL(fileURLWithPath: a).standardizedFileURL.path
                 }
-                DistributedNotificationCenter.default().postNotificationName(kCliNote, object: absolute.joined(separator: "\u{1f}"), userInfo: nil, deliverImmediately: true)
+                // The token proves the command came from this user's own CLI, not some other process.
+                let payload = cliToken() + "\u{1e}" + absolute.joined(separator: "\u{1f}")
+                DistributedNotificationCenter.default().postNotificationName(kCliNote, object: payload, userInfo: nil, deliverImmediately: true)
             } else {
                 others.first?.activate()
             }
@@ -47,6 +49,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         app.delegate = d
         app.setActivationPolicy(.accessory)
         app.run()
+    }
+
+    // A per-user secret in Application Support (mode 0600). Distributed notifications can be posted by any
+    // process, including sandboxed ones, so commands without it are treated like links from the web.
+    static func cliToken() -> String {
+        let u = Settings.supportFolder.appendingPathComponent("cli-token")
+        if let t = try? String(contentsOf: u, encoding: .utf8), t.count >= 32 { return t }
+        let t = (0..<4).map { _ in UUID().uuidString }.joined()
+        FileManager.default.createFile(atPath: u.path, contents: Data(t.utf8), attributes: [.posixPermissions: 0o600])
+        return t
     }
 
     static var version: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev" }
@@ -68,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.applicationIconImage = Logo.appIcon
+        Library.shared.loadIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = Logo.menuBarIcon
         statusItem.button?.toolTip = kProductName
@@ -80,9 +93,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if key.hasPrefix("Hotkey.") { self?.registerHotkeys() }
         }
         registerHotkeys()
+        let token = AppDelegate.cliToken()
         DistributedNotificationCenter.default().addObserver(forName: kCliNote, object: nil, queue: .main) { [weak self] n in
             guard let s = n.object as? String else { return }
-            self?.runCli(s.components(separatedBy: "\u{1f}"))
+            let parts = s.components(separatedBy: "\u{1e}")
+            let trusted = parts.count == 2 && parts[0] == token
+            self?.runCli((parts.last ?? "").components(separatedBy: "\u{1f}"), trusted: trusted)
         }
         try? FileManager.default.createDirectory(at: s.capturesFolder, withIntermediateDirectories: true)
 
@@ -110,12 +126,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     args.append("--" + q.name)
                     if let v = q.value { args.append(v) }
                 }
-                runCli(args)
+                runCli(args, trusted: false)  // any web page can open these links
             }
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // Finish an active recording and pending writes before quitting, so nothing is lost.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let finishWrites = {
+            Library.shared.flush()
+            Output.waitForPendingSaves(timeout: 5)
+        }
+        guard let r = Recorder.current else {
+            finishWrites()
+            return .terminateNow
+        }
+        Toast.shared.show("Saving the recording…", "Quitting when it's done")
+        Recorder.onFinished.append {
+            finishWrites()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        r.stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { sender.reply(toApplicationShouldTerminate: true) }  // never hang a logout
+        return .terminateLater
+    }
 
     // Show in the Dock and ⌘-Tab while a real window (editor, history, settings) is open.
     func windowOpened(_ w: NSWindow) {
@@ -437,6 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let r = lastRegion else { return captureRegion(after) }
         guard permissionOK() else { return }
         let cursor = s.bool("CaptureCursor")
+        nameInfo = Capture.window(at: r.center, in: Capture.windows()).map { NameInfo(app: $0.app, window: $0.title) } ?? NameInfo()
         Task { @MainActor in
             do {
                 let img = try await Capture.rect(r, cursor: cursor)
@@ -498,6 +535,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.contentTintColor = Recorder.isActive ? .systemRed : nil
     }
 
+    // Keeps "last capture" commands pointing at the right file after a rename or trash elsewhere.
+    func fileMoved(from a: URL, to b: URL) { if lastURL == a { lastURL = b } }
+    func filesRemoved(_ us: Set<URL>) { if let u = lastURL, us.contains(u) { lastURL = nil } }
+
     func setLast(_ img: CGImage?, url: URL?) {
         if let img { lastImage = img }
         if let url { lastURL = url }
@@ -509,10 +550,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let img else { return Toast.shared.show("Capture failed") }
         if redacted < 0 && (after == .redact || (s.bool("AutoRedact") && after != .ocr)) {
             Toast.shared.show("Redacting sensitive text…", ms: 10000)
-            OCR.async({ OCR.findSensitive(try OCR.words(img)) }) { [weak self] r in
+            OCR.async({ () -> (CGImage, Int) in
+                let rects = OCR.findSensitive(try OCR.words(img))
+                return (try OCR.pixelate(img, rects: rects), rects.count)
+            }) { [weak self] r in
                 Toast.shared.hide()
-                let rects = (try? r.get()) ?? []
-                self?.deliver(OCR.pixelate(img, rects: rects), scale: scale, where: rect, after == .redact ? .normal : after, redacted: rects.count, note: note)
+                switch r {
+                case .success(let (clean, n)):
+                    self?.deliver(clean, scale: scale, where: rect, after == .redact ? .normal : after, redacted: n, note: note)
+                case .failure(let e):
+                    // Never hand out an unredacted image when redaction was asked for: let the user do it by hand.
+                    Toast.shared.show("Auto-redact failed — nothing was copied, saved or uploaded",
+                                      "\(e.localizedDescription) Opened in the editor so you can redact it yourself.", ms: 9000)
+                    Editor.open(img, scale: scale)
+                }
             }
             return
         }
@@ -607,8 +658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func promptRename(_ url: URL) {
         Palette.shared.prompt("Name this capture  ·  ↩ renames, ⎋ keeps the current name", initial: url.deletingPathExtension().lastPathComponent) { [weak self] name in
             guard let n = Output.rename(url, to: name) else { return Toast.shared.show("Rename failed", url.lastPathComponent) }
-            Library.shared.moved(from: url, to: n)
-            if self?.lastURL == url { self?.lastURL = n }
+            Library.shared.moved(from: url, to: n)  // also updates lastURL
             Toast.shared.show("Renamed", n.lastPathComponent)
         }
     }
@@ -632,8 +682,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: command line
 
-    func runCli(_ args: [String]) {
+    // `trusted`: typed by the user (launch arguments or our own CLI). Links and unknown processes must not be
+    // able to send files or screenshots off the machine, and other commands need the user's OK.
+    func runCli(_ args: [String], trusted: Bool = true) {
         guard let first = args.first, !first.isEmpty else { return }
+        if !trusted {
+            let lower = args.map { $0.lowercased() }
+            let sends = lower.contains("--upload") || ["upload", "edit", "pin"].contains(lower[0])
+                || [Cmd.regionUpload, .uploadLast, .uploadFile].contains { $0.rawValue.lowercased() == lower[0] }
+            if sends {
+                return Toast.shared.show("Blocked a request from a link or another app", "“\(args.joined(separator: " "))” can only be run from the command line.", ms: 8000)
+            }
+            activateApp()
+            let a = NSAlert()
+            a.messageText = "Run “\(args.joined(separator: " "))”?"
+            a.informativeText = "A link or another app asked Ather Screenshot to run this command."
+            a.addButton(withTitle: "Run")
+            a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
         var after: After?
         var delay: Int?
         var i = 1

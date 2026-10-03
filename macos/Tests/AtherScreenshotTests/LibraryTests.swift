@@ -17,7 +17,7 @@ final class LibraryTests: XCTestCase {
     private func u(_ n: String) -> URL { URL(fileURLWithPath: "/tmp/ather-lib-test/\(n)") }
 
     private func lib(_ names: [(String, Double, Int)]) -> Library {
-        let l = Library(empty: true)
+        let l = Library(persists: false)
         l.apply(names.map { (u($0.0), $0.1, $0.2) })
         return l
     }
@@ -122,5 +122,67 @@ final class LibraryTests: XCTestCase {
     func testSeededShuffleIsStable() {
         var a = SeededRandom(seed: 42), b = SeededRandom(seed: 42)
         XCTAssertEqual(Array(0..<20).shuffled(using: &a), Array(0..<20).shuffled(using: &b))
+    }
+}
+
+final class ReviewRegressionTests: XCTestCase {
+    func testPathContainmentIsComponentWise() {
+        XCTAssertTrue(Library.isInside("/Users/a/Pictures/Ather/2026-10/x.png", "/Users/a/Pictures/Ather"))
+        XCTAssertFalse(Library.isInside("/Users/a/Pictures/Ather Old/x.png", "/Users/a/Pictures/Ather"))
+        XCTAssertTrue(Library.isInside("/Users/a/Pictures/Ather/x.png", "/Users/a/Pictures/Ather/"))
+    }
+
+    func testDecodingToleratesMissingKeys() throws {
+        let m = try JSONDecoder().decode(ItemMeta.self, from: #"{"rating": 4, "tags": ["bug"]}"#.data(using: .utf8)!)
+        XCTAssertEqual(m.rating, 4)
+        XCTAssertEqual(m.tags, ["bug"])
+        XCTAssertEqual(m.indexed, 0)
+        let f = try JSONDecoder().decode(Filter.self, from: #"{"text": "x", "futureField": 1}"#.data(using: .utf8)!)
+        XCTAssertEqual(f.text, "x")
+        let s = try JSONDecoder().decode(SmartFolder.self, from: #"{"name": "S"}"#.data(using: .utf8)!)
+        XCTAssertEqual(s.name, "S")
+    }
+
+    func testChangedFileIsReOCRd() {
+        let l = Library(persists: false)
+        let u = URL(fileURLWithPath: "/tmp/ather-review/a.png")
+        l.apply([(u, 100, 10)])
+        l.testSetText(u.path, "old text", indexed: 1)
+        l.apply([(u, 100, 10)])
+        XCTAssertEqual(l.meta(u).text, "old text")     // unchanged file keeps its OCR
+        l.apply([(u, 200, 10)])
+        XCTAssertNil(l.meta(u).text)                    // modified file is OCR'd again
+        XCTAssertEqual(l.meta(u).indexed, 0)
+    }
+
+    func testCropOutsideImageStillExportsAnnotations() {
+        let ctx = makeContext(width: 200, height: 100)!
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+        let base = ctx.makeImage()!
+        var st = DocState()
+        st.annots = [Annot(tool: .pixelate, color: 0, level: 1, unit: 1, pts: [.zero, CGPoint(x: 200, y: 100)]),
+                     Annot(tool: .rect, color: 0, level: 4, unit: 1, pts: [CGPoint(x: 10, y: 10), CGPoint(x: 190, y: 90)])]
+        st.crop = .null
+        let out = Render.compose(base, st)
+        XCTAssertEqual(out.width, 200)
+        XCTAssertNotEqual(out.color(atPixel: CGPoint(x: 10, y: 50))?.hex, "#FFFFFF")  // the red rectangle is there
+    }
+
+    func testPixelateThrowsInsteadOfReturningOriginal() throws {
+        let ctx = makeContext(width: 40, height: 40)!
+        let img = ctx.makeImage()!
+        XCTAssertNoThrow(try OCR.pixelate(img, rects: [CGRect(x: 0, y: 0, width: 20, height: 20)]))
+    }
+
+    func testDuplicateCacheInvalidatesOnChange() {
+        let l = Library(persists: false)
+        let a = URL(fileURLWithPath: "/tmp/ather-review/a.png"), b = URL(fileURLWithPath: "/tmp/ather-review/b.png")
+        l.apply([(a, 1, 1), (b, 2, 1)])
+        l.testSetHash(a.path, 0xFF)
+        l.testSetHash(b.path, 0x0F00_0000_0000)
+        XCTAssertTrue(l.duplicateGroups().isEmpty)
+        l.testSetHash(b.path, 0xFF)
+        XCTAssertEqual(l.duplicateGroups().count, 1)
     }
 }

@@ -228,7 +228,8 @@ private struct HotkeyField: NSViewRepresentable {
                 window?.makeFirstResponder(nil)
             default:
                 let hk = Hotkey.from(event: e)
-                guard !hk.text.isEmpty, !hk.mods.isEmpty || hk.isFunctionKey else { NSSound.beep(); return }
+                // Needs ⌃, ⌥ or ⌘ (⇧ alone would swallow capital letters system-wide), unless it's a function key.
+                guard !hk.text.isEmpty, !hk.mods.subtracting(.shift).isEmpty || hk.isFunctionKey else { NSSound.beep(); return }
                 for c in kCmds where c.cmd != cmd && Hotkey.parse(Settings.shared.hotkey(c.cmd)) == hk {
                     Settings.shared.set("Hotkey." + c.cmd.rawValue, "")
                 }

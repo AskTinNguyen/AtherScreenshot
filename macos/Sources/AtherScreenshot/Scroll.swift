@@ -39,8 +39,8 @@ final class ScrollCapture {
 
     private init(region: CGRect, delayMs: Int, maxFrames: Int, done: @escaping (CGImage?, Int, String?) -> Void) {
         self.region = region
-        self.delayMs = delayMs
-        self.maxFrames = maxFrames
+        self.delayMs = min(5000, max(50, delayMs))  // also reachable through `defaults write`
+        self.maxFrames = min(1000, maxFrames)
         self.done = done
     }
 

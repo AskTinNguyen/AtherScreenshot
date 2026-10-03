@@ -272,8 +272,9 @@ enum Render {
     static func compose(_ base: CGImage, _ st: DocState, pixel: CGImage? = nil) -> CGImage {
         let px = pixel ?? pixelBase(base, st.annots)
         let extent = CGRect(x: 0, y: 0, width: base.width, height: base.height)
-        let crop = (st.crop ?? extent).integral.intersection(extent)
-        guard let ctx = makeContext(width: Int(crop.width), height: Int(crop.height)) else { return base }
+        var crop = (st.crop ?? extent).integral.intersection(extent)
+        if crop.isNull || crop.width < 1 || crop.height < 1 { crop = extent }  // never fall back to the unannotated base
+        guard let ctx = makeContext(width: Int(crop.width), height: Int(crop.height)) else { return px }
         ctx.translateBy(x: -crop.minX, y: -crop.minY)
         drawImageFlipped(ctx, px, in: extent)
         spotlight(ctx, st.annots, extent: extent)

@@ -22,7 +22,8 @@ enum Output {
     static func uniqueURL(_ dir: URL, _ stem: String, _ ext: String) -> URL {
         var url = dir.appendingPathComponent(stem).appendingPathExtension(ext)
         var i = 2
-        while FileManager.default.fileExists(atPath: url.path), i < 10000 {
+        // Also skip names already handed out to captures that are still being written.
+        while FileManager.default.fileExists(atPath: url.path) || reserved.contains(url.path), i < 10000 {
             url = dir.appendingPathComponent("\(stem) (\(i))").appendingPathExtension(ext)
             i += 1
         }
@@ -53,15 +54,32 @@ enum Output {
 
     static func newCaptureURL(ext: String, info: NameInfo = NameInfo()) -> URL {
         let u = makeCaptureURL(base: Settings.shared.capturesFolder, ext: ext, info: info)
+        reserved.insert(u.path)
         Library.shared.noteCapture(u, info: info)  // the gallery shows which app a capture came from
         return u
     }
 
+    private static let saveGroup = DispatchGroup()
+    private static var reserved = Set<String>()   // names handed out whose files aren't written yet
+
     static func savePNG(_ img: CGImage, to url: URL, completion: @escaping (Bool) -> Void) {
+        saveGroup.enter()
         DispatchQueue.global(qos: .userInitiated).async {
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let ok = (try? img.pngData()?.write(to: url, options: .atomic)) != nil
-            DispatchQueue.main.async { completion(ok) }
+            DispatchQueue.main.async {
+                reserved.remove(url.path)
+                completion(ok)
+                saveGroup.leave()
+            }
+        }
+    }
+
+    // Used on quit. Completions run on the main thread, so pump it while waiting.
+    static func waitForPendingSaves(timeout: TimeInterval) {
+        let end = Date().addingTimeInterval(timeout)
+        while saveGroup.wait(timeout: .now()) == .timedOut && Date() < end {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
         }
     }
 

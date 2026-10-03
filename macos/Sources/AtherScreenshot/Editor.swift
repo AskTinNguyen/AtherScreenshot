@@ -130,11 +130,13 @@ final class Editor: NSObject, NSWindowDelegate {
         let img = export()
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = Output.newCaptureURL(ext: "png").deletingPathExtension().lastPathComponent
+        panel.nameFieldStringValue = Output.makeCaptureURL(base: FileManager.default.temporaryDirectory, ext: "png", info: NameInfo()).deletingPathExtension().lastPathComponent
         panel.beginSheetModal(for: window) { r in
             guard r == .OK, let url = panel.url else { return }
-            Output.savePNG(img, to: url) { ok in Toast.shared.show(ok ? "Saved" : "Save failed", url.lastPathComponent) }
-            self.dirty = false
+            Output.savePNG(img, to: url) { ok in
+                Toast.shared.show(ok ? "Saved" : "Save failed", url.lastPathComponent)
+                if ok { self.dirty = false }  // a failed save must still warn before closing
+            }
         }
     }
 
@@ -413,9 +415,9 @@ final class EditorCanvas: NSView {
     override func mouseDown(with e: NSEvent) {
         window?.makeFirstResponder(self)
         let p = toImage(convert(e.locationInWindow, from: nil))
-        if editingText != nil && tool == .text {
+        if editingText != nil {  // a click anywhere finishes the text being typed
             commitText()
-            return
+            if tool == .text { return }
         }
         switch tool {
         case .select:
@@ -483,9 +485,11 @@ final class EditorCanvas: NSView {
         let r = a.rect
         let minSize = 3 / zoom
         if a.tool == .crop {
-            if r.width >= minSize && r.height >= minSize {
+            // A drag that misses the image would crop to nothing, so it's ignored.
+            let c = r.integral.intersection(visible)
+            if r.width >= minSize && r.height >= minSize && !c.isNull && c.width >= 1 && c.height >= 1 {
                 pushUndo()
-                state.crop = r.integral.intersection(visible)
+                state.crop = c
                 changed(pixels: false)
             }
             needsDisplay = true

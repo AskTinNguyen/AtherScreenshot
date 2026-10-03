@@ -24,6 +24,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let chrome = RecordingChrome()
     private var viz: InputViz?
     private var finished = false
+    // countdown → starting (async stream setup) → recording; stop() during the first two cancels cleanly.
+    private enum Phase { case countdown, starting, recording }
+    private var phase = Phase.countdown
+    private var cancelWhileStarting = false
 
     // Touched only on `queue`.
     private var writer: AVAssetWriter?
@@ -34,6 +38,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var paused = false
     private var pauseStart = CMTime.invalid
     private var pauseOffset = CMTime.zero
+    private var resumeAt = CMTime.invalid      // raw host time of the last resume
+    private var lastVideoPTS = CMTime.invalid  // last appended (retimed) timestamps, kept increasing
+    private var lastAudioPTS = CMTime.invalid
+    private var lastMicPTS = CMTime.invalid
+    private var micAllowed = true
     private var gifDir: URL?
     private var gifFrames: [(URL, CMTime)] = []
     private var gifInterval = CMTime(value: 1, timescale: 15)
@@ -71,26 +80,39 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let secs = s.int("CountdownSeconds")
         guard secs > 0 else { return startCapture() }
         countdown = Countdown(over: regionRect, seconds: secs, done: { [weak self] ok in
-            guard let self else { return }
+            guard let self, !self.finished else { return }
             self.countdown = nil
             if ok { self.startCapture() } else { self.abort(nil) }
         })
     }
 
     private func startCapture() {
+        phase = .starting
         if case .region(let r) = target { chrome.showFrame(around: r) }
         chrome.showBar(near: regionRect, recorder: self)
         Task { @MainActor in
             do {
-                if s.bool("RecordMicrophone"), !gif { _ = await AVCaptureDevice.requestAccess(for: .audio) }
+                if s.bool("RecordMicrophone"), !gif {
+                    self.micAllowed = await AVCaptureDevice.requestAccess(for: .audio)
+                    if !self.micAllowed {
+                        Toast.shared.show("Recording without the microphone", "Allow Ather Screenshot in System Settings › Privacy & Security › Microphone.", ms: 6000)
+                    }
+                }
                 try await self.startStream()
+                if self.cancelWhileStarting {  // stop/discard was pressed while the stream was being set up
+                    try? await self.stream?.stopCapture()
+                    self.writer?.cancelWriting()
+                    return self.abort(nil, notice: "Recording cancelled")
+                }
+                self.phase = .recording
                 self.startDate = Date()
                 self.chrome.startTimer()
                 if self.s.bool("ShowClicks") || self.s.bool("ShowKeys") {
                     self.viz = InputViz(clicks: self.s.bool("ShowClicks"), keys: self.s.bool("ShowKeys"), region: self.regionRect)
                 }
             } catch {
-                self.abort(error.localizedDescription)
+                self.writer?.cancelWriting()
+                self.abort(self.cancelWhileStarting ? nil : error.localizedDescription, notice: self.cancelWhileStarting ? "Recording cancelled" : nil)
             }
         }
     }
@@ -118,6 +140,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             let k = CGFloat(filter.pointPixelScale)
             pxSize = CGSize(width: filter.contentRect.width * k, height: filter.contentRect.height * k)
         }
+        guard pxSize.width >= 2, pxSize.height >= 2, pxSize.width.isFinite, pxSize.height.isFinite, regionRect.width > 0 else {
+            throw CaptureError.failed("That area is too small to record.")
+        }
         if gif {
             // GIFs at 1× and at most 1280 wide: Retina GIFs get huge for no visible gain.
             let k = min(1, 1280 / pxSize.width, 1 / max(1, pxSize.width / regionRect.width))
@@ -137,7 +162,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         cfg.colorSpaceName = CGColorSpace.sRGB
         cfg.scalesToFit = true
         let systemAudio = !gif && s.bool("RecordSystemAudio")
-        let mic = !gif && s.bool("RecordMicrophone")
+        let mic = !gif && s.bool("RecordMicrophone") && micAllowed
         if systemAudio {
             cfg.capturesAudio = true
             cfg.excludesCurrentProcessAudio = true
@@ -210,6 +235,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard sb.isValid, !paused, !finished else { return }
+        // Captured during a pause but delivered after resume: retiming would move it before earlier samples.
+        if resumeAt.isValid, sb.presentationTimeStamp < resumeAt { return }
         switch type {
         case .screen:
             guard let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
@@ -220,41 +247,53 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 w.startSession(atSourceTime: sb2.presentationTimeStamp)
                 sessionStarted = true
             }
-            if v.isReadyForMoreMediaData, v.append(sb2) { frameCount += 1 }
+            let pts = sb2.presentationTimeStamp
+            if lastVideoPTS.isValid && pts <= lastVideoPTS { return }  // the writer fails on non-increasing timestamps
+            if v.isReadyForMoreMediaData, v.append(sb2) {
+                frameCount += 1
+                lastVideoPTS = pts
+            }
         case .audio:
-            appendAudio(sb, to: audioIn)
+            appendAudio(sb, to: audioIn, last: &lastAudioPTS)
         default:
-            if #available(macOS 15.0, *), type == .microphone { appendAudio(sb, to: micIn) }
+            if #available(macOS 15.0, *), type == .microphone { appendAudio(sb, to: micIn, last: &lastMicPTS) }
         }
     }
 
-    private func appendAudio(_ sb: CMSampleBuffer, to input: AVAssetWriterInput?) {
+    private func appendAudio(_ sb: CMSampleBuffer, to input: AVAssetWriterInput?, last: inout CMTime) {
         guard sessionStarted, let input, input.isReadyForMoreMediaData, let sb2 = retimed(sb) else { return }
-        input.append(sb2)
+        let pts = sb2.presentationTimeStamp
+        if last.isValid && pts <= last { return }
+        if input.append(sb2) { last = pts }
     }
 
     private func gifFrame(_ sb: CMSampleBuffer) {
         guard let dir = gifDir, let px = sb.imageBuffer else { return }
         let t = CMTimeSubtract(sb.presentationTimeStamp, pauseOffset)
-        if let last = gifFrames.last?.1, CMTimeSubtract(t, last) < gifInterval { return }
+        // The stream already paces frames at the GIF rate; only drop ones that arrive well early (jitter is normal).
+        if let last = gifFrames.last?.1, CMTimeSubtract(t, last) < CMTimeMultiplyByFloat64(gifInterval, multiplier: 0.6) { return }
         guard let img = sharedCIContext.createCGImage(CIImage(cvPixelBuffer: px), from: CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(px), height: CVPixelBufferGetHeight(px))),
               let data = img.pngData() else { return }
         let url = dir.appendingPathComponent(String(format: "%06d.png", gifFrames.count))
         if (try? data.write(to: url)) != nil { gifFrames.append((url, t)) }
     }
 
+    // The stream ended on its own (stopped from the menu bar, window closed, display gone): keep what was recorded.
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        DispatchQueue.main.async { self.stop(error: error.localizedDescription) }
+        DispatchQueue.main.async { self.stop(reason: error.localizedDescription) }
     }
 
     // MARK: control
 
     func togglePause() {
+        guard phase == .recording, !finished else { return }
         if let at = pausedAt {
             pausedTotal += Date().timeIntervalSince(at)
             pausedAt = nil
             queue.async {
-                self.pauseOffset = CMTimeAdd(self.pauseOffset, CMTimeSubtract(Recorder.hostNow, self.pauseStart))
+                let now = Recorder.hostNow
+                self.pauseOffset = CMTimeAdd(self.pauseOffset, CMTimeSubtract(now, self.pauseStart))
+                self.resumeAt = now
                 self.paused = false
             }
         } else {
@@ -271,18 +310,44 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         Date().timeIntervalSince(startDate) - pausedTotal - (pausedAt.map { Date().timeIntervalSince($0) } ?? 0)
     }
 
-    private func abort(_ error: String?) {
+    // Called once the recording is fully over (saved, discarded or failed); used to quit cleanly.
+    static var onFinished: [() -> Void] = []
+
+    private func finishedCleanup() {
+        if Recorder.current === self { Recorder.current = nil }
+        AppDelegate.shared?.recordingChanged()
+        let f = Recorder.onFinished
+        Recorder.onFinished = []
+        f.forEach { $0() }
+    }
+
+    private func abort(_ error: String?, notice: String? = nil) {
+        finished = true
         countdown?.close()
+        countdown = nil
         chrome.close()
         viz?.stop()
-        Recorder.current = nil
-        if let error { Toast.shared.show("Recording failed", error, ms: 6000) }
+        try? FileManager.default.removeItem(at: tmpURL)
+        if let d = gifDir { try? FileManager.default.removeItem(at: d) }
+        finishedCleanup()
+        if let error { Toast.shared.show("Recording failed", error, ms: 6000) } else if let notice { Toast.shared.show(notice) }
     }
 
     func discard() { stop(discard: true) }
 
-    func stop(discard: Bool = false, error: String? = nil) {
+    // `reason`: the stream stopped by itself; what was recorded is still saved.
+    func stop(discard: Bool = false, reason: String? = nil) {
         guard !finished else { return }
+        switch phase {
+        case .countdown:
+            return abort(nil, notice: "Recording cancelled")
+        case .starting:
+            // startCapture's task sees this once the stream is up and tears it down.
+            cancelWhileStarting = true
+            chrome.close()
+            return
+        case .recording: break
+        }
         finished = true
         let duration = elapsed
         chrome.close()
@@ -293,35 +358,35 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             try? await st?.stopCapture()
             self.queue.async {
                 self.stopTime = CMTimeSubtract(Recorder.hostNow, self.pauseOffset)
-                if self.gif { self.finishGif(discard: discard || error != nil, duration: duration, error: error) }
-                else { self.finishMp4(discard: discard || error != nil, duration: duration, error: error) }
+                if self.gif { self.finishGif(discard: discard, duration: duration, reason: reason) }
+                else { self.finishMp4(discard: discard, duration: duration, reason: reason) }
             }
         }
     }
 
-    private func finishMp4(discard: Bool, duration: TimeInterval, error: String?) {
-        guard let w = writer, sessionStarted else {
+    private func finishMp4(discard: Bool, duration: TimeInterval, reason: String?) {
+        guard let w = writer, sessionStarted, !discard else {
             writer?.cancelWriting()
-            return DispatchQueue.main.async { self.done(nil, duration: duration, error: error ?? (discard ? nil : "No frames were recorded.")) }
-        }
-        if discard {
-            w.cancelWriting()
             try? FileManager.default.removeItem(at: tmpURL)
-            return DispatchQueue.main.async { self.done(nil, duration: duration, error: error) }
+            let err = discard ? nil : (reason ?? "No frames were recorded.")
+            return DispatchQueue.main.async { self.done(nil, duration: duration, error: err) }
         }
         [videoIn, audioIn, micIn].forEach { $0?.markAsFinished() }
         w.finishWriting {
+            let ok = w.status == .completed
+            if !ok { try? FileManager.default.removeItem(at: self.tmpURL) }
             DispatchQueue.main.async {
-                self.done(w.status == .completed ? self.tmpURL : nil, duration: duration, error: w.status == .completed ? nil : (w.error?.localizedDescription ?? "Couldn't write the video."))
+                self.done(ok ? self.tmpURL : nil, duration: duration, error: ok ? nil : (w.error?.localizedDescription ?? "Couldn't write the video."), note: reason)
             }
         }
     }
 
-    private func finishGif(discard: Bool, duration: TimeInterval, error: String?) {
+    private func finishGif(discard: Bool, duration: TimeInterval, reason: String?) {
         defer { if let d = gifDir { try? FileManager.default.removeItem(at: d) } }
         guard !discard, !gifFrames.isEmpty,
               let dst = CGImageDestinationCreateWithURL(tmpURL as CFURL, UTType.gif.identifier as CFString, gifFrames.count, nil) else {
-            return DispatchQueue.main.async { self.done(nil, duration: duration, error: error ?? (discard ? nil : "No frames were recorded.")) }
+            let err = discard ? nil : (reason ?? "No frames were recorded.")
+            return DispatchQueue.main.async { self.done(nil, duration: duration, error: err) }
         }
         CGImageDestinationSetProperties(dst, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
         for (i, f) in gifFrames.enumerated() {
@@ -331,12 +396,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             CGImageDestinationAddImage(dst, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFUnclampedDelayTime: delay, kCGImagePropertyGIFDelayTime: delay]] as CFDictionary)
         }
         let ok = CGImageDestinationFinalize(dst)
-        DispatchQueue.main.async { self.done(ok ? self.tmpURL : nil, duration: duration, error: ok ? nil : "Couldn't write the GIF.") }
+        DispatchQueue.main.async { self.done(ok ? self.tmpURL : nil, duration: duration, error: ok ? nil : "Couldn't write the GIF.", note: reason) }
     }
 
-    private func done(_ tmp: URL?, duration: TimeInterval, error: String?) {
-        Recorder.current = nil
-        AppDelegate.shared?.recordingChanged()
+    private func done(_ tmp: URL?, duration: TimeInterval, error: String?, note: String? = nil) {
+        defer { finishedCleanup() }
         if let error { return Toast.shared.show("Recording failed", error, ms: 6000) }
         guard let tmp else { return Toast.shared.show("Recording discarded") }
         var info = NameInfo()
@@ -350,7 +414,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         copyFile(url)
         AppDelegate.shared?.setLast(nil, url: url)
         let size = ByteCountFormatter.string(fromByteCount: Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0), countStyle: .file)
-        Toast.shared.show(gif ? "GIF saved and copied" : "Video saved and copied", "\(url.lastPathComponent)  ·  \(formatTime(duration))  ·  \(size)",
+        Toast.shared.show(note == nil ? (gif ? "GIF saved and copied" : "Video saved and copied") : "Recording stopped: \(note!)",
+                          "\(url.lastPathComponent)  ·  \(formatTime(duration))  ·  \(size)",
                           ms: Settings.shared.int("ToastMs") + 2500) { Output.open(url) }
     }
 }

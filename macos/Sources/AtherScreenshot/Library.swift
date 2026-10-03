@@ -61,6 +61,37 @@ struct SmartFolder: Codable, Identifiable, Hashable {
     var filter: Filter
 }
 
+// Decoding tolerates missing keys, so library.json from another app version still loads.
+extension KeyedDecodingContainer {
+    func value<T: Decodable>(_ k: Key, _ def: T) -> T { ((try? decodeIfPresent(T.self, forKey: k)) ?? nil) ?? def }
+}
+
+extension ItemMeta {
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mtime = c.value(.mtime, mtime); size = c.value(.size, size); w = c.value(.w, w); h = c.value(.h, h)
+        duration = c.value(.duration, duration); tags = c.value(.tags, tags); rating = c.value(.rating, rating)
+        comment = c.value(.comment, comment); collections = c.value(.collections, collections); app = c.value(.app, app)
+        window = c.value(.window, window); text = c.value(.text, text); colors = c.value(.colors, colors)
+        dhash = c.value(.dhash, dhash); indexed = c.value(.indexed, indexed)
+    }
+}
+
+extension LibCollection {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(id: c.value(.id, UUID()), name: c.value(.name, "Collection"), autoTags: c.value(.autoTags, []))
+    }
+}
+
+extension SmartFolder {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(id: c.value(.id, UUID()), name: c.value(.name, "Smart folder"), filter: c.value(.filter, Filter()))
+    }
+}
+
 // MARK: - Filters (the search bar, and what a smart folder saves)
 
 enum ShapeFilter: String, Codable, CaseIterable, Identifiable {
@@ -129,6 +160,22 @@ struct Filter: Codable, Equatable, Hashable {
     var minWidth = 0
     var minHeight = 0
 
+    init(text: String = "", types: [MediaType] = [], tags: [String] = [], anyTag: Bool = false, untagged: Bool = false,
+         minRating: Int = 0, color: String? = nil, shape: ShapeFilter? = nil, date: DateFilter? = nil, size: SizeFilter? = nil,
+         apps: [String] = [], minWidth: Int = 0, minHeight: Int = 0) {
+        self.text = text; self.types = types; self.tags = tags; self.anyTag = anyTag; self.untagged = untagged
+        self.minRating = minRating; self.color = color; self.shape = shape; self.date = date; self.size = size
+        self.apps = apps; self.minWidth = minWidth; self.minHeight = minHeight
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(text: c.value(.text, ""), types: c.value(.types, []), tags: c.value(.tags, []), anyTag: c.value(.anyTag, false),
+                  untagged: c.value(.untagged, false), minRating: c.value(.minRating, 0), color: c.value(.color, nil),
+                  shape: c.value(.shape, nil), date: c.value(.date, nil), size: c.value(.size, nil), apps: c.value(.apps, []),
+                  minWidth: c.value(.minWidth, 0), minHeight: c.value(.minHeight, 0))
+    }
+
     var isEmpty: Bool { self == Filter() }
     var activeCount: Int {
         [!text.isEmpty, !types.isEmpty, !tags.isEmpty || untagged, minRating > 0, color != nil, shape != nil, date != nil,
@@ -189,15 +236,23 @@ final class Library: ObservableObject {
     @Published private(set) var progress: (done: Int, total: Int) = (0, 0)
 
     private var features: [String: Data] = [:]                         // archived VNFeaturePrintObservation
+    private var featuresDirty = false
     private var printCache: [String: VNFeaturePrintObservation] = [:]
     private var pending: [String: NameInfo] = [:]                     // source app of captures not yet scanned
     private var saveWork: DispatchWorkItem?
     private var indexing = false
     private var loaded = false
+    private var persists = true
+    private var generation = 0          // bumped by renames/deletes so an in-flight scan can't undo them
+    private(set) var techVersion = 0    // bumped when hashes/feature prints change (caches duplicate groups)
+    private var dupCache: (version: Int, groups: [[URL]])?
+    private var similarCache: (url: URL, version: Int, count: Int, result: [(URL, Float)])?
     private let io = DispatchQueue(label: "ather.library.io")
 
     static let dateFormat: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
         f.dateFormat = "yyyy-MM-dd HH:mm"
         return f
     }()
@@ -213,18 +268,27 @@ final class Library: ObservableObject {
         var smartFolders: [SmartFolder]
     }
 
-    // For tests: an isolated store.
-    init(empty: Bool = false) {
-        if empty { loaded = true }
+    // `persists: false` gives tests an in-memory store that never touches disk.
+    init(persists: Bool = true) {
+        self.persists = persists
+        if !persists { loaded = true }
     }
 
+    // Loads library.json once. Every mutation goes through here first, so nothing can save an
+    // empty store over the real one.
     func loadIfNeeded() {
         guard !loaded else { return }
         loaded = true
-        if let d = try? Data(contentsOf: fileURL), let s = try? JSONDecoder().decode(Saved.self, from: d) {
-            meta = s.items
-            collections = s.collections
-            smartFolders = s.smartFolders
+        if let d = try? Data(contentsOf: fileURL) {
+            if let s = try? JSONDecoder().decode(Saved.self, from: d) {
+                meta = s.items
+                collections = s.collections
+                smartFolders = s.smartFolders
+            } else {
+                // Unreadable (corrupt or from a newer version): keep it aside rather than overwrite it.
+                let bad = fileURL.deletingPathExtension().appendingPathExtension("unreadable-\(Int(Date().timeIntervalSince1970)).json")
+                try? FileManager.default.moveItem(at: fileURL, to: bad)
+            }
         } else {
             importLegacyOCR()
         }
@@ -240,24 +304,42 @@ final class Library: ObservableObject {
     }
 
     func save() {
+        guard persists, loaded else { return }
         saveWork?.cancel()
         let snapshot = Saved(items: meta, collections: collections, smartFolders: smartFolders)
-        let feats = features
+        let feats: [String: Data]? = featuresDirty ? features : nil  // the big file only when it changed
+        featuresDirty = false
         let url = fileURL, furl = featuresURL
         let w = DispatchWorkItem {
             if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url, options: .atomic) }
-            let enc = PropertyListEncoder()
-            enc.outputFormat = .binary
-            if let d = try? enc.encode(feats) { try? d.write(to: furl, options: .atomic) }
+            if let feats {
+                let enc = PropertyListEncoder()
+                enc.outputFormat = .binary
+                if let d = try? enc.encode(feats) { try? d.write(to: furl, options: .atomic) }
+            }
         }
         saveWork = w
         io.asyncAfter(deadline: .now() + 0.8, execute: w)
     }
 
+    // Writes any pending save now (used on quit).
+    func flush() {
+        guard let w = saveWork, !w.isCancelled else { return }
+        io.sync { w.perform() }
+        w.cancel()
+    }
+
     // MARK: scanning
+
+    func isInLibrary(_ u: URL) -> Bool { Library.isInside(u.path, folder.path) }
+    static func isInside(_ path: String, _ dir: String) -> Bool {
+        let d = dir.hasSuffix("/") ? dir : dir + "/"
+        return path.hasPrefix(d)
+    }
 
     func refresh(done: (() -> Void)? = nil) {
         loadIfNeeded()
+        let gen = generation
         DispatchQueue.global(qos: .userInitiated).async {
             let list = Output.listCaptures()
             let stats: [(URL, Double, Int)] = list.map { u in
@@ -265,6 +347,8 @@ final class Library: ObservableObject {
                 return (u, v?.contentModificationDate?.timeIntervalSince1970 ?? 0, v?.fileSize ?? 0)
             }
             DispatchQueue.main.async {
+                // A rename or delete happened while listing: this listing is stale, take a new one.
+                if gen != self.generation { return self.refresh(done: done) }
                 self.apply(stats)
                 done?()
                 self.indexInBackground()
@@ -272,13 +356,18 @@ final class Library: ObservableObject {
         }
     }
 
-    // Exposed for tests.
+    // Reconciles metadata with a directory listing: new files get entries, changed files get re-indexed,
+    // files gone from the captures folder lose theirs.
     func apply(_ stats: [(URL, Double, Int)]) {
+        loadIfNeeded()
         var m = meta
         let live = Set(stats.map { $0.0.path })
         for (u, mtime, size) in stats {
             var e = m[u.path] ?? ItemMeta()
-            if e.mtime != mtime { e.indexed = 0 }  // changed on disk: re-index the technical fields
+            if e.mtime != mtime {  // changed on disk: re-index everything derived from the pixels
+                e.indexed = 0
+                if e.mtime != 0 { e.text = nil }
+            }
             e.mtime = mtime
             e.size = size
             if let info = pending.removeValue(forKey: u.path) {
@@ -287,7 +376,14 @@ final class Library: ObservableObject {
             }
             m[u.path] = e
         }
-        for k in m.keys where !live.contains(k) && k.hasPrefix(folder.path) { m.removeValue(forKey: k) }
+        let base = folder.path
+        for k in m.keys where !live.contains(k) && Library.isInside(k, base) { m.removeValue(forKey: k) }
+        let deadFeatures = features.keys.filter { m[$0] == nil }
+        if !deadFeatures.isEmpty {
+            for k in deadFeatures { features.removeValue(forKey: k); printCache[k] = nil }
+            featuresDirty = true
+            techVersion += 1
+        }
         meta = m
         urls = stats.map(\.0)
         save()
@@ -303,16 +399,19 @@ final class Library: ObservableObject {
 
     private func indexInBackground() {
         guard !indexing else { return }
-        let todo = urls.filter { (meta[$0.path]?.indexed ?? 0) < Library.indexVersion }
+        let todo = urls.compactMap { u -> (URL, Double, Bool)? in
+            guard let e = meta[u.path], e.indexed < Library.indexVersion else { return nil }
+            return (u, e.mtime, e.text == nil)  // text survives only for legacy-imported OCR of an unchanged file
+        }
         guard !todo.isEmpty else { return }
         indexing = true
         progress = (0, todo.count)
-        let haveText = Set(meta.filter { $0.value.text != nil && $0.value.indexed == 0 }.map(\.key))
         Task.detached(priority: .utility) {
-            for (i, u) in todo.enumerated() {
-                let r = await Indexer.index(u, ocr: !haveText.contains(u.path))
+            for (i, (u, mtime, ocr)) in todo.enumerated() {
+                let r = await Indexer.index(u, ocr: ocr)
                 await MainActor.run {
-                    if var e = self.meta[u.path] {
+                    // Drop results for files renamed, deleted or changed while they were being indexed.
+                    if var e = self.meta[u.path], e.mtime == mtime {
                         e.w = r.w
                         e.h = r.h
                         e.duration = r.duration
@@ -321,8 +420,11 @@ final class Library: ObservableObject {
                         if let t = r.text { e.text = t } else if e.text == nil { e.text = "" }
                         e.indexed = Library.indexVersion
                         self.meta[u.path] = e
+                        if let f = r.feature { self.features[u.path] = f } else { self.features.removeValue(forKey: u.path) }
+                        self.printCache[u.path] = nil
+                        self.featuresDirty = true
+                        self.techVersion += 1
                     }
-                    if let f = r.feature { self.features[u.path] = f; self.printCache[u.path] = nil }
                     self.progress = (i + 1, todo.count)
                     if (i + 1) % 20 == 0 || i == todo.count - 1 { self.save() }
                 }
@@ -338,6 +440,7 @@ final class Library: ObservableObject {
     // MARK: mutations
 
     private func edit(_ us: [URL], _ body: (inout ItemMeta) -> Void) {
+        loadIfNeeded()
         var m = meta
         for u in us { body(&m[u.path, default: ItemMeta()]) }
         meta = m
@@ -359,11 +462,13 @@ final class Library: ObservableObject {
         let us = urls.filter { meta[$0.path]?.tags.contains { $0.lowercased() == old.lowercased() } ?? false }
         edit(us) { $0.tags = Library.normalize($0.tags.map { $0.lowercased() == old.lowercased() ? new : $0 }) }
         for i in smartFolders.indices { smartFolders[i].filter.tags = smartFolders[i].filter.tags.map { $0.lowercased() == old.lowercased() ? new : $0 } }
+        save()
     }
     func deleteTag(_ tag: String) { removeTag(tag, from: urls) }
 
     @discardableResult
     func createCollection(_ name: String) -> LibCollection {
+        loadIfNeeded()
         let c = LibCollection(name: name.trimmingCharacters(in: .whitespaces))
         collections.append(c)
         save()
@@ -389,6 +494,7 @@ final class Library: ObservableObject {
     func remove(_ us: [URL], fromCollection id: UUID) { edit(us) { $0.collections.removeAll { $0 == id } } }
 
     func saveSmartFolder(_ name: String, _ f: Filter) -> SmartFolder {
+        loadIfNeeded()
         let s = SmartFolder(name: name, filter: f)
         smartFolders.append(s)
         save()
@@ -405,15 +511,23 @@ final class Library: ObservableObject {
     // Keeps tags, rating etc. when a file is renamed through the app.
     func moved(from a: URL, to b: URL) {
         guard a != b else { return }
+        loadIfNeeded()
+        generation += 1
         if let e = meta.removeValue(forKey: a.path) { meta[b.path] = e }
-        if let f = features.removeValue(forKey: a.path) { features[b.path] = f }
+        if let f = features.removeValue(forKey: a.path) { features[b.path] = f; featuresDirty = true }
+        AppDelegate.shared?.fileMoved(from: a, to: b)
         printCache[a.path] = nil
         if let i = urls.firstIndex(of: a) { urls[i] = b }
         save()
     }
 
     func removed(_ us: [URL]) {
+        loadIfNeeded()
+        generation += 1
+        featuresDirty = true
+        techVersion += 1
         let gone = Set(us)
+        AppDelegate.shared?.filesRemoved(gone)
         for u in us { meta.removeValue(forKey: u.path); features.removeValue(forKey: u.path); printCache[u.path] = nil }
         urls.removeAll { gone.contains($0) }
         save()
@@ -425,7 +539,7 @@ final class Library: ObservableObject {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var out: [URL] = []
         for f in files where Output.mediaExtensions.contains(f.pathExtension.lowercased()) {
-            if f.path.hasPrefix(folder.path) { out.append(f); continue }  // already in the library
+            if isInLibrary(f) { out.append(f); continue }  // already in the library
             let dst = Output.uniqueURL(dir, f.deletingPathExtension().lastPathComponent, f.pathExtension)
             if (try? FileManager.default.copyItem(at: f, to: dst)) != nil { out.append(dst) }
         }
@@ -456,6 +570,13 @@ final class Library: ObservableObject {
     // Groups of identical or near-identical captures, largest first. The perceptual hash finds candidates;
     // the Vision feature print confirms them (a rescaled copy scores ~0.2, a different screen ~1.0).
     func duplicateGroups(maxDistance: Int = 10, maxFeatureDistance: Float = 0.3) -> [[URL]] {
+        if let c = dupCache, c.version == techVersion, Set(c.groups.joined()).isSubset(of: Set(urls)) { return c.groups }
+        let g = computeDuplicateGroups(maxDistance: maxDistance, maxFeatureDistance: maxFeatureDistance)
+        dupCache = (techVersion, g)
+        return g
+    }
+
+    private func computeDuplicateGroups(maxDistance: Int, maxFeatureDistance: Float) -> [[URL]] {
         let items = urls.compactMap { u -> (URL, UInt64)? in meta(u).dhash.map { (u, $0) } }
         var parent = Array(0..<items.count)
         func find(_ i: Int) -> Int { var i = i; while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }; return i }
@@ -486,6 +607,13 @@ final class Library: ObservableObject {
 
     // Reverse image search: everything ordered by visual similarity to `u` (Vision feature prints).
     func similar(to u: URL, limit: Int = 120) -> [(URL, Float)] {
+        if let c = similarCache, c.url == u, c.version == techVersion, c.count == urls.count { return c.result }
+        let r = computeSimilar(to: u, limit: limit)
+        similarCache = (u, techVersion, urls.count, r)
+        return r
+    }
+
+    private func computeSimilar(to u: URL, limit: Int) -> [(URL, Float)] {
         guard let p = featurePrint(u.path) else { return [] }
         var out: [(URL, Float)] = []
         for v in urls where v != u {
@@ -498,9 +626,12 @@ final class Library: ObservableObject {
 
     var hasFeatures: Bool { !features.isEmpty }
 
-    func testSetHash(_ path: String, _ h: UInt64) { meta[path]?.dhash = h }
+    #if DEBUG
+    func testSetHash(_ path: String, _ h: UInt64) { meta[path]?.dhash = h; techVersion += 1 }
     func testSetApp(_ path: String, _ app: String) { meta[path]?.app = app }
-    func testSetFeature(_ path: String, _ d: Data) { features[path] = d }
+    func testSetFeature(_ path: String, _ d: Data) { features[path] = d; techVersion += 1 }
+    func testSetText(_ path: String, _ t: String, indexed: Int) { meta[path]?.text = t; meta[path]?.indexed = indexed }
+    #endif
 }
 
 // MARK: - Indexer (runs off the main thread)
