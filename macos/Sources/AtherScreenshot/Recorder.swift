@@ -27,7 +27,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // countdown → starting (async stream setup) → recording; stop() during the first two cancels cleanly.
     private enum Phase { case countdown, starting, recording }
     private var phase = Phase.countdown
-    var isCapturing: Bool { phase == .recording && !finished }
+    // Recording or still saving the file: quitting must wait for it.
+    var hasFootage: Bool { phase == .recording }
     private var cancelWhileStarting = false
 
     // Touched only on `queue`.

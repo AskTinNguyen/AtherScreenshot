@@ -79,6 +79,8 @@ open "atherscreenshot://region?pin"
 
 If the app is already running, the command goes to that instance.
 
+Commands typed in a terminal run directly. Commands from `atherscreenshot://` links (which any web page can open) or from tools without a terminal (Shortcuts, Raycast, cron…) ask for confirmation first. They can never upload, or open, pin or edit files, even when "After capture" is set to upload.
+
 ## Layout (`Sources/AtherScreenshot`)
 
 `App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

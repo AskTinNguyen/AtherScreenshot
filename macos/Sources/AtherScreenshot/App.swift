@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                    AtherScreenshot edit|pin|upload <file>
             Any shortcut name from Settings works as a command too (e.g. CaptureRegionPin).
             If the app is already running, the command goes to that instance.
+            Commands from a terminal are trusted. Commands from atherscreenshot:// links or from
+            tools without a terminal (Shortcuts, Raycast, cron…) ask first and never upload or open files.
             """)
             exit(0)
         }
@@ -143,7 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
         }
-        guard let r = Recorder.current, r.isCapturing else {
+        guard let r = Recorder.current, r.hasFootage else {
             Recorder.current?.stop()  // countdown or still starting: nothing recorded yet, just cancel
             finishWrites()
             return .terminateNow
@@ -449,28 +451,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func captureRegion(_ after: After) {
+        let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
         let info = frontInfo()
         snapshotThen { snap in
             Overlay.run(.region, snapshot: snap) { [weak self] r in
                 guard let self, let r else { return }
                 self.lastRegion = r.rect
                 self.nameInfo = r.window.map { NameInfo(app: $0.app, window: $0.title) } ?? info
-                self.deliver(snap.crop(r.rect), scale: snap.scale(for: r.rect), where: r.rect, after)
+                self.deliver(snap.crop(r.rect), scale: snap.scale(for: r.rect), where: r.rect, after, allowUpload: allow)
             }
         }
     }
 
     private func captureFull(display: Bool, _ after: After) {
+        let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
         let info = frontInfo()
         let mouse = Geo.mouse
         snapshotThen { snap in
             let rect = display ? (snap.shot(at: mouse)?.frame ?? snap.bounds) : snap.bounds
             self.nameInfo = display ? info : NameInfo()
-            self.deliver(snap.crop(rect), scale: snap.scale(for: rect), where: rect, after)
+            self.deliver(snap.crop(rect), scale: snap.scale(for: rect), where: rect, after, allowUpload: allow)
         }
     }
 
     private func captureActiveWindow(_ after: After) {
+        let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
         guard permissionOK() else { return }
         guard let w = Capture.activeWindow() else { return Toast.shared.show("No window to capture") }
         let cursor = s.bool("CaptureCursor")
@@ -478,12 +483,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 let img = try await Capture.window(w.id, cursor: cursor)
                 self.nameInfo = NameInfo(app: w.app, window: w.title)
-                self.deliver(img, scale: CGFloat(img.width) / max(1, w.frame.width), where: w.frame, after)
+                self.deliver(img, scale: CGFloat(img.width) / max(1, w.frame.width), where: w.frame, after, allowUpload: allow)
             } catch { Toast.shared.show("Capture failed", error.localizedDescription) }
         }
     }
 
     private func captureLastRegion(_ after: After) {
+        let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
         guard let r = lastRegion else { return captureRegion(after) }
         guard permissionOK() else { return }
         let cursor = s.bool("CaptureCursor")
@@ -491,7 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { @MainActor in
             do {
                 let img = try await Capture.rect(r, cursor: cursor)
-                self.deliver(img, scale: CGFloat(img.width) / max(1, r.width), where: r, after)
+                self.deliver(img, scale: CGFloat(img.width) / max(1, r.width), where: r, after, allowUpload: allow)
             } catch { Toast.shared.show("Capture failed", error.localizedDescription) }
         }
     }
@@ -511,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func ruler() { snapshotThen { snap in Overlay.run(.ruler, snapshot: snap) { _ in } } }
 
     private func scrolling(_ after: After) {
+        let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
         snapshotThen { snap in
             Overlay.run(.region, snapshot: snap) { [weak self] r in
                 guard let self, let r else { return }
@@ -519,7 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ScrollCapture.start(region: r.rect, delayMs: self.s.int("ScrollDelayMs"), maxFrames: self.s.int("ScrollMaxFrames")) { img, frames, err in
                     Toast.shared.hide()
                     if let err { return Toast.shared.show("Scrolling capture failed", err, ms: 8000) }
-                    self.deliver(img, scale: snap.scale(for: r.rect), where: r.rect, after, note: "\(frames) frames")
+                    self.deliver(img, scale: snap.scale(for: r.rect), where: r.rect, after, note: "\(frames) frames", allowUpload: allow)
                 }
             }
         }
@@ -560,7 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // `redacted < 0`: auto-redact hasn't run for this image yet.
-    func deliver(_ img: CGImage?, scale: CGFloat, where rect: CGRect?, _ after: After, redacted: Int = -1, note: String = "") {
+    func deliver(_ img: CGImage?, scale: CGFloat, where rect: CGRect?, _ after: After, redacted: Int = -1, note: String = "", allowUpload: Bool = true) {
         guard let img else { return Toast.shared.show("Capture failed") }
         if redacted < 0 && (after == .redact || (s.bool("AutoRedact") && after != .ocr)) {
             Toast.shared.show("Redacting sensitive text…", ms: 10000)
@@ -571,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Toast.shared.hide()
                 switch r {
                 case .success(let (clean, n)):
-                    self?.deliver(clean, scale: scale, where: rect, after == .redact ? .normal : after, redacted: n, note: note)
+                    self?.deliver(clean, scale: scale, where: rect, after == .redact ? .normal : after, redacted: n, note: note, allowUpload: allowUpload)
                 case .failure(let e):
                     // Never hand out an unredacted image when redaction was asked for: let the user do it by hand.
                     Toast.shared.show("Auto-redact failed — nothing was copied, saved or uploaded",
@@ -609,7 +616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let copied = s.bool("CopyToClipboard") && copyImage(img)
         let pin = after == .pin || afterSetting == "pin"
         if pin { Pin.show(img, at: rect, scale: scale) }
-        let upload = uploadAllowed && (after == .upload || afterSetting == "upload")
+        let upload = allowUpload && (after == .upload || afterSetting == "upload")
         var toast: UInt64 = 0
         let save = s.bool("SaveToFile")
         if s.bool("ShowToast") && !pin && !upload {

@@ -236,8 +236,8 @@ final class Library: ObservableObject {
     @Published private(set) var progress: (done: Int, total: Int) = (0, 0)
 
     private var features: [String: Data] = [:]                         // archived VNFeaturePrintObservation
-    private var featuresDirty = false   // cleared only once a write of the features file has happened
-    private var saveSeq = 0
+    private var featuresDirty = false   // cleared only once the latest prints are on disk
+    private var featureVersion = 0      // bumped on every change to `features`
     private var printCache: [String: VNFeaturePrintObservation] = [:]
     private var pending: [String: NameInfo] = [:]                     // source app of captures not yet scanned
     private var saveWork: DispatchWorkItem?
@@ -309,8 +309,7 @@ final class Library: ObservableObject {
         saveWork?.cancel()
         let snapshot = Saved(items: meta, collections: collections, smartFolders: smartFolders)
         let feats: [String: Data]? = featuresDirty ? features : nil  // the big file only when it changed
-        saveSeq += 1
-        let seq = saveSeq
+        let fv = featureVersion
         let url = fileURL, furl = featuresURL
         let w = DispatchWorkItem { [weak self] in
             if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url, options: .atomic) }
@@ -318,8 +317,8 @@ final class Library: ObservableObject {
                 let enc = PropertyListEncoder()
                 enc.outputFormat = .binary
                 if let d = try? enc.encode(feats), (try? d.write(to: furl, options: .atomic)) != nil {
-                    // A newer save may carry newer prints; only the latest one clears the flag.
-                    let clear = { if self?.saveSeq == seq { self?.featuresDirty = false } }
+                    // Clear only if no print changed since this snapshot was taken.
+                    let clear = { if self?.featureVersion == fv { self?.featuresDirty = false } }
                     if Thread.isMainThread { clear() } else { DispatchQueue.main.async(execute: clear) }
                 }
             }
@@ -387,7 +386,7 @@ final class Library: ObservableObject {
         let deadFeatures = features.keys.filter { m[$0] == nil }
         if !deadFeatures.isEmpty {
             for k in deadFeatures { features.removeValue(forKey: k); printCache[k] = nil }
-            featuresDirty = true
+            featuresDirty = true; featureVersion += 1
             techVersion += 1
         }
         meta = m
@@ -428,7 +427,7 @@ final class Library: ObservableObject {
                         self.meta[u.path] = e
                         if let f = r.feature { self.features[u.path] = f } else { self.features.removeValue(forKey: u.path) }
                         self.printCache[u.path] = nil
-                        self.featuresDirty = true
+                        self.featuresDirty = true; self.featureVersion += 1
                         self.techVersion += 1
                     }
                     self.progress = (i + 1, todo.count)
@@ -520,7 +519,7 @@ final class Library: ObservableObject {
         loadIfNeeded()
         generation += 1
         if let e = meta.removeValue(forKey: a.path) { meta[b.path] = e }
-        if let f = features.removeValue(forKey: a.path) { features[b.path] = f; featuresDirty = true }
+        if let f = features.removeValue(forKey: a.path) { features[b.path] = f; featuresDirty = true; featureVersion += 1 }
         AppDelegate.shared?.fileMoved(from: a, to: b)
         printCache[a.path] = nil
         if let i = urls.firstIndex(of: a) { urls[i] = b }
@@ -530,7 +529,7 @@ final class Library: ObservableObject {
     func removed(_ us: [URL]) {
         loadIfNeeded()
         generation += 1
-        featuresDirty = true
+        featuresDirty = true; featureVersion += 1
         techVersion += 1
         let gone = Set(us)
         AppDelegate.shared?.filesRemoved(gone)
