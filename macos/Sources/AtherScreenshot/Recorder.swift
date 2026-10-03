@@ -27,6 +27,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // countdown → starting (async stream setup) → recording; stop() during the first two cancels cleanly.
     private enum Phase { case countdown, starting, recording }
     private var phase = Phase.countdown
+    var isCapturing: Bool { phase == .recording && !finished }
     private var cancelWhileStarting = false
 
     // Touched only on `queue`.
@@ -100,8 +101,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 try await self.startStream()
                 if self.cancelWhileStarting {  // stop/discard was pressed while the stream was being set up
+                    self.queue.sync { self.finished = true }  // sample callbacks stop touching the writer
                     try? await self.stream?.stopCapture()
-                    self.writer?.cancelWriting()
+                    self.queue.sync { self.writer?.cancelWriting() }
                     return self.abort(nil, notice: "Recording cancelled")
                 }
                 self.phase = .recording
@@ -111,7 +113,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.viz = InputViz(clicks: self.s.bool("ShowClicks"), keys: self.s.bool("ShowKeys"), region: self.regionRect)
                 }
             } catch {
-                self.writer?.cancelWriting()
+                self.queue.sync {
+                    self.finished = true
+                    self.writer?.cancelWriting()
+                }
                 self.abort(self.cancelWhileStarting ? nil : error.localizedDescription, notice: self.cancelWhileStarting ? "Recording cancelled" : nil)
             }
         }
@@ -348,11 +353,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         case .recording: break
         }
+        if pausedAt != nil { togglePause() }  // before `finished`, so the pause is accounted for
         finished = true
         let duration = elapsed
         chrome.close()
         viz?.stop()
-        if pausedAt != nil { togglePause() }
         let st = stream
         Task { @MainActor in
             try? await st?.stopCapture()

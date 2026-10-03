@@ -35,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     a.hasPrefix("-") || !FileManager.default.fileExists(atPath: a) ? a : URL(fileURLWithPath: a).standardizedFileURL.path
                 }
                 // The token proves the command came from this user's own CLI, not some other process.
-                let payload = cliToken() + "\u{1e}" + absolute.joined(separator: "\u{1f}")
+                // Only a command typed in a terminal carries the token; launches by other apps don't.
+                let payload = (interactiveLaunch ? cliToken() : "") + "\u{1e}" + absolute.joined(separator: "\u{1f}")
                 DistributedNotificationCenter.default().postNotificationName(kCliNote, object: payload, userInfo: nil, deliverImmediately: true)
             } else {
                 others.first?.activate()
@@ -53,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // A per-user secret in Application Support (mode 0600). Distributed notifications can be posted by any
     // process, including sandboxed ones, so commands without it are treated like links from the web.
+    // Started from a terminal (or a script attached to one), as opposed to by another app with arguments.
+    static var interactiveLaunch: Bool { isatty(STDIN_FILENO) != 0 || isatty(STDERR_FILENO) != 0 }
+
     static func cliToken() -> String {
         let u = Settings.supportFolder.appendingPathComponent("cli-token")
         if let t = try? String(contentsOf: u, encoding: .utf8), t.count >= 32 { return t }
@@ -103,7 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? FileManager.default.createDirectory(at: s.capturesFolder, withIntermediateDirectories: true)
 
         if !launchArgs.isEmpty {
-            runCli(launchArgs)
+            runCli(launchArgs, trusted: AppDelegate.interactiveLaunch)
         } else if !UserDefaults.standard.bool(forKey: "Welcomed") {
             UserDefaults.standard.set(true, forKey: "Welcomed")
             let hk = Hotkey.display(s.hotkey(.region)), pal = Hotkey.display(s.hotkey(.palette))
@@ -136,20 +140,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Finish an active recording and pending writes before quitting, so nothing is lost.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let finishWrites = {
+            Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
-            Output.waitForPendingSaves(timeout: 5)
         }
-        guard let r = Recorder.current else {
+        guard let r = Recorder.current, r.isCapturing else {
+            Recorder.current?.stop()  // countdown or still starting: nothing recorded yet, just cancel
             finishWrites()
             return .terminateNow
         }
         Toast.shared.show("Saving the recording…", "Quitting when it's done")
-        Recorder.onFinished.append {
+        var replied = false
+        let finish = {
+            guard !replied else { return }
+            replied = true
             finishWrites()
             sender.reply(toApplicationShouldTerminate: true)
         }
+        Recorder.onFinished.append { DispatchQueue.main.async { finish() } }
         r.stop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { sender.reply(toApplicationShouldTerminate: true) }  // never hang a logout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { finish() }  // never hang a logout
         return .terminateLater
     }
 
@@ -310,8 +319,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: commands
 
-    func execute(_ c: Cmd, after: After? = nil, delay: Int? = nil) {
-        if let delay, delay > 0 { return delayed(c, seconds: delay, after: after) }
+    // False while running a command a link or another app asked for: nothing leaves the machine,
+    // even when "After capture" is set to upload.
+    private var uploadAllowed = true
+
+    func execute(_ c: Cmd, after: After? = nil, delay: Int? = nil, untrusted: Bool = false) {
+        uploadAllowed = !untrusted
+        if let delay, delay > 0 { return delayed(c, seconds: delay, after: after, untrusted: untrusted) }
         if cmdDef(c).capture {
             Palette.shared.close()
             Overlay.active?.finish(nil)
@@ -328,8 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .monitor: captureFull(display: true, after ?? .normal)
         case .window: captureActiveWindow(after ?? .normal)
         case .lastRegion: captureLastRegion(after ?? .normal)
-        case .regionDelayed: delayed(.region, seconds: s.int("DelaySeconds"), after: after)
-        case .fullscreenDelayed: delayed(.fullscreen, seconds: s.int("DelaySeconds"), after: after)
+        case .regionDelayed: delayed(.region, seconds: s.int("DelaySeconds"), after: after, untrusted: untrusted)
+        case .fullscreenDelayed: delayed(.fullscreen, seconds: s.int("DelaySeconds"), after: after, untrusted: untrusted)
         case .colorPicker: pickColor()
         case .ruler: ruler()
         case .scrolling: scrolling(after ?? .normal)
@@ -392,7 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func delayed(_ c: Cmd, seconds: Int, after: After?) {
+    private func delayed(_ c: Cmd, seconds: Int, after: After?, untrusted: Bool = false) {
         delayTimer?.invalidate()
         var left = max(1, seconds)
         let id = Toast.shared.post("Capturing in \(left)…", cmdDef(c).title, ms: (left + 1) * 1000)
@@ -401,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if left <= 0 {
                 t.invalidate()
                 Toast.shared.hide()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self?.execute(c, after: after) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self?.execute(c, after: after, untrusted: untrusted) }
             } else {
                 Toast.shared.update(id, body: "\(cmdDef(c).title) in \(left)…")
             }
@@ -595,7 +609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let copied = s.bool("CopyToClipboard") && copyImage(img)
         let pin = after == .pin || afterSetting == "pin"
         if pin { Pin.show(img, at: rect, scale: scale) }
-        let upload = after == .upload || afterSetting == "upload"
+        let upload = uploadAllowed && (after == .upload || afterSetting == "upload")
         var toast: UInt64 = 0
         let save = s.bool("SaveToFile")
         if s.bool("ShowToast") && !pin && !upload {
@@ -727,12 +741,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let cmd = kCliNames[first.lowercased()] ?? Cmd.allCases.first { $0.rawValue.lowercased() == first.lowercased() }
         guard let cmd else {
-            if FileManager.default.fileExists(atPath: first) { Editor.open(url: URL(fileURLWithPath: first)) }
+            if trusted, FileManager.default.fileExists(atPath: first) { Editor.open(url: URL(fileURLWithPath: first)) }
             else { Toast.shared.show("Unknown command", first) }
             return
         }
         // Region-based commands honour --pin/--edit/...; others ignore it.
         let regional: Set<Cmd> = [.region, .fullscreen, .monitor, .window, .lastRegion, .scrolling]
-        execute(cmd, after: regional.contains(cmd) ? after : nil, delay: delay)
+        execute(cmd, after: regional.contains(cmd) ? after : nil, delay: delay, untrusted: !trusted)
     }
 }

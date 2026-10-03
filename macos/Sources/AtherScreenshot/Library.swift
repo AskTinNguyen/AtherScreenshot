@@ -236,7 +236,8 @@ final class Library: ObservableObject {
     @Published private(set) var progress: (done: Int, total: Int) = (0, 0)
 
     private var features: [String: Data] = [:]                         // archived VNFeaturePrintObservation
-    private var featuresDirty = false
+    private var featuresDirty = false   // cleared only once a write of the features file has happened
+    private var saveSeq = 0
     private var printCache: [String: VNFeaturePrintObservation] = [:]
     private var pending: [String: NameInfo] = [:]                     // source app of captures not yet scanned
     private var saveWork: DispatchWorkItem?
@@ -308,14 +309,19 @@ final class Library: ObservableObject {
         saveWork?.cancel()
         let snapshot = Saved(items: meta, collections: collections, smartFolders: smartFolders)
         let feats: [String: Data]? = featuresDirty ? features : nil  // the big file only when it changed
-        featuresDirty = false
+        saveSeq += 1
+        let seq = saveSeq
         let url = fileURL, furl = featuresURL
-        let w = DispatchWorkItem {
+        let w = DispatchWorkItem { [weak self] in
             if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url, options: .atomic) }
             if let feats {
                 let enc = PropertyListEncoder()
                 enc.outputFormat = .binary
-                if let d = try? enc.encode(feats) { try? d.write(to: furl, options: .atomic) }
+                if let d = try? enc.encode(feats), (try? d.write(to: furl, options: .atomic)) != nil {
+                    // A newer save may carry newer prints; only the latest one clears the flag.
+                    let clear = { if self?.saveSeq == seq { self?.featuresDirty = false } }
+                    if Thread.isMainThread { clear() } else { DispatchQueue.main.async(execute: clear) }
+                }
             }
         }
         saveWork = w

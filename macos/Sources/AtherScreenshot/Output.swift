@@ -67,20 +67,17 @@ enum Output {
         DispatchQueue.global(qos: .userInitiated).async {
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let ok = (try? img.pngData()?.write(to: url, options: .atomic)) != nil
+            saveGroup.leave()  // the bytes are on disk; quitting no longer needs to wait for the main thread
             DispatchQueue.main.async {
                 reserved.remove(url.path)
                 completion(ok)
-                saveGroup.leave()
             }
         }
     }
 
-    // Used on quit. Completions run on the main thread, so pump it while waiting.
+    // Used on quit: waits until every queued PNG is written.
     static func waitForPendingSaves(timeout: TimeInterval) {
-        let end = Date().addingTimeInterval(timeout)
-        while saveGroup.wait(timeout: .now()) == .timedOut && Date() < end {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-        }
+        _ = saveGroup.wait(timeout: .now() + timeout)
     }
 
     // Returns the new URL, or nil.
