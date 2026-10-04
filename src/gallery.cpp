@@ -26,6 +26,7 @@ using std::min;
 
 #include "gallery_model.h"
 #include "media.h"
+#include "videoio.h"
 #include "ocr.h"
 #include "output.h"
 #include "palette.h"
@@ -43,7 +44,7 @@ namespace gp = Gdiplus;
 constexpr wchar_t kClass[] = L"AtherScreenshotGallery";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
 constexpr UINT WM_THUMB = WM_APP + 30, WM_LIBCHANGED = WM_APP + 31;
-enum : UINT_PTR { kTimerLib = 1, kTimerSearch, kTimerTip, kTimerSlide, kTimerGif, kTimerSpin };
+enum : UINT_PTR { kTimerLib = 1, kTimerSearch, kTimerTip, kTimerSlide, kTimerGif, kTimerSpin, kTimerVideo };
 enum : int { kSearchId = 100, kTagEditId, kCommentId };
 
 constexpr int kSidebarW = 216, kInspectorW = 290, kSpacing = 8, kPadX = 16, kBottomPad = 76, kListRowH = 34, kListHeadH = 30;
@@ -554,6 +555,7 @@ public:
     // preview
     GifAnim gif;
     BitmapPtr previewImg;
+    std::unique_ptr<VideoPlayer> previewVideo;  // a video in the preview plays
     std::wstring previewLoaded;
     double pvZoom = 0;  // 0 = fit
     double pvX = 0, pvY = 0;
@@ -2179,6 +2181,8 @@ void Gallery::SetPreview(const std::wstring& u) {
         model.slideshow = false;
         KillTimer(hwnd, kTimerSlide);
         KillTimer(hwnd, kTimerGif);
+        KillTimer(hwnd, kTimerVideo);
+        previewVideo.reset();
         gif = {};
         previewImg.reset();
         previewLoaded.clear();
@@ -2194,6 +2198,8 @@ void Gallery::PaintPreview(HDC dc) {
         pvZoom = 0;
         pvX = pvY = 0;
         KillTimer(hwnd, kTimerGif);
+        KillTimer(hwnd, kTimerVideo);
+        previewVideo.reset();
         gif = {};
         previewImg.reset();
         const MediaType mt = MediaTypeOf(u);
@@ -2205,7 +2211,12 @@ void Gallery::PaintPreview(HDC dc) {
             }
         } else if (mt == MediaType::Video) {
             VideoInfo vi;
-            if (ProbeVideo(u, &vi)) ProbeVideo(u, nullptr, std::min(1.0, vi.duration / 2), 0, &previewImg);
+            if (ProbeVideo(u, &vi)) ProbeVideo(u, nullptr, 0, 0, &previewImg);  // shown until playback starts
+            previewVideo = VideoPlayer::Open(u, hwnd, WM_NULL, nullptr);
+            if (previewVideo) {
+                previewVideo->Play();
+                SetTimer(hwnd, kTimerVideo, 15, nullptr);
+            }
         } else {
             previewImg = LoadImageFile(u);
         }
@@ -2230,17 +2241,31 @@ void Gallery::PaintPreview(HDC dc) {
         StretchBlt(dc, x, y, w, h, md, 0, 0, previewImg->Width(), previewImg->Height(), SRCCOPY);
         SelectClipRgn(dc, nullptr);
         DeleteObject(clip);
-        if (MediaTypeOf(u) == MediaType::Video) {  // the poster frame; Enter opens the video editor
+        const bool video = MediaTypeOf(u) == MediaType::Video;
+        if (video && !(previewVideo && previewVideo->Playing())) {  // paused or ended: a play button; Enter opens the video editor
             const int cx = (area.left + area.right) / 2, cy = (area.top + area.bottom) / 2;
             RECT pb{cx - S(36), cy - S(36), cx + S(36), cy + S(36)};
             FillRR(dc, pb, Sf(36), gp::Color(170, 0, 0, 0));
             Text(dc, fBig, L"\xE768", pb, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            AddHot(pb, [this, u] { Open(u); }, L"Edit video (Enter)");
+            AddHot(pb, [this, u] {
+                if (previewVideo) {
+                    previewVideo->Play();
+                    SetTimer(hwnd, kTimerVideo, 15, nullptr);
+                    Changed(false);
+                } else {
+                    Open(u);
+                }
+            }, previewVideo ? L"Play" : L"Edit video (Enter)");
         }
         Hot h2;
         h2.r = area;
         h2.cursor = pvZoom > 0 ? IDC_SIZEALL : IDC_ARROW;
         h2.tile = -3;  // the preview image: drag pans, wheel zooms
+        if (video && previewVideo && previewVideo->Playing())
+            h2.click = [this] {
+                previewVideo->Pause();
+                Changed(false);
+            };
         h2.dbl = [this] {
             pvZoom = pvZoom > 0 ? 0 : 1.0;
             pvX = pvY = 0;
@@ -3420,6 +3445,19 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
                         KillTimer(hwnd, kTimerSlide);
                     }
                     break;
+                case kTimerVideo: {
+                    double t = 0;
+                    if (!previewVideo || model.preview.empty()) {
+                        KillTimer(hwnd, kTimerVideo);
+                    } else if (auto f = previewVideo->NewFrame(&t)) {
+                        previewImg = f;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    } else if (!previewVideo->Playing()) {
+                        KillTimer(hwnd, kTimerVideo);  // ended: the play button comes back
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    break;
+                }
                 case kTimerGif:
                     KillTimer(hwnd, kTimerGif);
                     if (!gif.frames.empty() && model.preview == gif.path) {
@@ -3525,6 +3563,7 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
             }
             model.lib.Unsubscribe(libListener);
             thumbs.Stop();
+            previewVideo.reset();
             return 0;
         }
     }

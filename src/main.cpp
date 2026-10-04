@@ -18,6 +18,7 @@ using std::min;
 
 #include "capture.h"
 #include "editor.h"
+#include "videoeditor.h"
 #include "gallery.h"
 #include "installer.h"
 #include "library.h"
@@ -271,6 +272,7 @@ void ShowHotkeyErrors() {
 
 void ApplyEditorDefaults() {
     SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile});
+    SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
     SetFileNameTemplate(g_settings.fileNameTemplate);
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);
@@ -505,7 +507,8 @@ void OnRecordingDone(const RecordResult& r) {
                         L"  ·  " + FormatBytes(r.bytes) + L"\nCopied as a file — paste it anywhere.";
     if (!r.warning.empty()) body += L"\n" + r.warning;
     std::wstring path = r.path;
-    ShowToast(L"Recording saved", body, r.thumb, [path] { OpenPath(path); }, g_settings.toastMs + 2500);
+    const bool gif = r.format == RecordFormat::Gif;
+    ShowToast(L"Recording saved", body, r.thumb, [path, gif] { gif ? OpenPath(path) : (void)OpenVideoEditor(path); }, g_settings.toastMs + 2500);
 }
 
 void BeginRecording(RecordFormat fmt, const RECT& rect, HWND window, const std::wstring& title) {
@@ -578,7 +581,7 @@ void OpenHistory() {
     h.editorOpen = [] { return EditorCount() > 0; };
     h.addToEditor = [](const std::vector<std::wstring>& paths) { AddImagesToEditor(paths); };
     h.collage = [](const std::vector<std::wstring>& paths) { OpenCollage(paths); };
-    h.openVideo = [](const std::wstring& path) { OpenPath(path); };
+    h.openVideo = [](const std::wstring& path) { OpenVideoEditor(path); };
     ShowGallery(h);
 }
 
@@ -654,9 +657,12 @@ std::vector<PaletteItem> BuildPaletteItems() {
         const CmdDef* c = FindCmd(CmdStopRecording);
         items.insert(items.begin(), {c->id, c->title, HintFor(*c), c->keywords, c->icon});
     }
-    g_recents = RecentCaptures(g_settings.CapturesFolder(), 8);
-    for (size_t i = 0; i < g_recents.size(); ++i)
-        items.push_back({CmdRecentBase + (int)i, FileNameOf(g_recents[i]), L"Recent", L"recent open history image file", 0xEB9F});
+    g_recents = RecentCaptures(g_settings.CapturesFolder(), 8, true);
+    for (size_t i = 0; i < g_recents.size(); ++i) {
+        const bool video = IsVideoFile(g_recents[i]);
+        items.push_back({CmdRecentBase + (int)i, FileNameOf(g_recents[i]), L"Recent", video ? L"recent open history video recording file" : L"recent open history image file",
+                         (wchar_t)(video ? 0xE714 : 0xEB9F)});
+    }
     return items;
 }
 
@@ -687,7 +693,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
     g_uploadAllowed = !untrusted;
     if (id >= CmdRecentBase) {
         size_t i = id - CmdRecentBase;
-        if (i < g_recents.size()) OpenPath(g_recents[i]);
+        if (i < g_recents.size()) IsVideoFile(g_recents[i]) ? (void)OpenVideoEditor(g_recents[i]) : OpenPath(g_recents[i]);
         return;
     }
     const CmdDef* def = FindCmd(id);
@@ -797,7 +803,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
             else Notify(L"No capture yet");
             break;
         case CmdOpenLast:
-            if (!g_lastPath.empty()) OpenPath(g_lastPath);
+            if (!g_lastPath.empty()) IsVideoFile(g_lastPath) ? (void)OpenVideoEditor(g_lastPath) : OpenPath(g_lastPath);
             else if (auto recent = RecentCaptures(g_settings.CapturesFolder(), 1); !recent.empty()) OpenPath(recent[0]);
             else Notify(L"No saved capture yet");
             break;
@@ -1190,12 +1196,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool featureStats = n >= 3 && _wcsicmp(av[1], L"--feature-stats") == 0;
         const bool gallerySnaps = n >= 3 && _wcsicmp(av[1], L"--gallery-snapshots") == 0;
         const bool editorSnaps = n >= 3 && _wcsicmp(av[1], L"--editor-snapshots") == 0;
-        const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps) && n >= 3 ? av[2] : L"";
+        const bool videoSnaps = n >= 3 && _wcsicmp(av[1], L"--video-snapshots") == 0;
+        const bool editVideo = n >= 3 && _wcsicmp(av[1], L"--edit-video") == 0;
+        const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps || videoSnaps || editVideo) && n >= 3 ? av[2] : L"";
         LocalFree(av);
         if (writeIcon) return ok ? 0 : 1;
         if (featureStats) return FeatureStats(filter);  // developer tool, see library_tests.cpp
         if (gallerySnaps) return GallerySnapshots(filter);  // developer tool, see gallery.cpp
         if (editorSnaps) return EditorSnapshots(filter);    // developer tool, see editor.cpp
+        if (videoSnaps) return VideoEditorSnapshots(filter);  // developer tool, see videoeditor.cpp
+        if (editVideo) {  // developer tool: just the video editor, without the rest of the app
+            SetVideoEditorOptions(DefaultCapturesFolder(), nullptr);
+            if (!OpenVideoEditor(filter)) return 1;
+            MSG msg;
+            while (VideoEditorCount() > 0 && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            return 0;
+        }
         if (selftest) {  // unit tests (see selftest.h)
             const int failures = test::Run(filter);
             Gdiplus::GdiplusShutdown(gdipToken);

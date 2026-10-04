@@ -159,6 +159,7 @@ public:
     VRect View() const { return view_; }
     SIZE Out() const { return out_; }
     bool zoomInPreview = false;  // preview applies zoom only while playing, so editing stays put
+    uint64_t settled = 0;        // preview while paused: the selected item shows fully, not mid-animation
 
 private:
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;

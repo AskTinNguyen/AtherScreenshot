@@ -570,6 +570,7 @@ VRect FrameRenderer::ZoomTarget(VRect r, VRect v) {
 }
 
 Motion FrameRenderer::MotionOf(const Mark& m, double t) const {
+    if (settled && m.id == settled) return {};
     Motion mo = Motion::Between(m.InStyle(), m.OutStyle(), m.start, m.end, t, (int)m.text.size(), (double)full_.cy);
     const double a = t - m.start, u = full_.cy;
     constexpr double kPi = 3.14159265358979323846;
@@ -588,6 +589,7 @@ Motion FrameRenderer::MotionOf(const Mark& m, double t) const {
 }
 
 Motion FrameRenderer::CaptionMotion(const Caption& c, double t) const {
+    if (settled && c.id == settled) return {};
     const AnimStyle s = edit_.captionStyle == AnimStyle::Auto ? AnimStyle::Fade : edit_.captionStyle;
     return Motion::Between(s, s == AnimStyle::Typewriter ? AnimStyle::Fade : s, c.start, c.end, t, (int)c.text.size(), (double)full_.cy);
 }
@@ -967,6 +969,12 @@ ATHER_TEST(video_animation_styles) {
     CHECK(mo(AnimStyle::None, 2.3, MarkKind::Box, std::nullopt, Emphasis::Pulse).scale != 1);
     CHECK(mo(AnimStyle::None, 2, MarkKind::Box, std::nullopt, Emphasis::Ping).ring.has_value());
     CHECK(mo(AnimStyle::None, 2.1, MarkKind::Box, std::nullopt, Emphasis::Bounce).dy != 0);
+    // Paused preview: the selected item shows fully, even at its first frame.
+    Mark fresh = MakeMark(MarkKind::Text, {0, 0}, {10, 10}, 0, L"New", AnimStyle::Fade);
+    CHECK_NEAR(r.MotionOf(fresh, 1).alpha, 0, 0.01);
+    FrameRenderer paused(EditWith({}), kSize, true);
+    paused.settled = fresh.id;
+    CHECK_EQ(paused.MotionOf(fresh, 1).alpha, 1.0);
 }
 
 ATHER_TEST(video_draw_on_and_typewriter_render_partway) {
