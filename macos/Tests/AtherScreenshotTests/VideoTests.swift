@@ -94,6 +94,12 @@ final class VideoTests: XCTestCase {
             let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
             v.cacheDisplay(in: v.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out).appendingPathComponent("ui-video-editor.png"))
+            // A real window capture (includes the video layer), when this process may record the screen.
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-o", "-l\(e.window.windowNumber)", URL(fileURLWithPath: out).appendingPathComponent("ui-video-editor-live.png").path]
+            try? p.run()
+            p.waitUntilExit()
             e.dirty = false
             e.window.close()
         }

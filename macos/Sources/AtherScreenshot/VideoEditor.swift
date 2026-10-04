@@ -740,16 +740,28 @@ extension VideoEditor: NSTextFieldDelegate {
 
 final class VideoStage: NSView {
     weak var editor: VideoEditor?
-    let playerLayer = AVPlayerLayer()
+    private let playerView = PlayerView()
+    var playerLayer: AVPlayerLayer { playerView.playerLayer }
     private var dragFrom: CGPoint?
+    // Crop guides and captions draw in a view above the video; a layer-backed view's own drawing sits under its sublayers.
+    private let overlay = StageOverlay()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
         layer?.cornerRadius = 8
-        playerLayer.videoGravity = .resizeAspect
-        layer?.addSublayer(playerLayer)
+        layer?.masksToBounds = true
+        playerView.autoresizingMask = [.width, .height]
+        addSubview(playerView)
+        overlay.stage = self
+        overlay.autoresizingMask = [.width, .height]
+        addSubview(overlay)
+    }
+
+    override var needsDisplay: Bool {
+        get { super.needsDisplay }
+        set { super.needsDisplay = newValue; if newValue { overlay.needsDisplay = true } }
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -759,10 +771,8 @@ final class VideoStage: NSView {
 
     override func layout() {
         super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        playerLayer.frame = bounds
-        CATransaction.commit()
+        playerView.frame = bounds
+        overlay.frame = bounds
     }
 
     // Where the video is drawn, in view coordinates.
@@ -776,7 +786,7 @@ final class VideoStage: NSView {
         let r = videoRect, s = (editor?.videoSize.width ?? 1) / max(1, r.width)
         return CGPoint(x: (p.x - r.minX) * s, y: (p.y - r.minY) * s)
     }
-    private func toView(_ r: CGRect) -> CGRect {
+    fileprivate func toView(_ r: CGRect) -> CGRect {
         let v = videoRect, s = v.width / max(1, editor?.videoSize.width ?? 1)
         return CGRect(x: v.minX + r.minX * s, y: v.minY + r.minY * s, width: r.width * s, height: r.height * s)
     }
@@ -807,7 +817,7 @@ final class VideoStage: NSView {
 
     override func mouseUp(with e: NSEvent) { dragFrom = nil }
 
-    override func draw(_ dirtyRect: NSRect) {
+    fileprivate func drawOverlay() {
         guard let ed = editor, let ctx = NSGraphicsContext.current?.cgContext else { return }
         let v = videoRect
         if let c = ed.edit.crop {
@@ -855,6 +865,25 @@ final class VideoStage: NSView {
             }
         }
     }
+}
+
+private final class PlayerView: NSView {
+    let playerLayer = AVPlayerLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        playerLayer.videoGravity = .resizeAspect
+        layer = playerLayer
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+private final class StageOverlay: NSView {
+    weak var stage: VideoStage?
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the stage
+    override func draw(_ dirtyRect: NSRect) { stage?.drawOverlay() }
 }
 
 // MARK: - Timeline (thumbnails, trim handles, playhead, caption lane)
