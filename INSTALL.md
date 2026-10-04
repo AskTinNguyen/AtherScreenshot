@@ -20,9 +20,11 @@ The installer:
 | `Ctrl+Alt+K` | Command palette: every feature, searchable |
 | `Ctrl+Alt+E` | Capture and annotate |
 | `Shift+PrintScreen` | Record MP4 (press again to stop) |
-| `Ctrl+Alt+H` | Capture history |
+| `Ctrl+Alt+H` | Capture gallery: search, tags, collections, versions |
 
 Every feature is in the command palette. Change shortcuts and options in **Settings** (palette → "Settings").
+
+Click the notification after a recording (or open an MP4 from the gallery) to trim it, crop it, change its speed, and add captions and callouts. **Auto captions** use Windows speech recognition on your PC. If it isn't installed for your language, add a speech pack in Windows Settings › Time & language › Speech.
 
 **If PrintScreen doesn't work:** go to Windows Settings › Accessibility › Keyboard and turn off *"Use the Print screen key to open screen capture"*. Also close ShareX, Lightshot or any other tool that uses that key.
 
@@ -32,7 +34,7 @@ Run the newer `AtherScreenshot-Setup-<version>.exe` and click **UPDATE**. Your s
 
 ## Uninstall
 
-Go to **Settings › Apps › Installed apps › Ather Screenshot › Uninstall**. Your captures (`Pictures\AtherScreenshot`) and settings (`%APPDATA%\AtherScreenshot`) are kept.
+Go to **Settings › Apps › Installed apps › Ather Screenshot › Uninstall**. Your captures (`Pictures\AtherScreenshot`), settings and gallery library (`%APPDATA%\AtherScreenshot`) are kept.
 
 ## Portable use
 
