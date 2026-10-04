@@ -739,6 +739,8 @@ void DrawToolIcon(gp::Graphics& g, Tool t, const RECT& r, float s, gp::Color c) 
 
 // ---- the editor window ----
 
+struct EditorTest;
+
 class Editor;
 std::vector<Editor*> g_editors;  // most recently active last
 
@@ -803,6 +805,13 @@ private:
     BitmapPtr Export();
     BitmapPtr StyledFrame(const Bitmap& img) const;
     void AutoRedact();
+    // Pixelate boxes from auto-redact. While a drag is under way they wait: the drag's rollback (Esc, a collage
+    // swap) restores a snapshot from before they existed and would silently drop them.
+    void ReceiveRedactions(std::vector<Annot> boxes);
+    void AddRedactions(std::vector<Annot> boxes);
+    void FlushRedactions();
+    bool Gesture() const { return drawing_ || moving_ || resizing_.has_value() || framing_.has_value(); }
+    std::vector<Annot> pendingRedactions_;
     void CopyAnnotations();
     void PasteAnnotations();
     void DuplicateSelected();
@@ -911,6 +920,7 @@ private:
     void SwapCollage(int a, int b);
     void CollageMenu(int which, POINT at);
     void DrawCollageBar(HDC dc);
+    friend struct EditorTest;
     friend bool ather::OpenCollage(const std::vector<std::wstring>&);
     friend int ather::EditorSnapshots(const std::wstring&);
     friend LRESULT CALLBACK EditorProc(HWND, UINT, WPARAM, LPARAM);
@@ -1296,20 +1306,42 @@ void Editor::AutoRedact() {
         auto rects = FindSensitive(words);
         if (rects.empty())
             return (void)ShowToast(L"Nothing sensitive found", std::to_wstring(words.size()) + L" words checked", nullptr, nullptr, 2500);
-        e->PushUndo();
+        std::vector<Annot> boxes;
         for (const RECT& r : rects) {
             Annot a;
             a.type = Tool::Pixelate;
             a.unit = unit;
             a.level = 2;
             a.pts = {gp::PointF((float)(r.left + f.left), (float)(r.top + f.top)), gp::PointF((float)(r.right + f.left), (float)(r.bottom + f.top))};
-            e->st_.annots.push_back(a);
+            boxes.push_back(a);
         }
-        e->Changed(true);
-        e->SetTool(Tool::Select);
-        ShowToast(L"Redacted " + std::to_wstring(rects.size()) + (rects.size() == 1 ? L" item" : L" items"),
-                  L"Each one is a normal pixelate box: move, delete or undo it.", nullptr, nullptr, 3000);
+        e->ReceiveRedactions(std::move(boxes));
     });
+}
+
+void Editor::ReceiveRedactions(std::vector<Annot> boxes) {
+    if (Gesture()) {  // added when the drag ends
+        pendingRedactions_.insert(pendingRedactions_.end(), boxes.begin(), boxes.end());
+        return;
+    }
+    AddRedactions(std::move(boxes));
+}
+
+void Editor::AddRedactions(std::vector<Annot> boxes) {
+    if (boxes.empty()) return;
+    PushUndo();
+    const size_t n = boxes.size();
+    for (auto& a : boxes) st_.annots.push_back(std::move(a));
+    Changed(true);
+    SetTool(Tool::Select);
+    ShowToast(L"Redacted " + std::to_wstring(n) + (n == 1 ? L" item" : L" items"), L"Each one is a normal pixelate box: move, delete or undo it.",
+              nullptr, nullptr, 3000);
+}
+
+void Editor::FlushRedactions() {
+    if (pendingRedactions_.empty() || Gesture()) return;
+    AddRedactions(std::move(pendingRedactions_));
+    pendingRedactions_.clear();
 }
 
 void Editor::CopyAnnotations() {
@@ -2059,7 +2091,15 @@ void Editor::OnDropFiles(HDROP drop) {
 }
 
 void Editor::OnKeyDown(WPARAM vk) {
-    const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    // AltGr arrives as Ctrl+Alt: typing "ż" or "@" must not trigger Ctrl shortcuts.
+    const bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, shift = GetKeyState(VK_SHIFT) < 0;
+    if (Gesture()) {  // mid-drag only Esc does anything: other commands would act on a half-moved document
+        if (vk == VK_ESCAPE) {
+            CancelLive();
+            FlushRedactions();
+        }
+        return;
+    }
     if (ctrl) {
         switch (vk) {
             case 'Z': shift ? Redo() : Undo(); return;
@@ -2598,14 +2638,20 @@ LRESULT Editor::Proc(UINT m, WPARAM w, LPARAM l) {
                 Invalidate();
             }
             return 0;
-        case WM_LBUTTONUP: OnLButtonUp(GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
+        case WM_LBUTTONUP:
+            OnLButtonUp(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+            FlushRedactions();
+            return 0;
         case WM_RBUTTONUP: OnRButtonUp(GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
-        case WM_MOUSEWHEEL: SetLevel(level_ + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1)); return 0;
+        case WM_MOUSEWHEEL:
+            if (!Gesture()) SetLevel(level_ + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1));  // not the shape being dragged
+            return 0;
         case WM_KEYDOWN: OnKeyDown(w); return 0;
         case WM_CHAR: OnChar((wchar_t)w); return 0;
         case WM_DROPFILES: OnDropFiles((HDROP)w); return 0;
         case WM_CAPTURECHANGED:
             if ((HWND)l != hwnd && (drawing_ || moving_ || resizing_ || framing_)) CancelLive();
+            FlushRedactions();
             return 0;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
@@ -2910,6 +2956,38 @@ ATHER_TEST(editor_crop_outside_image_still_exports_annotations) {
     auto out = Compose(*base, st);
     CHECK_EQ(out->Width(), 200);
     CHECK(Rgb(At(*out, 10, 50)) != 0xFFFFFFu);  // the red rectangle is there
+}
+
+// Auto-redact finishing in the middle of a drag: the boxes wait for the drag to end, and cancelling the drag
+// (which restores the document from before it) doesn't lose them.
+namespace {
+struct EditorTest {
+    static void Redactions();
+};
+}  // namespace
+
+ATHER_TEST(editor_redactions_survive_a_cancelled_drag) { EditorTest::Redactions(); }
+
+void EditorTest::Redactions() {
+    auto img = SolidBmp(400, 300, 0xFFFFFFFF);
+    auto* e = new Editor(img, {});
+    e->hidden_ = true;
+    CHECK(e->Create());
+    if (!e->hwnd) return;
+    e->PushUndo();  // what a drag start does
+    e->drawing_ = true;
+    e->live_.type = Tool::Arrow;
+    e->live_.pts = {gp::PointF(10, 10), gp::PointF(50, 50)};
+    Annot box;
+    box.type = Tool::Pixelate;
+    box.pts = {gp::PointF(20, 20), gp::PointF(80, 40)};
+    e->ReceiveRedactions({box});
+    CHECK(std::none_of(e->st_.annots.begin(), e->st_.annots.end(), [](const Annot& a) { return a.type == Tool::Pixelate; }));
+    e->OnKeyDown(VK_ESCAPE);  // cancel the drag
+    CHECK(!e->Gesture());
+    CHECK(std::any_of(e->st_.annots.begin(), e->st_.annots.end(), [](const Annot& a) { return a.type == Tool::Pixelate; }));
+    e->dirty_ = false;
+    DestroyWindow(e->hwnd);
 }
 
 // ---- shared with the video editor (annot.h) ----

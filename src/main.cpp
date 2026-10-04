@@ -845,6 +845,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
 
 struct CliRequest {
     int cmd = 0;
+    bool fromLink = false;  // came from an atherscreenshot:// link
     After after = After::Default;
     int delayMs = 0;
     std::wstring file;  // edit / upload / pin <file>
@@ -955,6 +956,14 @@ std::vector<std::wstring> SplitArgs(const std::wstring& cmdline, bool* fromLink)
     return args;
 }
 
+// A file argument, judged by its shape only (never by touching the disk: from a link, even checking whether
+// \\host\share\x exists would connect to that host). Flags like --pin or /pin don't qualify.
+bool LooksLikePath(const std::wstring& a) {
+    if (a.empty() || a[0] == L'-') return false;
+    if (a[0] == L'/' && a.find_first_of(L"/\\.:", 1) == std::wstring::npos) return false;  // /pin
+    return a.find_first_of(L"\\/:.") != std::wstring::npos;
+}
+
 CliRequest ParseCli(const std::vector<std::wstring>& args) {
     CliRequest req;
     req.args = args;
@@ -982,13 +991,13 @@ CliRequest ParseCli(const std::vector<std::wstring>& args) {
         else if (a == L"redact") req.after = After::Redact;
         else if (a == L"ocr" && req.cmd) req.after = After::Ocr;
         else if (a == L"delay" && i + 1 < args.size()) req.delayMs = std::clamp(_wtoi(args[++i].c_str()), 0, 60) * 1000;
-        else if (req.cmd && GetFileAttributesW(args[i].c_str()) != INVALID_FILE_ATTRIBUTES) req.file = args[i];
+        else if (req.cmd && LooksLikePath(args[i])) req.file = args[i];  // checked only once trusted (RunCli)
         else if (!req.cmd) {
             for (const auto& [name, id] : kAliases)
                 if (a == name) req.cmd = id;
             for (const auto& c : kCmds)  // any settings.ini hotkey name works too, e.g. CaptureRegionPin
                 if (!req.cmd && _wcsicmp(a.c_str(), c.key) == 0) req.cmd = c.id;
-            if (!req.cmd && i == 0 && GetFileAttributesW(args[i].c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (!req.cmd && i == 0 && LooksLikePath(args[i])) {
                 req.cmd = CmdEditLast;  // AtherScreenshot.exe picture.png opens it in the editor
                 req.file = args[i];
             }
@@ -1016,6 +1025,11 @@ std::wstring JoinArgs(const std::vector<std::wstring>& args) {
     return s.size() > 200 ? s.substr(0, 200) + L"…" : s;
 }
 
+// Commands that use --pin/--edit/--upload/--redact/--ocr: a capture that the "after" action applies to.
+bool UsesAfter(int cmd) {
+    return cmd == CmdRegion || cmd == CmdFullscreen || cmd == CmdMonitor || cmd == CmdWindow || cmd == CmdLastRegion;
+}
+
 void RunCli(const CliRequest& req, bool trusted) {
     if (!req.error.empty())
         return ShowToast(L"Ather Screenshot command line", req.error +
@@ -1023,7 +1037,11 @@ void RunCli(const CliRequest& req, bool trusted) {
                              L"[--pin|--edit|--upload|--redact|--ocr] [--delay N]",
                          nullptr, nullptr, 8000), void();
     if (!req.cmd) return;
-    if (!trusted) {
+    // Explorer's "Open with" and dragging a picture onto the exe launch it with just a path: opening that file in
+    // the editor is what the user asked for, and nothing leaves the machine. Links can't produce this shape.
+    const bool openWith = !trusted && !req.fromLink && req.cmd == CmdEditLast && !req.file.empty() && req.after == After::Default &&
+                          req.args.size() == 1;
+    if (!trusted && !openWith) {
         if (CliTouchesFiles(req))
             return ShowToast(L"Blocked a request from a link or another app",
                              L"“" + JoinArgs(req.args) + L"” can only be run from a command prompt.", nullptr, nullptr, 8000),
@@ -1034,7 +1052,9 @@ void RunCli(const CliRequest& req, bool trusted) {
                                                                MB_SETFOREGROUND) != IDOK)
             return;
     }
-    if (!req.file.empty()) {  // file-based commands
+    if (!req.file.empty()) {  // file-based commands: never fall back to "the last capture" for a file that isn't there
+        if (GetFileAttributesW(req.file.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return Notify(L"File not found", req.file);
         if (req.cmd == CmdUploadLast) return UploadAndCopyLink(req.file);
         if (req.cmd == CmdEditLast || req.cmd == CmdPinLast) {
             BitmapPtr img = LoadImageFile(req.file);
@@ -1044,7 +1064,8 @@ void RunCli(const CliRequest& req, bool trusted) {
             return;
         }
     }
-    g_cliAfterPending = req.after;
+    // Only captures use an "after" action; for anything else it would linger and hijack the next capture.
+    g_cliAfterPending = UsesAfter(req.cmd) ? req.after : After::Default;
     if (req.delayMs) {
         g_delayedCmd = req.cmd;
         g_delayedUntrusted = !trusted;
@@ -1052,6 +1073,26 @@ void RunCli(const CliRequest& req, bool trusted) {
     } else {
         Execute(req.cmd, false, !trusted);
     }
+}
+
+// The command line with relative file arguments made absolute, for forwarding to the running instance.
+std::wstring AbsoluteCommandLine() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return GetCommandLineW();
+    std::wstring out;
+    for (int i = 0; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (i > 0 && LooksLikePath(a) && _wcsnicmp(a.c_str(), L"atherscreenshot:", 16) != 0) {
+            wchar_t full[32768];
+            const DWORD n = GetFullPathNameW(a.c_str(), 32768, full, nullptr);
+            if (n > 0 && n < 32768) a = full;
+        }
+        if (!out.empty()) out += L' ';
+        out += L'"' + a + L'"';  // paths can't contain quotes
+    }
+    LocalFree(argv);
+    return out;
 }
 
 // ---- tray ----
@@ -1143,7 +1184,9 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             RunOnUi([cmd, tokenOk] {  // don't keep the sender blocked
                 bool fromLink = false;
                 auto args = SplitArgs(cmd, &fromLink);
-                RunCli(ParseCli(args), tokenOk && !fromLink);
+                CliRequest req = ParseCli(args);
+                req.fromLink = fromLink;
+                RunCli(req, tokenOk && !fromLink);
             });
             return TRUE;
         }
@@ -1237,7 +1280,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             AllowSetForegroundWindow(pid);
             if (argc > 1) {
                 // Only a command typed in a console carries the token; launches by other apps and links don't.
-                std::wstring cmd = (InteractiveLaunch() ? CliToken() : std::wstring()) + L'\x1e' + GetCommandLineW();
+                std::wstring cmd = (InteractiveLaunch() ? CliToken() : std::wstring()) + L'\x1e' + AbsoluteCommandLine();
                 COPYDATASTRUCT cds{kCopyDataCli, (DWORD)((cmd.size() + 1) * sizeof(wchar_t)), (PVOID)cmd.c_str()};
                 DWORD_PTR result = 0;
                 SendMessageTimeoutW(other, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 3000, &result);
@@ -1283,7 +1326,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (argc > 1) {  // first launch with a command: run it too
         bool fromLink = false;
         auto args = SplitArgs(GetCommandLineW(), &fromLink);
-        RunCli(ParseCli(args), InteractiveLaunch() && !fromLink);
+        CliRequest req = ParseCli(args);
+        req.fromLink = fromLink;
+        RunCli(req, InteractiveLaunch() && !fromLink);
     }
 
     MSG msg;
@@ -1345,6 +1390,17 @@ ATHER_TEST(cli_untrusted_requests_never_touch_files) {
     CHECK_EQ(ParseCli({L"region", L"--pin"}).after, After::Pin);
     CHECK_EQ(ParseCli({L"gallery"}).cmd, (int)CmdHistory);
     CHECK(!ParseCli({L"nonsense"}).error.empty());
+    // A link's network path is taken as a file by its shape (so it's blocked) without ever being opened.
+    bool link = false;
+    const CliRequest unc = ParseCli(SplitArgs(L"AtherScreenshot.exe \"atherscreenshot://region?x=//attacker.invalid/s/a.png\"", &link));
+    CHECK(link);
+    CHECK(unc.file == L"//attacker.invalid/s/a.png");
+    CHECK(CliTouchesFiles(unc));
+    CHECK(!LooksLikePath(L"--pin") && !LooksLikePath(L"/pin") && LooksLikePath(L"a.png") && LooksLikePath(L"C:\\x"));
+    // "Open with": a bare path opens it in the editor.
+    CHECK_EQ(ParseCli({L"C:\\shots\\a.png"}).cmd, (int)CmdEditLast);
+    // --pin and friends only apply to captures.
+    CHECK(UsesAfter(CmdRegion) && !UsesAfter(CmdRuler) && !UsesAfter(CmdScrolling) && !UsesAfter(CmdRecordVideo));
 }
 
 ATHER_TEST(cli_token_is_private_and_stable) {
