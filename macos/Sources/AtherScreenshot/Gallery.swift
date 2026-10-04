@@ -285,7 +285,7 @@ final class GalleryModel: ObservableObject {
 
     func open(_ u: URL? = nil) {
         guard let u = u ?? focus ?? selected.first else { return }
-        if isImage(u) { Editor.open(url: u) } else { Output.open(u) }
+        if isImage(u) { Editor.open(url: u) } else if MediaType.of(u) == .video { VideoEditor.open(u) } else { Output.open(u) }
     }
 
     func copy() {
@@ -658,7 +658,7 @@ private struct ItemMenu: View {
     let url: URL
     var body: some View {
         let ensure = { if !model.selection.contains(url) { model.selection = [url]; model.focus = url } }
-        Button(model.isImage(url) ? "Annotate" : "Open") { model.open(url) }
+        Button(model.isImage(url) ? "Annotate" : MediaType.of(url) == .video ? "Edit video" : "Open") { model.open(url) }
         Button("Preview") { ensure(); model.preview = url }
         Button("Find similar") { model.findSimilar(url) }
         if model.selection.count > 1 && model.selection.contains(url) { Button("Make collage") { model.collage() } }
@@ -1673,7 +1673,8 @@ private struct Inspector: View {
         }
 
         HStack(spacing: 4) {
-            ghost(model.isImage(u) ? "Annotate" : "Open", model.isImage(u) ? "pencil.tip.crop.circle" : "play") { model.open(u) }
+            ghost(model.isImage(u) ? "Annotate" : MediaType.of(u) == .video ? "Edit video" : "Open",
+                  model.isImage(u) ? "pencil.tip.crop.circle" : MediaType.of(u) == .video ? "film" : "play") { model.open(u) }
             ghost("Find similar", "sparkle.magnifyingglass") { model.findSimilar(u) }
         }
         .padding(.top, 4)

@@ -422,7 +422,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let size = ByteCountFormatter.string(fromByteCount: Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0), countStyle: .file)
         Toast.shared.show(note == nil ? (gif ? "GIF saved and copied" : "Video saved and copied") : "Recording stopped: \(note!)",
                           "\(url.lastPathComponent)  ·  \(formatTime(duration))  ·  \(size)",
-                          ms: Settings.shared.int("ToastMs") + 2500) { Output.open(url) }
+                          ms: Settings.shared.int("ToastMs") + 2500) { if self.gif { Output.open(url) } else { VideoEditor.open(url) } }
     }
 }
 

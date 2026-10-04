@@ -313,7 +313,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for u in Output.listCaptures().prefix(5) {
             items.append(PaletteItem(id: "recent", title: "Open recent: \(u.lastPathComponent)", keywords: "recent last history file", icon: "clock",
                                      hint: Library.dateFormat.string(from: (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date())) {
-                if ["mp4", "mov", "gif"].contains(u.pathExtension.lowercased()) { Output.open(u) } else { Editor.open(url: u) }
+                if ["mp4", "mov"].contains(u.pathExtension.lowercased()) { VideoEditor.open(u) }
+                else if u.pathExtension.lowercased() == "gif" { Output.open(u) } else { Editor.open(url: u) }
             })
         }
         return items

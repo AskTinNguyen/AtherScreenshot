@@ -45,6 +45,18 @@ All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.at
 - **Collage (⌘G in the gallery):** select two or more screenshots and press Collage. Choose a layout (auto, grid, row, column, feature), gap, margin, background, corners, shadow and size (fit, 1920 px wide, square). Drag one screenshot onto another to swap them; everything else in the editor works on top.
 - Saved results join the gallery: edits are tagged "edited" and keep the original's metadata; collages are tagged "collage" and keep the tags and collections their screenshots share. Both list the screenshots they include.
 
+## Video editor
+
+Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent) opens a small editor instead of a player:
+
+- **Trim:** drag the yellow handles on the timeline, or press I and O at the playhead.
+- **Crop:** press C and drag on the video; pick Free, 16:9, 4:3, 1:1 or 9:16 to keep a shape.
+- **Speed** 0.5–4× (audio keeps its pitch) and **Mute**.
+- **Captions:** T adds one at the playhead; type in the field, drag it on the timeline to move it or its edges to retime it, choose top, middle or bottom and the text size. **Auto captions** transcribes the speech with macOS speech recognition (on this Mac when supported) and splits it into short captions.
+- **Save** (⌘S) writes a new MP4; **Save GIF** (⌘⇧S) writes a GIF. The original stays untouched, and the result stacks with it in the gallery.
+
+Space plays, ←/→ step a frame (⇧ a second), ⌫ deletes the selected caption, ⌘Z undoes.
+
 ## Capture gallery (⌃⌥H)
 
 An Eagle-style library for everything in the captures folder. Metadata lives in `~/Library/Application Support/AtherScreenshot/library.json` (feature prints in `features.plist`); the image files are never modified.
@@ -53,6 +65,9 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 - **Search:** text (file name, OCR text, tags, comments, source app, window title), plus filters for type, tags (all/any/untagged), rating, color, shape (landscape, portrait, square, panorama, long page), minimum dimensions, date, file size and source app. **Find similar** is a reverse image search using Vision feature prints.
 - **Layout:** the window is just your captures under one floating toolbar (scope menu, search, filters, view options). Filter chips appear only while a filter is active, and an action bar floats in while something is selected. The sidebar (⌃⌘S) and the details inspector (⌘I) are hidden until you ask for them.
 - **Browse:** justified, grid or list layout; pinch or ⌘+/⌘− for thumbnail size. Sort by date, name, size, dimensions, rating or random (shuffle). The inspector shows tags, rating, comment, collections, color palette (click a color to search by it), info and OCR text. Space opens a full-window preview with zoom, playback for GIFs and videos, ←/→ navigation and a slideshow. Drag captures out to other apps, or drop files in to import them.
+- **Suggested tags:** each capture gets suggestions from its source app, the text in it, its shape and colors (code, terminal, error, chat, email, design, web, receipt, login, dashboard, mobile, dark…). They're searchable right away; click one to add it, right-click to stop suggesting it, or turn on Settings › Gallery › Tag captures automatically.
+- **Search by meaning:** words also match related words (on-device word model plus a screenshot vocabulary: "graph" finds charts, "login" finds sign-in screens), and phrases like "yesterday" or "last week" filter by date. Related matches come after exact ones.
+- **Versions:** an edited capture stacks with its original; the badge shows how many versions there are and opens the stack. C compares two captures (or an edit with its original) with a before/after slider or side by side.
 - **Indexing:** dimensions, palette, perceptual hash, feature print and OCR text are computed in the background; a small progress ring shows in the toolbar. Captures remember which app and window they came from.
 
 | Key | Action |
@@ -93,4 +108,4 @@ Commands typed in a terminal run directly. Commands from `atherscreenshot://` li
 
 ## Layout (`Sources/AtherScreenshot`)
 
-`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.
+`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, export) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

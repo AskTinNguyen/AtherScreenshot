@@ -16,6 +16,7 @@
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
     <key>NSMicrophoneUsageDescription</key><string>Ather Screenshot records your microphone in screen recordings when “Record microphone” is on.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>Ather Screenshot turns speech in your screen recordings into captions when you choose Auto captions.</string>
     <key>NSHumanReadableCopyright</key><string>Ather</string>
     <key>CFBundleURLTypes</key>
     <array>
