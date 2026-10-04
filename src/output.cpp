@@ -1,5 +1,6 @@
 #include "output.h"
 
+#include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincodec.h>
@@ -27,7 +28,77 @@ static bool OpenClipboardRetry(HWND owner) {
     return false;
 }
 
-bool CopyImageToClipboard(HWND owner, const Bitmap& img) {
+bool HasAlpha(const Bitmap& img) {
+    const uint32_t* p = img.Bits();
+    for (size_t i = 0, n = (size_t)img.Width() * img.Height(); i < n; ++i)
+        if ((p[i] >> 24) != 255) return true;
+    return false;
+}
+
+BitmapPtr Flatten(const Bitmap& img, COLORREF bg) {
+    auto out = Bitmap::Create(img.Width(), img.Height());
+    if (!out) return nullptr;
+    const uint32_t br = GetRValue(bg), bgg = GetGValue(bg), bb = GetBValue(bg);
+    const uint32_t* s = img.Bits();
+    uint32_t* d = out->Bits();
+    for (size_t i = 0, n = (size_t)img.Width() * img.Height(); i < n; ++i) {  // premultiplied over bg
+        const uint32_t p = s[i], k = 255 - (p >> 24);
+        const uint32_t r = std::min(255u, ((p >> 16) & 255) + br * k / 255), g = std::min(255u, ((p >> 8) & 255) + bgg * k / 255),
+                       b = std::min(255u, (p & 255) + bb * k / 255);
+        d[i] = 0xFF000000u | r << 16 | g << 8 | b;
+    }
+    return out;
+}
+
+static HRESULT WritePng(const Bitmap& img, IStream* out) {
+    const UINT w = img.Width(), h = img.Height();
+    const bool alpha = HasAlpha(img);
+    ComPtr<IWICImagingFactory> f;
+    ComPtr<IWICBitmap> src;
+    ComPtr<IWICBitmapEncoder> enc;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> props;
+    WICPixelFormatGUID fmt = alpha ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;  // no alpha channel: smaller files
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
+    if (SUCCEEDED(hr))
+        hr = f->CreateBitmapFromMemory(w, h, alpha ? GUID_WICPixelFormat32bppPBGRA : GUID_WICPixelFormat32bppBGR, w * 4, w * h * 4,
+                                       reinterpret_cast<BYTE*>(img.Bits()), &src);
+    if (SUCCEEDED(hr)) hr = f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc);
+    if (SUCCEEDED(hr)) hr = enc->Initialize(out, WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = enc->CreateNewFrame(&frame, &props);
+    if (SUCCEEDED(hr)) hr = frame->Initialize(props.Get());
+    if (SUCCEEDED(hr)) hr = frame->SetSize(w, h);
+    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
+    if (SUCCEEDED(hr)) hr = frame->WriteSource(src.Get(), nullptr);  // converts to `fmt` (un-premultiplies)
+    if (SUCCEEDED(hr)) hr = frame->Commit();
+    if (SUCCEEDED(hr)) hr = enc->Commit();
+    return hr;
+}
+
+std::vector<BYTE> EncodePng(const Bitmap& img) {
+    std::vector<BYTE> out;
+    ComPtr<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || FAILED(WritePng(img, stream.Get()))) return out;
+    STATSTG st{};
+    stream->Stat(&st, STATFLAG_NONAME);
+    out.resize((size_t)st.cbSize.QuadPart);
+    LARGE_INTEGER zero{};
+    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    ULONG read = 0;
+    stream->Read(out.data(), (ULONG)out.size(), &read);
+    out.resize(read);
+    return out;
+}
+
+bool CopyImageToClipboard(HWND owner, const Bitmap& source) {
+    BitmapPtr flat;
+    std::vector<BYTE> png;
+    if (HasAlpha(source)) {
+        flat = Flatten(source);
+        png = EncodePng(source);
+        if (!flat) return false;
+    }
+    const Bitmap& img = flat ? *flat : source;
     const int w = img.Width(), h = img.Height();
     const size_t stride = (size_t)w * 4, bytes = stride * h;
     HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + bytes);
@@ -53,8 +124,15 @@ bool CopyImageToClipboard(HWND owner, const Bitmap& img) {
     }
     EmptyClipboard();
     bool ok = SetClipboardData(CF_DIB, g) != nullptr;
-    CloseClipboard();
     if (!ok) GlobalFree(g);
+    if (ok && !png.empty()) {
+        if (HGLOBAL pg = GlobalAlloc(GMEM_MOVEABLE, png.size())) {
+            memcpy(GlobalLock(pg), png.data(), png.size());
+            GlobalUnlock(pg);
+            if (!SetClipboardData(RegisterClipboardFormatW(L"PNG"), pg)) GlobalFree(pg);
+        }
+    }
+    CloseClipboard();
     return ok;
 }
 
@@ -129,29 +207,12 @@ BitmapPtr LoadImageFile(const std::wstring& path) {
 }
 
 bool SavePng(const Bitmap& img, const std::wstring& path) {
-    const UINT w = img.Width(), h = img.Height();
     ComPtr<IWICImagingFactory> f;
-    ComPtr<IWICBitmap> src;
     ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapEncoder> enc;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IPropertyBag2> props;
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;  // no alpha channel: smaller files
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
-    if (SUCCEEDED(hr))
-        hr = f->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, w * h * 4,
-                                       reinterpret_cast<BYTE*>(img.Bits()), &src);
     if (SUCCEEDED(hr)) hr = f->CreateStream(&stream);
     if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
-    if (SUCCEEDED(hr)) hr = f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc);
-    if (SUCCEEDED(hr)) hr = enc->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-    if (SUCCEEDED(hr)) hr = enc->CreateNewFrame(&frame, &props);
-    if (SUCCEEDED(hr)) hr = frame->Initialize(props.Get());
-    if (SUCCEEDED(hr)) hr = frame->SetSize(w, h);
-    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
-    if (SUCCEEDED(hr)) hr = frame->WriteSource(src.Get(), nullptr);  // converts to `fmt`
-    if (SUCCEEDED(hr)) hr = frame->Commit();
-    if (SUCCEEDED(hr)) hr = enc->Commit();
+    if (SUCCEEDED(hr)) hr = WritePng(img, stream.Get());
     if (FAILED(hr)) {
         stream.Reset();
         DeleteFileW(path.c_str());

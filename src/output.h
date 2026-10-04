@@ -3,7 +3,12 @@
 
 namespace ather {
 
+// Pixels are premultiplied BGRA. An image with transparency is copied flattened onto white (CF_DIB) and also
+// as "PNG" with its alpha, which most apps prefer.
 bool CopyImageToClipboard(HWND owner, const Bitmap& img);
+bool HasAlpha(const Bitmap& img);
+BitmapPtr Flatten(const Bitmap& img, COLORREF bg = RGB(255, 255, 255));
+std::vector<BYTE> EncodePng(const Bitmap& img);
 bool CopyTextToClipboard(HWND owner, const std::wstring& text);
 // CF_HDROP, so the file can be pasted into Explorer, chat apps, etc.
 bool CopyFileToClipboard(HWND owner, const std::wstring& path);
@@ -12,6 +17,7 @@ bool CopyFilesToClipboard(HWND owner, const std::vector<std::wstring>& paths);
 // Decodes any WIC-supported image; transparency is flattened onto white.
 BitmapPtr LoadImageFile(const std::wstring& path);
 
+// 24-bit unless the image has transparency (then 32-bit with alpha).
 bool SavePng(const Bitmap& img, const std::wstring& path);
 // Encodes on a worker thread; `done` runs on the UI thread.
 void SavePngAsync(BitmapPtr img, std::wstring path, std::function<void(bool ok)> done);

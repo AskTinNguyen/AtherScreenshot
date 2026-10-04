@@ -270,7 +270,7 @@ void ShowHotkeyErrors() {
 }
 
 void ApplyEditorDefaults() {
-    SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport});
+    SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile});
     SetFileNameTemplate(g_settings.fileNameTemplate);
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);
@@ -351,7 +351,7 @@ void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = 
                 // Never hand out an unredacted image when redaction was asked for: let the user do it by hand.
                 ShowToast(L"Auto-redact failed — nothing was copied, saved or uploaded",
                           err + L"\nOpened in the editor so you can redact it yourself.", nullptr, nullptr, 9000);
-                OpenEditor(img);
+                OpenEditor(img, {L"", g_nameInfo.app, g_nameInfo.window});
                 return;
             }
             auto clean = img->Crop({0, 0, img->Width(), img->Height()});
@@ -382,7 +382,7 @@ void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = 
     }
 
     if (after == After::Edit || (after == After::Default && g_settings.afterCapture == L"edit")) {
-        OpenEditor(img);  // the editor copies/saves the annotated result when you press Done
+        OpenEditor(img, {L"", g_nameInfo.app, g_nameInfo.window});  // the editor copies/saves the annotated result on Done
         return;
     }
 
@@ -574,10 +574,10 @@ void OpenHistory() {
     h.icon = g_iconBig;
     h.regionHotkey = g_settings.Hotkey(L"CaptureRegion");
     h.upload = [](const std::wstring& path) { UploadAndCopyLink(path); };
-    h.openImage = [](const std::wstring& path) {
-        if (auto img = LoadImageFile(path)) OpenEditor(img);
-        else Notify(L"Could not open image", FileNameOf(path));
-    };
+    h.openImage = [](const std::wstring& path) { OpenEditorFile(path); };
+    h.editorOpen = [] { return EditorCount() > 0; };
+    h.addToEditor = [](const std::vector<std::wstring>& paths) { AddImagesToEditor(paths); };
+    h.collage = [](const std::vector<std::wstring>& paths) { OpenCollage(paths); };
     h.openVideo = [](const std::wstring& path) { OpenPath(path); };
     ShowGallery(h);
 }
@@ -623,8 +623,7 @@ void OpenImageInEditor() {
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     SetForegroundWindow(g_hwnd);
     if (!GetOpenFileNameW(&ofn)) return;
-    if (auto img = LoadImageFile(file)) OpenEditor(img);
-    else Notify(L"Could not open image", FileNameOf(file));
+    OpenEditorFile(file);
 }
 
 void CaptureActiveWindow(After after) {
@@ -760,7 +759,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdEditLast:
             if (g_last) OpenEditor(g_last);
             else if (auto recent = RecentCaptures(g_settings.CapturesFolder(), 1); !recent.empty())
-                OpenEditor(LoadImageFile(recent[0]));
+                OpenEditorFile(recent[0]);
             else Notify(L"No capture yet");
             break;
         case CmdOpenImage: OpenImageInEditor(); break;
@@ -1034,7 +1033,7 @@ void RunCli(const CliRequest& req, bool trusted) {
         if (req.cmd == CmdEditLast || req.cmd == CmdPinLast) {
             BitmapPtr img = LoadImageFile(req.file);
             if (!img) return Notify(L"Could not open image", FileNameOf(req.file));
-            if (req.cmd == CmdEditLast) OpenEditor(img);
+            if (req.cmd == CmdEditLast) OpenEditor(img, {req.file, L"", L""});
             else PinImage(img, nullptr);
             return;
         }
@@ -1190,11 +1189,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool selftest = n >= 2 && _wcsicmp(av[1], L"--selftest") == 0;
         const bool featureStats = n >= 3 && _wcsicmp(av[1], L"--feature-stats") == 0;
         const bool gallerySnaps = n >= 3 && _wcsicmp(av[1], L"--gallery-snapshots") == 0;
-        const std::wstring filter = (selftest || featureStats || gallerySnaps) && n >= 3 ? av[2] : L"";
+        const bool editorSnaps = n >= 3 && _wcsicmp(av[1], L"--editor-snapshots") == 0;
+        const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps) && n >= 3 ? av[2] : L"";
         LocalFree(av);
         if (writeIcon) return ok ? 0 : 1;
         if (featureStats) return FeatureStats(filter);  // developer tool, see library_tests.cpp
         if (gallerySnaps) return GallerySnapshots(filter);  // developer tool, see gallery.cpp
+        if (editorSnaps) return EditorSnapshots(filter);    // developer tool, see editor.cpp
         if (selftest) {  // unit tests (see selftest.h)
             const int failures = test::Run(filter);
             Gdiplus::GdiplusShutdown(gdipToken);
