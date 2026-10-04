@@ -32,9 +32,21 @@ final class GalleryModel: ObservableObject {
     @Published var thumbSize: Double = UserDefaults.standard.object(forKey: "GalleryThumb") as? Double ?? 190 {
         didSet { UserDefaults.standard.set(thumbSize, forKey: "GalleryThumb") }
     }
-    @Published var showInspector = UserDefaults.standard.object(forKey: "GalleryInspector") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showInspector, forKey: "GalleryInspector") }
+    // Canvas-first: sidebar and inspector start hidden; ⌃⌘S and ⌘I bring them in.
+    @Published var showSidebar = UserDefaults.standard.bool(forKey: "GallerySidebar") {
+        didSet { UserDefaults.standard.set(showSidebar, forKey: "GallerySidebar") }
     }
+    @Published var showInspector = UserDefaults.standard.bool(forKey: "GalleryInspectorShown") {
+        didSet {
+            UserDefaults.standard.set(showInspector, forKey: "GalleryInspectorShown")
+            if showInspector { inspectorDiscovered = true }
+        }
+    }
+    // The action bar spells out "⌘I" until the inspector has been opened once.
+    @Published private(set) var inspectorDiscovered = UserDefaults.standard.bool(forKey: "GalleryInspectorDiscovered") {
+        didSet { UserDefaults.standard.set(inspectorDiscovered, forKey: "GalleryInspectorDiscovered") }
+    }
+    @Published var showShortcuts = false
     @Published var showNames = UserDefaults.standard.bool(forKey: "GalleryNames") { didSet { UserDefaults.standard.set(showNames, forKey: "GalleryNames") } }
     @Published private(set) var visible: [URL] = []
     @Published private(set) var groups: [[URL]] = []           // duplicates scope
@@ -182,6 +194,7 @@ final class GalleryModel: ObservableObject {
     }
 
     func selectAll() { selection = Set(visible) }
+    func zoom(_ factor: Double) { thumbSize = min(360, max(110, thumbSize * factor)) }
 
     func step(_ d: Int) {
         guard let p = preview, let i = visible.firstIndex(of: p), !visible.isEmpty else { return }
@@ -214,6 +227,15 @@ final class GalleryModel: ObservableObject {
 
     func pin() { for u in targets where isImage(u) { if let img = CGImage.load(u) { Pin.show(img) } } }
     func reveal() { if !targets.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(targets) } }
+
+    // Selects a capture in the gallery, widening the view if it's filtered out.
+    func reveal(inGallery u: URL) {
+        guard lib.urls.contains(u) else { return Toast.shared.show("The original is no longer in the gallery") }
+        if !visible.contains(u) { scope = .all; filter = Filter() }
+        selection = [u]
+        focus = u
+        anchor = u
+    }
     func upload() { for u in targets { AppDelegate.shared?.upload(u) } }
 
     func copyText() {
@@ -481,6 +503,7 @@ private struct Tile: View {
     let height: CGFloat
     var fill = true
     var caption = false
+    @State private var hover = false
 
     var body: some View {
         let m = model.lib.meta(url)
@@ -489,26 +512,23 @@ private struct Tile: View {
             ZStack(alignment: .bottomLeading) {
                 ThumbImage(url: url, side: max(width, height), fill: fill)
                     .frame(width: width, height: height)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 HStack(spacing: 4) {
-                    if MediaType.of(url) != .image {
-                        Text(MediaType.of(url) == .gif ? "GIF" : (m.duration.map(formatTime) ?? "MP4"))
-                            .font(.system(size: 9, weight: .bold)).padding(.horizontal, 5).padding(.vertical, 2)
-                            .background(C(Theme.accent)).foregroundColor(C(Theme.onAccent)).cornerRadius(4)
-                    }
-                    if m.rating > 0 {
-                        Text(String(repeating: "★", count: m.rating)).font(.system(size: 9)).padding(.horizontal, 5).padding(.vertical, 2)
-                            .background(Color.black.opacity(0.6)).foregroundColor(C(Theme.accent)).cornerRadius(4)
-                    }
-                    if let d = model.distances[url] {
-                        Text(String(format: "%.0f%%", similarity(d))).font(.system(size: 9, weight: .semibold))
-                            .padding(.horizontal, 5).padding(.vertical, 2).background(Color.black.opacity(0.6)).foregroundColor(.white).cornerRadius(4)
+                    if MediaType.of(url) != .image { badge(MediaType.of(url) == .gif ? "GIF" : (m.duration.map(formatTime) ?? "MP4")) }
+                    if m.rating > 0 { badge(String(repeating: "★", count: m.rating)) }
+                    if let d = model.distances[url] { badge(String(format: "%.0f%%", similarity(d))) }
+                    if hover && !caption {
+                        Text(url.deletingPathExtension().lastPathComponent).font(.system(size: 10, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(.ultraThinMaterial, in: Capsule()).foregroundColor(.white)
                     }
                 }
                 .padding(6)
+                .frame(maxWidth: width, alignment: .leading)
             }
-            .overlay(RoundedRectangle(cornerRadius: 7).stroke(sel ? C(Theme.accent) : (model.focus == url ? C(Theme.muted) : Color.clear), lineWidth: sel ? 2.5 : 1)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(sel ? C(Theme.accent) : (model.focus == url ? Color.white.opacity(0.35) : Color.clear), lineWidth: sel ? 2.5 : 1)
                 .padding(-2))
+            .onHover { hover = $0 }
             if caption {
                 Text(url.lastPathComponent).font(.system(size: 11)).foregroundColor(C(sel ? Theme.text : Theme.textDim)).lineLimit(1).truncationMode(.middle)
                     .frame(width: width, alignment: .leading)
@@ -524,6 +544,11 @@ private struct Tile: View {
         }
         .contextMenu { ItemMenu(model: model, url: url) }
         .id(url)
+    }
+
+    private func badge(_ s: String) -> some View {
+        Text(s).font(.system(size: 9, weight: .bold)).padding(.horizontal, 6).padding(.vertical, 2)
+            .background(.ultraThinMaterial, in: Capsule()).foregroundColor(.white)
     }
 }
 
@@ -558,7 +583,10 @@ private struct ItemMenu: View {
 
 private struct Browser: View {
     @ObservedObject var model: GalleryModel
+    var top: CGFloat = 0       // height of the floating toolbar the content scrolls under
     private let spacing: CGFloat = 8
+    private let bottom: CGFloat = 76
+    @State private var pinchBase: Double?
 
     var body: some View {
         GeometryReader { geo in
@@ -570,9 +598,10 @@ private struct Browser: View {
                     } else if case .duplicates = model.scope {
                         duplicates(width)
                     } else if model.layout == .list {
-                        list
+                        list.padding(.top, top)
                     } else {
                         ScrollView {
+                            Color.clear.frame(height: top)
                             if case .similar(let u) = model.scope { similarHeader(u) }
                             if model.layout == .justified { justified(width) } else { grid(width) }
                         }
@@ -587,6 +616,14 @@ private struct Browser: View {
             model.handleDrop(providers, into: nil)
             return true
         }
+        .simultaneousGesture(MagnificationGesture()
+            .onChanged { v in
+                guard model.layout != .list else { return }
+                let base = pinchBase ?? model.thumbSize
+                pinchBase = base
+                model.thumbSize = min(360, max(110, base * Double(v)))
+            }
+            .onEnded { _ in pinchBase = nil })
     }
 
     private func justified(_ width: CGFloat) -> some View {
@@ -601,7 +638,7 @@ private struct Browser: View {
                 }
             }
         }
-        .padding(16)
+        .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, bottom)
     }
 
     private func grid(_ width: CGFloat) -> some View {
@@ -611,7 +648,7 @@ private struct Browser: View {
                 Tile(model: model, url: u, width: side, height: side * 0.72, fill: false, caption: true)
             }
         }
-        .padding(16)
+        .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, bottom)
     }
 
     private struct Row: Identifiable {
@@ -679,7 +716,7 @@ private struct Browser: View {
                     .id("g\(i)")
                 }
             }
-            .padding(16)
+            .padding(.horizontal, 16).padding(.top, top + 8).padding(.bottom, bottom)
         }
     }
 
@@ -724,27 +761,21 @@ private struct Sidebar: View {
     @ObservedObject var model: GalleryModel
     @ObservedObject var lib: Library
     @State private var showAllTags = false
+    @AppStorage("GallerySidebarTagsCollapsed") private var tagsCollapsed = true
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 2) {
                 header("Library")
-                row(.all, "All captures", "square.grid.2x2", lib.urls.count)
-                row(.uncategorized, "Uncategorized", "tray", nil)
+                row(.all, "All captures", "square.grid.2x2", nil)
                 row(.recent, "Last 7 days", "clock", nil)
                 row(.rated, "Rated", "star", nil)
+                row(.uncategorized, "Uncategorized", "tray", nil)
                 row(.duplicates, "Duplicates", "square.on.square", nil)
-                header("Types")
-                ForEach(MediaType.allCases) { t in row(.type(t), t.label, t.symbol, lib.urls.filter { MediaType.of($0) == t }.count) }
 
-                header("Collections", add: {
-                    Palette.shared.prompt("New collection", initial: "") { name in
-                        if !name.isEmpty { model.scope = .collection(lib.createCollection(name).id) }
-                    }
-                })
-                if lib.collections.isEmpty { hint("Drag captures here, or press F on a selection.") }
+                if !lib.collections.isEmpty { header("Collections", add: newCollection) }
                 ForEach(lib.collections) { c in
-                    row(.collection(c.id), c.name, c.autoTags.isEmpty ? "folder" : "folder.badge.gearshape", lib.count(in: c.id))
+                    row(.collection(c.id), c.name, c.autoTags.isEmpty ? "folder" : "folder.badge.gearshape", nil)
                         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
                             model.handleDrop(providers, into: c.id)
                             return true
@@ -764,8 +795,7 @@ private struct Sidebar: View {
                         }
                 }
 
-                header("Smart folders", add: { model.saveSmartFolder() })
-                if lib.smartFolders.isEmpty { hint("Filter the gallery, then + saves it as a live smart folder.") }
+                if !lib.smartFolders.isEmpty { header("Smart folders", add: { model.saveSmartFolder() }) }
                 ForEach(lib.smartFolders) { s in
                     row(.smart(s.id), s.name, "folder.badge.gearshape", nil)
                         .contextMenu {
@@ -781,15 +811,15 @@ private struct Sidebar: View {
 
                 let tags = lib.allTags
                 if !tags.isEmpty {
-                    header("Tags")
-                    FlowLayout(spacing: 5) {
+                    header("Tags", collapsed: $tagsCollapsed)
+                    if !tagsCollapsed { FlowLayout(spacing: 5) {
                         ForEach((showAllTags ? tags : Array(tags.prefix(24))), id: \.0) { t, n in
                             let on = model.filter.tags.contains { $0.lowercased() == t.lowercased() }
                             Button { toggleTag(t) } label: {
-                                Text("\(t) \(Text("\(n)").foregroundColor(on ? C(Theme.onAccent).opacity(0.6) : C(Theme.muted)))")
-                                    .font(.system(size: 11)).padding(.horizontal, 7).padding(.vertical, 3)
-                                    .background(RoundedRectangle(cornerRadius: 5).fill(on ? C(Theme.accent) : C(Theme.raised)))
-                                    .foregroundColor(on ? C(Theme.onAccent) : C(Theme.textDim))
+                                Text("\(t) \(Text("\(n)").foregroundColor(C(Theme.muted)))")
+                                    .font(.system(size: 11)).padding(.horizontal, 8).padding(.vertical, 3)
+                                    .background(Capsule().fill(Color.white.opacity(on ? 0.2 : 0.06)))
+                                    .foregroundColor(on ? C(Theme.text) : C(Theme.textDim))
                             }
                             .buttonStyle(.plain)
                             .contextMenu {
@@ -800,63 +830,61 @@ private struct Sidebar: View {
                     }
                     .padding(.horizontal, 10).padding(.vertical, 4)
                     if tags.count > 24 { Button(showAllTags ? "Fewer" : "All \(tags.count) tags") { showAllTags.toggle() }.buttonStyle(.link).font(.system(size: 11)).padding(.leading, 12) }
-                }
-
-                let apps = lib.allApps
-                if !apps.isEmpty {
-                    header("Source apps")
-                    ForEach(apps.prefix(12), id: \.0) { a, n in
-                        let on = model.filter.apps.contains(a)
-                        Button {
-                            if on { model.filter.apps.removeAll { $0 == a } } else { model.filter.apps = [a] }
-                        } label: {
-                            rowLabel(a, "app.dashed", n, on)
-                        }
-                        .buttonStyle(.plain)
                     }
                 }
+
             }
-            .padding(.vertical, 10)
+            .padding(.top, 44).padding(.bottom, 10)
         }
-        .safeAreaInset(edge: .bottom) {
-            if lib.progress.total > 0 {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Indexing \(lib.progress.done) of \(lib.progress.total)…").font(.system(size: 10)).foregroundColor(C(Theme.muted))
-                    ProgressView(value: Double(lib.progress.done), total: Double(max(1, lib.progress.total))).tint(C(Theme.accent))
-                }
-                .padding(10).background(C(Theme.surface))
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack {
+                Menu {
+                    Button("New collection…", action: newCollection)
+                    Button(model.filter.isEmpty ? "New smart folder (set filters first)" : "New smart folder from filters") { model.saveSmartFolder() }
+                        .disabled(model.filter.isEmpty)
+                } label: { Image(systemName: "plus") }
+                    .menuStyle(.button).buttonStyle(GlassButtonStyle()).menuIndicator(.hidden).fixedSize().help("New collection or smart folder")
+                Spacer()
             }
+            .padding(8)
         }
-        .background(C(Theme.surface))
+        .background(.regularMaterial)
+    }
+
+    private func newCollection() {
+        Palette.shared.prompt("New collection", initial: "") { name in
+            if !name.isEmpty { model.scope = .collection(lib.createCollection(name).id) }
+        }
     }
 
     private func toggleTag(_ t: String) {
         if let i = model.filter.tags.firstIndex(where: { $0.lowercased() == t.lowercased() }) { model.filter.tags.remove(at: i) } else { model.filter.tags.append(t) }
     }
 
-    private func header(_ s: String, add: (() -> Void)? = nil) -> some View {
-        HStack {
-            Text(s.uppercased()).font(.system(size: 10, weight: .bold)).kerning(0.8).foregroundColor(C(Theme.muted))
+    private func header(_ s: String, add: (() -> Void)? = nil, collapsed: Binding<Bool>? = nil) -> some View {
+        HStack(spacing: 4) {
+            Text(s).font(.system(size: 11, weight: .semibold)).foregroundColor(C(Theme.muted))
+            if let collapsed {
+                Image(systemName: collapsed.wrappedValue ? "chevron.right" : "chevron.down").font(.system(size: 8, weight: .bold)).foregroundColor(C(Theme.muted))
+            }
             Spacer()
             if let add { Button(action: add) { Image(systemName: "plus") }.buttonStyle(.plain).foregroundColor(C(Theme.muted)).help("New") }
         }
-        .padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 4)
-    }
-
-    private func hint(_ s: String) -> some View {
-        Text(s).font(.system(size: 10)).foregroundColor(C(Theme.muted)).padding(.horizontal, 12).padding(.bottom, 4)
+        .contentShape(Rectangle())
+        .onTapGesture { collapsed?.wrappedValue.toggle() }
+        .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 4)
     }
 
     private func rowLabel(_ title: String, _ icon: String, _ count: Int?, _ on: Bool) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: icon).frame(width: 16).foregroundColor(on ? C(Theme.accent) : C(Theme.textDim))
+            Image(systemName: icon).frame(width: 16).foregroundColor(on ? C(Theme.text) : C(Theme.muted))
             Text(title).lineLimit(1).foregroundColor(on ? C(Theme.text) : C(Theme.textDim))
             Spacer()
             if let count { Text("\(count)").font(.system(size: 11)).monospacedDigit().foregroundColor(C(Theme.muted)) }
         }
         .font(.system(size: 13))
         .padding(.horizontal, 10).padding(.vertical, 5)
-        .background(RoundedRectangle(cornerRadius: 6).fill(on ? C(Theme.selected) : Color.clear))
+        .background(RoundedRectangle(cornerRadius: 6).fill(on ? Color.white.opacity(0.10) : Color.clear))
         .contentShape(Rectangle())
         .padding(.horizontal, 6)
     }
@@ -892,181 +920,394 @@ struct FlowLayout: Layout {
     }
 }
 
-// MARK: - Filter bar
+// MARK: - Floating chrome
+
+// Translucent floating surface for the toolbar, action bar and overlays.
+private extension View {
+    func glass(_ radius: CGFloat = 18) -> some View {
+        background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.35), radius: 16, y: 6)
+    }
+}
+
+private struct GlassButtonStyle: ButtonStyle {
+    var on = false
+    func makeBody(configuration: Configuration) -> some View { Face(configuration: configuration, on: on) }
+
+    struct Face: View {
+        let configuration: Configuration
+        let on: Bool
+        @State private var hover = false
+        var body: some View {
+            configuration.label
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(on ? C(Theme.text) : C(Theme.textDim))
+                .frame(minWidth: 30, minHeight: 28).padding(.horizontal, 2)
+                .background(Capsule().fill(Color.white.opacity(configuration.isPressed ? 0.16 : on ? 0.12 : hover ? 0.08 : 0)))
+                .contentShape(Capsule())
+                .onHover { hover = $0 }
+        }
+    }
+}
+
+extension Filter {
+    // Everything except the search text, which lives in the search field.
+    var hasConstraints: Bool { var f = self; f.text = ""; return !f.isEmpty }
+}
+
+private struct TopBar: View {
+    @ObservedObject var model: GalleryModel
+    @ObservedObject var lib: Library
+    @FocusState private var searchFocused: Bool
+    @State private var filtersOpen = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 2) {
+                Button { model.showSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
+                    .buttonStyle(GlassButtonStyle(on: model.showSidebar)).help(model.showSidebar ? "Hide sidebar (⌃⌘S)" : "Show sidebar (⌃⌘S)")
+                if !model.showSidebar { scopeMenu }
+                search
+                Button { filtersOpen.toggle() } label: {
+                    Image(systemName: "line.3.horizontal.decrease")
+                        .overlay(alignment: .topTrailing) {
+                            if model.filter.hasConstraints { Circle().fill(C(Theme.accent)).frame(width: 6, height: 6).offset(x: 5, y: -3) }
+                        }
+                }
+                .buttonStyle(GlassButtonStyle(on: filtersOpen)).help("Filters")
+                .popover(isPresented: $filtersOpen, arrowEdge: .bottom) { FilterPanel(model: model, lib: lib) }
+                viewMenu
+                if lib.progress.total > 0 {
+                    ProgressView(value: Double(lib.progress.done), total: Double(max(1, lib.progress.total)))
+                        .progressViewStyle(.circular).controlSize(.small).frame(width: 28)
+                        .help("Indexing \(lib.progress.done) of \(lib.progress.total)…")
+                }
+            }
+            .padding(4)
+            .glass(20)
+            if model.filter.hasConstraints { ActiveFilters(model: model) }
+        }
+        .onChange(of: model.focusSearch) { searchFocused = true }
+    }
+
+    private var scopeMenu: some View {
+        Menu {
+            Section("Library") {
+                scope(.all, "All captures"); scope(.recent, "Last 7 days"); scope(.rated, "Rated")
+                scope(.uncategorized, "Uncategorized"); scope(.duplicates, "Duplicates")
+            }
+            Section("Types") { ForEach(MediaType.allCases) { t in scope(.type(t), t.label) } }
+            Section("Collections") {
+                ForEach(lib.collections) { c in scope(.collection(c.id), c.name) }
+                Button("New collection…") {
+                    Palette.shared.prompt("New collection", initial: "") { name in
+                        if !name.isEmpty { model.scope = .collection(lib.createCollection(name).id) }
+                    }
+                }
+            }
+            if !lib.smartFolders.isEmpty {
+                Section("Smart folders") { ForEach(lib.smartFolders) { s in scope(.smart(s.id), s.name) } }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(model.title).font(.system(size: 13, weight: .semibold)).lineLimit(1).frame(maxWidth: 180)
+                Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).foregroundColor(C(Theme.muted))
+            }
+            .padding(.horizontal, 8)
+        }
+        .menuStyle(.button).buttonStyle(GlassButtonStyle(on: false)).menuIndicator(.hidden).fixedSize()
+        .help("\(lib.urls.count) captures in your library")
+    }
+
+    private func scope(_ s: Scope, _ title: String) -> some View {
+        Button { model.scope = s } label: {
+            if model.scope == s { Label(title, systemImage: "checkmark") } else { Text(title) }
+        }
+    }
+
+    private var search: some View {
+        let wide = searchFocused || !model.filter.text.isEmpty
+        return HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundColor(C(Theme.muted))
+            TextField(model.visible.count == 1 ? "Search 1 capture" : "Search \(model.visible.count.formatted()) captures", text: $model.filter.text)
+                .textFieldStyle(.plain).focused($searchFocused)
+                .onSubmit { searchFocused = false }
+            if !model.filter.text.isEmpty {
+                Button { model.filter.text = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundColor(C(Theme.muted))
+            }
+        }
+        .font(.system(size: 13))
+        .padding(.horizontal, 10)
+        .frame(width: wide ? 340 : 240, height: 28)
+        .background(Capsule().fill(Color.white.opacity(wide ? 0.10 : 0.05)))
+        .animation(.easeOut(duration: 0.15), value: wide)
+    }
+
+    private var viewMenu: some View {
+        Menu {
+            Picker("Layout", selection: $model.layout) {
+                Label("Rows", systemImage: "rectangle.split.3x3").tag(GalleryLayout.justified)
+                Label("Grid", systemImage: "square.grid.3x3").tag(GalleryLayout.grid)
+                Label("List", systemImage: "list.bullet").tag(GalleryLayout.list)
+            }
+            .pickerStyle(.inline)
+            Picker("Sort by", selection: $model.sort) { ForEach(GallerySort.allCases) { Text($0.label).tag($0) } }.pickerStyle(.menu)
+            if model.sort == .random { Button("Shuffle again") { model.shuffle() } }
+            Divider()
+            Button("Larger thumbnails  ⌘+") { model.zoom(1.15) }.disabled(model.layout == .list)
+            Button("Smaller thumbnails  ⌘−") { model.zoom(1 / 1.15) }.disabled(model.layout == .list)
+            Toggle("Show names", isOn: $model.showNames)
+            Divider()
+            Toggle("Sidebar  ⌃⌘S", isOn: $model.showSidebar)
+            Toggle("Inspector  ⌘I", isOn: $model.showInspector)
+            Button("Keyboard shortcuts  ⌘/") { model.showShortcuts = true }
+        } label: {
+            Image(systemName: "ellipsis")
+        }
+        .menuStyle(.button).buttonStyle(GlassButtonStyle(on: false)).menuIndicator(.hidden).fixedSize()
+        .help("View options")
+    }
+}
+
+// Chips for the filters in effect, under the toolbar. Hidden when nothing is filtered.
+private struct ActiveFilters: View {
+    @ObservedObject var model: GalleryModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                Button(action: item.1) {
+                    HStack(spacing: 5) {
+                        Text(item.0).lineLimit(1)
+                        Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).foregroundColor(C(Theme.muted))
+                    }
+                    .font(.system(size: 11, weight: .medium)).foregroundColor(C(Theme.text))
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .glass(12)
+                }
+                .buttonStyle(.plain).help("Remove filter")
+            }
+            Button(isSmart ? "Update smart folder" : "Save as smart folder") { model.saveSmartFolder() }
+                .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(C(Theme.textDim)).padding(.leading, 4)
+        }
+    }
+
+    private var isSmart: Bool { if case .smart = model.scope { return true } else { return false } }
+
+    private var items: [(String, () -> Void)] {
+        let f = model.filter
+        var out: [(String, () -> Void)] = []
+        if !f.types.isEmpty { out.append((f.types.map(\.label).joined(separator: ", "), { model.filter.types = [] })) }
+        if f.untagged { out.append(("Untagged", { model.filter.untagged = false })) }
+        for t in f.tags { out.append(("#" + t, { model.filter.tags.removeAll { $0 == t } })) }
+        if f.minRating > 0 { out.append((String(repeating: "★", count: f.minRating) + "+", { model.filter.minRating = 0 })) }
+        if let c = f.color { out.append(("Color " + c, { model.filter.color = nil })) }
+        if let s = f.shape { out.append((s.label, { model.filter.shape = nil })) }
+        if f.minWidth > 0 || f.minHeight > 0 { out.append(("≥ \(f.minWidth) × \(f.minHeight)", { model.filter.minWidth = 0; model.filter.minHeight = 0 })) }
+        if let d = f.date { out.append((d.label, { model.filter.date = nil })) }
+        if let s = f.size { out.append((s.label, { model.filter.size = nil })) }
+        for a in f.apps { out.append((a, { model.filter.apps.removeAll { $0 == a } })) }
+        return out
+    }
+}
 
 private let presetColors: [String] = ["#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#00C7BE", "#0A84FF", "#5E5CE6", "#BF5AF2", "#FF2D55",
                                       "#A2845E", "#FFFFFF", "#8E8E93", "#1C1C1E", "#D4FF00"]
 
-private struct FilterBar: View {
+// The filter popover: every filter in one place, colors inline.
+private struct FilterPanel: View {
     @ObservedObject var model: GalleryModel
     @ObservedObject var lib: Library
-    @FocusState private var searchFocused: Bool
-    @State private var colorOpen = false
     @State private var custom = Color.red
 
     var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                Text(model.title).font(.system(size: 15, weight: .semibold)).foregroundColor(C(Theme.text)).lineLimit(1)
-                Text("\(model.visible.count)").font(.system(size: 12)).monospacedDigit().foregroundColor(C(Theme.muted))
-                Spacer()
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass").foregroundColor(C(Theme.muted))
-                    TextField("Search names, text in images, tags, comments, apps", text: $model.filter.text)
-                        .textFieldStyle(.plain).focused($searchFocused)
-                        .onSubmit { searchFocused = false }
-                    if !model.filter.text.isEmpty {
-                        Button { model.filter.text = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundColor(C(Theme.muted))
+        VStack(alignment: .leading, spacing: 12) {
+            FlowLayout(spacing: 6) {
+                chip("Type", model.filter.types.isEmpty ? nil : model.filter.types.map { $0.label }.joined(separator: ", ")) {
+                    ForEach(MediaType.allCases) { t in
+                        Toggle(t.label, isOn: Binding(get: { model.filter.types.contains(t) }, set: { on in
+                            if on { model.filter.types.append(t) } else { model.filter.types.removeAll { $0 == t } }
+                        }))
                     }
                 }
-                .font(.system(size: 13))
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(RoundedRectangle(cornerRadius: 7).fill(C(Theme.raised)))
-                .overlay(RoundedRectangle(cornerRadius: 7).stroke(searchFocused ? C(Theme.accent) : C(Theme.border)))
-                .frame(maxWidth: 380)
-                Menu {
-                    Picker("Sort", selection: $model.sort) { ForEach(GallerySort.allCases) { Text($0.label).tag($0) } }.pickerStyle(.inline)
-                    if model.sort == .random { Button("Shuffle again") { model.shuffle() } }
-                } label: { Image(systemName: "arrow.up.arrow.down") }
-                    .menuStyle(.borderlessButton).frame(width: 30).help("Sort: \(model.sort.label)")
-                Picker("", selection: $model.layout) {
-                    Image(systemName: "rectangle.split.3x3").tag(GalleryLayout.justified).help("Justified")
-                    Image(systemName: "square.grid.3x3").tag(GalleryLayout.grid).help("Grid")
-                    Image(systemName: "list.bullet").tag(GalleryLayout.list).help("List")
+                chip("Tags", model.filter.untagged ? "Untagged" : model.filter.tags.isEmpty ? nil : model.filter.tags.joined(separator: model.filter.anyTag ? " or " : " + ")) {
+                    Toggle("Untagged only", isOn: $model.filter.untagged)
+                    Toggle("Match any tag (instead of all)", isOn: $model.filter.anyTag)
+                    Divider()
+                    ForEach(lib.allTags.prefix(40), id: \.0) { t, n in
+                        Toggle("\(t)  (\(n))", isOn: Binding(get: { model.filter.tags.contains { $0.lowercased() == t.lowercased() } }, set: { on in
+                            if on { model.filter.tags.append(t) } else { model.filter.tags.removeAll { $0.lowercased() == t.lowercased() } }
+                        }))
+                    }
                 }
-                .pickerStyle(.segmented).frame(width: 110).labelsHidden()
-                Slider(value: $model.thumbSize, in: 110...360).frame(width: 90).help("Thumbnail size").disabled(model.layout == .list)
-                Button { model.showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
-                    .buttonStyle(.plain).foregroundColor(model.showInspector ? C(Theme.accent) : C(Theme.muted)).help("Inspector (⌘I)")
+                chip("Rating", model.filter.minRating > 0 ? String(repeating: "★", count: model.filter.minRating) + "+" : nil) {
+                    Picker("", selection: $model.filter.minRating) {
+                        Text("Any").tag(0)
+                        ForEach(1...5, id: \.self) { Text(String(repeating: "★", count: $0) + ($0 < 5 ? " or more" : "")).tag($0) }
+                    }.pickerStyle(.inline)
+                }
+                chip("Shape", model.filter.shape?.label) {
+                    Picker("", selection: $model.filter.shape) {
+                        Text("Any").tag(ShapeFilter?.none)
+                        ForEach(ShapeFilter.allCases) { Text($0.label).tag(ShapeFilter?.some($0)) }
+                    }.pickerStyle(.inline)
+                }
+                chip("Dimensions", model.filter.minWidth > 0 || model.filter.minHeight > 0 ? "≥ \(model.filter.minWidth) × \(model.filter.minHeight)" : nil) {
+                    ForEach([(0, 0, "Any"), (800, 600, "At least 800 × 600"), (1280, 720, "At least 1280 × 720 (HD)"), (1920, 1080, "At least 1920 × 1080 (Full HD)"),
+                             (2560, 1440, "At least 2560 × 1440"), (3840, 2160, "At least 3840 × 2160 (4K)")], id: \.0) { w, h, label in
+                        Button(label) { model.filter.minWidth = w; model.filter.minHeight = h }
+                    }
+                }
+                chip("Date", model.filter.date?.label) {
+                    Picker("", selection: $model.filter.date) {
+                        Text("Any time").tag(DateFilter?.none)
+                        ForEach(DateFilter.allCases) { Text($0.label).tag(DateFilter?.some($0)) }
+                    }.pickerStyle(.inline)
+                }
+                chip("File size", model.filter.size?.label) {
+                    Picker("", selection: $model.filter.size) {
+                        Text("Any size").tag(SizeFilter?.none)
+                        ForEach(SizeFilter.allCases) { Text($0.label).tag(SizeFilter?.some($0)) }
+                    }.pickerStyle(.inline)
+                }
+                if !lib.allApps.isEmpty {
+                    chip("App", model.filter.apps.isEmpty ? nil : model.filter.apps.joined(separator: ", ")) {
+                        Button("Any app") { model.filter.apps = [] }
+                        ForEach(lib.allApps, id: \.0) { a, n in
+                            Toggle("\(a)  (\(n))", isOn: Binding(get: { model.filter.apps.contains(a) }, set: { on in
+                                if on { model.filter.apps.append(a) } else { model.filter.apps.removeAll { $0 == a } }
+                            }))
+                        }
+                    }
+                }
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    chip("Type", model.filter.types.isEmpty ? nil : model.filter.types.map { $0.label }.joined(separator: ", ")) {
-                        ForEach(MediaType.allCases) { t in
-                            Toggle(t.label, isOn: Binding(get: { model.filter.types.contains(t) }, set: { on in
-                                if on { model.filter.types.append(t) } else { model.filter.types.removeAll { $0 == t } }
-                            }))
-                        }
-                    }
-                    chip("Tags", model.filter.untagged ? "Untagged" : model.filter.tags.isEmpty ? nil : model.filter.tags.joined(separator: model.filter.anyTag ? " or " : " + ")) {
-                        Toggle("Untagged only", isOn: $model.filter.untagged)
-                        Toggle("Match any tag (instead of all)", isOn: $model.filter.anyTag)
-                        Divider()
-                        ForEach(lib.allTags.prefix(40), id: \.0) { t, n in
-                            Toggle("\(t)  (\(n))", isOn: Binding(get: { model.filter.tags.contains { $0.lowercased() == t.lowercased() } }, set: { on in
-                                if on { model.filter.tags.append(t) } else { model.filter.tags.removeAll { $0.lowercased() == t.lowercased() } }
-                            }))
-                        }
-                    }
-                    chip("Rating", model.filter.minRating > 0 ? String(repeating: "★", count: model.filter.minRating) + "+" : nil) {
-                        Picker("", selection: $model.filter.minRating) {
-                            Text("Any").tag(0)
-                            ForEach(1...5, id: \.self) { Text(String(repeating: "★", count: $0) + ($0 < 5 ? " or more" : "")).tag($0) }
-                        }.pickerStyle(.inline)
-                    }
-                    colorChip
-                    chip("Shape", model.filter.shape?.label) {
-                        Picker("", selection: $model.filter.shape) {
-                            Text("Any").tag(ShapeFilter?.none)
-                            ForEach(ShapeFilter.allCases) { Text($0.label).tag(ShapeFilter?.some($0)) }
-                        }.pickerStyle(.inline)
-                    }
-                    chip("Dimensions", model.filter.minWidth > 0 || model.filter.minHeight > 0 ? "≥ \(model.filter.minWidth) × \(model.filter.minHeight)" : nil) {
-                        ForEach([(0, 0, "Any"), (800, 600, "At least 800 × 600"), (1280, 720, "At least 1280 × 720 (HD)"), (1920, 1080, "At least 1920 × 1080 (Full HD)"),
-                                 (2560, 1440, "At least 2560 × 1440"), (3840, 2160, "At least 3840 × 2160 (4K)")], id: \.0) { w, h, label in
-                            Button(label) { model.filter.minWidth = w; model.filter.minHeight = h }
-                        }
-                    }
-                    chip("Date", model.filter.date?.label) {
-                        Picker("", selection: $model.filter.date) {
-                            Text("Any time").tag(DateFilter?.none)
-                            ForEach(DateFilter.allCases) { Text($0.label).tag(DateFilter?.some($0)) }
-                        }.pickerStyle(.inline)
-                    }
-                    chip("File size", model.filter.size?.label) {
-                        Picker("", selection: $model.filter.size) {
-                            Text("Any size").tag(SizeFilter?.none)
-                            ForEach(SizeFilter.allCases) { Text($0.label).tag(SizeFilter?.some($0)) }
-                        }.pickerStyle(.inline)
-                    }
-                    if !lib.allApps.isEmpty {
-                        chip("App", model.filter.apps.isEmpty ? nil : model.filter.apps.joined(separator: ", ")) {
-                            Button("Any app") { model.filter.apps = [] }
-                            ForEach(lib.allApps, id: \.0) { a, n in
-                                Toggle("\(a)  (\(n))", isOn: Binding(get: { model.filter.apps.contains(a) }, set: { on in
-                                    if on { model.filter.apps.append(a) } else { model.filter.apps.removeAll { $0 == a } }
-                                }))
-                            }
-                        }
-                    }
-                    if !model.filter.isEmpty {
-                        Button("Clear") { model.filter = Filter() }.buttonStyle(.plain).font(.system(size: 11)).foregroundColor(C(Theme.textDim)).padding(.leading, 4)
-                        Button { model.saveSmartFolder() } label: {
-                            Label(isSmart ? "Update smart folder" : "Save as smart folder", systemImage: "folder.badge.gearshape")
-                        }
-                        .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(C(Theme.accent)).padding(.leading, 6)
-                    }
+            Text("Contains color").font(.system(size: 11, weight: .medium)).foregroundColor(C(Theme.muted))
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(22), spacing: 9), count: 8), alignment: .leading, spacing: 9) {
+                ForEach(presetColors, id: \.self) { hex in
+                    let c = Filter.rgb(hex)!
+                    let on = model.filter.color == hex
+                    Circle().fill(Color(red: Double(c.0) / 255, green: Double(c.1) / 255, blue: Double(c.2) / 255)).frame(width: 22, height: 22)
+                        .overlay(Circle().stroke(on ? Color.white : Color.white.opacity(0.18), lineWidth: on ? 2 : 0.5))
+                        .onTapGesture { model.filter.color = on ? nil : hex }
+                        .help(hex)
                 }
+                ColorPicker("", selection: $custom, supportsOpacity: false).labelsHidden()
+                    .onChange(of: custom) { model.filter.color = NSColor(custom).hex }
+                    .help("Custom color")
+            }
+            if model.filter.hasConstraints {
+                Divider()
+                HStack {
+                    Button("Clear filters") { model.filter = Filter(text: model.filter.text) }
+                    Spacer()
+                    Button("Save as smart folder") { model.saveSmartFolder() }
+                }
+                .font(.system(size: 12))
             }
         }
-        .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(C(Theme.surface))
-        .onChange(of: model.focusSearch) { searchFocused = true }
+        .padding(14).frame(width: 340)
     }
-
-    private var isSmart: Bool { if case .smart = model.scope { return true } else { return false } }
 
     private func chip<Content: View>(_ name: String, _ value: String?, @ViewBuilder content: () -> Content) -> some View {
         Menu { content() } label: {
             HStack(spacing: 4) {
                 Text(value.map { "\(name): \($0)" } ?? name).lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold)).foregroundColor(C(Theme.muted))
             }
-            .font(.system(size: 11, weight: .medium))
-            .padding(.horizontal, 9).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 12).fill(value != nil ? C(Theme.accent) : C(Theme.raised)))
-            .foregroundColor(value != nil ? C(Theme.onAccent) : C(Theme.textDim))
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(Capsule().fill(Color.white.opacity(value != nil ? 0.18 : 0.07)))
+            .foregroundColor(value != nil ? C(Theme.text) : C(Theme.textDim))
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
     }
+}
 
-    private var colorChip: some View {
-        Button { colorOpen.toggle() } label: {
-            HStack(spacing: 5) {
-                if let hex = model.filter.color, let c = Filter.rgb(hex) {
-                    Circle().fill(Color(red: Double(c.0) / 255, green: Double(c.1) / 255, blue: Double(c.2) / 255)).frame(width: 10, height: 10)
-                        .overlay(Circle().stroke(Color.black.opacity(0.3)))
-                }
-                Text(model.filter.color.map { "Color: \($0)" } ?? "Color")
-                Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
-            }
-            .font(.system(size: 11, weight: .medium))
-            .padding(.horizontal, 9).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 12).fill(model.filter.color != nil ? C(Theme.accent) : C(Theme.raised)))
-            .foregroundColor(model.filter.color != nil ? C(Theme.onAccent) : C(Theme.textDim))
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: $colorOpen) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Find captures containing a color").font(.system(size: 12, weight: .semibold))
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(24), spacing: 8), count: 7), spacing: 8) {
-                    ForEach(presetColors, id: \.self) { hex in
-                        let c = Filter.rgb(hex)!
-                        Circle().fill(Color(red: Double(c.0) / 255, green: Double(c.1) / 255, blue: Double(c.2) / 255)).frame(width: 24, height: 24)
-                            .overlay(Circle().stroke(model.filter.color == hex ? C(Theme.accent) : Color.gray.opacity(0.4), lineWidth: model.filter.color == hex ? 2 : 1))
-                            .onTapGesture { model.filter.color = hex; colorOpen = false }
+// Floats over the bottom of the canvas while something is selected.
+private struct ActionBar: View {
+    @ObservedObject var model: GalleryModel
+
+    var body: some View {
+        let n = model.selection.count
+        HStack(spacing: 2) {
+            Button { model.selection = [] } label: { Image(systemName: "xmark") }.buttonStyle(GlassButtonStyle()).help("Deselect (Esc)")
+            Text(n == 1 ? "1 selected" : "\(n) selected").font(.system(size: 12)).monospacedDigit().foregroundColor(C(Theme.textDim))
+                .padding(.trailing, 6)
+            divider
+            action("doc.on.doc", "Copy (⌘C)") { model.copy() }
+            action("tag", "Add tags (T)") { model.tagPicker() }
+            action("folder.badge.plus", "Add to collection (F)") { model.collectionPicker() }
+            Menu {
+                ForEach(0...5, id: \.self) { r in Button(r == 0 ? "No rating" : String(repeating: "★", count: r)) { model.rate(r) } }
+            } label: { Image(systemName: "star") }
+                .menuStyle(.button).buttonStyle(GlassButtonStyle()).menuIndicator(.hidden).fixedSize().help("Rate (0–5)")
+            action("pin", "Pin to screen (⌘P)") { model.pin() }
+            action("square.and.arrow.up", "Upload and copy link (⌘U)") { model.upload() }
+            action("trash", "Move to Trash (⌘⌫)") { model.trash() }
+            divider
+            Button { model.showInspector.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                    if !model.inspectorDiscovered {
+                        Text("Details")
+                        Text("⌘I").font(.system(size: 10, weight: .semibold)).foregroundColor(C(Theme.muted))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(RoundedRectangle(cornerRadius: 4).stroke(Color.white.opacity(0.2), lineWidth: 0.5))
                     }
                 }
-                HStack {
-                    ColorPicker("Custom", selection: $custom, supportsOpacity: false)
-                    Button("Use") { model.filter.color = NSColor(custom).hex; colorOpen = false }
-                    Spacer()
-                    if model.filter.color != nil { Button("Clear") { model.filter.color = nil; colorOpen = false } }
-                }
-                .font(.system(size: 12))
+                .padding(.horizontal, model.inspectorDiscovered ? 0 : 6)
             }
-            .padding(14).frame(width: 260)
+            .buttonStyle(GlassButtonStyle(on: model.showInspector)).help(model.showInspector ? "Hide details (⌘I)" : "Show details (⌘I)")
         }
+        .padding(4)
+        .glass(20)
+    }
+
+    private var divider: some View { Rectangle().fill(Color.white.opacity(0.12)).frame(width: 0.5, height: 18).padding(.horizontal, 4) }
+
+    private func action(_ icon: String, _ help: String, _ run: @escaping () -> Void) -> some View {
+        Button(action: run) { Image(systemName: icon) }.buttonStyle(GlassButtonStyle()).help(help)
+    }
+}
+
+// ⌘/ cheat sheet; replaces the old always-on shortcut footer.
+private struct ShortcutsCard: View {
+    @ObservedObject var model: GalleryModel
+    private let rows: [(String, String)] = [
+        ("Space", "Preview"), ("↩", "Open or annotate"), ("← → ↑ ↓", "Move selection"), ("T", "Add tags"), ("F", "Add to collection"),
+        ("1–5, 0", "Rate, clear rating"), ("/  or  ⌘F", "Search"), ("⌘C", "Copy"), ("⌘T", "Copy text (OCR)"),
+        ("⌘P", "Pin to screen"), ("⌘R", "Rename"), ("⌘U", "Upload and copy link"), ("⌘O", "Show in Finder"), ("⌘⌫", "Move to Trash"),
+        ("⌘I", "Details"), ("⌃⌘S", "Sidebar"), ("⌘+  ⌘−", "Thumbnail size"), ("⌘⇧S", "Save as smart folder"), ("⌘K", "All actions"),
+    ]
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.35).ignoresSafeArea().onTapGesture { model.showShortcuts = false }
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Keyboard shortcuts").font(.system(size: 15, weight: .semibold)).foregroundColor(C(Theme.text))
+                    Spacer()
+                    Button { model.showShortcuts = false } label: { Image(systemName: "xmark") }.buttonStyle(GlassButtonStyle()).help("Close (Esc)")
+                }
+                Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 8) {
+                    ForEach(0..<(rows.count + 1) / 2, id: \.self) { i in
+                        GridRow {
+                            cell(rows[i * 2])
+                            if i * 2 + 1 < rows.count { cell(rows[i * 2 + 1]) }
+                        }
+                    }
+                }
+            }
+            .padding(20)
+            .frame(width: 560)
+            .glass(18)
+        }
+    }
+
+    @ViewBuilder private func cell(_ r: (String, String)) -> some View {
+        Text(r.0).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundColor(C(Theme.text)).frame(width: 74, alignment: .leading)
+        Text(r.1).font(.system(size: 12)).foregroundColor(C(Theme.textDim)).frame(width: 170, alignment: .leading)
     }
 }
 
@@ -1079,6 +1320,8 @@ private struct Inspector: View {
     @State private var comment = ""
     @State private var commentFor: URL?
     @State private var showText = false
+    @State private var addingTag = false
+    @State private var editingComment = false
 
     var body: some View {
         ScrollView {
@@ -1094,10 +1337,11 @@ private struct Inspector: View {
             .padding(14)
         }
         .background(C(Theme.surface))
+        .onChange(of: model.single) { addingTag = false; editingComment = false; newTag = "" }
     }
 
     private func section(_ s: String) -> some View {
-        Text(s.uppercased()).font(.system(size: 10, weight: .bold)).kerning(0.8).foregroundColor(C(Theme.muted))
+        Text(s).font(.system(size: 11, weight: .semibold)).foregroundColor(C(Theme.muted))
     }
 
     private var overview: some View {
@@ -1128,11 +1372,11 @@ private struct Inspector: View {
         HStack(spacing: 3) {
             ForEach(1...5, id: \.self) { i in
                 Image(systemName: i <= rating ? "star.fill" : "star")
-                    .foregroundColor(i <= rating ? C(Theme.accent) : C(Theme.muted))
+                    .foregroundColor(i <= rating ? C(Theme.accent) : Color.white.opacity(0.25))
                     .onTapGesture { set(i == rating ? 0 : i) }
             }
         }
-        .font(.system(size: 14))
+        .font(.system(size: 12))
     }
 
     private func tagChips(_ tags: [String], remove: @escaping (String) -> Void) -> some View {
@@ -1151,14 +1395,16 @@ private struct Inspector: View {
 
     private func tagField(_ targets: [URL]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            TextField("Add tags (comma-separated)…", text: $newTag)
+            TextField("Add tags, comma-separated", text: $newTag)
                 .textFieldStyle(.plain).font(.system(size: 12))
                 .padding(.horizontal, 8).padding(.vertical, 5)
-                .background(RoundedRectangle(cornerRadius: 6).fill(C(Theme.raised)))
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
                 .onSubmit {
                     lib.addTags(newTag.split(separator: ",").map(String.init), to: targets)
                     newTag = ""
+                    addingTag = false
                 }
+                .onExitCommand { newTag = ""; addingTag = false }
             let q = newTag.split(separator: ",").last.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
             if !q.isEmpty {
                 let have = Set(targets.flatMap { lib.meta($0).tags.map { $0.lowercased() } })
@@ -1192,99 +1438,138 @@ private struct Inspector: View {
         }
     }
 
+    // Only what the capture has: empty tags, collections and comment collapse into "+" buttons.
     @ViewBuilder
     private func single(_ u: URL) -> some View {
         let m = lib.meta(u)
-        ThumbImage(url: u, side: 600, fill: false)
-            .frame(height: 170).frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .onTapGesture { model.preview = u }
-            .help("Click to preview (Space)")
-        Text(u.lastPathComponent).font(.system(size: 13, weight: .semibold)).foregroundColor(C(Theme.text)).lineLimit(2).textSelection(.enabled)
-            .onTapGesture(count: 2) { model.rename() }
+        VStack(alignment: .leading, spacing: 4) {
+            Text(u.deletingPathExtension().lastPathComponent).font(.system(size: 13, weight: .semibold)).foregroundColor(C(Theme.text))
+                .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                .onTapGesture(count: 2) { model.rename() }
+                .help("Double-click to rename")
+            Text(summary(u, m)).font(.system(size: 11)).monospacedDigit().foregroundColor(C(Theme.muted))
+        }
         stars(m.rating) { model.lib.setRating($0, [u]) }
 
-        section("Tags")
-        if !m.tags.isEmpty { tagChips(m.tags) { lib.removeTag($0, from: [u]) } }
-        tagField([u])
-
-        section("Collections")
-        collectionsRow([u], member: Set(m.collections))
-
-        section("Comment")
-        TextEditor(text: $comment)
-            .font(.system(size: 12)).scrollContentBackground(.hidden)
-            .frame(minHeight: 54, maxHeight: 120)
-            .padding(4).background(RoundedRectangle(cornerRadius: 6).fill(C(Theme.raised)))
-            .onAppear { comment = m.comment; commentFor = u }
-            .onChange(of: u) { if let p = commentFor, comment != lib.meta(p).comment { lib.setComment(comment, p) }; comment = lib.meta(u).comment; commentFor = u }
-            .onChange(of: comment) { if commentFor == u && comment != lib.meta(u).comment { lib.setComment(comment, u) } }
-
-        if !m.colors.isEmpty {
-            section("Palette")
-            let cols = Array(m.colors.prefix(6))
-            let total = cols.reduce(0) { $0 + $1.ratio }
-            GeometryReader { g in
-                HStack(spacing: 0) {
-                    ForEach(cols, id: \.self) { s in
-                        Rectangle().fill(Color(nsColor: s.color))
-                            .frame(width: max(3, g.size.width * s.ratio / max(0.0001, total)))
-                            .help("\(s.hex)  ·  \(Int(s.ratio * 100))%  ·  click to find captures with this color")
-                            .onTapGesture { model.filter.color = s.hex; if case .similar = model.scope { model.scope = .all } }
-                    }
-                }
-            }
-            .frame(height: 22).clipShape(RoundedRectangle(cornerRadius: 5))
-            HStack(spacing: 6) {
-                ForEach(m.colors.prefix(6), id: \.self) { s in
-                    Text(s.hex).font(.system(size: 9, design: .monospaced)).foregroundColor(C(Theme.muted)).onTapGesture { copyText(s.hex); Toast.shared.show("\(s.hex) copied") }
-                }
+        let members = lib.collections.filter { m.collections.contains($0.id) }
+        if !m.tags.isEmpty || !members.isEmpty {
+            FlowLayout(spacing: 5) {
+                ForEach(m.tags, id: \.self) { t in chip(t, icon: nil, open: { model.filter.tags = [t] }) { lib.removeTag(t, from: [u]) } }
+                ForEach(members) { c in chip(c.name, icon: "folder", open: { model.scope = .collection(c.id) }) { lib.remove([u], fromCollection: c.id) } }
             }
         }
+        if addingTag { tagField([u]) }
+        if editingComment || !m.comment.isEmpty { commentEditor(u, m) }
+        HStack(spacing: 4) {
+            if !addingTag { ghost("Tag", "tag") { addingTag = true } }
+            ghost("Collection", "folder") { model.collectionPicker() }
+            if !editingComment && m.comment.isEmpty { ghost("Comment", "text.bubble") { editingComment = true } }
+        }
 
-        section("Info")
-        VStack(alignment: .leading, spacing: 5) {
-            info("Type", MediaType.of(u).label.dropLast().description)
-            if m.w > 0 { info("Dimensions", "\(m.w) × \(m.h)") }
-            if let d = m.duration, MediaType.of(u) != .image { info("Duration", formatTime(d)) }
-            info("Size", ByteCountFormatter.string(fromByteCount: Int64(m.size), countStyle: .file))
-            info("Captured", Library.dateFormat.string(from: Date(timeIntervalSince1970: m.mtime)))
-            if !m.app.isEmpty { info("App", m.app) }
-            if !m.window.isEmpty { info("Window", m.window) }
-            info("Folder", u.deletingLastPathComponent().lastPathComponent)
+        if !m.colors.isEmpty { paletteBar(m) }
+
+        if !m.app.isEmpty || !m.window.isEmpty || m.editedFrom != nil {
+            VStack(alignment: .leading, spacing: 5) {
+                if !m.app.isEmpty { info("App", m.app) }
+                if !m.window.isEmpty { info("Window", m.window) }
+                if let o = m.editedFrom {
+                    HStack(alignment: .top) {
+                        Text("Edited from").foregroundColor(C(Theme.muted)).frame(width: 82, alignment: .leading)
+                        Button(URL(fileURLWithPath: o).deletingPathExtension().lastPathComponent) { model.reveal(inGallery: URL(fileURLWithPath: o)) }
+                            .buttonStyle(.link).lineLimit(1).truncationMode(.middle)
+                    }
+                    .font(.system(size: 11))
+                }
+            }
         }
 
         if let t = m.text, !t.isEmpty {
-            HStack {
-                section("Text in image")
-                Spacer()
-                Button(showText ? "Less" : "More") { showText.toggle() }.buttonStyle(.link).font(.system(size: 10))
-                Button("Copy") { copyText(t); Toast.shared.show("Text copied") }.buttonStyle(.link).font(.system(size: 10))
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Button { showText.toggle() } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: showText ? "chevron.down" : "chevron.right").font(.system(size: 8, weight: .bold))
+                            Text("Text in image")
+                            Text("\(t.split(whereSeparator: \.isWhitespace).count) words").foregroundColor(C(Theme.muted))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                    Button { copyText(t); Toast.shared.show("Text copied") } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.plain).foregroundColor(C(Theme.muted)).help("Copy text (⌘T)")
+                }
+                .font(.system(size: 11, weight: .medium)).foregroundColor(C(Theme.textDim))
+                if showText { Text(t).font(.system(size: 11)).foregroundColor(C(Theme.textDim)).textSelection(.enabled) }
             }
-            Text(t).font(.system(size: 11)).foregroundColor(C(Theme.textDim)).lineLimit(showText ? nil : 4).textSelection(.enabled)
         }
 
-        HStack(spacing: 8) {
-            Button { model.findSimilar(u) } label: { Label("Find similar", systemImage: "sparkle.magnifyingglass") }
-            Button { model.open(u) } label: { Label(model.isImage(u) ? "Annotate" : "Open", systemImage: model.isImage(u) ? "pencil.and.outline" : "play") }
+        HStack(spacing: 4) {
+            ghost(model.isImage(u) ? "Annotate" : "Open", model.isImage(u) ? "pencil.tip.crop.circle" : "play") { model.open(u) }
+            ghost("Find similar", "sparkle.magnifyingglass") { model.findSimilar(u) }
         }
-        .font(.system(size: 11))
-        HStack(spacing: 8) {
-            Button { model.reveal() } label: { Label("Finder", systemImage: "folder") }
-            Button { model.trash() } label: { Label("Trash", systemImage: "trash") }
+        .padding(.top, 4)
+    }
+
+    private func summary(_ u: URL, _ m: ItemMeta) -> String {
+        var parts: [String] = []
+        if m.w > 0 { parts.append("\(m.w) × \(m.h)") }
+        if let d = m.duration, MediaType.of(u) != .image { parts.append(formatTime(d)) }
+        parts.append(ByteCountFormatter.string(fromByteCount: Int64(m.size), countStyle: .file))
+        parts.append(Library.dateFormat.string(from: Date(timeIntervalSince1970: m.mtime)))
+        return parts.joined(separator: "  ·  ")
+    }
+
+    private func chip(_ s: String, icon: String?, open: @escaping () -> Void, remove: @escaping () -> Void) -> some View {
+        HStack(spacing: 4) {
+            if let icon { Image(systemName: icon).font(.system(size: 9)) }
+            Text(s).onTapGesture(count: 2, perform: open)
+            Image(systemName: "xmark").font(.system(size: 7, weight: .bold)).foregroundColor(C(Theme.muted)).onTapGesture(perform: remove)
         }
-        .font(.system(size: 11))
+        .font(.system(size: 11)).padding(.horizontal, 8).padding(.vertical, 3)
+        .background(Capsule().fill(Color.white.opacity(0.08))).foregroundColor(C(Theme.text))
+        .help("Double-click to show all")
+    }
+
+    private func ghost(_ title: String, _ icon: String, _ run: @escaping () -> Void) -> some View {
+        Button(action: run) { Label(title, systemImage: icon).labelStyle(.titleAndIcon).font(.system(size: 11)).padding(.horizontal, 6) }
+            .buttonStyle(GlassButtonStyle())
+    }
+
+    private func commentEditor(_ u: URL, _ m: ItemMeta) -> some View {
+        TextEditor(text: $comment)
+            .font(.system(size: 12)).scrollContentBackground(.hidden)
+            .frame(minHeight: 40, maxHeight: 120)
+            .padding(4).background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05)))
+            .onAppear { comment = m.comment; commentFor = u }
+            .onChange(of: u) {
+                if let p = commentFor, comment != lib.meta(p).comment { lib.setComment(comment, p) }
+                comment = lib.meta(u).comment; commentFor = u; editingComment = false
+            }
+            .onChange(of: comment) { if commentFor == u && comment != lib.meta(u).comment { lib.setComment(comment, u) } }
+    }
+
+    private func paletteBar(_ m: ItemMeta) -> some View {
+        let cols = Array(m.colors.prefix(6))
+        let total = cols.reduce(0) { $0 + $1.ratio }
+        return GeometryReader { g in
+            HStack(spacing: 0) {
+                ForEach(cols, id: \.self) { s in
+                    Rectangle().fill(Color(nsColor: s.color))
+                        .frame(width: max(3, g.size.width * s.ratio / max(0.0001, total)))
+                        .help("\(s.hex)  ·  \(Int(s.ratio * 100))%  ·  click to find this color, right-click to copy")
+                        .onTapGesture { model.filter.color = s.hex; if case .similar = model.scope { model.scope = .all } }
+                        .contextMenu { Button("Copy \(s.hex)") { copyText(s.hex); Toast.shared.show("\(s.hex) copied") } }
+                }
+            }
+        }
+        .frame(height: 12).clipShape(Capsule())
     }
 
     @ViewBuilder
     private func multiple(_ us: [URL]) -> some View {
         Text("\(us.count) captures selected").font(.system(size: 13, weight: .semibold)).foregroundColor(C(Theme.text))
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4), spacing: 4) {
-            ForEach(us.prefix(16), id: \.self) { u in ThumbImage(url: u, side: 120).frame(height: 44).clipShape(RoundedRectangle(cornerRadius: 3)) }
-        }
         let bytes = us.reduce(0) { $0 + lib.meta($1).size }
         Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)).font(.system(size: 11)).foregroundColor(C(Theme.muted))
-        section("Rating")
         let rs = Set(us.map { lib.meta($0).rating })
         stars(rs.count == 1 ? rs.first! : 0) { lib.setRating($0, us) }
         section("Tags on all of them")
@@ -1295,11 +1580,7 @@ private struct Inspector: View {
         section("Collections")
         let memberAll = us.map { Set(lib.meta($0).collections) }.reduce(Set(lib.meta(us[0]).collections)) { $0.intersection($1) }
         collectionsRow(us, member: memberAll)
-        HStack(spacing: 8) {
-            Button { model.batchRename(us) } label: { Label("Batch rename", systemImage: "character.cursor.ibeam") }
-            Button { model.trash() } label: { Label("Trash", systemImage: "trash") }
-        }
-        .font(.system(size: 11))
+        ghost("Batch rename", "character.cursor.ibeam") { model.batchRename(us) }
     }
 }
 
@@ -1424,28 +1705,51 @@ struct GalleryView: View {
 
     var body: some View {
         ZStack {
-            HSplitView {
-                Sidebar(model: model, lib: lib).frame(minWidth: 190, idealWidth: 220, maxWidth: 320)
-                VStack(spacing: 0) {
-                    FilterBar(model: model, lib: lib)
-                    Rectangle().fill(C(Theme.border)).frame(height: 1)
-                    Browser(model: model).background(C(Theme.bg))
-                    Rectangle().fill(C(Theme.border)).frame(height: 1)
-                    Text("Space preview  ·  T tags  ·  F collection  ·  1–5 rate  ·  ↩ open  ·  ⌘F search  ·  ⌘C copy  ·  ⌘R rename  ·  ⌘⌫ Trash  ·  ⌘K all actions")
-                        .font(.system(size: 11)).foregroundColor(C(Theme.muted)).lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 6)
-                        .background(C(Theme.surface))
+            HStack(spacing: 0) {
+                if model.showSidebar {
+                    Sidebar(model: model, lib: lib).frame(width: 216)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                    hairline
                 }
-                .frame(minWidth: 420)
+                Browser(model: model, top: model.filter.hasConstraints ? 92 : 56)
+                    .background(C(Theme.bg))
+                    .overlay(alignment: .top) { TopBar(model: model, lib: lib).padding(.top, 8).padding(.horizontal, 12) }
+                    .overlay(alignment: .bottom) {
+                        if !model.selection.isEmpty {
+                            ActionBar(model: model).padding(.bottom, 14).transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
+                    .frame(minWidth: 480)
                 if model.showInspector {
-                    Inspector(model: model, lib: lib).frame(minWidth: 240, idealWidth: 290, maxWidth: 380)
+                    hairline
+                    inspector.frame(width: 290).transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
+            .animation(.snappy(duration: 0.25), value: model.showSidebar)
+            .animation(.snappy(duration: 0.25), value: model.showInspector)
+            .animation(.snappy(duration: 0.2), value: model.selection.isEmpty)
+            if model.showShortcuts { ShortcutsCard(model: model).transition(.opacity) }
             if let p = model.preview { PreviewOverlay(model: model, url: p) }
         }
+        .ignoresSafeArea()
         .background(C(Theme.bg))
         .preferredColorScheme(.dark)
         .tint(C(Theme.accent))
+    }
+
+    private var hairline: some View { Rectangle().fill(Color.white.opacity(0.08)).frame(width: 0.5) }
+
+    private var inspector: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button { model.showInspector = false } label: { Image(systemName: "xmark") }
+                    .buttonStyle(GlassButtonStyle()).help("Hide details (⌘I)")
+            }
+            .padding(.horizontal, 8).frame(height: 52)
+            Inspector(model: model, lib: lib)
+        }
+        .background(C(Theme.surface))
     }
 }
 
@@ -1470,11 +1774,16 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
                           backing: .buffered, defer: false)
         super.init()
         window.title = "Capture gallery"
+        window.styleMask.insert(.fullSizeContentView)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.toolbar = NSToolbar()          // taller title bar, so the traffic lights line up with the floating toolbar
+        window.toolbarStyle = .unified
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = Theme.bg
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.minSize = NSSize(width: 860, height: 480)
+        window.minSize = NSSize(width: 640, height: 420)
         window.contentView = NSHostingView(rootView: GalleryView(model: model, lib: Library.shared))
         window.setFrameAutosaveName("AtherGallery")
         if window.frame.origin == .zero { window.center() }
@@ -1497,19 +1806,23 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
         let cmd = f.contains(.command), shift = f.contains(.shift)
         let code = Int(e.keyCode)
 
+        if m.showShortcuts {
+            if code == kVK_Escape || (cmd && code == kVK_ANSI_Slash) || (shift && code == kVK_ANSI_Slash) { m.showShortcuts = false; return true }
+            return true
+        }
         if m.preview != nil {
             switch code {
             case kVK_LeftArrow, kVK_UpArrow: m.step(-1)
             case kVK_RightArrow, kVK_DownArrow: m.step(1)
             case kVK_Escape, kVK_Space: m.preview = nil; m.slideshow = false
             case kVK_Return: m.open(m.preview)
-            default: return cmd ? commandKey(code, shift) : false
+            default: return cmd ? commandKey(code, f) : false
             }
             return true
         }
         if typing {
             if code == kVK_Escape { window.makeFirstResponder(nil); return true }
-            if cmd && [kVK_ANSI_I, kVK_ANSI_K, kVK_ANSI_W].contains(code) { return commandKey(code, shift) }
+            if cmd && [kVK_ANSI_I, kVK_ANSI_K, kVK_ANSI_W, kVK_ANSI_S, kVK_ANSI_Slash].contains(code) { return commandKey(code, f) }
             if (code == kVK_DownArrow || code == kVK_Return) && window.firstResponder is NSTextView && !(window.firstResponder as! NSTextView).isFieldEditorMultiline {
                 window.makeFirstResponder(nil)
                 if m.focus == nil { m.move(1) }
@@ -1517,7 +1830,7 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
             }
             return false
         }
-        if cmd { return commandKey(code, shift) }
+        if cmd { return commandKey(code, f) }
         switch code {
         case kVK_LeftArrow: m.move(-1, extend: shift)
         case kVK_RightArrow: m.move(1, extend: shift)
@@ -1535,15 +1848,20 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
         case kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5:
             m.rate(Int(e.charactersIgnoringModifiers ?? "0") ?? 0)
         case kVK_Delete, kVK_ForwardDelete: break
-        case kVK_ANSI_Slash: m.focusSearch += 1
+        case kVK_ANSI_Slash: if shift { m.showShortcuts = true } else { m.focusSearch += 1 }
         default: return false
         }
         return true
     }
 
-    private func commandKey(_ code: Int, _ shift: Bool) -> Bool {
+    private func commandKey(_ code: Int, _ flags: NSEvent.ModifierFlags) -> Bool {
         let m = model
+        let shift = flags.contains(.shift), ctrl = flags.contains(.control)
         switch code {
+        case kVK_ANSI_S where ctrl: m.showSidebar.toggle()
+        case kVK_ANSI_Slash: m.showShortcuts.toggle()
+        case kVK_ANSI_Equal: m.zoom(1.15)
+        case kVK_ANSI_Minus: m.zoom(1 / 1.15)
         case kVK_ANSI_A: m.selectAll()
         case kVK_ANSI_C: m.copy()
         case kVK_ANSI_P: m.pin()

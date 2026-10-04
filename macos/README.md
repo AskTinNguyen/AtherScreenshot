@@ -44,8 +44,9 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 
 - **Organize:** tags (T), collections (F, or drag captures onto a collection). A capture can be in several collections, and a collection can add tags automatically to everything dropped into it. Smart folders save the current search and filters as a live folder. Also star ratings (1–5, 0 clears), comments, batch rename (`{n} {name} {date} {app}`), and Duplicates (identical or near-identical captures, with "keep newest, trash the rest").
 - **Search:** text (file name, OCR text, tags, comments, source app, window title), plus filters for type, tags (all/any/untagged), rating, color, shape (landscape, portrait, square, panorama, long page), minimum dimensions, date, file size and source app. **Find similar** is a reverse image search using Vision feature prints.
-- **Browse:** justified, grid or list layout with a thumbnail size slider. Sort by date, name, size, dimensions, rating or random (shuffle). The inspector shows tags, rating, comment, collections, color palette (click a color to search by it), info and OCR text. Space opens a full-window preview with zoom, playback for GIFs and videos, ←/→ navigation and a slideshow. Drag captures out to other apps, or drop files in to import them.
-- **Indexing:** dimensions, palette, perceptual hash, feature print and OCR text are computed in the background; progress shows at the bottom of the sidebar. Captures remember which app and window they came from.
+- **Layout:** the window is just your captures under one floating toolbar (scope menu, search, filters, view options). Filter chips appear only while a filter is active, and an action bar floats in while something is selected. The sidebar (⌃⌘S) and the details inspector (⌘I) are hidden until you ask for them.
+- **Browse:** justified, grid or list layout; pinch or ⌘+/⌘− for thumbnail size. Sort by date, name, size, dimensions, rating or random (shuffle). The inspector shows tags, rating, comment, collections, color palette (click a color to search by it), info and OCR text. Space opens a full-window preview with zoom, playback for GIFs and videos, ←/→ navigation and a slideshow. Drag captures out to other apps, or drop files in to import them.
+- **Indexing:** dimensions, palette, perceptual hash, feature print and OCR text are computed in the background; a small progress ring shows in the toolbar. Captures remember which app and window they came from.
 
 | Key | Action |
 |---|---|
@@ -57,7 +58,9 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 | ⌘A, ⇧-arrows, ⌘/⇧-click | Select several |
 | ⌘C ⌘T ⌘P ⌘R ⌘U ⌘O ⌘⌫ | Copy, copy text, pin, rename/batch rename, upload, show in Finder, Trash |
 | ⌘⇧S | Save the filters as a smart folder |
-| ⌘I | Toggle the inspector |
+| ⌘I / ⌃⌘S | Toggle the inspector / sidebar |
+| ⌘+ ⌘− | Thumbnail size |
+| ⌘/ or ? | Keyboard shortcuts |
 | ⌘K | All actions |
 
 ## Differences from Windows

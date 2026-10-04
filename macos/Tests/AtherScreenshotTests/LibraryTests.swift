@@ -185,4 +185,32 @@ final class ReviewRegressionTests: XCTestCase {
         l.testSetHash(b.path, 0xFF)
         XCTAssertEqual(l.duplicateGroups().count, 1)
     }
+
+    func testEditedCopyInheritsMetadata() {
+        let l = Library(persists: false)
+        let a = URL(fileURLWithPath: "/tmp/ather-review/a.png"), b = URL(fileURLWithPath: "/tmp/ather-review/b.png")
+        l.apply([(a, 1, 1)])
+        l.addTags(["bug"], to: [a])
+        l.setRating(4, [a])
+        l.setComment("check", a)
+        l.testSetApp(a.path, "Safari")
+        let c = l.createCollection("Sprint")
+        l.add([a], toCollection: c.id)
+        l.noteEdit(b, from: a, info: NameInfo(), edited: true)
+        l.apply([(a, 1, 1), (b, 2, 1)])
+        let m = l.meta(b)
+        XCTAssertEqual(m.tags, ["bug", "edited"])
+        XCTAssertEqual(m.rating, 4)
+        XCTAssertEqual(m.comment, "check")
+        XCTAssertEqual(m.app, "Safari")
+        XCTAssertEqual(m.collections, [c.id])
+        XCTAssertEqual(m.editedFrom, a.path)
+
+        // Saving straight from a fresh capture without changes is not an edit.
+        let d = URL(fileURLWithPath: "/tmp/ather-review/d.png")
+        l.noteEdit(d, from: nil, info: NameInfo(app: "Notes"), edited: false)
+        l.apply([(a, 1, 1), (b, 2, 1), (d, 3, 1)])
+        XCTAssertEqual(l.meta(d).tags, [])
+        XCTAssertEqual(l.meta(d).app, "Notes")
+    }
 }

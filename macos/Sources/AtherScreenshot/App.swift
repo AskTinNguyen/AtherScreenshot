@@ -588,7 +588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // Never hand out an unredacted image when redaction was asked for: let the user do it by hand.
                     Toast.shared.show("Auto-redact failed — nothing was copied, saved or uploaded",
                                       "\(e.localizedDescription) Opened in the editor so you can redact it yourself.", ms: 9000)
-                    Editor.open(img, scale: scale)
+                    Editor.open(img, scale: scale, info: self?.nameInfo ?? NameInfo())
                 }
             }
             return
@@ -615,7 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if after == .edit || (after == .normal && afterSetting == "edit") {
-            Editor.open(img, scale: scale)  // the editor copies/saves the result on Done
+            Editor.open(img, scale: scale, info: nameInfo)  // the editor copies/saves the result on Done
             return
         }
         let copied = s.bool("CopyToClipboard") && copyImage(img)
@@ -625,8 +625,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var toast: UInt64 = 0
         let save = s.bool("SaveToFile")
         if s.bool("ShowToast") && !pin && !upload {
+            let info = nameInfo
             toast = Toast.shared.post(copied ? "Copied to clipboard" : "Captured", dims + (save ? "  ·  saving…" : ""), image: img) {
-                Editor.open(img, scale: scale)
+                Editor.open(img, scale: scale, info: info)
             }
         }
         guard save || upload else { return }

@@ -45,6 +45,7 @@ struct ItemMeta: Codable {
     var colors: [PaletteColor] = []
     var dhash: UInt64?
     var indexed = 0            // indexer version that produced the technical fields
+    var editedFrom: String?    // path of the capture this one was edited from
 
     var aspect: CGFloat { w > 0 && h > 0 ? CGFloat(w) / CGFloat(h) : 16 / 10 }
 }
@@ -74,7 +75,7 @@ extension ItemMeta {
         duration = c.value(.duration, duration); tags = c.value(.tags, tags); rating = c.value(.rating, rating)
         comment = c.value(.comment, comment); collections = c.value(.collections, collections); app = c.value(.app, app)
         window = c.value(.window, window); text = c.value(.text, text); colors = c.value(.colors, colors)
-        dhash = c.value(.dhash, dhash); indexed = c.value(.indexed, indexed)
+        dhash = c.value(.dhash, dhash); indexed = c.value(.indexed, indexed); editedFrom = c.value(.editedFrom, editedFrom)
     }
 }
 
@@ -239,7 +240,10 @@ final class Library: ObservableObject {
     private var featuresDirty = false   // cleared only once the latest prints are on disk
     private var featureVersion = 0      // bumped on every change to `features`
     private var printCache: [String: VNFeaturePrintObservation] = [:]
-    private var pending: [String: NameInfo] = [:]                     // source app of captures not yet scanned
+    private var pending: [String: ItemMeta] = [:]   // metadata for files we're about to write, applied when the scan finds them
+    private var stream: FSEventStreamRef?
+    private var watchedPath = ""
+    private var diskWork: DispatchWorkItem?
     private var saveWork: DispatchWorkItem?
     private var indexing = false
     private var loaded = false
@@ -344,6 +348,7 @@ final class Library: ObservableObject {
 
     func refresh(done: (() -> Void)? = nil) {
         loadIfNeeded()
+        watch()
         let gen = generation
         DispatchQueue.global(qos: .userInitiated).async {
             let list = Output.listCaptures()
@@ -375,9 +380,14 @@ final class Library: ObservableObject {
             }
             e.mtime = mtime
             e.size = size
-            if let info = pending.removeValue(forKey: u.path) {
-                if e.app.isEmpty { e.app = info.app }
-                if e.window.isEmpty { e.window = info.window }
+            if let p = pending.removeValue(forKey: u.path) {
+                if e.app.isEmpty { e.app = p.app }
+                if e.window.isEmpty { e.window = p.window }
+                for t in p.tags where !e.tags.contains(where: { $0.lowercased() == t.lowercased() }) { e.tags.append(t) }
+                for c in p.collections where !e.collections.contains(c) { e.collections.append(c) }
+                if e.rating == 0 { e.rating = p.rating }
+                if e.comment.isEmpty { e.comment = p.comment }
+                if e.editedFrom == nil { e.editedFrom = p.editedFrom }
             }
             m[u.path] = e
         }
@@ -397,7 +407,53 @@ final class Library: ObservableObject {
     // Called when a capture file name is chosen, so the gallery knows which app it came from.
     func noteCapture(_ url: URL, info: NameInfo) {
         guard !info.app.isEmpty || !info.window.isEmpty else { return }
-        pending[url.path] = info
+        var p = pending[url.path] ?? ItemMeta()
+        p.app = info.app
+        p.window = info.window
+        pending[url.path] = p
+    }
+
+    // Called before an edited image is written: it joins the gallery tagged "edited", keeping the original's
+    // tags, collections, rating, comment and source app, and remembers which capture it came from.
+    func noteEdit(_ url: URL, from source: URL?, info: NameInfo, edited: Bool) {
+        loadIfNeeded()
+        var p = pending[url.path] ?? ItemMeta()
+        if let source, let o = meta[source.path] {
+            p.tags = o.tags; p.collections = o.collections; p.rating = o.rating; p.comment = o.comment
+            p.app = o.app; p.window = o.window
+            p.editedFrom = source.path
+        }
+        if p.app.isEmpty { p.app = info.app }
+        if p.window.isEmpty { p.window = info.window }
+        if edited && !p.tags.contains(where: { $0.lowercased() == "edited" }) { p.tags.append("edited") }
+        pending[url.path] = p
+    }
+
+    // MARK: watching the captures folder
+
+    // Anything written into the captures folder (captures, edits, recordings, files from Finder) shows up
+    // in the gallery without reopening it.
+    private func watch() {
+        guard persists, watchedPath != folder.path else { return }
+        if let s = stream { FSEventStreamStop(s); FSEventStreamInvalidate(s); FSEventStreamRelease(s); stream = nil }
+        watchedPath = folder.path
+        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<Library>.fromOpaque(info).takeUnretainedValue().changedOnDisk()
+        }
+        guard let s = FSEventStreamCreate(nil, callback, &ctx, [watchedPath] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.4,
+                                          FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer)) else { return }
+        FSEventStreamSetDispatchQueue(s, .main)
+        FSEventStreamStart(s)
+        stream = s
+    }
+
+    private func changedOnDisk() {
+        diskWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.refresh() }
+        diskWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: w)
     }
 
     // MARK: indexing

@@ -9,6 +9,8 @@ final class Editor: NSObject, NSWindowDelegate {
     let base: CGImage
     let unit: CGFloat
     let window: NSWindow
+    private var source: URL?
+    private var info = NameInfo()
     let canvas: EditorCanvas
     private let toolbar: EditorToolbar
     private let status = NSTextField(labelWithString: "")
@@ -16,9 +18,12 @@ final class Editor: NSObject, NSWindowDelegate {
     var dirty = false
     private var redacting = false
 
+    // `source`: the file being edited, if any; `info`: where the image was captured. Both carry over to the saved copy.
     @discardableResult
-    static func open(_ img: CGImage, scale: CGFloat? = nil) -> Editor {
+    static func open(_ img: CGImage, scale: CGFloat? = nil, source: URL? = nil, info: NameInfo = NameInfo()) -> Editor {
         let e = Editor(img, unit: scale ?? Geo.mouseScreen.backingScaleFactor)
+        e.source = source
+        e.info = info
         instances.append(e)
         return e
     }
@@ -29,7 +34,7 @@ final class Editor: NSObject, NSWindowDelegate {
             return
         }
         // Treat files as Retina-scale when they came from a Retina display (most captures do).
-        open(img, scale: Geo.mouseScreen.backingScaleFactor)
+        open(img, scale: Geo.mouseScreen.backingScaleFactor, source: url)
     }
 
     private init(_ img: CGImage, unit: CGFloat) {
@@ -116,7 +121,11 @@ final class Editor: NSObject, NSWindowDelegate {
 
     func save(close: Bool = false) {
         let img = export()
-        let url = Output.newCaptureURL(ext: "png", info: NameInfo(w: img.width, h: img.height))
+        var info = self.info
+        info.w = img.width
+        info.h = img.height
+        let url = Output.newCaptureURL(ext: "png", info: info)
+        Library.shared.noteEdit(url, from: source, info: info, edited: !canvas.state.annots.isEmpty || img.width != base.width || img.height != base.height)
         Output.savePNG(img, to: url) { ok in
             if ok { AppDelegate.shared?.setLast(img, url: url) }
             Toast.shared.show(ok ? (close ? "Copied and saved" : "Saved") : "Save failed", url.lastPathComponent, image: ok ? img : nil) {
@@ -133,6 +142,7 @@ final class Editor: NSObject, NSWindowDelegate {
         panel.nameFieldStringValue = Output.makeCaptureURL(base: FileManager.default.temporaryDirectory, ext: "png", info: NameInfo()).deletingPathExtension().lastPathComponent
         panel.beginSheetModal(for: window) { r in
             guard r == .OK, let url = panel.url else { return }
+            Library.shared.noteEdit(url, from: self.source, info: self.info, edited: true)
             Output.savePNG(img, to: url) { ok in
                 Toast.shared.show(ok ? "Saved" : "Save failed", url.lastPathComponent)
                 if ok { self.dirty = false }  // a failed save must still warn before closing

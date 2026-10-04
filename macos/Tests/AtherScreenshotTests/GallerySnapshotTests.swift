@@ -77,23 +77,53 @@ final class GallerySnapshotTests: XCTestCase {
         lib.testSetApp(url("Terminal").path, "Terminal")
         lib.setComment("Numbers look off for Tuesday — check with data team.", url("Dashboard"))
 
+        // New files appear without a manual refresh (the captures folder is watched).
+        let fresh = caps.appendingPathComponent("Edited later.png")
+        try card(800, 500, .systemTeal, .systemBlue, "Edited later", "Saved from the editor").pngData()!.write(to: fresh)
+        for _ in 0..<20 where !lib.urls.contains(fresh) { wait(0.25) }
+        XCTAssertTrue(lib.urls.contains(fresh))
+        try FileManager.default.removeItem(at: fresh)
+        for _ in 0..<20 where lib.urls.contains(fresh) { wait(0.25) }
+        XCTAssertFalse(lib.urls.contains(fresh))
+
         let model = GalleryModel()
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1320, height: 820), styleMask: [.titled], backing: .buffered, defer: false)
+        model.showSidebar = false
+        model.showInspector = false
+        UserDefaults.standard.removeObject(forKey: "GalleryInspectorDiscovered")
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1320, height: 820), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        w.titlebarAppearsTransparent = true
         w.isReleasedWhenClosed = false
         w.appearance = NSAppearance(named: .darkAqua)
         let host = NSHostingView(rootView: GalleryView(model: model, lib: lib))
         w.contentView = host
         w.orderFront(nil)
-        wait(0.5)
+        wait(2.5)
+        snap(host, "gallery-canvas", out: out)
         model.selection = [url("Dashboard")]
         model.focus = url("Dashboard")
-        wait(2.5)
-        snap(host, "gallery-justified", out: out)
+        wait(1)
+        snap(host, "gallery-selected", out: out)
+        model.showInspector = true
+        wait(1)
+        snap(host, "gallery-inspector", out: out)
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: "GalleryInspectorDiscovered"))
+        model.showInspector = false
+        model.showSidebar = true
+        wait(1)
+        snap(host, "gallery-sidebar", out: out)
+        model.showSidebar = false
+        model.showShortcuts = true
+        wait(0.6)
+        snap(host, "gallery-shortcuts", out: out)
+        model.showShortcuts = false
 
         model.filter = Filter(text: "revenue")
         wait(1)
         snap(host, "gallery-search", out: out)
 
+        model.filter = Filter(tags: ["bug"], color: "#FF3B30")
+        wait(1)
+        snap(host, "gallery-filtered", out: out)
         model.filter = Filter(color: "#FF3B30")
         wait(1)
         XCTAssertTrue(model.visible.contains(url("Checkout error")))
@@ -124,6 +154,10 @@ final class GallerySnapshotTests: XCTestCase {
         model.preview = url("Login screen")
         wait(1)
         snap(host, "gallery-preview", out: out)
+        model.preview = nil
+        w.setContentSize(NSSize(width: 700, height: 600))
+        wait(1)
+        snap(host, "gallery-narrow", out: out)
         w.close()
     }
 }
