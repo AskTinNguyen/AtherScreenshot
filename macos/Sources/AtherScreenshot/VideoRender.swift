@@ -23,6 +23,7 @@ enum MarkKind: String, CaseIterable {
         case .title: return "Title card"
         }
     }
+    var plural: String { self == .box ? "boxes" : self == .emoji ? "emoji" : label.lowercased() + "s" }
     var symbol: String {
         switch self {
         case .text: return "textformat"
@@ -52,12 +53,61 @@ enum MarkKind: String, CaseIterable {
     var isLine: Bool { self == .arrow }
     var hasText: Bool { [.text, .bubble, .emoji, .title].contains(self) }
     var isRegion: Bool { [.blur, .pixelate, .zoom].contains(self) }
-    var defaultSeconds: Double { self == .zoom ? 3 : self == .title ? 2.5 : 3 }
+    var isStroke: Bool { [.arrow, .box, .ellipse].contains(self) }
+    var defaultSeconds: Double { self == .title ? 2.5 : 3 }
+
+    // What "Auto" means for each kind.
+    var defaultStyle: AnimStyle {
+        switch self {
+        case .arrow, .box, .ellipse: return .drawOn
+        case .step, .emoji, .bubble: return .pop
+        case .text: return .slide
+        case .title: return .fade
+        case .blur, .pixelate, .zoom: return .none
+        }
+    }
+
+    // The styles that make sense for this kind, so menus stay short.
+    var styles: [AnimStyle] {
+        switch self {
+        case .arrow, .box, .ellipse: return [.none, .fade, .drawOn, .pop, .scale]
+        case .step, .emoji: return [.none, .fade, .pop, .scale, .slide]
+        case .text, .bubble: return [.none, .fade, .pop, .slide, .wipe, .blurIn, .typewriter]
+        case .title: return [.none, .fade, .slide, .wipe, .blurIn]
+        case .blur, .pixelate: return [.none, .fade, .blurIn]
+        case .zoom: return []
+        }
+    }
 }
 
-enum MarkAnimation: Int, CaseIterable {
-    case none, fade, pop
-    var label: String { ["No animation", "Fade", "Pop"][rawValue] }
+// One animation style plays the item in and (mirrored) out.
+enum AnimStyle: String, CaseIterable {
+    case auto, none, fade, pop, scale, slide, wipe, blurIn, drawOn, typewriter
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .none: return "None"
+        case .fade: return "Fade"
+        case .pop: return "Pop"
+        case .scale: return "Scale"
+        case .slide: return "Slide up"
+        case .wipe: return "Wipe"
+        case .blurIn: return "Blur in"
+        case .drawOn: return "Draw on"
+        case .typewriter: return "Typewriter"
+        }
+    }
+    static let captionStyles: [AnimStyle] = [.auto, .none, .fade, .pop, .slide, .typewriter]
+}
+
+enum Emphasis: String, CaseIterable {
+    case none, pulse, bounce, shake, ping
+    var label: String { ["none": "None", "pulse": "Pulse", "bounce": "Bounce", "shake": "Shake", "ping": "Ping"][rawValue]! }
+}
+
+enum CaptionLook: Int, CaseIterable {
+    case pill, outline, bar
+    var label: String { ["Pill", "Outline", "Bar"][rawValue] }
 }
 
 struct Mark: Equatable {
@@ -72,10 +122,30 @@ struct Mark: Equatable {
     var color = 0                // index into kColors
     var level = 2
     var step = 1
-    var animation = MarkAnimation.fade
+    var style = AnimStyle.auto
+    var exit: AnimStyle?         // advanced: a different exit; nil mirrors `style`
+    var emphasis = Emphasis.none
+    var snappy = false           // zoom: quick instead of smooth
 
     var rect: CGRect { Geo.norm(a, b) }
     func active(_ t: Double) -> Bool { t >= start && t < end }
+    var inStyle: AnimStyle { style == .auto ? kind.defaultStyle : style }
+    var outStyle: AnimStyle {
+        let s = exit.map { $0 == .auto ? kind.defaultStyle : $0 } ?? inStyle
+        return s == .drawOn || s == .typewriter ? .fade : s   // these don't play backwards well
+    }
+}
+
+// How an item looks at one moment of its entrance, exit or emphasis.
+struct Motion: Equatable {
+    var alpha: CGFloat = 1
+    var scale: CGFloat = 1
+    var dx: CGFloat = 0          // video pixels; positive is right / down
+    var dy: CGFloat = 0
+    var reveal: CGFloat = 1      // 0…1: wipe, draw on, typewriter
+    var wipe = false
+    var blur: CGFloat = 0
+    var ring: CGFloat?           // ping: 0…1 phase of the ring
 }
 
 // MARK: - Frame renderer
@@ -112,21 +182,24 @@ final class FrameRenderer {
         for m in edit.marks where (m.kind == .blur || m.kind == .pixelate) && m.active(t) {
             let r = ci(m.rect, H).intersection(img.extent)
             guard !r.isEmpty else { continue }
-            let (alpha, _) = envelope(m, t)
+            let mo = motion(m, t)
             var fx: CIImage
+            let k = mo.blur > 0 ? max(0.15, 1 - mo.blur / (12 * unit)) : 1   // blur in: the effect strengthens
             if m.kind == .blur {
-                fx = img.clampedToExtent().applyingGaussianBlur(sigma: Double(max(4, min(r.width, r.height) * [0.03, 0.05, 0.08, 0.12, 0.18][m.level]))).cropped(to: r)
+                fx = img.clampedToExtent().applyingGaussianBlur(sigma: Double(k * max(4, min(r.width, r.height) * [0.03, 0.05, 0.08, 0.12, 0.18][m.level]))).cropped(to: r)
             } else {
-                let block = max(6, min(r.width, r.height) * [0.04, 0.07, 0.1, 0.14, 0.2][m.level])
+                let block = max(6, k * min(r.width, r.height) * [0.04, 0.07, 0.1, 0.14, 0.2][m.level])
                 fx = img.clampedToExtent().applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: block, kCIInputCenterKey: CIVector(x: r.minX, y: r.minY)]).cropped(to: r)
             }
-            if alpha < 1 { fx = faded(fx, alpha) }
+            if mo.alpha < 1 { fx = faded(fx, mo.alpha) }
             img = fx.composited(over: img)
         }
         // 2. Markup that sits on the video (moves with zoom).
         for m in edit.marks where !m.kind.isRegion && m.kind != .title && m.active(t) {
-            guard let (cg, r) = markImage(m) else { continue }
-            img = place(cg, r, H, envelope(m, t)).composited(over: img)
+            let mo = motion(m, t)
+            guard mo.alpha > 0.001, let (cg, r) = markImage(m, reveal: mo.wipe ? 1 : mo.reveal) else { continue }
+            if let phase = mo.ring, let ring = ringImage(r) { img = place(ring.0, ring.1, H, Motion(alpha: (1 - phase) * 0.8, scale: 1 + phase * 0.5)).composited(over: img) }
+            img = place(cg, r, H, mo).composited(over: img)
         }
         // 3. The visible area: the crop, or a zoom into it.
         let r = viewRect(at: t)
@@ -141,12 +214,14 @@ final class FrameRenderer {
         let origin = preview ? view.origin : .zero
         let OH = preview ? H : out.height
         for c in edit.captions where c.active(t) && (preview || !c.text.trimmingCharacters(in: .whitespaces).isEmpty) {
-            guard let (cg, pr) = captionImage(c, in: tsize) else { continue }
-            framed = place(cg, pr.offsetBy(dx: origin.x, dy: origin.y), OH, (1, 1)).composited(over: framed)
+            let mo = captionMotion(c, t)
+            guard mo.alpha > 0.001, let (cg, pr) = captionImage(c, in: tsize, at: t, reveal: mo.reveal) else { continue }
+            framed = place(cg, pr.offsetBy(dx: origin.x, dy: origin.y), OH, mo).composited(over: framed)
         }
         for m in edit.marks where m.kind == .title && m.active(t) {
+            let mo = motion(m, t)
             guard let cg = titleImage(m, size: tsize) else { continue }
-            framed = place(cg, CGRect(origin: origin, size: tsize), OH, envelope(m, t)).composited(over: framed)
+            framed = place(cg, CGRect(origin: origin, size: tsize), OH, mo).composited(over: framed)
         }
         if preview { return framed.composited(over: img) }
         return framed.composited(over: CIImage(color: .black).cropped(to: target))
@@ -155,8 +230,8 @@ final class FrameRenderer {
     func viewRect(at t: Double) -> CGRect {
         guard !preview || zoomInPreview, let z = edit.marks.first(where: { $0.kind == .zoom && $0.active(t) }) else { return view }
         let target = FrameRenderer.zoomTarget(z.rect, view: view)
-        let ramp = min(0.45, (z.end - z.start) / 3)
-        let p = smooth(min(1, min(t - z.start, z.end - t) / max(0.01, ramp)))
+        let ramp = min(z.snappy ? 0.18 : 0.45, (z.end - z.start) / 3)
+        let p = ease(min(1, min(t - z.start, z.end - t) / max(0.01, ramp)))
         return CGRect(x: view.minX + (target.minX - view.minX) * p, y: view.minY + (target.minY - view.minY) * p,
                       width: view.width + (target.width - view.width) * p, height: view.height + (target.height - view.height) * p)
     }
@@ -172,20 +247,32 @@ final class FrameRenderer {
         return CGRect(x: x, y: y, width: w, height: h)
     }
 
-    private func smooth(_ x: Double) -> CGFloat { CGFloat(x * x * (3 - 2 * x)) }
+    private func ease(_ x: Double) -> CGFloat { CGFloat(x * x * (3 - 2 * x)) }
+    private func easeOut(_ x: CGFloat) -> CGFloat { 1 - pow(1 - x, 3) }
 
-    // Opacity and scale for a mark's entrance and exit.
-    func envelope(_ m: Mark, _ t: Double) -> (CGFloat, CGFloat) {
-        let a = t - m.start, b = m.end - t
-        switch m.animation {
-        case .none: return (1, 1)
-        case .fade:
-            let d = max(0.01, min(0.25, (m.end - m.start) / 3))
-            return (CGFloat(min(1, a / d, b / d)), 1)
-        case .pop:
-            let x = min(1, a / 0.22)
-            let back = 1 + 2.2 * pow(x - 1, 3) + 1.2 * pow(x - 1, 2)   // ease-out with a little overshoot
-            return (CGFloat(min(1, a / 0.1, b / 0.15)), CGFloat(0.55 + 0.45 * back))
+    // MARK: motion
+
+    func motion(_ m: Mark, _ t: Double) -> Motion {
+        var mo = Motion.between(m.inStyle, m.outStyle, start: m.start, end: m.end, t: t, chars: m.text.count, height: full.height)
+        if m.emphasis != .none { emphasize(&mo, m.emphasis, since: t - m.start) }
+        return mo
+    }
+
+    func captionMotion(_ c: Caption, _ t: Double) -> Motion {
+        let s = edit.captionStyle == .auto ? AnimStyle.fade : edit.captionStyle
+        return Motion.between(s, s == .typewriter ? .fade : s, start: c.start, end: c.end, t: t, chars: c.text.count, height: full.height)
+    }
+
+    private func emphasize(_ mo: inout Motion, _ e: Emphasis, since a: Double) {
+        let u = Double(full.height)
+        switch e {
+        case .none: break
+        case .pulse: mo.scale *= CGFloat(1 + 0.045 * sin(a * 2 * .pi / 1.2))
+        case .bounce: mo.dy -= CGFloat(abs(sin(a * .pi / 0.55)) * u * 0.018)
+        case .shake:
+            let c = a.truncatingRemainder(dividingBy: 2)   // a short shake every two seconds
+            if c < 0.45 { mo.dx += CGFloat(sin(c * 2 * .pi * 9) * (1 - c / 0.45) * u * 0.008) }
+        case .ping: mo.ring = CGFloat(a.truncatingRemainder(dividingBy: 1.4) / 1.4)
         }
     }
 
@@ -197,15 +284,18 @@ final class FrameRenderer {
         i.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha)])
     }
 
-    private func place(_ cg: CGImage, _ r: CGRect, _ H: CGFloat, _ env: (CGFloat, CGFloat)) -> CIImage {
+    private func place(_ cg: CGImage, _ r: CGRect, _ H: CGFloat, _ mo: Motion) -> CIImage {
         let c = ci(r, H)
         var i = CIImage(cgImage: cg).transformed(by: CGAffineTransform(scaleX: c.width / CGFloat(cg.width), y: c.height / CGFloat(cg.height)))
             .transformed(by: CGAffineTransform(translationX: c.minX, y: c.minY))
-        if env.1 != 1 {
-            i = i.transformed(by: CGAffineTransform(translationX: -c.midX, y: -c.midY).concatenating(CGAffineTransform(scaleX: env.1, y: env.1))
+        if mo.wipe && mo.reveal < 1 { i = i.cropped(to: CGRect(x: c.minX, y: c.minY - c.height, width: c.width * max(0, mo.reveal), height: c.height * 3)) }
+        if mo.blur > 0.3 { i = i.clampedToExtent().applyingGaussianBlur(sigma: Double(mo.blur)).cropped(to: i.extent.insetBy(dx: -mo.blur * 3, dy: -mo.blur * 3)) }
+        if mo.scale != 1 {
+            i = i.transformed(by: CGAffineTransform(translationX: -c.midX, y: -c.midY).concatenating(CGAffineTransform(scaleX: mo.scale, y: mo.scale))
                 .concatenating(CGAffineTransform(translationX: c.midX, y: c.midY)))
         }
-        return env.0 < 1 ? faded(i, max(0, env.0)) : i
+        if mo.dx != 0 || mo.dy != 0 { i = i.transformed(by: CGAffineTransform(translationX: mo.dx, y: -mo.dy)) }
+        return mo.alpha < 1 ? faded(i, max(0, mo.alpha)) : i
     }
 
     private func cached(_ key: String, _ make: () -> CGImage?) -> CGImage? {
@@ -214,15 +304,22 @@ final class FrameRenderer {
         FrameRenderer.lock.unlock()
         guard let img = make() else { return nil }
         FrameRenderer.lock.lock()
-        if FrameRenderer.cache.count > 300 { FrameRenderer.cache.removeAll() }
+        if FrameRenderer.cache.count > 400 { FrameRenderer.cache.removeAll() }
         FrameRenderer.cache[key] = img
         FrameRenderer.lock.unlock()
         return img
     }
 
+    private func typed(_ s: String, _ reveal: CGFloat) -> String {
+        reveal >= 1 ? s : String(s.prefix(Int((CGFloat(s.count) * reveal).rounded(.up))))
+    }
+
     // A mark drawn on its own, with the rect it covers in video coordinates.
-    func markImage(_ m: Mark) -> (CGImage, CGRect)? {
+    // `reveal` < 1 draws an arrow, box or ellipse partway (draw on), or text partway (typewriter).
+    func markImage(_ m: Mark, reveal: CGFloat = 1) -> (CGImage, CGRect)? {
         let u = unit
+        let rv = (reveal * 30).rounded(.up) / 30   // a step per frame is plenty, and keeps the cache small
+        if m.kind.isStroke && rv < 1 { return strokeOn(m, rv) }
         var annot: Annot?
         switch m.kind {
         case .arrow: annot = Annot(tool: .arrow, color: m.color, level: m.level, unit: u, pts: [m.a, m.b])
@@ -230,14 +327,19 @@ final class FrameRenderer {
         case .ellipse: annot = Annot(tool: .ellipse, color: m.color, level: m.level, unit: u, pts: [m.rect.origin, CGPoint(x: m.rect.maxX, y: m.rect.maxY)])
         case .step: annot = Annot(tool: .step, color: m.color, level: m.level, unit: u, pts: [CGPoint(x: m.rect.midX, y: m.rect.midY)], step: m.step)
         case .text:
-            let shown = m.text.isEmpty && preview ? "Text" : m.text
+            let shown = m.text.isEmpty && preview ? "Text" : typed(m.text, rv)
             guard !shown.isEmpty else { return nil }
             annot = Annot(tool: .text, color: m.color, level: m.level, unit: u, pts: [m.rect.origin], text: shown, wrap: max(40, m.rect.width))
         default: break
         }
         if let a = annot {
-            let b = Render.bounds(a).insetBy(dx: -8 * u, dy: -8 * u).integral
-            let key = "a|\(m.kind)|\(a.pts)|\(a.color)|\(a.level)|\(a.text)|\(a.step)|\(u)"
+            var b = Render.bounds(a).insetBy(dx: -8 * u, dy: -8 * u).integral
+            if m.kind == .text {   // typewriter: keep the box the size of the whole text, so it doesn't drift
+                var whole = a
+                whole.text = m.text.isEmpty ? a.text : m.text
+                b = Render.bounds(whole).insetBy(dx: -8 * u, dy: -8 * u).integral
+            }
+            let key = "a|\(m.kind)|\(a.pts)|\(a.color)|\(a.level)|\(a.text)|\(a.step)|\(u)|\(b)"
             guard let img = cached(key, {
                 guard let ctx = makeContext(width: max(1, Int(b.width)), height: max(1, Int(b.height))) else { return nil }
                 ctx.translateBy(x: -b.minX, y: -b.minY)
@@ -264,11 +366,12 @@ final class FrameRenderer {
             return (img, r)
         }
         if m.kind == .bubble {
-            let shown = m.text.isEmpty && preview ? "Say something" : m.text
-            guard !shown.isEmpty else { return nil }
+            let whole = m.text.isEmpty && preview ? "Say something" : m.text
+            guard !whole.isEmpty else { return nil }
+            let shown = m.text.isEmpty ? whole : typed(whole, rv)
             let tail = r.height * 0.32
             let full = CGRect(x: r.minX, y: r.minY, width: r.width, height: r.height + tail)
-            let key = "b|\(shown)|\(r.size)|\(m.color)|\(m.level)"
+            let key = "b|\(shown)|\(whole)|\(r.size)|\(m.color)|\(m.level)"
             guard let img = cached(key, {
                 guard let ctx = makeContext(width: Int(full.width), height: Int(full.height)) else { return nil }
                 let body = CGRect(x: 2, y: 2, width: r.width - 4, height: r.height - 4)
@@ -288,8 +391,9 @@ final class FrameRenderer {
                 var fs = kTextPx[m.level] * u * 0.8
                 func attr() -> [NSAttributedString.Key: Any] { [.font: NSFont.systemFont(ofSize: fs, weight: .semibold), .foregroundColor: fill.isDark ? NSColor.white : NSColor.black, .paragraphStyle: p] }
                 let inner = body.insetBy(dx: body.height * 0.28, dy: body.height * 0.14)
-                var tb = NSAttributedString(string: shown, attributes: attr()).boundingRect(with: CGSize(width: inner.width, height: 10_000), options: [.usesLineFragmentOrigin])
-                while tb.height > inner.height && fs > 8 { fs *= 0.9; tb = NSAttributedString(string: shown, attributes: attr()).boundingRect(with: CGSize(width: inner.width, height: 10_000), options: [.usesLineFragmentOrigin]) }
+                // Sized by the whole text, so typing it out doesn't change the layout.
+                var tb = NSAttributedString(string: whole, attributes: attr()).boundingRect(with: CGSize(width: inner.width, height: 10_000), options: [.usesLineFragmentOrigin])
+                while tb.height > inner.height && fs > 8 { fs *= 0.9; tb = NSAttributedString(string: whole, attributes: attr()).boundingRect(with: CGSize(width: inner.width, height: 10_000), options: [.usesLineFragmentOrigin]) }
                 withNSContext(ctx, flipped: true) {
                     NSAttributedString(string: shown, attributes: attr()).draw(with: CGRect(x: inner.minX, y: inner.midY - tb.height / 2, width: inner.width, height: tb.height + 2), options: [.usesLineFragmentOrigin])
                 }
@@ -300,26 +404,87 @@ final class FrameRenderer {
         return nil
     }
 
-    // A caption pill in output coordinates (top-left origin), sized like the export.
-    func captionImage(_ c: Caption, in size: CGSize) -> (CGImage, CGRect)? {
-        let text = c.text.isEmpty ? "Type a caption…" : c.text
-        let fontSize = max(14, size.height * VideoEdit.captionScale[edit.captionSize])
-        let attrs = VideoExport.captionAttributes(fontSize, dim: c.text.isEmpty)
-        let maxW = size.width * 0.86
-        let tb = NSAttributedString(string: text, attributes: attrs).boundingRect(with: CGSize(width: maxW, height: 10_000), options: [.usesLineFragmentOrigin])
+    // Arrow, box or ellipse drawn partway along its outline.
+    private func strokeOn(_ m: Mark, _ p: CGFloat) -> (CGImage, CGRect)? {
+        let u = unit
+        if m.kind == .arrow {   // the arrow grows from its tail, head first
+            var g = m
+            g.b = CGPoint(x: m.a.x + (m.b.x - m.a.x) * max(0.08, p), y: m.a.y + (m.b.y - m.a.y) * max(0.08, p))
+            return markImage(g, reveal: 1)
+        }
+        let a = Annot(tool: m.kind == .box ? .rect : .ellipse, color: m.color, level: m.level, unit: u, pts: [m.rect.origin, CGPoint(x: m.rect.maxX, y: m.rect.maxY)])
+        let b = Render.bounds(a).insetBy(dx: -8 * u, dy: -8 * u).integral
+        let key = "s|\(m.kind)|\(m.rect)|\(m.color)|\(m.level)|\(p)|\(u)"
+        guard let img = cached(key, {
+            guard let ctx = makeContext(width: max(1, Int(b.width)), height: max(1, Int(b.height))) else { return nil }
+            ctx.translateBy(x: -b.minX, y: -b.minY)
+            let r = a.rect
+            let path = m.kind == .box ? CGPath(rect: r, transform: nil) : CGPath(ellipseIn: r, transform: nil)
+            let len = m.kind == .box ? 2 * (r.width + r.height) : .pi * (3 * (r.width + r.height) / 2 - sqrt((3 * r.width + r.height) * (r.width + 3 * r.height)) / 2)
+            ctx.setShadow(offset: CGSize(width: 0, height: 1 * u), blur: 3 * u, color: NSColor.black.withAlphaComponent(0.35).cgColor)
+            ctx.setStrokeColor(a.nsColor.cgColor)
+            ctx.setLineWidth(a.strokeW)
+            ctx.setLineCap(.round)
+            ctx.setLineDash(phase: 0, lengths: [len * p, len * 2])
+            ctx.addPath(path)
+            ctx.strokePath()
+            return ctx.makeImage()
+        }) else { return nil }
+        return (img, b)
+    }
+
+    // Ping: a ring around the item that spreads and fades.
+    private func ringImage(_ r: CGRect) -> (CGImage, CGRect)? {
+        let pad = max(6, min(r.width, r.height) * 0.12)
+        let box = r.insetBy(dx: -pad, dy: -pad).integral
+        let key = "r|\(box.size)"
+        guard let img = cached(key, {
+            guard let ctx = makeContext(width: Int(box.width), height: Int(box.height)) else { return nil }
+            ctx.setStrokeColor(NSColor.white.cgColor)
+            ctx.setLineWidth(max(2, 2.5 * unit))
+            ctx.strokeEllipse(in: CGRect(origin: .zero, size: box.size).insetBy(dx: 3 * unit, dy: 3 * unit))
+            return ctx.makeImage()
+        }) else { return nil }
+        return (img, box)
+    }
+
+    // A caption in output coordinates (top-left origin), in the video's caption look.
+    func captionImage(_ c: Caption, in size: CGSize, at t: Double? = nil, reveal: CGFloat = 1) -> (CGImage, CGRect)? {
+        let whole = c.text.isEmpty ? "Type a caption…" : c.text
+        let look = edit.captionLook
+        let fontSize = max(14, size.height * VideoEdit.captionScale[edit.captionSize]) * (look == .outline ? 1.25 : 1)
+        let maxW = size.width * (look == .bar ? 0.92 : 0.86)
+        // The spoken word lights up, when the caption still matches its transcription.
+        var hot: Range<String.Index>?
+        if edit.highlightWords, let t, !c.words.isEmpty, c.words.map(\.text).joined(separator: " ") == c.text, let i = c.words.firstIndex(where: { t >= $0.start && t < $0.end }) {
+            var lo = c.text.startIndex
+            for w in c.words.prefix(i) { lo = c.text.index(lo, offsetBy: w.text.count + 1) }
+            hot = lo..<c.text.index(lo, offsetBy: c.words[i].text.count)
+        }
+        let shown = typed(whole, (reveal * 30).rounded(.up) / 30)
+        func attributed(_ s: String) -> NSAttributedString {
+            let a = NSMutableAttributedString(string: s, attributes: VideoExport.captionAttributes(fontSize, dim: c.text.isEmpty, look: look))
+            if let hot, hot.upperBound <= s.endIndex { a.addAttribute(.foregroundColor, value: Theme.rgb(255, 214, 10), range: NSRange(hot, in: s)) }
+            return a
+        }
+        let tb = attributed(whole).boundingRect(with: CGSize(width: maxW, height: 10_000), options: [.usesLineFragmentOrigin])
         let pad = fontSize * 0.45
-        let w = ceil(tb.width) + pad * 2, h = ceil(tb.height) + pad * 1.2
-        let margin = size.height * 0.06
+        var w = ceil(tb.width) + pad * 2, h = ceil(tb.height) + pad * 1.2
+        if look == .bar { w = size.width }
+        let margin = look == .bar ? 0 : size.height * 0.06
         let y: CGFloat = c.position == .top ? margin : c.position == .middle ? (size.height - h) / 2 : size.height - margin - h
         let r = CGRect(x: ((size.width - w) / 2).rounded(), y: y.rounded(), width: w.rounded(.up), height: h.rounded(.up))
-        let key = "c|\(text)|\(r.size)|\(fontSize)"
+        let key = "c|\(shown)|\(whole)|\(r.size)|\(fontSize)|\(look)|\(hot.map { "\($0)" } ?? "")"
         guard let img = cached(key, {
             guard let ctx = makeContext(width: Int(r.width), height: Int(r.height)) else { return nil }
-            ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: r.size), cornerWidth: fontSize * 0.35, cornerHeight: fontSize * 0.35, transform: nil))
-            ctx.setFillColor(NSColor.black.withAlphaComponent(0.62).cgColor)
-            ctx.fillPath()
+            if look != .outline {
+                let radius = look == .bar ? 0 : fontSize * 0.35
+                ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: r.size), cornerWidth: radius, cornerHeight: radius, transform: nil))
+                ctx.setFillColor(NSColor.black.withAlphaComponent(look == .bar ? 0.7 : 0.62).cgColor)
+                ctx.fillPath()
+            }
             withNSContext(ctx, flipped: true) {
-                NSAttributedString(string: text, attributes: attrs).draw(with: CGRect(x: pad, y: pad * 0.6, width: r.width - pad * 2, height: ceil(tb.height) + 2), options: [.usesLineFragmentOrigin])
+                attributed(shown).draw(with: CGRect(x: (r.width - ceil(tb.width)) / 2, y: pad * 0.6, width: ceil(tb.width) + 1, height: ceil(tb.height) + 2), options: [.usesLineFragmentOrigin])
             }
             return ctx.makeImage()
         }) else { return nil }
@@ -350,6 +515,62 @@ final class FrameRenderer {
                 if !m.subtitle.isEmpty { s.draw(with: CGRect(x: (size.width - w) / 2, y: top + tb.height + gap, width: w, height: sb.height + 2), options: [.usesLineFragmentOrigin]) }
             }
             return ctx.makeImage()
+        }
+    }
+}
+
+extension Motion {
+    // Entrance and exit of one item at time `t`. Each style has one tuned duration.
+    static func between(_ inS: AnimStyle, _ outS: AnimStyle, start: Double, end: Double, t: Double, chars: Int, height: CGFloat) -> Motion {
+        let len = max(0.05, end - start)
+        func dur(_ s: AnimStyle, entering: Bool) -> Double {
+            switch s {
+            case .none, .auto: return 0
+            case .pop: return entering ? 0.24 : 0.16
+            case .drawOn: return min(0.6, len / 2)
+            case .typewriter: return min(len * 0.6, max(0.3, Double(chars) * 0.035))
+            case .wipe: return 0.4
+            default: return entering ? 0.3 : 0.22
+            }
+        }
+        var m = Motion()
+        let di = min(dur(inS, entering: true), len / 2), dO = min(dur(outS, entering: false), len / 2)
+        if di > 0, t - start < di { m.apply(inS, CGFloat((t - start) / di), height: height) }
+        if dO > 0, end - t < dO {
+            var o = Motion()
+            o.apply(outS, CGFloat(max(0, end - t) / dO), height: height)
+            m.alpha *= o.alpha; m.scale *= o.scale; m.dx += o.dx; m.dy += o.dy
+            m.blur = max(m.blur, o.blur)
+            if o.wipe { m.wipe = true; m.reveal = min(m.reveal, o.reveal) }
+        }
+        return m
+    }
+
+    // `p`: 0 (hidden) … 1 (fully shown).
+    mutating func apply(_ s: AnimStyle, _ p: CGFloat, height: CGFloat) {
+        let p = min(1, max(0, p))
+        let out = 1 - pow(1 - p, 3)
+        switch s {
+        case .none, .auto: break
+        case .fade: alpha = p
+        case .pop:
+            let back = 1 + 2.2 * pow(p - 1, 3) + 1.2 * pow(p - 1, 2)   // ease-out with a little overshoot
+            alpha = min(1, p * 2.5)
+            scale = 0.55 + 0.45 * back
+        case .scale:
+            alpha = p
+            scale = 0.85 + 0.15 * out
+        case .slide:
+            alpha = p
+            dy = (1 - out) * height * 0.035
+        case .wipe:
+            wipe = true
+            reveal = out
+        case .blurIn:
+            alpha = min(1, p * 1.6)
+            blur = (1 - out) * max(1, height / 720) * 12
+        case .drawOn, .typewriter:
+            reveal = p
         }
     }
 }

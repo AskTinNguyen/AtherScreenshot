@@ -30,8 +30,8 @@ final class MarkupTests: XCTestCase {
         return e
     }
 
-    private func mark(_ k: MarkKind, _ a: CGPoint, _ b: CGPoint, color: Int = 0, text: String = "", anim: MarkAnimation = .none) -> Mark {
-        Mark(kind: k, start: 1, end: 3, a: a, b: b, text: text, color: color, animation: anim)
+    private func mark(_ k: MarkKind, _ a: CGPoint, _ b: CGPoint, color: Int = 0, text: String = "", anim: AnimStyle = .none) -> Mark {
+        Mark(kind: k, start: 1, end: 3, a: a, b: b, text: text, color: color, style: anim)
     }
 
     func testBlurOnlyWhileActive() {
@@ -68,14 +68,80 @@ final class MarkupTests: XCTestCase {
         XCTAssertEqual(FrameRenderer.zoomTarget(z.rect, view: CGRect(origin: .zero, size: size)).width / FrameRenderer.zoomTarget(z.rect, view: CGRect(origin: .zero, size: size)).height, 640.0 / 360, accuracy: 0.01)
     }
 
-    func testAnimations() {
+    func testAnimationStyles() {
         let r = FrameRenderer(edit: edit([]), full: size, preview: false)
-        let fade = mark(.box, .zero, CGPoint(x: 10, y: 10), anim: .fade)
-        XCTAssertEqual(r.envelope(fade, 1).0, 0, accuracy: 0.01)
-        XCTAssertEqual(r.envelope(fade, 2).0, 1, accuracy: 0.01)
-        let pop = mark(.emoji, .zero, CGPoint(x: 10, y: 10), anim: .pop)
-        XCTAssertLessThan(r.envelope(pop, 1.02).1, 0.8)
-        XCTAssertEqual(r.envelope(pop, 1.5).1, 1, accuracy: 0.01)
+        func mo(_ st: AnimStyle, _ t: Double, kind: MarkKind = .box, exit: AnimStyle? = nil, emphasis: Emphasis = .none) -> Motion {
+            var m = mark(kind, .zero, CGPoint(x: 10, y: 10), text: "Hello world", anim: st)
+            m.exit = exit
+            m.emphasis = emphasis
+            return r.motion(m, t)
+        }
+        XCTAssertEqual(mo(.fade, 1).alpha, 0, accuracy: 0.01)
+        XCTAssertEqual(mo(.fade, 2).alpha, 1, accuracy: 0.01)
+        XCTAssertLessThan(mo(.fade, 2.95).alpha, 0.5)                   // the same style plays it out
+        XCTAssertLessThan(mo(.pop, 1.02).scale, 0.8)
+        XCTAssertEqual(mo(.pop, 1.5).scale, 1, accuracy: 0.01)
+        XCTAssertGreaterThan(mo(.slide, 1.05).dy, 5)                    // comes up from below
+        XCTAssertLessThan(mo(.drawOn, 1.1).reveal, 0.5)
+        XCTAssertEqual(mo(.drawOn, 2.95).reveal, 1)                     // draw on leaves with a fade instead
+        XCTAssertLessThan(mo(.drawOn, 2.95).alpha, 1)
+        XCTAssertTrue(mo(.wipe, 1.1).wipe)
+        XCTAssertGreaterThan(mo(.blurIn, 1.05).blur, 1)
+        XCTAssertEqual(mo(.auto, 1.05, kind: .arrow).reveal, mo(.drawOn, 1.05, kind: .arrow).reveal)   // auto: the kind's default
+        // Advanced: a different exit.
+        XCTAssertEqual(mo(.pop, 2.95, exit: AnimStyle.none).alpha, 1)
+        XCTAssertEqual(mo(.none, 2.95, exit: .fade).alpha, mo(.fade, 2.95).alpha, accuracy: 0.01)
+        // While on screen.
+        XCTAssertNotEqual(mo(.none, 2.3, emphasis: .pulse).scale, 1)
+        XCTAssertNotNil(mo(.none, 2, emphasis: .ping).ring)
+        XCTAssertNotEqual(mo(.none, 2.1, emphasis: .bounce).dy, 0)
+    }
+
+    func testDrawOnAndTypewriterRenderPartway() {
+        let r = FrameRenderer(edit: edit([]), full: size, preview: false)
+        let box = mark(.box, CGPoint(x: 100, y: 100), CGPoint(x: 300, y: 250), color: 6)
+        let full = r.markImage(box)!.0, half = r.markImage(box, reveal: 0.3)!.0
+        func lit(_ i: CGImage) -> Int {   // opaque pixels, read straight from an RGBA copy
+            var px = [UInt8](repeating: 0, count: i.width * i.height * 4)
+            let ctx = CGContext(data: &px, width: i.width, height: i.height, bitsPerComponent: 8, bytesPerRow: i.width * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.draw(i, in: CGRect(x: 0, y: 0, width: i.width, height: i.height))
+            return stride(from: 3, to: px.count, by: 4).filter { px[$0] > 128 }.count
+        }
+        XCTAssertLessThan(lit(half), lit(full) / 2)
+        let text = mark(.text, CGPoint(x: 50, y: 50), CGPoint(x: 400, y: 100), color: 6, text: "Typewriter text here")
+        XCTAssertLessThan(lit(r.markImage(text, reveal: 0.25)!.0), lit(r.markImage(text)!.0))
+        XCTAssertEqual(r.markImage(text, reveal: 0.25)!.1, r.markImage(text)!.1)   // same box while typing, so it doesn't drift
+    }
+
+    func testCaptionLooksAndWordHighlight() {
+        var e = edit([])
+        let words = [CaptionWord(start: 1, end: 1.5, text: "Click"), CaptionWord(start: 1.5, end: 3, text: "Deploy")]
+        e.captions = [Caption(start: 1, end: 3, text: "Click Deploy", words: words)]
+        let r = FrameRenderer(edit: e, full: size, preview: false)
+        let (_, pill) = r.captionImage(e.captions[0], in: size, at: 1.2)!
+        XCTAssertLessThan(pill.width, size.width * 0.6)
+        e.captionLook = .bar
+        XCTAssertEqual(FrameRenderer(edit: e, full: size, preview: false).captionImage(e.captions[0], in: size, at: 1.2)!.1.width, size.width)
+        // The spoken word turns yellow: count yellow pixels in the first and second half of the caption.
+        e.captionLook = .pill
+        let rr = FrameRenderer(edit: e, full: size, preview: false)
+        func yellowSide(_ t: Double) -> (Int, Int) {
+            let img = rr.captionImage(e.captions[0], in: size, at: t)!.0
+            var l = 0, rt = 0
+            for x in stride(from: 0, to: img.width, by: 2) { for y in stride(from: 0, to: img.height, by: 2) {
+                let c = img.color(atPixel: CGPoint(x: x, y: y))!.usingColorSpace(.sRGB)!
+                if c.redComponent > 0.8 && c.greenComponent > 0.6 && c.blueComponent < 0.3 { if x < img.width / 2 { l += 1 } else { rt += 1 } }
+            } }
+            return (l, rt)
+        }
+        let early = yellowSide(1.2), late = yellowSide(2)
+        XCTAssertGreaterThan(early.0, early.1)    // "Click" lit
+        XCTAssertGreaterThan(late.1, late.0)      // then "Deploy"
+        // Edited text no longer matches the words: no highlight.
+        e.captions[0].text = "Press Deploy"
+        let edited = FrameRenderer(edit: e, full: size, preview: false).captionImage(e.captions[0], in: size, at: 1.2)!.0
+        XCTAssertNotNil(edited)
     }
 
     func testCropAppliesToMarkupAndCaptions() {

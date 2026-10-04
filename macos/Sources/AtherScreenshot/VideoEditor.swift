@@ -15,6 +15,13 @@ struct Caption: Equatable {
     var end: Double
     var text: String
     var position = CaptionPosition.bottom
+    var words: [CaptionWord] = []   // from auto captions: when each word is spoken
+}
+
+struct CaptionWord: Equatable {
+    var start: Double
+    var end: Double
+    var text: String
 }
 
 enum CaptionPosition: Int, CaseIterable {
@@ -31,6 +38,9 @@ struct VideoEdit: Equatable {
     var captions: [Caption] = []
     var captionSize = 1        // small, medium, large
     var marks: [Mark] = []     // text, emoji, callouts, blur, zoom, title cards
+    var captionLook = CaptionLook.pill
+    var captionStyle = AnimStyle.auto
+    var highlightWords = true  // auto captions: the spoken word lights up
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
     static let captionScale: [CGFloat] = [0.034, 0.045, 0.06]
@@ -94,10 +104,21 @@ enum VideoExport {
         return Prepared(composition: comp, video: vc, size: renderer.out)
     }
 
-    static func captionAttributes(_ size: CGFloat, dim: Bool = false) -> [NSAttributedString.Key: Any] {
+    static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill) -> [NSAttributedString.Key: Any] {
         let p = NSMutableParagraphStyle()
         p.alignment = .center
-        return [.font: NSFont.systemFont(ofSize: size, weight: .semibold), .foregroundColor: NSColor.white.withAlphaComponent(dim ? 0.5 : 1), .paragraphStyle: p]
+        var a: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size, weight: look == .outline ? .heavy : .semibold),
+                                                .foregroundColor: NSColor.white.withAlphaComponent(dim ? 0.5 : 1), .paragraphStyle: p]
+        if look == .outline {   // white text with a dark edge, no box
+            a[.strokeColor] = NSColor.black
+            a[.strokeWidth] = -2.5
+            let sh = NSShadow()
+            sh.shadowBlurRadius = size * 0.05
+            sh.shadowOffset = NSSize(width: 0, height: -size * 0.03)
+            sh.shadowColor = NSColor.black.withAlphaComponent(0.45)
+            a[.shadow] = sh
+        }
+        return a
     }
 
     static func run(_ s: AVAssetExportSession) async throws {
@@ -184,10 +205,11 @@ enum VideoExport {
             if var c = cur, s - c.end < 0.7, c.text.count + w.count < 42, e - c.start < 3.5 {
                 c.text += " " + w
                 c.end = e
+                c.words.append(CaptionWord(start: s, end: e, text: w))
                 cur = c
             } else {
                 if let c = cur { out.append(c) }
-                cur = Caption(start: s, end: max(e, s + 0.4), text: w)
+                cur = Caption(start: s, end: max(e, s + 0.4), text: w, words: [CaptionWord(start: s, end: e, text: w)])
             }
         }
         if let c = cur { out.append(c) }
@@ -195,6 +217,7 @@ enum VideoExport {
         for i in out.indices {
             let next = i + 1 < out.count ? out[i + 1].start : out[i].end + 0.8
             out[i].end = min(next, out[i].end + 0.8)
+            if var last = out[i].words.last { last.end = out[i].end; out[i].words[out[i].words.count - 1] = last }   // the last word stays lit
         }
         return out
     }
@@ -228,7 +251,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private let playButton = NSButton()
     private let timeLabel = NSTextField(labelWithString: "")
     private let speedPopup = NSPopUpButton()
-    private let sizePopup = NSPopUpButton()
+    private let captionsMenu = NSPopUpButton(frame: .zero, pullsDown: true)
     private let aspectPopup = NSPopUpButton()
     private let addPopup = NSPopUpButton(frame: .zero, pullsDown: true)
     private let muteButton = NSButton()
@@ -271,7 +294,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         Task { @MainActor in await self.load() }
     }
 
-    private func load() async {
+    @MainActor private func load() async {   // touches the window after each await
         do {
             duration = try await asset.load(.duration).seconds
             videoSize = try await VideoExport.displaySize(asset)
@@ -354,9 +377,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead"
 
         let auto = barButton("Auto captions", "waveform.badge.mic", "Transcribe speech into captions, on this Mac") { [weak self] in self?.autoCaptions() }
-        sizePopup.addItems(withTitles: ["Small captions", "Medium captions", "Large captions"])
-        sizePopup.bezelStyle = .recessed
-        bind(sizePopup) { [weak self] in guard let self else { return }; self.pushUndo(); self.edit.captionSize = self.sizePopup.indexOfSelectedItem }
+        captionsMenu.bezelStyle = .recessed
+        captionsMenu.toolTip = "Caption look, animation and size, for the whole video"
+        rebuildCaptionsMenu()
 
         let gif = barButton("Save GIF", "photo.stack", "Save as a GIF (⌘⇧S)") { [weak self] in self?.save(gif: true) }
         let save = NSButton(title: "Save", target: nil, action: nil)
@@ -373,7 +396,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, sizePopup, spacer, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
@@ -507,15 +530,19 @@ final class VideoEditor: NSObject, NSWindowDelegate {
                 inspector.addArrangedSubview(popup(["Blur", "Pixelate"], m.kind == .blur ? 0 : 1) { [weak self] i in self?.updateMark { $0.kind = i == 0 ? .blur : .pixelate } })
                 inspector.addArrangedSubview(popup((1...5).map { "Strength \($0)" }, m.level) { [weak self] i in self?.updateMark { $0.level = i } })
             case .zoom:
-                let l = NSTextField(labelWithString: "Zooms into the box while it plays (shown during playback)")
-                l.font = Theme.font(12)
-                l.textColor = Theme.textDim
+                inspector.addArrangedSubview(popup(["Smooth zoom", "Snappy zoom"], m.snappy ? 1 : 0) { [weak self] i in self?.updateMark { $0.snappy = i == 1 } })
+                let l = NSTextField(labelWithString: "The box sets how far it zooms · plays back zoomed")
+                l.font = Theme.font(11)
+                l.textColor = Theme.muted
                 inspector.addArrangedSubview(l)
             }
-            if !m.kind.isRegion {
-                inspector.addArrangedSubview(popup(MarkAnimation.allCases.map(\.label), m.animation.rawValue) { [weak self] i in
-                    self?.updateMark { $0.animation = MarkAnimation(rawValue: i) ?? .fade }
-                })
+            if !m.kind.styles.isEmpty {
+                inspector.addArrangedSubview(animationMenu(m))
+                let replay = NSButton(image: NSImage(systemSymbolName: "play.circle", accessibilityDescription: "Replay") ?? NSImage(), target: nil, action: nil)
+                replay.bezelStyle = .recessed
+                replay.toolTip = "Play this item from just before it appears"
+                link(replay) { [weak self] in self?.replay(m) }
+                inspector.addArrangedSubview(replay)
             }
         }
         if ci != nil || mi != nil {
@@ -526,6 +553,104 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             link(del) { [weak self] in self?.deleteSelected() }
             inspector.addArrangedSubview(del)
         }
+    }
+
+    // One menu: the style (in and out), an optional effect while on screen, and the advanced options.
+    private func animationMenu(_ m: Mark) -> NSPopUpButton {
+        let p = NSPopUpButton(frame: .zero, pullsDown: true)
+        p.bezelStyle = .recessed
+        let menu = p.menu!
+        let style = m.style == .auto ? "Auto (\(m.kind.defaultStyle.label))" : m.style.label
+        var title = "Animation: " + style
+        if m.emphasis != .none { title += " · " + m.emphasis.label }
+        if let x = m.exit { title += " → " + (x == .auto ? m.kind.defaultStyle.label : x.label) }
+        menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
+        func item(_ t: String, on: Bool, indent: Int = 0, _ run: @escaping () -> Void) -> NSMenuItem {
+            let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
+            let a = MenuAction(run)
+            inspectorActions.append(a)
+            it.target = a
+            it.state = on ? .on : .off
+            it.indentationLevel = indent
+            return it
+        }
+        for st in [AnimStyle.auto] + m.kind.styles {
+            menu.addItem(item(st == .auto ? "Auto (\(m.kind.defaultStyle.label))" : st.label, on: m.style == st) { [weak self] in self?.updateMark { $0.style = st } })
+        }
+        if m.kind != .blur && m.kind != .pixelate {
+            menu.addItem(.separator())
+            let h = NSMenuItem(title: "While on screen", action: nil, keyEquivalent: "")
+            h.isEnabled = false
+            menu.addItem(h)
+            for e in Emphasis.allCases {
+                menu.addItem(item(e.label, on: m.emphasis == e, indent: 1) { [weak self] in self?.updateMark { $0.emphasis = e } })
+            }
+        }
+        menu.addItem(.separator())
+        menu.addItem(item("Different exit animation", on: m.exit != nil) { [weak self] in self?.updateMark { $0.exit = $0.exit == nil ? .fade : nil }; self?.rebuildInspector() })
+        if m.exit != nil {
+            let sub = NSMenu()
+            for st in m.kind.styles where st != .drawOn && st != .typewriter {
+                sub.addItem(item(st.label, on: m.exit == st) { [weak self] in self?.updateMark { $0.exit = st }; self?.rebuildInspector() })
+            }
+            let it = NSMenuItem(title: "Exit", action: nil, keyEquivalent: "")
+            it.submenu = sub
+            it.indentationLevel = 1
+            menu.addItem(it)
+        }
+        menu.addItem(item("Apply to all \(m.kind.plural)", on: false) { [weak self] in
+            guard let self else { return }
+            self.pushUndo()
+            for i in self.edit.marks.indices where self.edit.marks[i].kind == m.kind {
+                self.edit.marks[i].style = m.style; self.edit.marks[i].exit = m.exit; self.edit.marks[i].emphasis = m.emphasis
+            }
+        })
+        return p
+    }
+
+    // Toolbar "Captions" menu: look, animation, word highlight and size, for the whole video.
+    private func rebuildCaptionsMenu() {
+        let menu = captionsMenu.menu!
+        menu.removeAllItems()
+        actions.removeAll { $0.tag == 1 }
+        menu.addItem(withTitle: "Captions", action: nil, keyEquivalent: "")
+        captionsMenu.item(at: 0)?.image = NSImage(systemSymbolName: "captions.bubble", accessibilityDescription: "Captions")
+        func item(_ t: String, on: Bool, _ run: @escaping () -> Void) {
+            let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
+            let a = MenuAction(run)
+            a.tag = 1
+            actions.append(a)
+            it.target = a
+            it.state = on ? .on : .off
+            menu.addItem(it)
+        }
+        func header(_ t: String) {
+            let h = NSMenuItem(title: t, action: nil, keyEquivalent: "")
+            h.isEnabled = false
+            menu.addItem(h)
+        }
+        header("Look")
+        for l in CaptionLook.allCases { item("   " + l.label, on: edit.captionLook == l) { [weak self] in self?.setCaptions { $0.captionLook = l } } }
+        menu.addItem(.separator())
+        header("Animation")
+        for st in AnimStyle.captionStyles { item("   " + (st == .auto ? "Auto (Fade)" : st.label), on: edit.captionStyle == st) { [weak self] in self?.setCaptions { $0.captionStyle = st } } }
+        menu.addItem(.separator())
+        item("Highlight the spoken word", on: edit.highlightWords) { [weak self] in self?.setCaptions { $0.highlightWords.toggle() } }
+        menu.addItem(.separator())
+        header("Size")
+        for (i, n) in ["Small", "Medium", "Large"].enumerated() { item("   " + n, on: edit.captionSize == i) { [weak self] in self?.setCaptions { $0.captionSize = i } } }
+    }
+
+    private func setCaptions(_ f: (inout VideoEdit) -> Void) {
+        pushUndo()
+        f(&edit)
+    }
+
+    func replay(_ m: Mark) {
+        player.pause()
+        seek(max(edit.trimStart, m.start - 0.4))
+        player.rate = Float(edit.speed)
+        playStateChanged()
     }
 
     private func link(_ c: NSControl, _ run: @escaping () -> Void) {
@@ -610,7 +735,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         aspectPopup.isHidden = !cropping
         muteButton.state = edit.muted ? .on : .off
         speedPopup.selectItem(at: VideoEdit.speeds.firstIndex(of: edit.speed) ?? 1)
-        sizePopup.selectItem(at: edit.captionSize)
+        rebuildCaptionsMenu()
     }
 
     private func updateTime() {
@@ -710,8 +835,6 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         let start = insertTime
         var m = Mark(kind: k, start: start, end: min(edit.trimEnd, start + k.defaultSeconds), a: a, b: b, text: text, color: color, level: level)
         if k == .step { m.step = (edit.marks.filter { $0.kind == .step }.map(\.step).max() ?? 0) + 1 }
-        if k == .emoji || k == .step { m.animation = .pop }
-        if k.isRegion { m.animation = .none }
         edit.marks.append(m)
         selected = m.id
         if k == .text || k == .bubble || k == .title { focusField() }

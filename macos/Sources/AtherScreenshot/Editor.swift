@@ -1079,6 +1079,7 @@ final class EditorCanvas: NSView {
 
 final class MenuAction: NSObject {
     let run: () -> Void
+    var tag = 0
     init(_ run: @escaping () -> Void) { self.run = run }
     @objc func fire() { run() }
 }

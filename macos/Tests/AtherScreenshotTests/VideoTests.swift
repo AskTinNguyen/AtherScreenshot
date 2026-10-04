@@ -86,7 +86,9 @@ final class VideoTests: XCTestCase {
             e.edit.trimStart = 0.4
             e.edit.trimEnd = 2.6
             e.edit.crop = CGRect(x: 60, y: 30, width: 480, height: 300)
-            e.edit.captions = [Caption(start: 0.5, end: 1.6, text: "Open Settings, then click Deploy"), Caption(start: 1.8, end: 2.4, text: "Done")]
+            let words = ["Open", "Settings,", "then", "click", "Deploy"].enumerated().map { CaptionWord(start: 0.5 + Double($0.offset) * 0.22, end: 0.72 + Double($0.offset) * 0.22, text: $0.element) }
+            e.edit.captions = [Caption(start: 0.5, end: 1.6, text: "Open Settings, then click Deploy", words: words), Caption(start: 1.8, end: 2.4, text: "Done")]
+            e.edit.captionLook = .outline
             e.edit.marks = [
                 Mark(kind: .arrow, start: 0.6, end: 2.0, a: CGPoint(x: 140, y: 250), b: CGPoint(x: 250, y: 160), color: 6, level: 2),
                 Mark(kind: .emoji, start: 0.6, end: 2.0, a: CGPoint(x: 420, y: 70), b: CGPoint(x: 490, y: 140), text: "🎉"),
