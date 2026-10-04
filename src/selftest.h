@@ -13,6 +13,9 @@ void Check(bool ok, const char* expr, const char* file, int line);
 void Note(const std::string& text);  // extra context printed with the next failure
 int Run(const std::wstring& filter);
 std::wstring TempDir();  // a fresh folder inside the run's temp folder
+// For developer tools that print through the same channel (--feature-stats).
+void Out(const std::string& text);
+void FlushOut();
 
 }  // namespace ather::test
 

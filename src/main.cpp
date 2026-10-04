@@ -20,6 +20,7 @@ using std::min;
 #include "editor.h"
 #include "history.h"
 #include "installer.h"
+#include "library.h"
 #include "logo.h"
 #include "version.h"
 #include "ocr.h"
@@ -46,6 +47,10 @@ using std::min;
 #pragma comment(lib, "bcrypt")
 
 using namespace ather;
+
+namespace ather {
+int FeatureStats(const std::wstring& folder);
+}
 
 namespace {
 
@@ -163,7 +168,7 @@ constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 constexpr UINT WM_APP_PALETTE = WM_APP + 2;
 constexpr ULONG_PTR kCopyDataCli = 0xA7E1;  // WM_COPYDATA tag for forwarded command lines
-constexpr UINT_PTR kDeferTimer = 1, kDelayTimer = 2;
+constexpr UINT_PTR kDeferTimer = 1, kDelayTimer = 2, kLibraryTimer = 3;
 
 HWND g_hwnd = nullptr;
 HICON g_icon = nullptr;     // small: tray
@@ -267,6 +272,8 @@ void ShowHotkeyErrors() {
 void ApplyEditorDefaults() {
     SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport});
     SetFileNameTemplate(g_settings.fileNameTemplate);
+    Library::Shared().SetFolder(g_settings.CapturesFolder());
+    Library::Shared().SetAutoTag(g_settings.autoTag);
 }
 
 void ReloadSettings(bool notify) {
@@ -323,7 +330,7 @@ void PromptRename(const std::wstring& path) {
                    [path](std::wstring name) {
                        std::wstring np = RenameCapture(path, name);
                        if (np.empty()) return Notify(L"Rename failed", FileNameOf(path));
-                       if (g_lastPath == path) g_lastPath = np;
+                       Library::Shared().Moved(path, np);  // keeps tags, rating... (also updates g_lastPath)
                        Notify(L"Renamed", FileNameOf(np));
                    });
 }
@@ -397,6 +404,7 @@ void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = 
         std::wstring path;
         if (g_settings.saveToFile) {
             path = MakeCapturePath(g_settings.CapturesFolder(), L"png", info);
+            Library::Shared().NoteCapture(path, info.app, info.window);  // the gallery shows where it came from
         } else {
             wchar_t tmp[MAX_PATH];
             GetTempPathW(MAX_PATH, tmp);
@@ -515,6 +523,7 @@ void BeginRecording(RecordFormat fmt, const RECT& rect, HWND window, const std::
     o.countdownSeconds = g_settings.countdownSeconds;
     o.path = MakeCapturePath(g_settings.CapturesFolder(), fmt == RecordFormat::Gif ? L"gif" : L"mp4",
                              {title, WindowAppName(window), RectW(rect), RectH(rect)});
+    Library::Shared().NoteCapture(o.path, WindowAppName(window), title);
     std::wstring err;
     if (!StartRecording(o, OnRecordingDone, &err)) Notify(L"Could not start recording", err);
 }
@@ -1135,7 +1144,8 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_TIMER:
             KillTimer(h, w);
-            if (w == kDeferTimer) Execute(g_deferredCmd, false, g_deferredUntrusted);
+            if (w == kLibraryTimer) Library::Shared().Refresh();
+            else if (w == kDeferTimer) Execute(g_deferredCmd, false, g_deferredUntrusted);
             else if (w == kDelayTimer) Execute(g_delayedCmd, false, g_delayedUntrusted);
             return 0;
         case WM_DESTROY:
@@ -1168,9 +1178,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool writeIcon = n == 3 && _wcsicmp(av[1], L"--write-icon") == 0;
         const bool ok = writeIcon && WriteLogoIco(av[2]);
         const bool selftest = n >= 2 && _wcsicmp(av[1], L"--selftest") == 0;
-        const std::wstring filter = selftest && n >= 3 ? av[2] : L"";
+        const bool featureStats = n >= 3 && _wcsicmp(av[1], L"--feature-stats") == 0;
+        const std::wstring filter = (selftest || featureStats) && n >= 3 ? av[2] : L"";
         LocalFree(av);
         if (writeIcon) return ok ? 0 : 1;
+        if (featureStats) return FeatureStats(filter);  // developer tool, see library_tests.cpp
         if (selftest) {  // unit tests (see selftest.h)
             const int failures = test::Run(filter);
             Gdiplus::GdiplusShutdown(gdipToken);
@@ -1217,6 +1229,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     bool firstRun = g_settings.Load(HotkeyDefs());
     ApplyEditorDefaults();
+    Library& lib = Library::Shared();
+    lib.LoadIfNeeded();
+    // Keeps "last capture" commands pointing at the right file after a rename or delete elsewhere.
+    lib.onMoved = [](const std::wstring& from, const std::wstring& to) {
+        if (g_lastPath == from) g_lastPath = to;
+    };
+    lib.onRemoved = [](const std::vector<std::wstring>& gone) {
+        if (std::find(gone.begin(), gone.end(), g_lastPath) != gone.end()) g_lastPath.clear();
+    };
+    SetTimer(g_hwnd, kLibraryTimer, 4000, nullptr);  // scan and index in the background once things settle
     RegisterHotkeys();
     AddTrayIcon();
     if (!g_hotkeyErrors.empty()) {
@@ -1244,7 +1266,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
         Sleep(10);
     }
-    WaitForPendingSaves(5000);
+    WaitForPendingSaves(5000);  // first: their completions may register library changes
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    lib.StopBackgroundWork();
+    lib.Flush();
     Gdiplus::GdiplusShutdown(gdipToken);
     CoUninitialize();
     if (mutex) CloseHandle(mutex);

@@ -46,6 +46,8 @@ public:
     int scrollMaxFrames = 60;
     // editor
     bool styledExport = false;
+    // gallery
+    bool autoTag = false;  // [Gallery] AutoTag: apply suggested tags
     // upload
     std::wstring uploader = L"none";  // none | imgur | custom | s3
     std::wstring imgurClientId;

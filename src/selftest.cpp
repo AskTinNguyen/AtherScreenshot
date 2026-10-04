@@ -62,6 +62,12 @@ void RemoveTree(const std::wstring& dir) {
 
 void Register(const char* name, void (*fn)()) { Cases().push_back({name, fn}); }
 
+void Out(const std::string& text) { Print(text); }
+void FlushOut() {
+    Flush();
+    g_out.clear();
+}
+
 void Note(const std::string& text) { g_note = text; }
 
 void Check(bool ok, const char* expr, const char* file, int line) {
