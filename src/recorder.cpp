@@ -20,6 +20,7 @@
 #include "audio.h"
 #include "capture.h"
 #include "inputviz.h"
+#include "media.h"
 #include "wgc.h"
 
 #pragma comment(lib, "mfplat")
@@ -53,114 +54,19 @@ public:
 class Mp4Sink : public Sink {
 public:
     HRESULT Begin(int w, int h, int fps, const std::wstring& path, bool audio) override {
-        static std::once_flag mfInit;
-        std::call_once(mfInit, [] { MFStartup(MF_VERSION); });
         w_ = w;
         h_ = h;
         frameDur_ = kTicksPerSecond / fps;
-        ComPtr<IMFAttributes> attr;
-        ComPtr<IMFMediaType> out, in;
-        HRESULT hr = MFCreateAttributes(&attr, 2);
-        if (SUCCEEDED(hr)) hr = attr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, attr.Get(), &writer_);
-        // Screen content: ~0.12 bits per pixel per frame keeps text crisp.
-        const UINT32 bitrate = (UINT32)std::clamp<double>((double)w * h * fps * 0.12, 2e6, 50e6);
-        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&out);
-        if (SUCCEEDED(hr)) hr = out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        if (SUCCEEDED(hr)) hr = out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
-        if (SUCCEEDED(hr)) hr = MFSetAttributeSize(out.Get(), MF_MT_FRAME_SIZE, w, h);
-        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(out.Get(), MF_MT_FRAME_RATE, fps, 1);
-        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(out.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        if (SUCCEEDED(hr)) hr = writer_->AddStream(out.Get(), &stream_);
-        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&in);
-        if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-        if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32)(w * 4));  // positive = top-down
-        if (SUCCEEDED(hr)) hr = MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, w, h);
-        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);
-        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        if (SUCCEEDED(hr)) hr = writer_->SetInputMediaType(stream_, in.Get(), nullptr);
-        if (SUCCEEDED(hr) && audio) hr = AddAudioStream();
-        if (SUCCEEDED(hr)) hr = writer_->BeginWriting();
-        return hr;
+        return writer_.Begin(path, w, h, fps, audio ? AudioCapture::kRate : 0, AudioCapture::kChannels);
     }
-
-    HRESULT Write(const uint32_t* px, int64_t t) override {
-        const DWORD bytes = (DWORD)w_ * h_ * 4;
-        ComPtr<IMFMediaBuffer> buf;
-        ComPtr<IMFSample> sample;
-        BYTE* dst = nullptr;
-        HRESULT hr = MFCreateMemoryBuffer(bytes, &buf);
-        if (SUCCEEDED(hr)) hr = buf->Lock(&dst, nullptr, nullptr);
-        if (FAILED(hr)) return hr;
-        MFCopyImage(dst, w_ * 4, reinterpret_cast<const BYTE*>(px), w_ * 4, w_ * 4, h_);
-        buf->Unlock();
-        buf->SetCurrentLength(bytes);
-        if (FAILED(hr = MFCreateSample(&sample))) return hr;
-        sample->AddBuffer(buf.Get());
-        sample->SetSampleTime(t);
-        sample->SetSampleDuration(frameDur_);
-        std::lock_guard lock(mu_);
-        hr = writer_->WriteSample(stream_, sample.Get());
-        if (SUCCEEDED(hr)) ++frames_;
-        return hr;
-    }
-
-    void WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t) override {
-        const DWORD bytes = frames * AudioCapture::kChannels * 2;
-        ComPtr<IMFMediaBuffer> buf;
-        ComPtr<IMFSample> sample;
-        BYTE* dst = nullptr;
-        if (FAILED(MFCreateMemoryBuffer(bytes, &buf)) || FAILED(buf->Lock(&dst, nullptr, nullptr))) return;
-        memcpy(dst, pcm, bytes);
-        buf->Unlock();
-        buf->SetCurrentLength(bytes);
-        if (FAILED(MFCreateSample(&sample))) return;
-        sample->AddBuffer(buf.Get());
-        sample->SetSampleTime(t);
-        sample->SetSampleDuration((int64_t)frames * kTicksPerSecond / AudioCapture::kRate);
-        std::lock_guard lock(mu_);
-        writer_->WriteSample(audioStream_, sample.Get());
-    }
-
-    HRESULT End(int64_t) override {
-        std::lock_guard lock(mu_);
-        return frames_ ? writer_->Finalize() : E_FAIL;
-    }
+    HRESULT Write(const uint32_t* px, int64_t t) override { return writer_.WriteFrame(px, t, frameDur_); }
+    void WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t) override { writer_.WriteAudio(pcm, frames, t); }
+    HRESULT End(int64_t) override { return writer_.Finalize(); }
 
 private:
-    HRESULT AddAudioStream() {
-        ComPtr<IMFMediaType> out, in;
-        HRESULT hr = MFCreateMediaType(&out);
-        if (SUCCEEDED(hr)) hr = out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        if (SUCCEEDED(hr)) hr = out->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioCapture::kRate);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AudioCapture::kChannels);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        if (SUCCEEDED(hr)) hr = out->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
-        if (SUCCEEDED(hr)) hr = writer_->AddStream(out.Get(), &audioStream_);
-        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&in);
-        if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-        if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioCapture::kRate);
-        if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AudioCapture::kChannels);
-        if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, AudioCapture::kChannels * 2);
-        if (SUCCEEDED(hr))
-            hr = in->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AudioCapture::kRate * AudioCapture::kChannels * 2);
-        if (SUCCEEDED(hr)) hr = writer_->SetInputMediaType(audioStream_, in.Get(), nullptr);
-        return hr;
-    }
-
-    ComPtr<IMFSinkWriter> writer_;
-    std::mutex mu_;
-    DWORD stream_ = 0, audioStream_ = 0;
+    Mp4Writer writer_;
     int w_ = 0, h_ = 0;
-    int64_t frameDur_ = 0, frames_ = 0;
+    int64_t frameDur_ = 0;
 };
 
 class GifSink : public Sink {
@@ -204,83 +110,10 @@ private:
 
     static int Cs(int64_t t) { return (int)(t / 100000); }  // GIF delays are in 1/100 s
 
-    static void SetBytes(IWICMetadataQueryWriter* w, const wchar_t* name, const void* data, ULONG n) {
-        PROPVARIANT pv;
-        PropVariantInit(&pv);
-        pv.vt = VT_UI1 | VT_VECTOR;
-        pv.caub.cElems = n;
-        pv.caub.pElems = (UCHAR*)data;
-        w->SetMetadataByName(name, &pv);
-    }
-
-    static void SetUShort(IWICMetadataQueryWriter* w, const wchar_t* name, USHORT v) {
-        PROPVARIANT pv;
-        PropVariantInit(&pv);
-        pv.vt = VT_UI2;
-        pv.uiVal = v;
-        w->SetMetadataByName(name, &pv);
-    }
-
-    HRESULT Open() {
-        ComPtr<IWICMetadataQueryWriter> meta;
-        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f_));
-        if (SUCCEEDED(hr)) hr = f_->CreateStream(&stream_);
-        if (SUCCEEDED(hr)) hr = stream_->InitializeFromFilename(path_.c_str(), GENERIC_WRITE);
-        if (SUCCEEDED(hr)) hr = f_->CreateEncoder(GUID_ContainerFormatGif, nullptr, &enc_);
-        if (SUCCEEDED(hr)) hr = enc_->Initialize(stream_.Get(), WICBitmapEncoderNoCache);
-        if (SUCCEEDED(hr) && SUCCEEDED(enc_->GetMetadataQueryWriter(&meta))) {
-            SetBytes(meta.Get(), L"/appext/Application", "NETSCAPE2.0", 11);
-            const UCHAR loop[] = {3, 1, 0, 0, 0};  // loop forever
-            SetBytes(meta.Get(), L"/appext/Data", loop, 5);
-            SetUShort(meta.Get(), L"/logscrdesc/Width", (USHORT)w_);
-            SetUShort(meta.Get(), L"/logscrdesc/Height", (USHORT)h_);
-        }
-        return hr;
-    }
-
-    HRESULT Encode(const Frame& fr, int delayCs) {
-        ComPtr<IWICBitmapFrameEncode> frame;
-        ComPtr<IWICBitmap> src;
-        ComPtr<IWICPalette> pal;
-        ComPtr<IWICFormatConverter> conv;
-        ComPtr<IWICMetadataQueryWriter> meta;
-        WICPixelFormatGUID fmt = GUID_WICPixelFormat8bppIndexed;
-        HRESULT hr = enc_->CreateNewFrame(&frame, nullptr);
-        if (SUCCEEDED(hr)) hr = frame->Initialize(nullptr);
-        if (SUCCEEDED(hr)) hr = frame->SetSize(w_, h_);
-        if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
-        if (SUCCEEDED(hr))
-            hr = f_->CreateBitmapFromMemory(w_, h_, GUID_WICPixelFormat32bppBGR, w_ * 4, w_ * h_ * 4,
-                                            (BYTE*)fr.px.data(), &src);
-        if (SUCCEEDED(hr)) hr = f_->CreatePalette(&pal);
-        if (SUCCEEDED(hr)) {
-            // Build the palette from a downscaled copy for big frames: much faster, visually the same.
-            ComPtr<IWICBitmapScaler> scaler;
-            const double area = (double)w_ * h_;
-            if (area > 250000 && SUCCEEDED(f_->CreateBitmapScaler(&scaler))) {
-                double k = std::sqrt(250000 / area);
-                scaler->Initialize(src.Get(), std::max(1, (int)(w_ * k)), std::max(1, (int)(h_ * k)),
-                                   WICBitmapInterpolationModeNearestNeighbor);
-                hr = pal->InitializeFromBitmap(scaler.Get(), 256, FALSE);
-            } else {
-                hr = pal->InitializeFromBitmap(src.Get(), 256, FALSE);
-            }
-        }
-        if (SUCCEEDED(hr)) hr = f_->CreateFormatConverter(&conv);
-        if (SUCCEEDED(hr))
-            hr = conv->Initialize(src.Get(), GUID_WICPixelFormat8bppIndexed, WICBitmapDitherTypeNone, pal.Get(), 0,
-                                  WICBitmapPaletteTypeCustom);
-        if (SUCCEEDED(hr)) hr = frame->SetPalette(pal.Get());
-        if (SUCCEEDED(hr) && SUCCEEDED(frame->GetMetadataQueryWriter(&meta)))
-            SetUShort(meta.Get(), L"/grctlext/Delay", (USHORT)std::clamp(delayCs, 2, 65535));
-        if (SUCCEEDED(hr)) hr = frame->WriteSource(conv.Get(), nullptr);
-        if (SUCCEEDED(hr)) hr = frame->Commit();
-        return hr;
-    }
-
     void Work() {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        hr_ = Open();
+        GifWriter gif;
+        hr_ = gif.Begin(path_, w_, h_);
         Frame pending;
         bool has = false;
         int64_t endT = 0;
@@ -296,15 +129,13 @@ private:
                 f = std::move(q_.front());
                 q_.pop_front();
             }
-            if (has && SUCCEEDED(hr_)) hr_ = Encode(pending, Cs(f.t) - Cs(pending.t));
+            if (has && SUCCEEDED(hr_)) hr_ = gif.Add(pending.px.data(), Cs(f.t) - Cs(pending.t));
             pending = std::move(f);
             has = true;
         }
-        if (SUCCEEDED(hr_)) hr_ = has ? Encode(pending, std::max(10, Cs(endT) - Cs(pending.t))) : E_FAIL;
-        if (SUCCEEDED(hr_)) hr_ = enc_->Commit();
-        enc_.Reset();
-        stream_.Reset();
-        f_.Reset();
+        if (SUCCEEDED(hr_)) hr_ = has ? gif.Add(pending.px.data(), std::max(10, Cs(endT) - Cs(pending.t))) : E_FAIL;
+        const HRESULT fin = gif.Finish();
+        if (SUCCEEDED(hr_)) hr_ = fin;
         if (SUCCEEDED(co)) CoUninitialize();
     }
 
@@ -318,9 +149,6 @@ private:
     int64_t endT_ = 0;
     std::atomic<HRESULT> hr_{S_OK};
     std::vector<uint32_t> last_;
-    ComPtr<IWICImagingFactory> f_;
-    ComPtr<IWICStream> stream_;
-    ComPtr<IWICBitmapEncoder> enc_;
 };
 
 // ---- session ----

@@ -19,6 +19,7 @@ using std::min;
 }  // namespace Gdiplus
 #include <gdiplus.h>
 
+#include "annot.h"
 #include "collage.h"
 #include "library.h"
 #include "media.h"
@@ -2910,5 +2911,96 @@ ATHER_TEST(editor_crop_outside_image_still_exports_annotations) {
     CHECK_EQ(out->Width(), 200);
     CHECK(Rgb(At(*out, 10, 50)) != 0xFFFFFFu);  // the red rectangle is there
 }
+
+// ---- shared with the video editor (annot.h) ----
+
+namespace annot {
+
+int ColorCount() { return (int)std::size(kColors); }
+COLORREF Color(int i) { return kColors[std::clamp(i, 0, ColorCount() - 1)]; }
+const wchar_t* ColorName(int i) { return kColorNames[std::clamp(i, 0, ColorCount() - 1)]; }
+int Levels() { return kLevels; }
+float TextPx(int level) { return kTextPx[std::clamp(level, 0, kLevels - 1)]; }
+bool IsDark(COLORREF c) { return ather::IsDark(c); }
+
+static Annot ToAnnot(const Shape& s) {
+    Annot a;
+    a.color = Color(s.color);
+    a.level = std::clamp(s.level, 0, kLevels - 1);
+    a.unit = s.unit;
+    a.step = s.step;
+    a.text = s.text;
+    a.wrap = s.wrap;
+    switch (s.kind) {
+        case Kind::Arrow: a.type = Tool::Arrow; break;
+        case Kind::Rect: a.type = Tool::Rect; break;
+        case Kind::Ellipse: a.type = Tool::Ellipse; break;
+        case Kind::Step: a.type = Tool::Step; break;
+        case Kind::Text: a.type = Tool::Text; break;
+    }
+    a.pts = {gp::PointF(s.ax, s.ay)};
+    if (s.kind != Kind::Step && s.kind != Kind::Text) a.pts.push_back(gp::PointF(s.bx, s.by));
+    return a;
+}
+
+BoxF Bounds(const Shape& s) {
+    const gp::RectF r = ather::Bounds(ToAnnot(s));
+    return {r.X, r.Y, r.Width, r.Height};
+}
+
+float StrokeWidth(const Shape& s) { return StrokeW(ToAnnot(s)); }
+
+void Draw(Bitmap& dst, const Shape& s, float ox, float oy) {
+    gp::Bitmap gb(dst.Width(), dst.Height(), dst.Width() * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(dst.Bits()));
+    gp::Graphics g(&gb);
+    g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
+    g.TranslateTransform(-ox, -oy);
+    DrawAnnot(g, ToAnnot(s));
+}
+
+void DrawPartialOutline(Bitmap& dst, const Shape& s, float part, float ox, float oy) {
+    const Annot a = ToAnnot(s);
+    const gp::RectF r = NormRect(a.pts[0], a.pts.back());
+    gp::Bitmap gb(dst.Width(), dst.Height(), dst.Width() * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(dst.Bits()));
+    gp::Graphics g(&gb);
+    g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+    g.TranslateTransform(-ox, -oy);
+    gp::GraphicsPath path;
+    if (s.kind == Kind::Ellipse) path.AddEllipse(r);
+    else path.AddRectangle(r);
+    path.Flatten(nullptr, 0.25f);
+    // Walk the flattened outline and keep the first `part` of its length.
+    const int n = path.GetPointCount();
+    if (n < 2) return;
+    std::vector<gp::PointF> pts(n);
+    path.GetPathPoints(pts.data(), n);
+    pts.push_back(pts[0]);
+    double total = 0;
+    for (size_t i = 1; i < pts.size(); ++i) total += std::hypot(pts[i].X - pts[i - 1].X, pts[i].Y - pts[i - 1].Y);
+    double left = total * std::clamp(part, 0.f, 1.f);
+    std::vector<gp::PointF> keep{pts[0]};
+    for (size_t i = 1; i < pts.size() && left > 0; ++i) {
+        const double seg = std::hypot(pts[i].X - pts[i - 1].X, pts[i].Y - pts[i - 1].Y);
+        if (seg <= left) {
+            keep.push_back(pts[i]);
+            left -= seg;
+        } else {
+            const float k = (float)(left / seg);
+            keep.push_back(gp::PointF(pts[i - 1].X + (pts[i].X - pts[i - 1].X) * k, pts[i - 1].Y + (pts[i].Y - pts[i - 1].Y) * k));
+            left = 0;
+        }
+    }
+    if (keep.size() < 2) return;
+    gp::Pen pen(GC(a.color), StrokeW(a));
+    pen.SetStartCap(gp::LineCapRound);
+    pen.SetEndCap(gp::LineCapRound);
+    pen.SetLineJoin(gp::LineJoinRound);
+    g.DrawLines(&pen, keep.data(), (INT)keep.size());
+}
+
+}  // namespace annot
 
 }  // namespace ather
