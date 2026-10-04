@@ -31,7 +31,7 @@ Version **0.0.1**
 | **Windows** | [**AtherScreenshot-Setup-0.0.1.exe**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-Setup-0.0.1.exe) | 2.7 MB | Windows 10/11, x64 |
 | Windows (portable) | [AtherScreenshot-0.0.1-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
 
-Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256SUMS-Windows.txt)
+Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256SUMS-Windows.txt) · All files are also on the [v0.0.1 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
 
 **First launch.** The builds aren't signed yet, so your OS asks once:
 
