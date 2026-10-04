@@ -2,7 +2,7 @@ import AppKit
 import CoreImage
 
 enum Tool: Int, CaseIterable, Codable {
-    case select, arrow, line, rect, ellipse, pen, highlight, text, step, blur, pixelate, spotlight, magnify, crop
+    case select, arrow, line, rect, ellipse, pen, highlight, text, step, blur, pixelate, spotlight, magnify, crop, canvas, image
 
     var info: (name: String, key: Character, symbol: String, hint: String) {
         switch self {
@@ -20,9 +20,13 @@ enum Tool: Int, CaseIterable, Codable {
         case .spotlight: return ("Spotlight", "s", "flashlight.on.fill", "Drag to keep an area bright and dim everything else")
         case .magnify: return ("Magnifier", "m", "plus.magnifyingglass", "Drag from the detail to where the zoomed bubble should go")
         case .crop: return ("Crop", "c", "crop", "Drag the area to keep")
+        case .canvas: return ("Canvas", "k", "arrow.up.left.and.arrow.down.right.square", "Drag an edge to add space  ·  ⌥ drags both sides")
+        case .image: return ("Insert image", "i", "photo.badge.plus", "Drop, paste or pick a screenshot  ·  drag a corner to resize, ⇧ for free resize")
         }
     }
     var isPixel: Bool { self == .blur || self == .pixelate || self == .magnify }
+    // Changes to these redraw the background raster (image layers sit under blur/pixelate).
+    var isRaster: Bool { isPixel || self == .image }
     var isRect: Bool { [.rect, .ellipse, .highlight, .blur, .pixelate, .spotlight, .crop].contains(self) }
 }
 
@@ -36,6 +40,17 @@ let kStepR: [CGFloat] = [11, 14, 18, 23, 30]
 let kBlurR: [CGFloat] = [3, 6, 10, 15, 22]
 let kMagR: [CGFloat] = [36, 48, 64, 84, 110]  // magnifier bubble radius (zoom is 2×)
 
+// A screenshot placed on the canvas. Always flattened on export.
+struct ImageLayer {
+    var image: CGImage
+    var source: URL?
+    var radius: CGFloat = 0
+    var shadow = false
+    var border = false
+    var opacity: CGFloat = 1
+    var slot: Int?             // index into the collage's images, when part of a collage layout
+}
+
 struct Annot: Codable {
     var tool: Tool
     var color: Int
@@ -44,6 +59,10 @@ struct Annot: Codable {
     var pts: [CGPoint]
     var text = ""
     var step = 0
+    var wrap: CGFloat?     // text: wrap width, so notes stay on the canvas
+    var layer: ImageLayer?
+
+    private enum CodingKeys: String, CodingKey { case tool, color, level, unit, pts, text, step, wrap }
 
     var nsColor: NSColor { kColors[min(max(0, color), kColors.count - 1)] }
     var strokeW: CGFloat { kStroke[level] * unit }
@@ -59,7 +78,8 @@ struct Annot: Codable {
 
 struct DocState {
     var annots: [Annot] = []
-    var crop: CGRect?
+    var crop: CGRect?      // the document frame in image coordinates; inside the image it crops, outside it adds space
+    var fill: CGColor?     // background for space outside the image; nil is transparent
 }
 
 enum Render {
@@ -73,7 +93,7 @@ enum Render {
 
     static func textRect(_ a: Annot) -> CGRect {
         let s = NSAttributedString(string: a.text.isEmpty ? "Ag" : a.text, attributes: textAttrs(a))
-        var r = s.boundingRect(with: CGSize(width: 100_000, height: 100_000), options: [.usesLineFragmentOrigin])
+        var r = s.boundingRect(with: CGSize(width: a.wrap ?? 100_000, height: 100_000), options: [.usesLineFragmentOrigin])
         r.origin = a.pts[0]
         if a.text.isEmpty { r.size.width = 0 }
         return r
@@ -117,14 +137,73 @@ enum Render {
 
     // MARK: pixel tools (blur, pixelate, magnify), applied in order on top of the base image
 
-    static func pixelBase(_ base: CGImage, _ annots: [Annot]) -> CGImage {
-        let pix = annots.filter { $0.tool.isPixel }
-        guard !pix.isEmpty else { return base }
-        let H = CGFloat(base.height)
-        func ci(_ r: CGRect) -> CGRect { CGRect(x: r.minX, y: H - r.maxY, width: r.width, height: r.height) }
-        func ci(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x, y: H - p.y) }
+    static func frame(_ base: CGImage, _ st: DocState) -> CGRect {
         let extent = CGRect(x: 0, y: 0, width: base.width, height: base.height)
-        var cur = CIImage(cgImage: base)
+        guard var f = st.crop?.integral, f.width >= 1, f.height >= 1 else { return extent }
+        if !f.intersects(extent) && !st.annots.contains(where: { $0.tool == .image }) { f = extent }
+        return f
+    }
+
+    // Everything under the annotations, covering the document frame: fill, the screenshot, image layers.
+    static func raster(_ base: CGImage, _ st: DocState) -> (CGImage, CGRect) {
+        let extent = CGRect(x: 0, y: 0, width: base.width, height: base.height)
+        let f = frame(base, st)
+        let layers = st.annots.filter { $0.tool == .image && $0.layer != nil }
+        if f == extent && layers.isEmpty { return (base, f) }
+        guard let ctx = makeContext(width: Int(f.width), height: Int(f.height)) else { return (base, extent) }
+        ctx.translateBy(x: -f.minX, y: -f.minY)
+        if let fill = st.fill {
+            ctx.setFillColor(fill)
+            ctx.fill(f)
+        }
+        drawImageFlipped(ctx, base, in: extent)
+        for a in layers { drawLayer(a, ctx) }
+        return (ctx.makeImage() ?? base, f)
+    }
+
+    static func drawLayer(_ a: Annot, _ ctx: CGContext) {
+        guard let l = a.layer else { return }
+        let r = a.rect
+        guard r.width >= 1, r.height >= 1 else { return }
+        let path = CGPath(roundedRect: r, cornerWidth: min(l.radius, r.width / 2), cornerHeight: min(l.radius, r.height / 2), transform: nil)
+        ctx.saveGState()
+        ctx.setAlpha(l.opacity)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        if l.shadow {
+            ctx.saveGState()
+            let d = max(r.width, r.height)
+            ctx.setShadow(offset: CGSize(width: 0, height: min(10 * a.unit, d * 0.012)), blur: min(30 * a.unit, d * 0.04), color: NSColor.black.withAlphaComponent(0.45).cgColor)
+            ctx.addPath(path)
+            ctx.setFillColor(NSColor.black.cgColor)
+            ctx.fillPath()
+            ctx.restoreGState()
+        }
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.clip()
+        ctx.interpolationQuality = .high
+        drawImageFlipped(ctx, l.image, in: r)
+        ctx.restoreGState()
+        if l.border {
+            ctx.addPath(path)
+            ctx.setStrokeColor(a.nsColor.cgColor)
+            ctx.setLineWidth(a.strokeW)
+            ctx.strokePath()
+        }
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
+    }
+
+    // The raster with blur, pixelate and magnify applied in order. Returned with the rect it covers.
+    static func pixelBase(_ base: CGImage, _ st: DocState) -> (CGImage, CGRect) {
+        let (bg, f) = raster(base, st)
+        let pix = st.annots.filter { $0.tool.isPixel }
+        guard !pix.isEmpty else { return (bg, f) }
+        let H = f.height
+        func ci(_ r: CGRect) -> CGRect { CGRect(x: r.minX - f.minX, y: H - (r.maxY - f.minY), width: r.width, height: r.height) }
+        func ci(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - f.minX, y: H - (p.y - f.minY)) }
+        let extent = CGRect(x: 0, y: 0, width: bg.width, height: bg.height)
+        var cur = CIImage(cgImage: bg)
         for a in pix {
             switch a.tool {
             case .blur:
@@ -152,7 +231,7 @@ enum Render {
             default: break
             }
         }
-        return sharedCIContext.createCGImage(cur, from: extent) ?? base
+        return (sharedCIContext.createCGImage(cur, from: extent) ?? bg, f)
     }
 
     // MARK: vector drawing in image coordinates on a flipped (y-down) context
@@ -264,22 +343,38 @@ enum Render {
                 ctx.setLineDash(phase: 0, lengths: [5 * a.unit, 4 * a.unit])
                 ctx.stroke(a.rect)
             }
-        case .select: break
+        case .select, .canvas, .image: break
         }
     }
 
     // Full composition in image pixels, with the crop applied.
-    static func compose(_ base: CGImage, _ st: DocState, pixel: CGImage? = nil) -> CGImage {
-        let px = pixel ?? pixelBase(base, st.annots)
-        let extent = CGRect(x: 0, y: 0, width: base.width, height: base.height)
-        var crop = (st.crop ?? extent).integral.intersection(extent)
-        if crop.isNull || crop.width < 1 || crop.height < 1 { crop = extent }  // never fall back to the unannotated base
-        guard let ctx = makeContext(width: Int(crop.width), height: Int(crop.height)) else { return px }
-        ctx.translateBy(x: -crop.minX, y: -crop.minY)
-        drawImageFlipped(ctx, px, in: extent)
-        spotlight(ctx, st.annots, extent: extent)
-        for a in st.annots where !a.tool.isPixel || a.tool == .magnify { draw(a, ctx) }
+    // Full composition in document pixels: the frame (crop or extra space), image layers and annotations, flattened.
+    static func compose(_ base: CGImage, _ st: DocState, pixel: (CGImage, CGRect)? = nil) -> CGImage {
+        let f = frame(base, st)
+        let (px, pr) = pixel.flatMap { $0.1 == f ? $0 : nil } ?? pixelBase(base, st)  // never fall back to the unannotated base
+        guard let ctx = makeContext(width: Int(f.width), height: Int(f.height)) else { return px }
+        ctx.translateBy(x: -f.minX, y: -f.minY)
+        drawImageFlipped(ctx, px, in: pr)
+        spotlight(ctx, st.annots, extent: f)
+        for a in st.annots where !a.tool.isRaster || a.tool == .magnify { draw(a, ctx) }
         return ctx.makeImage() ?? base
+    }
+
+    // Average color along the image border: a fill that makes added space look like part of the screenshot.
+    static func edgeColor(_ img: CGImage) -> CGColor {
+        let n = 32
+        guard let ctx = makeContext(width: n, height: n, flipped: false) else { return NSColor.white.cgColor }
+        ctx.interpolationQuality = .medium
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: n, height: n))
+        guard let data = ctx.data else { return NSColor.white.cgColor }
+        let p = data.bindMemory(to: UInt8.self, capacity: ctx.bytesPerRow * n)
+        var r = 0, g = 0, b = 0, a = 0, count = 0
+        for y in 0..<n { for x in 0..<n where x == 0 || y == 0 || x == n - 1 || y == n - 1 {
+            let o = y * ctx.bytesPerRow + x * 4   // BGRA, premultiplied
+            b += Int(p[o]); g += Int(p[o + 1]); r += Int(p[o + 2]); a += Int(p[o + 3]); count += 1
+        } }
+        guard a > 0 else { return NSColor.white.cgColor }
+        return CGColor(srgbRed: CGFloat(r) / CGFloat(a), green: CGFloat(g) / CGFloat(a), blue: CGFloat(b) / CGFloat(a), alpha: 1)
     }
 
     // Presentation export: gradient backdrop, padding, soft shadow and rounded corners.

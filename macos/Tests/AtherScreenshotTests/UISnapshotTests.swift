@@ -49,6 +49,62 @@ final class UISnapshotTests: XCTestCase {
         e.window.close()
     }
 
+    func testEditorSpaceAndOverlay() throws {
+        try XCTSkipIf(out == nil)
+        let e = Editor.open(sample(), scale: 2)
+        e.window.setContentSize(NSSize(width: 1150, height: 760))
+        e.canvas.extend(.below)
+        let inset = makeContext(width: 600, height: 360)!
+        inset.setFillColor(NSColor.systemOrange.cgColor)
+        inset.fill(CGRect(x: 0, y: 0, width: 600, height: 360))
+        withNSContext(inset, flipped: true) {
+            NSAttributedString(string: "Inserted screenshot", attributes: [.font: NSFont.systemFont(ofSize: 40, weight: .bold), .foregroundColor: NSColor.white]).draw(at: CGPoint(x: 40, y: 40))
+        }
+        e.canvas.insert(inset.makeImage()!, source: nil, at: CGPoint(x: 1050, y: 560))
+        var note = Annot(tool: .text, color: 7, level: 1, unit: 2, pts: [CGPoint(x: 40, y: 860)],
+                         text: "Remarks: the deploy banner should mention the region, and the IP needs to be redacted before sharing.")
+        note.wrap = 1300
+        e.canvas.state.annots.append(note)
+        e.canvas.changed(pixels: true)
+        snap(e.window.contentView!, "ui-editor-space-overlay")
+        e.canvas.setTool(.canvas)
+        snap(e.window.contentView!, "ui-editor-canvas-tool")
+        e.dirty = false
+        e.window.close()
+    }
+
+    func testCollageEditor() throws {
+        try XCTSkipIf(out == nil)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ather-collage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let colors: [NSColor] = [.systemTeal, .systemPink, .systemIndigo, .systemOrange]
+        let sizes = [(1600, 1000), (900, 1300), (1300, 800), (1100, 1100)]
+        var urls: [URL] = []
+        for (i, (w, h)) in sizes.enumerated() {
+            let ctx = makeContext(width: w, height: h)!
+            ctx.setFillColor(colors[i].cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+            withNSContext(ctx, flipped: true) {
+                NSAttributedString(string: "Screen \(i + 1)", attributes: [.font: NSFont.systemFont(ofSize: 64, weight: .bold), .foregroundColor: NSColor.white]).draw(at: CGPoint(x: 50, y: 50))
+            }
+            let u = dir.appendingPathComponent("s\(i).png")
+            try ctx.makeImage()!.pngData()!.write(to: u)
+            urls.append(u)
+        }
+        let e = try XCTUnwrap(Editor.openCollage(urls))
+        e.window.setContentSize(NSSize(width: 1150, height: 780))
+        snap(e.window.contentView!, "ui-collage-auto")
+        e.collage?.layout = .feature
+        e.collage?.background = 2
+        e.collage?.shadow = true
+        e.applyCollage()
+        snap(e.window.contentView!, "ui-collage-feature")
+        let img = e.export()
+        XCTAssertGreaterThan(img.width, 1000)
+        e.dirty = false
+        e.window.close()
+    }
+
     func testPaletteAndToast() throws {
         try XCTSkipIf(out == nil)
         let items = kCmds.prefix(12).map { d in

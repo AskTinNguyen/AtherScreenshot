@@ -46,6 +46,7 @@ struct ItemMeta: Codable {
     var dhash: UInt64?
     var indexed = 0            // indexer version that produced the technical fields
     var editedFrom: String?    // path of the capture this one was edited from
+    var includes: [String] = [] // paths of screenshots placed into this one (overlays, collages)
 
     var aspect: CGFloat { w > 0 && h > 0 ? CGFloat(w) / CGFloat(h) : 16 / 10 }
 }
@@ -76,6 +77,7 @@ extension ItemMeta {
         comment = c.value(.comment, comment); collections = c.value(.collections, collections); app = c.value(.app, app)
         window = c.value(.window, window); text = c.value(.text, text); colors = c.value(.colors, colors)
         dhash = c.value(.dhash, dhash); indexed = c.value(.indexed, indexed); editedFrom = c.value(.editedFrom, editedFrom)
+        includes = c.value(.includes, includes)
     }
 }
 
@@ -388,6 +390,7 @@ final class Library: ObservableObject {
                 if e.rating == 0 { e.rating = p.rating }
                 if e.comment.isEmpty { e.comment = p.comment }
                 if e.editedFrom == nil { e.editedFrom = p.editedFrom }
+                if e.includes.isEmpty { e.includes = p.includes }
             }
             m[u.path] = e
         }
@@ -415,9 +418,21 @@ final class Library: ObservableObject {
 
     // Called before an edited image is written: it joins the gallery tagged "edited", keeping the original's
     // tags, collections, rating, comment and source app, and remembers which capture it came from.
-    func noteEdit(_ url: URL, from source: URL?, info: NameInfo, edited: Bool) {
+    // A collage is tagged "collage" and keeps the tags and collections all of its screenshots share.
+    func noteEdit(_ url: URL, from source: URL?, info: NameInfo, edited: Bool, includes: [URL] = [], collage: Bool = false) {
         loadIfNeeded()
         var p = pending[url.path] ?? ItemMeta()
+        p.includes = includes.map(\.path)
+        if collage {
+            let ms = includes.compactMap { meta[$0.path] }
+            if let first = ms.first {
+                p.tags = first.tags.filter { t in ms.allSatisfy { $0.tags.contains { $0.lowercased() == t.lowercased() } } }
+                p.collections = first.collections.filter { c in ms.allSatisfy { $0.collections.contains(c) } }
+            }
+            if !p.tags.contains(where: { $0.lowercased() == "collage" }) { p.tags.append("collage") }
+            pending[url.path] = p
+            return
+        }
         if let source, let o = meta[source.path] {
             p.tags = o.tags; p.collections = o.collections; p.rating = o.rating; p.comment = o.comment
             p.app = o.app; p.window = o.window

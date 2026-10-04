@@ -38,6 +38,13 @@ macOS reserves ⌘⇧3/4/5, so the defaults use ⌃⌥:
 
 All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.ather.screenshot`) under the same key names as `settings.ini`, so `defaults write com.ather.screenshot Uploader s3` works.
 
+## Editor extras
+
+- **Insert image (I):** drop a screenshot from the gallery or Finder onto the editor, paste one with ⌘V, or press I to pick from recent captures. It becomes a layer: drag to move, drag a corner to resize (⇧ for free resize), ⌘] / ⌘[ to bring forward or send back, and right-click for rounded corners, shadow, border and opacity. Blur and pixelate apply to layers too. Everything is flattened when you save.
+- **Canvas (K):** drag any edge to add space around the screenshot (⌥ moves both sides), or use Space below, Space right and Even margin. The space is filled with the screenshot's edge color, white, black or transparent. Text wraps at the canvas edge, so notes in the margin stay on the image.
+- **Collage (⌘G in the gallery):** select two or more screenshots and press Collage. Choose a layout (auto, grid, row, column, feature), gap, margin, background, corners, shadow and size (fit, 1920 px wide, square). Drag one screenshot onto another to swap them; everything else in the editor works on top.
+- Saved results join the gallery: edits are tagged "edited" and keep the original's metadata; collages are tagged "collage" and keep the tags and collections their screenshots share. Both list the screenshots they include.
+
 ## Capture gallery (⌃⌥H)
 
 An Eagle-style library for everything in the captures folder. Metadata lives in `~/Library/Application Support/AtherScreenshot/library.json` (feature prints in `features.plist`); the image files are never modified.
@@ -86,4 +93,4 @@ Commands typed in a terminal run directly. Commands from `atherscreenshot://` li
 
 ## Layout (`Sources/AtherScreenshot`)
 
-`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.
+`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

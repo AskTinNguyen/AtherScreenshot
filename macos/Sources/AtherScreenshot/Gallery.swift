@@ -228,6 +228,19 @@ final class GalleryModel: ObservableObject {
     func pin() { for u in targets where isImage(u) { if let img = CGImage.load(u) { Pin.show(img) } } }
     func reveal() { if !targets.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(targets) } }
 
+    func collage() {
+        let imgs = targets.filter(isImage)
+        guard imgs.count >= 2 else { return Toast.shared.show("Select two or more screenshots for a collage") }
+        Editor.openCollage(imgs)
+    }
+
+    var editorOpen: Bool { !Editor.instances.isEmpty }
+
+    func addToEditor() {
+        guard let e = Editor.instances.last else { return Toast.shared.show("No editor is open", "Open a screenshot to annotate first") }
+        e.insertImages(targets.filter(isImage))
+    }
+
     // Selects a capture in the gallery, widening the view if it's filtered out.
     func reveal(inGallery u: URL) {
         guard lib.urls.contains(u) else { return Toast.shared.show("The original is no longer in the gallery") }
@@ -560,6 +573,8 @@ private struct ItemMenu: View {
         Button(model.isImage(url) ? "Annotate" : "Open") { model.open(url) }
         Button("Preview") { ensure(); model.preview = url }
         Button("Find similar") { model.findSimilar(url) }
+        if model.selection.count > 1 && model.selection.contains(url) { Button("Make collage") { model.collage() } }
+        if model.editorOpen { Button("Add to open editor") { ensure(); model.addToEditor() } }
         Divider()
         Button("Add tags…") { ensure(); model.tagPicker() }
         Button("Add to collection…") { ensure(); model.collectionPicker() }
@@ -1242,6 +1257,7 @@ private struct ActionBar: View {
                 ForEach(0...5, id: \.self) { r in Button(r == 0 ? "No rating" : String(repeating: "★", count: r)) { model.rate(r) } }
             } label: { Image(systemName: "star") }
                 .menuStyle(.button).buttonStyle(GlassButtonStyle()).menuIndicator(.hidden).fixedSize().help("Rate (0–5)")
+            if n > 1 { action("rectangle.3.group", "Make collage (⌘G)") { model.collage() } }
             action("pin", "Pin to screen (⌘P)") { model.pin() }
             action("square.and.arrow.up", "Upload and copy link (⌘U)") { model.upload() }
             action("trash", "Move to Trash (⌘⌫)") { model.trash() }
@@ -1278,7 +1294,7 @@ private struct ShortcutsCard: View {
         ("Space", "Preview"), ("↩", "Open or annotate"), ("← → ↑ ↓", "Move selection"), ("T", "Add tags"), ("F", "Add to collection"),
         ("1–5, 0", "Rate, clear rating"), ("/  or  ⌘F", "Search"), ("⌘C", "Copy"), ("⌘T", "Copy text (OCR)"),
         ("⌘P", "Pin to screen"), ("⌘R", "Rename"), ("⌘U", "Upload and copy link"), ("⌘O", "Show in Finder"), ("⌘⌫", "Move to Trash"),
-        ("⌘I", "Details"), ("⌃⌘S", "Sidebar"), ("⌘+  ⌘−", "Thumbnail size"), ("⌘⇧S", "Save as smart folder"), ("⌘K", "All actions"),
+        ("⌘I", "Details"), ("⌃⌘S", "Sidebar"), ("⌘+  ⌘−", "Thumbnail size"), ("⌘⇧S", "Save as smart folder"), ("⌘G", "Make collage"), ("⌘K", "All actions"),
     ]
 
     var body: some View {
@@ -1468,7 +1484,7 @@ private struct Inspector: View {
 
         if !m.colors.isEmpty { paletteBar(m) }
 
-        if !m.app.isEmpty || !m.window.isEmpty || m.editedFrom != nil {
+        if !m.app.isEmpty || !m.window.isEmpty || m.editedFrom != nil || !m.includes.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
                 if !m.app.isEmpty { info("App", m.app) }
                 if !m.window.isEmpty { info("Window", m.window) }
@@ -1477,6 +1493,19 @@ private struct Inspector: View {
                         Text("Edited from").foregroundColor(C(Theme.muted)).frame(width: 82, alignment: .leading)
                         Button(URL(fileURLWithPath: o).deletingPathExtension().lastPathComponent) { model.reveal(inGallery: URL(fileURLWithPath: o)) }
                             .buttonStyle(.link).lineLimit(1).truncationMode(.middle)
+                    }
+                    .font(.system(size: 11))
+                }
+                if !m.includes.isEmpty {
+                    HStack(alignment: .top) {
+                        Text("Includes").foregroundColor(C(Theme.muted)).frame(width: 82, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(m.includes.prefix(6), id: \.self) { o in
+                                Button(URL(fileURLWithPath: o).deletingPathExtension().lastPathComponent) { model.reveal(inGallery: URL(fileURLWithPath: o)) }
+                                    .buttonStyle(.link).lineLimit(1).truncationMode(.middle)
+                            }
+                            if m.includes.count > 6 { Text("and \(m.includes.count - 6) more").foregroundColor(C(Theme.muted)) }
+                        }
                     }
                     .font(.system(size: 11))
                 }
@@ -1872,6 +1901,7 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
         case kVK_ANSI_K: m.palette()
         case kVK_ANSI_F: m.focusSearch += 1
         case kVK_ANSI_I: m.showInspector.toggle()
+        case kVK_ANSI_G: m.collage()
         case kVK_ANSI_S where shift: m.saveSmartFolder()
         case kVK_Delete, kVK_ForwardDelete: m.trash()
         case kVK_ANSI_W: window.close()
