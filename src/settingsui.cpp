@@ -342,6 +342,11 @@ bool Window::OnRecordKey(UINT vk, bool down) {
     } else {
         std::wstring text = HotkeyToText(m, vk);
         if (text.empty()) return true;  // unsupported key: keep listening
+        if (!HotkeyAllowed(m, vk)) {    // would swallow ordinary typing: keep listening
+            ShowToast(L"Add Ctrl, Alt or Win", text + L" on its own would stop that key from typing. F-keys and PrintScreen work alone.",
+                      nullptr, nullptr, 3500);
+            return true;
+        }
         StopRecording();
         Write(i, text);
     }

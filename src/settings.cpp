@@ -6,6 +6,7 @@
 #include <cwctype>
 
 #include "output.h"
+#include "selftest.h"
 
 namespace ather {
 
@@ -89,6 +90,13 @@ std::wstring HotkeyToText(UINT mods, UINT vk) {
     return s + key;
 }
 
+// A global shortcut must not steal ordinary typing: it needs Ctrl, Alt or Win, unless the key never
+// types anything on its own (F-keys, PrintScreen, Pause, ScrollLock).
+bool HotkeyAllowed(UINT mods, UINT vk) {
+    if (mods & (MOD_CONTROL | MOD_ALT | MOD_WIN)) return true;
+    return (vk >= VK_F1 && vk <= VK_F24) || vk == VK_SNAPSHOT || vk == VK_PAUSE || vk == VK_SCROLL;
+}
+
 bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk) {
     mods = 0;
     vk = 0;
@@ -108,7 +116,7 @@ bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk) {
         if (plus == std::wstring::npos) break;
         start = plus + 1;
     }
-    return vk != 0;
+    return vk != 0 && HotkeyAllowed(mods, vk);
 }
 
 std::wstring Settings::Get(const wchar_t* section, const wchar_t* key, const wchar_t* def) const {
@@ -207,15 +215,7 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
 
 bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     bool created = false;
-    if (path_.empty()) {
-        PWSTR p = nullptr;
-        std::wstring dir;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) dir = p;
-        CoTaskMemFree(p);
-        dir += L"\\AtherScreenshot";
-        SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
-        path_ = dir + L"\\settings.ini";
-    }
+    if (path_.empty()) path_ = SupportFolder() + L"\\settings.ini";
     if (GetFileAttributesW(path_.c_str()) == INVALID_FILE_ATTRIBUTES) {
         WriteTemplate(defs);
         created = true;
@@ -324,4 +324,19 @@ void Settings::WriteString(const wchar_t* section, const wchar_t* key, const std
     stamp_ = Stamp();
 }
 
+// ---- tests ----
+
+ATHER_TEST(hotkeys_need_a_modifier_unless_special) {
+    UINT m, vk;
+    CHECK(ParseHotkey(L"Ctrl+Alt+K", m, vk) && vk == 'K' && m == (MOD_CONTROL | MOD_ALT));
+    CHECK(ParseHotkey(L"PrintScreen", m, vk) && vk == VK_SNAPSHOT && m == 0);
+    CHECK(ParseHotkey(L"F9", m, vk) && vk == VK_F9);
+    CHECK(ParseHotkey(L"Shift+F2", m, vk));
+    CHECK(ParseHotkey(L"Win+Shift+S", m, vk));
+    CHECK(!ParseHotkey(L"K", m, vk));          // would stop K from typing
+    CHECK(!ParseHotkey(L"Shift+K", m, vk));    // so would Shift+K
+    CHECK(!ParseHotkey(L"Space", m, vk));
+    CHECK(!ParseHotkey(L"Ctrl+Nope", m, vk));
+    CHECK(HotkeyToText(MOD_CONTROL | MOD_SHIFT, 'S') == L"Ctrl+Shift+S");
+}
 }  // namespace ather

@@ -20,6 +20,7 @@ namespace ather {
 namespace {
 
 constexpr wchar_t kUninstallKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AtherScreenshot";
+constexpr wchar_t kProtocolKey[] = L"Software\\Classes\\atherscreenshot";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kMainClass[] = L"AtherScreenshotMain";
 constexpr ULONG_PTR kCopyDataCli = 0xA7E1;  // must match main.cpp
@@ -133,6 +134,19 @@ std::wstring Install(bool startWithWindows) {
         }
         RegCloseKey(k);
     }
+    // atherscreenshot://region?pin links. Anything arriving this way is untrusted: it asks first and can
+    // never upload, edit, pin or open files (see RunCli in main.cpp).
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kProtocolKey, 0, nullptr, 0, KEY_SET_VALUE | KEY_CREATE_SUB_KEY, nullptr, &k,
+                        nullptr) == ERROR_SUCCESS) {
+        SetString(k, nullptr, L"URL:Ather Screenshot");
+        SetString(k, L"URL Protocol", L"");
+        HKEY cmd;
+        if (RegCreateKeyExW(k, L"shell\\open\\command", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &cmd, nullptr) == ERROR_SUCCESS) {
+            SetString(cmd, nullptr, L"\"" + target + L"\" \"%1\"");
+            RegCloseKey(cmd);
+        }
+        RegCloseKey(k);
+    }
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);  // refresh Start menu
     return L"";
 }
@@ -150,6 +164,7 @@ void Uninstall() {
         RegCloseKey(k);
     }
     RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
+    RegDeleteTreeW(HKEY_CURRENT_USER, kProtocolKey);
     DeleteFileW(ShortcutPath().c_str());
     // This exe may be the one being deleted: remove the folder from a helper once we've exited.
     // (`timeout` refuses to run without a console, so wait with ping; retry in case the exe is still closing.)

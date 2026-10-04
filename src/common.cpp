@@ -2,6 +2,7 @@
 
 #include <dwmapi.h>
 #include <shellscalingapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 
@@ -112,6 +113,23 @@ bool IsOwnWindow(HWND hwnd) {
 std::wstring FileNameOf(const std::wstring& path) {
     size_t p = path.find_last_of(L"\\/");
     return p == std::wstring::npos ? path : path.substr(p + 1);
+}
+
+std::wstring SupportFolder() {
+    wchar_t over[MAX_PATH];
+    std::wstring dir;
+    const DWORD n = GetEnvironmentVariableW(L"ATHER_SUPPORT_DIR", over, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        dir = over;
+    } else {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) dir = p;
+        CoTaskMemFree(p);
+        dir += L"\\AtherScreenshot";
+    }
+    while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) dir.pop_back();
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    return dir;
 }
 
 static bool FontInstalled(const wchar_t* face) {

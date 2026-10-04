@@ -24,6 +24,7 @@ using std::min;
 #include "version.h"
 #include "ocr.h"
 #include "scroll.h"
+#include "selftest.h"
 #include "upload.h"
 #include "output.h"
 #include "overlay.h"
@@ -34,9 +35,15 @@ using std::min;
 #include "settingsui.h"
 #include "toast.h"
 
+#include <bcrypt.h>
+#include <aclapi.h>
+#include <sddl.h>
+
+#include <cwctype>
 #include <map>
 
 #pragma comment(lib, "gdiplus")
+#pragma comment(lib, "bcrypt")
 
 using namespace ather;
 
@@ -171,10 +178,14 @@ CaptureNameInfo g_nameInfo;  // window/app of the current capture, for file-name
 RECT g_lastRegion{};
 bool g_haveLastRegion = false;
 int g_deferredCmd = 0, g_delayedCmd = 0;
+bool g_deferredUntrusted = false, g_delayedUntrusted = false;
+// False while running a command a link or another app asked for (see RunCli). Captures read it when they
+// start, so a later command can't change it for a capture that's already under way.
+bool g_uploadAllowed = true;
 std::vector<int> g_mru;
 std::vector<std::wstring> g_recents;
 
-void Execute(int id, bool deferCapture);
+void Execute(int id, bool deferCapture, bool untrusted = false);
 
 const CmdDef* FindCmd(int id) {
     for (const auto& c : kCmds)
@@ -318,23 +329,31 @@ void PromptRename(const std::wstring& path) {
 }
 
 // redactedCount < 0: auto-redact hasn't run yet for this image.
-void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = -1) {
+// allowUpload: false for commands a link or another app asked for; then nothing leaves the machine, even
+// when "After capture" is set to upload.
+void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = -1, bool allowUpload = true) {
     if (!img) {
         Notify(L"Capture failed");
         return;
     }
     if (redactedCount < 0 && (after == After::Redact || (g_settings.autoRedact && after != After::Ocr))) {
         ShowToast(L"Redacting sensitive text…", L"", nullptr, nullptr, 10000);
-        RecognizeWordsAsync(img, [img, where, after](std::vector<OcrWord> words, std::wstring err) {
+        RecognizeWordsAsync(img, [img, where, after, allowUpload](std::vector<OcrWord> words, std::wstring err) {
+            HideToast();
+            if (!err.empty()) {
+                // Never hand out an unredacted image when redaction was asked for: let the user do it by hand.
+                ShowToast(L"Auto-redact failed — nothing was copied, saved or uploaded",
+                          err + L"\nOpened in the editor so you can redact it yourself.", nullptr, nullptr, 9000);
+                OpenEditor(img);
+                return;
+            }
             auto clean = img->Crop({0, 0, img->Width(), img->Height()});
             int n = 0;
-            if (err.empty())
-                for (const RECT& r : FindSensitive(words)) {
-                    clean->Pixelate(r, std::max(6, RectH(r) / 3));
-                    ++n;
-                }
-            HideToast();
-            Deliver(clean, where, after == After::Redact ? After::Default : after, n);
+            for (const RECT& r : FindSensitive(words)) {
+                clean->Pixelate(r, std::max(6, RectH(r) / 3));
+                ++n;
+            }
+            Deliver(clean, where, after == After::Redact ? After::Default : after, n, allowUpload);
         });
         return;
     }
@@ -364,7 +383,7 @@ void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = 
     const bool pin = after == After::Pin || g_settings.afterCapture == L"pin";
     if (pin) PinImage(img, &where);
 
-    const bool upload = after == After::Upload || g_settings.afterCapture == L"upload";
+    const bool upload = allowUpload && (after == After::Upload || g_settings.afterCapture == L"upload");
     uint64_t toast = 0;
     if (g_settings.showToast && !pin && !upload) {
         std::wstring body = dims + (g_settings.saveToFile ? L"  ·  saving…" : L"");
@@ -412,7 +431,7 @@ void CaptureRect(RECT r, After after = After::Default) {
     RECT virt = VirtualScreenRect();
     if (!IntersectRect(&r, &r, &virt)) return Notify(L"Nothing to capture");
     PrepareCapture();
-    Deliver(CaptureScreen(r, g_settings.captureCursor), r, after);
+    Deliver(CaptureScreen(r, g_settings.captureCursor), r, after, -1, g_uploadAllowed);
 }
 
 OverlayOptions MakeOverlayOptions() {
@@ -427,14 +446,15 @@ void StartRegion(After after) {
     PrepareCapture();
     const RECT virt = VirtualScreenRect();
     BitmapPtr shot = CaptureScreen(virt, false);
-    ShowOverlay(OverlayMode::Region, shot, virt, MakeOverlayOptions(), [shot, virt, after](const OverlayResult& r) {
+    const bool allow = g_uploadAllowed;
+    ShowOverlay(OverlayMode::Region, shot, virt, MakeOverlayOptions(), [shot, virt, after, allow](const OverlayResult& r) {
         if (!r.ok) return;
         RECT local = r.rect;
         OffsetRect(&local, -virt.left, -virt.top);
         g_lastRegion = r.rect;
         g_haveLastRegion = true;
         if (r.window) g_nameInfo = NameInfoFor(r.window);  // clicked a window: name the file after it
-        Deliver(shot->Crop(local), r.rect, after);
+        Deliver(shot->Crop(local), r.rect, after, -1, allow);
     });
 }
 
@@ -547,19 +567,20 @@ void StartScrolling() {
     if (OverlayActive() || ScrollingCaptureActive()) return;
     PrepareCapture();
     const RECT virt = VirtualScreenRect();
-    ShowOverlay(OverlayMode::Region, CaptureScreen(virt, false), virt, MakeOverlayOptions(), [](const OverlayResult& r) {
+    const bool allow = g_uploadAllowed;
+    ShowOverlay(OverlayMode::Region, CaptureScreen(virt, false), virt, MakeOverlayOptions(), [allow](const OverlayResult& r) {
         if (!r.ok) return;
         if (RectH(r.rect) < 80) return Notify(L"Region is too short for a scrolling capture");
         if (r.window) g_nameInfo = NameInfoFor(r.window);
         ShowToast(L"Scrolling capture…", L"Keep the mouse still. Press Esc to stop early.", nullptr, nullptr, 4000);
         RECT where = r.rect;
         StartScrollingCapture(r.rect, g_settings.scrollDelayMs, g_settings.scrollMaxFrames,
-                              [where](BitmapPtr img, int frames, std::wstring err) {
+                              [where, allow](BitmapPtr img, int frames, std::wstring err) {
                                   HideToast();
                                   if (!err.empty()) return Notify(L"Scrolling capture failed", err);
                                   if (!img) return Notify(L"Nothing captured");
                                   if (frames < 2) Notify(L"The page didn't scroll", L"Saved a single frame instead.");
-                                  Deliver(img, where, After::Default);
+                                  Deliver(img, where, After::Default, -1, allow);
                               });
     });
 }
@@ -644,7 +665,8 @@ After TakeCliAfter() {
     return a;
 }
 
-void Execute(int id, bool deferCapture) {
+void Execute(int id, bool deferCapture, bool untrusted) {
+    g_uploadAllowed = !untrusted;
     if (id >= CmdRecentBase) {
         size_t i = id - CmdRecentBase;
         if (i < g_recents.size()) OpenPath(g_recents[i]);
@@ -660,6 +682,7 @@ void Execute(int id, bool deferCapture) {
     if (deferCapture && def->capture) {
         // Let the palette / menu disappear from the screen before we grab it.
         g_deferredCmd = id;
+        g_deferredUntrusted = untrusted;
         SetTimer(g_hwnd, kDeferTimer, 60, nullptr);
         return;
     }
@@ -740,6 +763,7 @@ void Execute(int id, bool deferCapture) {
         case CmdRegionDelayed:
         case CmdFullscreenDelayed: {
             g_delayedCmd = id == CmdRegionDelayed ? CmdRegion : CmdFullscreen;
+            g_delayedUntrusted = untrusted;
             int ms = g_settings.delaySeconds * 1000;
             ShowToast(L"Capturing in " + std::to_wstring(g_settings.delaySeconds) + L" s…", L"", nullptr, nullptr,
                       std::max(300, ms - 700));
@@ -790,6 +814,10 @@ void Execute(int id, bool deferCapture) {
 }
 
 // ---- command line: AtherScreenshot.exe <command> [--pin|--edit|--upload|--redact|--ocr] [--delay N] ----
+//
+// Trust: commands typed in a console are trusted. Commands from atherscreenshot:// links, or from processes
+// without a console (scheduled tasks, launchers, other apps), ask first and can never upload, edit, pin or
+// open files. A forwarded command proves it came from a console through the per-install cli-token.
 
 struct CliRequest {
     int cmd = 0;
@@ -797,12 +825,115 @@ struct CliRequest {
     int delayMs = 0;
     std::wstring file;  // edit / upload / pin <file>
     std::wstring error;
+    std::vector<std::wstring> args;  // as given, for the confirmation prompt
 };
 
-CliRequest ParseCli(const std::wstring& cmdline) {
-    CliRequest req;
+std::wstring LowerStr(std::wstring s) {
+    for (auto& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+// Started from a console (cmd, PowerShell, Windows Terminal, or a script attached to one), as opposed to
+// being launched by another app, a link or the scheduler. A GUI-subsystem exe can only tell by attaching.
+bool InteractiveLaunch() {
+    static const bool interactive = [] {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS)) return false;
+        FreeConsole();
+        return true;
+    }();
+    return interactive;
+}
+
+// A per-install secret in the support folder, readable only by this user. WM_COPYDATA can be sent by any
+// process on the desktop, so forwarded commands without it are treated like links from the web.
+std::wstring CliToken() {
+    static std::wstring cached;
+    if (!cached.empty()) return cached;
+    const std::wstring path = SupportFolder() + L"\\cli-token";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        char buf[256] = {};
+        DWORD read = 0;
+        ReadFile(f, buf, sizeof(buf) - 1, &read, nullptr);
+        CloseHandle(f);
+        std::wstring t(buf, buf + read);
+        if (t.size() >= 32) return cached = t;
+    }
+    BYTE rnd[32];
+    if (BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return L"";
+    std::string hex;
+    for (BYTE b : rnd) {
+        char h[3];
+        sprintf_s(h, "%02x", b);
+        hex += h;
+    }
+    // Owner-only ACL: full access for this user, nobody else, no inherited entries.
+    SECURITY_ATTRIBUTES sa{sizeof(sa)};
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        BYTE info[256];
+        DWORD len = 0;
+        LPWSTR sid = nullptr;
+        if (GetTokenInformation(tok, TokenUser, info, sizeof(info), &len) &&
+            ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(info)->User.Sid, &sid)) {
+            std::wstring sddl = L"D:P(A;;FA;;;" + std::wstring(sid) + L")";
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr);
+            LocalFree(sid);
+        }
+        CloseHandle(tok);
+    }
+    sa.lpSecurityDescriptor = sd;
+    f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, sd ? &sa : nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (sd) LocalFree(sd);
+    if (f == INVALID_HANDLE_VALUE) return L"";
+    DWORD wr = 0;
+    WriteFile(f, hex.data(), (DWORD)hex.size(), &wr, nullptr);
+    CloseHandle(f);
+    return cached = std::wstring(hex.begin(), hex.end());
+}
+
+// atherscreenshot://region?pin&delay=3 -> {"region", "--pin", "--delay", "3"}
+std::vector<std::wstring> ArgsFromUrl(const std::wstring& url) {
+    std::vector<std::wstring> out;
+    std::wstring rest = url.substr(url.find(L':') + 1);
+    while (!rest.empty() && rest[0] == L'/') rest.erase(0, 1);
+    const size_t q = rest.find(L'?');
+    std::wstring host = rest.substr(0, q);
+    while (!host.empty() && host.back() == L'/') host.pop_back();
+    out.push_back(host);
+    if (q == std::wstring::npos) return out;
+    std::wstring query = rest.substr(q + 1);
+    for (size_t start = 0; start <= query.size();) {
+        size_t amp = query.find(L'&', start);
+        std::wstring item = query.substr(start, amp == std::wstring::npos ? std::wstring::npos : amp - start);
+        if (!item.empty()) {
+            size_t eq = item.find(L'=');
+            out.push_back(L"--" + item.substr(0, eq));
+            if (eq != std::wstring::npos) out.push_back(item.substr(eq + 1));
+        }
+        if (amp == std::wstring::npos) break;
+        start = amp + 1;
+    }
+    return out;
+}
+
+// The arguments after the program name. A link (atherscreenshot://…) is turned into the same form and is
+// never trusted, whoever started it.
+std::vector<std::wstring> SplitArgs(const std::wstring& cmdline, bool* fromLink) {
+    std::vector<std::wstring> args;
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmdline.c_str(), &argc);
+    for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
+    LocalFree(argv);
+    *fromLink = !args.empty() && _wcsnicmp(args[0].c_str(), L"atherscreenshot:", 16) == 0;
+    if (*fromLink) args = ArgsFromUrl(args[0]);
+    return args;
+}
+
+CliRequest ParseCli(const std::vector<std::wstring>& args) {
+    CliRequest req;
+    req.args = args;
     static const std::pair<const wchar_t*, int> kAliases[] = {
         {L"region", CmdRegion},       {L"fullscreen", CmdFullscreen}, {L"screen", CmdFullscreen},
         {L"monitor", CmdMonitor},     {L"window", CmdWindow},         {L"last", CmdLastRegion},
@@ -810,14 +941,14 @@ CliRequest ParseCli(const std::wstring& cmdline) {
         {L"record", CmdRecordVideo},  {L"video", CmdRecordVideo},     {L"mp4", CmdRecordVideo},
         {L"gif", CmdRecordGif},       {L"recordwindow", CmdRecordWindow}, {L"stop", CmdStopRecording},
         {L"pause", CmdPauseRecording}, {L"palette", CmdPalette},     {L"history", CmdHistory},
+        {L"gallery", CmdHistory},     {L"settings", CmdEditSettings},
         {L"scroll", CmdScrolling},    {L"scrolling", CmdScrolling},   {L"ruler", CmdRuler},
         {L"upload", CmdUploadLast},   {L"edit", CmdEditLast},         {L"pin", CmdPinLast},
         {L"open", CmdOpenLast},       {L"folder", CmdOpenFolder},     {L"quit", CmdExit},
         {L"exit", CmdExit},
     };
-    for (int i = 1; i < argc; ++i) {  // argv[0] is the program
-        std::wstring a = argv[i];
-        for (auto& c : a) c = (wchar_t)towlower(c);
+    for (size_t i = 0; i < args.size(); ++i) {
+        std::wstring a = LowerStr(args[i]);
         while (!a.empty() && (a[0] == L'-' || a[0] == L'/')) a.erase(0, 1);
         if (a == L"pin") {
             if (req.cmd) req.after = After::Pin;
@@ -826,27 +957,59 @@ CliRequest ParseCli(const std::wstring& cmdline) {
         else if (a == L"upload" && req.cmd) req.after = After::Upload;
         else if (a == L"redact") req.after = After::Redact;
         else if (a == L"ocr" && req.cmd) req.after = After::Ocr;
-        else if (a == L"delay" && i + 1 < argc) req.delayMs = std::clamp(_wtoi(argv[++i]), 0, 60) * 1000;
-        else if (req.cmd && GetFileAttributesW(argv[i]) != INVALID_FILE_ATTRIBUTES) req.file = argv[i];
+        else if (a == L"delay" && i + 1 < args.size()) req.delayMs = std::clamp(_wtoi(args[++i].c_str()), 0, 60) * 1000;
+        else if (req.cmd && GetFileAttributesW(args[i].c_str()) != INVALID_FILE_ATTRIBUTES) req.file = args[i];
         else if (!req.cmd) {
             for (const auto& [name, id] : kAliases)
                 if (a == name) req.cmd = id;
             for (const auto& c : kCmds)  // any settings.ini hotkey name works too, e.g. CaptureRegionPin
                 if (!req.cmd && _wcsicmp(a.c_str(), c.key) == 0) req.cmd = c.id;
-            if (!req.cmd) req.error = L"Unknown command: " + std::wstring(argv[i]);
+            if (!req.cmd && i == 0 && GetFileAttributesW(args[i].c_str()) != INVALID_FILE_ATTRIBUTES) {
+                req.cmd = CmdEditLast;  // AtherScreenshot.exe picture.png opens it in the editor
+                req.file = args[i];
+            }
+            if (!req.cmd) req.error = L"Unknown command: " + args[i];
         }
     }
-    LocalFree(argv);
     return req;
 }
 
-void RunCli(const CliRequest& req) {
+// What an untrusted request may not do at all: send anything off the machine, or touch files.
+bool CliTouchesFiles(const CliRequest& req) {
+    if (!req.file.empty() || req.after == After::Upload) return true;
+    switch (req.cmd) {
+        case CmdRegionUpload: case CmdUploadLast: case CmdUploadFile: case CmdEditLast: case CmdPinLast:
+        case CmdOpenLast: case CmdOpenImage: case CmdRenameLast: return true;
+    }
+    for (const auto& a : req.args)
+        if (_wcsicmp(a.c_str(), L"--upload") == 0 || _wcsicmp(a.c_str(), L"/upload") == 0) return true;
+    return false;
+}
+
+std::wstring JoinArgs(const std::vector<std::wstring>& args) {
+    std::wstring s;
+    for (const auto& a : args) s += (s.empty() ? L"" : L" ") + a;
+    return s.size() > 200 ? s.substr(0, 200) + L"…" : s;
+}
+
+void RunCli(const CliRequest& req, bool trusted) {
     if (!req.error.empty())
         return ShowToast(L"Ather Screenshot command line", req.error +
                              L"\nUsage: AtherScreenshot.exe region|fullscreen|window|record|gif|stop|history|scroll|ruler|... "
                              L"[--pin|--edit|--upload|--redact|--ocr] [--delay N]",
                          nullptr, nullptr, 8000), void();
     if (!req.cmd) return;
+    if (!trusted) {
+        if (CliTouchesFiles(req))
+            return ShowToast(L"Blocked a request from a link or another app",
+                             L"“" + JoinArgs(req.args) + L"” can only be run from a command prompt.", nullptr, nullptr, 8000),
+                   void();
+        const std::wstring q = L"Run “" + JoinArgs(req.args) + L"”?\n\nA link or another app asked Ather Screenshot to run this command.";
+        SetForegroundWindow(g_hwnd);
+        if (MessageBoxW(nullptr, q.c_str(), kProductName, MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST |
+                                                               MB_SETFOREGROUND) != IDOK)
+            return;
+    }
     if (!req.file.empty()) {  // file-based commands
         if (req.cmd == CmdUploadLast) return UploadAndCopyLink(req.file);
         if (req.cmd == CmdEditLast || req.cmd == CmdPinLast) {
@@ -860,9 +1023,10 @@ void RunCli(const CliRequest& req) {
     g_cliAfterPending = req.after;
     if (req.delayMs) {
         g_delayedCmd = req.cmd;
+        g_delayedUntrusted = !trusted;
         SetTimer(g_hwnd, kDelayTimer, req.delayMs, nullptr);
     } else {
-        Execute(req.cmd, false);
+        Execute(req.cmd, false, !trusted);
     }
 }
 
@@ -944,9 +1108,19 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_COPYDATA: {
             auto* cds = reinterpret_cast<COPYDATASTRUCT*>(l);
             if (cds->dwData != kCopyDataCli || !cds->lpData) return FALSE;
-            std::wstring cmd(static_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
-            cmd = cmd.c_str();  // drop the terminator
-            RunOnUi([cmd] { RunCli(ParseCli(cmd)); });  // don't keep the sender blocked
+            std::wstring payload(static_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+            payload = payload.c_str();  // drop the terminator
+            // "<token>\x1e<command line>": only our own CLI started from a console knows the token.
+            const size_t sep = payload.find(L'\x1e');
+            if (sep == std::wstring::npos) return FALSE;
+            const std::wstring token = CliToken();
+            const bool tokenOk = !token.empty() && payload.compare(0, sep, token) == 0 && sep == token.size();
+            const std::wstring cmd = payload.substr(sep + 1);
+            RunOnUi([cmd, tokenOk] {  // don't keep the sender blocked
+                bool fromLink = false;
+                auto args = SplitArgs(cmd, &fromLink);
+                RunCli(ParseCli(args), tokenOk && !fromLink);
+            });
             return TRUE;
         }
         case WM_APP_TRAY:
@@ -961,8 +1135,8 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_TIMER:
             KillTimer(h, w);
-            if (w == kDeferTimer) Execute(g_deferredCmd, false);
-            else if (w == kDelayTimer) Execute(g_delayedCmd, false);
+            if (w == kDeferTimer) Execute(g_deferredCmd, false, g_deferredUntrusted);
+            else if (w == kDelayTimer) Execute(g_delayedCmd, false, g_delayedUntrusted);
             return 0;
         case WM_DESTROY:
             RemoveTrayIcon();
@@ -993,8 +1167,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &n);
         const bool writeIcon = n == 3 && _wcsicmp(av[1], L"--write-icon") == 0;
         const bool ok = writeIcon && WriteLogoIco(av[2]);
+        const bool selftest = n >= 2 && _wcsicmp(av[1], L"--selftest") == 0;
+        const std::wstring filter = selftest && n >= 3 ? av[2] : L"";
         LocalFree(av);
         if (writeIcon) return ok ? 0 : 1;
+        if (selftest) {  // unit tests (see selftest.h)
+            const int failures = test::Run(filter);
+            Gdiplus::GdiplusShutdown(gdipToken);
+            CoUninitialize();
+            return failures;
+        }
     }
     // Install / update / uninstall flow (when launched from Downloads etc.).
     if (int code = 0; RunInstallFlow(GetCommandLineW(), g_iconBig, &code)) return code;
@@ -1010,7 +1192,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             GetWindowThreadProcessId(other, &pid);
             AllowSetForegroundWindow(pid);
             if (argc > 1) {
-                std::wstring cmd = GetCommandLineW();
+                // Only a command typed in a console carries the token; launches by other apps and links don't.
+                std::wstring cmd = (InteractiveLaunch() ? CliToken() : std::wstring()) + L'\x1e' + GetCommandLineW();
                 COPYDATASTRUCT cds{kCopyDataCli, (DWORD)((cmd.size() + 1) * sizeof(wchar_t)), (PVOID)cmd.c_str()};
                 DWORD_PTR result = 0;
                 SendMessageTimeoutW(other, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 3000, &result);
@@ -1043,7 +1226,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                g_settings.Hotkey(L"CaptureRegion") + L" to capture  ·  " + g_settings.Hotkey(L"CommandPalette") +
                    L" for commands");
     }
-    if (argc > 1) RunCli(ParseCli(GetCommandLineW()));  // first launch with a command: run it too
+    if (argc > 1) {  // first launch with a command: run it too
+        bool fromLink = false;
+        auto args = SplitArgs(GetCommandLineW(), &fromLink);
+        RunCli(ParseCli(args), InteractiveLaunch() && !fromLink);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -1053,7 +1240,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     // Let an in-flight recording finalize so the file isn't left truncated.
     StopRecording(false);
-    for (ULONGLONG end = GetTickCount64() + 15000; RecorderBusy() && GetTickCount64() < end;) {
+    for (ULONGLONG end = GetTickCount64() + 20000; RecorderBusy() && GetTickCount64() < end;) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
         Sleep(10);
     }
@@ -1062,4 +1249,48 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CoUninitialize();
     if (mutex) CloseHandle(mutex);
     return 0;
+}
+
+// ---- tests ----
+
+ATHER_TEST(cli_link_arguments) {
+    auto a = ArgsFromUrl(L"atherscreenshot://region?pin&delay=3");
+    CHECK_EQ(a.size(), 4u);
+    CHECK(a[0] == L"region" && a[1] == L"--pin" && a[2] == L"--delay" && a[3] == L"3");
+    CHECK(ArgsFromUrl(L"atherscreenshot:fullscreen/") == std::vector<std::wstring>{L"fullscreen"});
+    bool link = false;
+    auto b = SplitArgs(L"AtherScreenshot.exe atherscreenshot://upload", &link);
+    CHECK(link && b.size() == 1 && b[0] == L"upload");
+    auto c = SplitArgs(L"\"C:\\x\\AtherScreenshot.exe\" region --pin", &link);
+    CHECK(!link && c.size() == 2 && c[1] == L"--pin");
+}
+
+ATHER_TEST(cli_untrusted_requests_never_touch_files) {
+    // Blocked outright: uploads, and anything that edits, pins or opens files.
+    for (const auto& args : std::vector<std::vector<std::wstring>>{
+             {L"upload"}, {L"region", L"--upload"}, {L"CaptureRegionUpload"}, {L"UploadFile"}, {L"edit"}, {L"pin"},
+             {L"open"}, {L"OpenImageInEditor"}, {L"RenameLastCapture"}, {L"edit", L"C:\\Windows\\win.ini"}})
+        CHECK(CliTouchesFiles(ParseCli(args)));
+    // Allowed after confirmation: captures, including --pin / --edit of the new capture.
+    for (const auto& args : std::vector<std::vector<std::wstring>>{
+             {L"region"}, {L"region", L"--pin"}, {L"fullscreen", L"--edit"}, {L"record"}, {L"history"}, {L"stop"}})
+        CHECK(!CliTouchesFiles(ParseCli(args)));
+    CHECK_EQ(ParseCli({L"region", L"--pin"}).after, After::Pin);
+    CHECK_EQ(ParseCli({L"gallery"}).cmd, (int)CmdHistory);
+    CHECK(!ParseCli({L"nonsense"}).error.empty());
+}
+
+ATHER_TEST(cli_token_is_private_and_stable) {
+    const std::wstring a = CliToken();
+    CHECK(a.size() >= 32);
+    CHECK(a == CliToken());
+    const std::wstring path = SupportFolder() + L"\\cli-token";
+    CHECK(GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES);
+    // The file's DACL is protected and has one entry: this user.
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    PACL dacl = nullptr;
+    CHECK(GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
+                                nullptr, &sd) == ERROR_SUCCESS);
+    CHECK(dacl && dacl->AceCount == 1);
+    if (sd) LocalFree(sd);
 }

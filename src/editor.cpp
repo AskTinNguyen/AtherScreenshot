@@ -573,6 +573,7 @@ private:
     int nextStep_ = 1;
     std::vector<State> undo_, redo_;
     bool dirty_ = false;
+    uint64_t version_ = 0;  // bumped on every change; an async save only clears dirty_ for the version it wrote
 
     // tool state
     Tool tool_ = Tool::Arrow;
@@ -787,6 +788,7 @@ void Editor::PushUndo() {
     if (undo_.size() > 200) undo_.erase(undo_.begin());
     redo_.clear();
     dirty_ = true;
+    ++version_;
 }
 
 void Editor::Restore(State st) {
@@ -798,6 +800,7 @@ void Editor::Restore(State st) {
     Compose();
     if (sizeChanged) FitView();
     dirty_ = true;
+    ++version_;
 }
 
 void Editor::Undo() {
@@ -1022,10 +1025,14 @@ void Editor::Copy() {
 void Editor::Save() {
     auto img = Export();
     std::wstring path = MakeCapturePath(g_defaults.capturesFolder);
-    dirty_ = false;
-    SavePngAsync(img, path, [path](bool ok) {
+    HWND h = hwnd;
+    const uint64_t version = version_;
+    SavePngAsync(img, path, [path, h, version](bool ok) {
         if (ok) ShowToast(L"Saved", FileNameOf(path), nullptr, [path] { OpenPath(path); }, 2200);
         else ShowToast(L"Save failed", path, nullptr, nullptr, 4000);
+        // Only a successful write counts as saved, and only if nothing changed while it was written.
+        auto* e = IsWindow(h) ? reinterpret_cast<Editor*>(GetWindowLongPtrW(h, GWLP_USERDATA)) : nullptr;
+        if (e && ok && e->version_ == version) e->dirty_ = false;
     });
 }
 
@@ -1133,6 +1140,12 @@ void Editor::OpenCommandPalette() {
 
 void Editor::OnLButtonDown(int x, int y) {
     SetFocus(hwnd);
+    // Any click commits the text being typed, except picking a color or size for it.
+    bool styling = false;
+    for (const auto& b : buttons_)
+        if (PtInRect(&b.r, {x, y})) styling = b.kind == Button::KColor || b.kind == Button::KWidth;
+    const bool wasTexting = texting_;
+    if (texting_ && !styling) CommitText();
     for (const auto& b : buttons_) {
         if (!PtInRect(&b.r, {x, y})) continue;
         switch (b.kind) {
@@ -1145,10 +1158,7 @@ void Editor::OnLButtonDown(int x, int y) {
     }
     if (y < S(kToolbarH) || y >= client_.bottom - S(kStatusH)) return;
     const gp::PointF p = ToImg(x, y);
-    if (texting_) {
-        CommitText();
-        if (tool_ != Tool::Text) return;
-    }
+    if (wasTexting && tool_ != Tool::Text) return;  // that click only finished the text
     Annot a;
     a.type = tool_;
     a.color = kColors[color_];

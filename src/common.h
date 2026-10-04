@@ -87,6 +87,9 @@ RECT MonitorRectAt(POINT pt, bool workArea = false);
 float DpiScaleAt(POINT pt);
 bool IsOwnWindow(HWND hwnd);
 std::wstring FileNameOf(const std::wstring& path);
+// %APPDATA%\AtherScreenshot (created), or ATHER_SUPPORT_DIR when set: tests point it at a temp folder so
+// they never touch the real settings or library.
+std::wstring SupportFolder();
 
 // Body text: Segoe UI Variable (Windows 11), Segoe UI elsewhere.
 HFONT MakeFont(int px, int weight = FW_NORMAL, const wchar_t* face = nullptr);

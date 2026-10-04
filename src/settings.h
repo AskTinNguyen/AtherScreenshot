@@ -8,7 +8,9 @@ struct HotkeyDef {
     const wchar_t* defaultValue;
 };
 
-// "Ctrl+Shift+K", "PrintScreen", "Alt+F1" ... -> MOD_* flags + virtual key.
+// Needs Ctrl, Alt or Win, unless the key is an F-key, PrintScreen, Pause or ScrollLock.
+bool HotkeyAllowed(UINT mods, UINT vk);
+// "Ctrl+Shift+K", "PrintScreen", "Alt+F1" ... -> MOD_* flags + virtual key. Fails for keys HotkeyAllowed rejects.
 bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk);
 // Inverse of ParseHotkey; empty if the key can't be used as a hotkey.
 std::wstring HotkeyToText(UINT mods, UINT vk);

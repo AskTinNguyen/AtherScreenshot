@@ -7,11 +7,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <set>
 #include <thread>
 
 using Microsoft::WRL::ComPtr;
 
 namespace ather {
+
+// Names handed out for captures whose files aren't written yet, so two quick captures never share one.
+static std::mutex g_reservedMu;
+static std::set<std::wstring> g_reserved;
 
 static bool OpenClipboardRetry(HWND owner) {
     for (int i = 0; i < 20; ++i) {
@@ -156,6 +162,10 @@ void SavePngAsync(BitmapPtr img, std::wstring path, std::function<void(bool)> do
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool ok = SavePng(*img, path);
         if (SUCCEEDED(co)) CoUninitialize();
+        {
+            std::lock_guard lock(g_reservedMu);
+            g_reserved.erase(path);
+        }
         img.reset();
         if (done) RunOnUi([done = std::move(done), ok] { done(ok); });
         --g_pendingSaves;
@@ -190,10 +200,15 @@ static std::wstring SanitizeFileName(std::wstring s, size_t maxLen) {
     return s;
 }
 
+static bool Taken(const std::wstring& path) {
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    std::lock_guard lock(g_reservedMu);
+    return g_reserved.count(path) != 0;
+}
+
 static std::wstring UniquePath(const std::wstring& dir, const std::wstring& stem, const std::wstring& ext) {
     std::wstring path = dir + L"\\" + stem + L"." + ext;
-    for (int i = 2; GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES && i < 10000; ++i)
-        path = dir + L"\\" + stem + L" (" + std::to_wstring(i) + L")." + ext;
+    for (int i = 2; Taken(path) && i < 10000; ++i) path = dir + L"\\" + stem + L" (" + std::to_wstring(i) + L")." + ext;
     return path;
 }
 
@@ -222,7 +237,10 @@ std::wstring MakeCapturePath(const std::wstring& base, const wchar_t* ext, const
     if (name.empty()) name = L"Ather";
     std::wstring dir = base + L"\\" + sub;
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
-    return UniquePath(dir, name, ext);
+    std::wstring path = UniquePath(dir, name, ext);
+    std::lock_guard lock(g_reservedMu);
+    g_reserved.insert(path);
+    return path;
 }
 
 std::wstring RenameCapture(const std::wstring& path, const std::wstring& newName) {

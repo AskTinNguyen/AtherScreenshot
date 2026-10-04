@@ -44,7 +44,8 @@ class Sink {
 public:
     virtual ~Sink() = default;
     virtual HRESULT Begin(int w, int h, int fps, const std::wstring& path, bool audio) = 0;
-    virtual void Write(const uint32_t* px, int64_t t) = 0;  // t in 100 ns on the (pause-free) timeline
+    // t in 100 ns on the (pause-free) timeline. A failure ends the recording early but keeps what was written.
+    virtual HRESULT Write(const uint32_t* px, int64_t t) = 0;
     virtual void WriteAudio(const int16_t*, uint32_t, int64_t) {}
     virtual HRESULT End(int64_t t) = 0;
 };
@@ -88,22 +89,25 @@ public:
         return hr;
     }
 
-    void Write(const uint32_t* px, int64_t t) override {
+    HRESULT Write(const uint32_t* px, int64_t t) override {
         const DWORD bytes = (DWORD)w_ * h_ * 4;
         ComPtr<IMFMediaBuffer> buf;
         ComPtr<IMFSample> sample;
         BYTE* dst = nullptr;
-        if (FAILED(MFCreateMemoryBuffer(bytes, &buf)) || FAILED(buf->Lock(&dst, nullptr, nullptr))) return;
+        HRESULT hr = MFCreateMemoryBuffer(bytes, &buf);
+        if (SUCCEEDED(hr)) hr = buf->Lock(&dst, nullptr, nullptr);
+        if (FAILED(hr)) return hr;
         MFCopyImage(dst, w_ * 4, reinterpret_cast<const BYTE*>(px), w_ * 4, w_ * 4, h_);
         buf->Unlock();
         buf->SetCurrentLength(bytes);
-        if (FAILED(MFCreateSample(&sample))) return;
+        if (FAILED(hr = MFCreateSample(&sample))) return hr;
         sample->AddBuffer(buf.Get());
         sample->SetSampleTime(t);
         sample->SetSampleDuration(frameDur_);
         std::lock_guard lock(mu_);
-        writer_->WriteSample(stream_, sample.Get());
-        ++frames_;
+        hr = writer_->WriteSample(stream_, sample.Get());
+        if (SUCCEEDED(hr)) ++frames_;
+        return hr;
     }
 
     void WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t) override {
@@ -169,14 +173,16 @@ public:
         return S_OK;
     }
 
-    void Write(const uint32_t* px, int64_t t) override {
+    HRESULT Write(const uint32_t* px, int64_t t) override {
         const size_t n = (size_t)w_ * h_;
-        if (!last_.empty() && memcmp(last_.data(), px, n * 4) == 0) return;  // unchanged: the previous frame just lasts longer
+        if (!last_.empty() && memcmp(last_.data(), px, n * 4) == 0) return S_OK;  // unchanged: the previous frame just lasts longer
         last_.assign(px, px + n);
         std::lock_guard lock(m_);
-        if (q_.size() >= 6) return;  // encoder behind: drop, timestamps keep playback speed right
+        if (FAILED(hr_)) return hr_;  // the encoder gave up (disk full...): stop recording
+        if (q_.size() >= 6) return S_OK;  // encoder behind: drop, timestamps keep playback speed right
         q_.push_back({last_, t});
         cv_.notify_one();
+        return S_OK;
     }
 
     HRESULT End(int64_t t) override {
@@ -310,7 +316,7 @@ private:
     std::deque<Frame> q_;
     bool ending_ = false;
     int64_t endT_ = 0;
-    HRESULT hr_ = S_OK;
+    std::atomic<HRESULT> hr_{S_OK};
     std::vector<uint32_t> last_;
     ComPtr<IWICImagingFactory> f_;
     ComPtr<IWICStream> stream_;
@@ -372,6 +378,7 @@ void Run(Session* s) {
     if (SUCCEEDED(hr)) hr = sink->Begin(s->outW, s->outH, s->opt.fps, s->opt.path, withAudio);
 
     int64_t lastT = 0;
+    std::wstring stopReason;  // the recording ended by itself; the footage is still saved
     if (SUCCEEDED(hr)) {
         auto raw = Bitmap::Create(s->outW, s->outH);
         auto frame = Bitmap::Create(s->outW, s->outH);  // raw + click/key overlays
@@ -391,6 +398,11 @@ void Run(Session* s) {
             MemDC mem(raw->Handle(), screen);
             if (s->scaled) SetStretchBltMode(mem, COLORONCOLOR);
             while (!s->stop) {
+                // A followed window that closes ends the recording; what was captured is kept.
+                if (s->opt.window && !IsWindow(s->opt.window)) {
+                    stopReason = L"The window was closed.";
+                    break;
+                }
                 if (!s->clock.Paused()) {
                     if (wgc) {
                         wgc->Grab(raw->Bits());  // no new frame = screen unchanged, reuse the previous one
@@ -413,7 +425,12 @@ void Run(Session* s) {
                         px = frame->Bits();
                     }
                     lastT = s->clock.ActiveTicks100ns(RecClock::Now());
-                    sink->Write(px, lastT);
+                    if (HRESULT whr = sink->Write(px, lastT); FAILED(whr)) {  // keep what's written so far
+                        wchar_t msg[96];
+                        swprintf_s(msg, L"Couldn't write more frames (0x%08lX).", (unsigned long)whr);
+                        stopReason = msg;
+                        break;
+                    }
                     if (!res.thumb) {
                         res.thumb = Bitmap::Create(s->outW, s->outH);
                         memcpy(res.thumb->Bits(), px, bytes);
@@ -454,6 +471,7 @@ void Run(Session* s) {
         }
     } else {
         res.ok = true;
+        if (!stopReason.empty()) res.warning = L"Stopped early: " + stopReason + (res.warning.empty() ? L"" : L" " + res.warning);
         WIN32_FILE_ATTRIBUTE_DATA fa{};
         if (GetFileAttributesExW(s->opt.path.c_str(), GetFileExInfoStandard, &fa))
             res.bytes = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
