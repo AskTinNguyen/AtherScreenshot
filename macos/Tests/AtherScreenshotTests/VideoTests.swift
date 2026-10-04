@@ -102,7 +102,15 @@ final class VideoTests: XCTestCase {
         try await Task.sleep(nanoseconds: 1_200_000_000)
         await MainActor.run {
             let e = VideoEditor.instances.last!
-            e.selected = e.edit.marks[2].id
+            e.edit.captions[0].center = CGPoint(x: 0.5, y: 0.62)
+            e.edit.captionLook = .pill
+            e.edit.captionColor = 2
+            e.edit.captionEdge = 4
+            e.selected = e.edit.captions[0].id
+        }
+        try await Task.sleep(nanoseconds: 600_000_000)   // the paused preview redraws with the new caption style
+        await MainActor.run {
+            let e = VideoEditor.instances.last!
             let v = e.window.contentView!
             v.layoutSubtreeIfNeeded()
             let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
@@ -114,6 +122,34 @@ final class VideoTests: XCTestCase {
             p.arguments = ["-x", "-o", "-l\(e.window.windowNumber)", URL(fileURLWithPath: out).appendingPathComponent("ui-video-editor-live.png").path]
             try? p.run()
             p.waitUntilExit()
+            e.dirty = false
+            e.window.close()
+        }
+    }
+
+    // Picking an animation updates the menu right away (it used to keep the old label).
+    func testAnimationMenuConfirmsChoice() async throws {
+        let clip = try await makeClip()
+        await MainActor.run { _ = NSApplication.shared; VideoEditor.open(clip) }
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        await MainActor.run {
+            let e = VideoEditor.instances.last!
+            e.seek(1)
+            e.addMark(.box)
+            func menu() -> NSPopUpButton? {
+                func find(_ v: NSView) -> NSPopUpButton? {
+                    if let p = v as? NSPopUpButton, p.itemTitle(at: 0).hasPrefix("Animation") { return p }
+                    for s in v.subviews { if let f = find(s) { return f } }
+                    return nil
+                }
+                return find(e.window.contentView!)
+            }
+            XCTAssertEqual(menu()?.itemTitle(at: 0), "Animation: Auto (Draw on)")
+            let pop = menu()!.itemArray.first { $0.title == "Pop" }!
+            _ = (pop.target as! MenuAction).fire()
+            XCTAssertEqual(menu()?.itemTitle(at: 0), "Animation: Pop")
+            XCTAssertEqual(menu()?.itemArray.first { $0.title == "Pop" }?.state, .on)
+            XCTAssertEqual(e.edit.marks.last?.style, .pop)
             e.dirty = false
             e.window.close()
         }

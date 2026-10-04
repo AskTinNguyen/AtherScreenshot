@@ -151,4 +151,33 @@ final class MarkupTests: XCTestCase {
         XCTAssertEqual(img.width, 320)
         XCTAssertGreaterThan(px(img, 5, 5).brightnessComponent, 0.9)              // white card fills the cropped frame
     }
+
+    func testCaptionDragPositionAndColors() {
+        var e = edit([])
+        e.captions = [Caption(start: 1, end: 3, text: "Moved")]
+        let base = FrameRenderer(edit: e, full: size, preview: false).captionImage(e.captions[0], in: size)!.1
+        XCTAssertGreaterThan(base.minY, size.height * 0.7)                    // bottom by default
+        e.captions[0].center = CGPoint(x: 0.25, y: 0.2)
+        let moved = FrameRenderer(edit: e, full: size, preview: false).captionImage(e.captions[0], in: size)!.1
+        XCTAssertEqual(moved.midX, size.width * 0.25, accuracy: 2)
+        XCTAssertEqual(moved.midY, size.height * 0.2, accuracy: 2)
+        e.captions[0].center = CGPoint(x: 1, y: 1)                           // kept on screen
+        let edge = FrameRenderer(edit: e, full: size, preview: false).captionImage(e.captions[0], in: size)!.1
+        XCTAssertLessThanOrEqual(edge.maxX, size.width + 1)
+        XCTAssertLessThanOrEqual(edge.maxY, size.height + 1)
+
+        // Text and box colors: a red box behind blue text.
+        e.captions[0].center = nil
+        e.captionEdge = 0
+        e.captionColor = 4
+        let img = FrameRenderer(edit: e, full: size, preview: false).captionImage(e.captions[0], in: size)!.0
+        var reds = 0, blues = 0
+        for x in stride(from: 0, to: img.width, by: 2) { for y in stride(from: 0, to: img.height, by: 2) {
+            let c = img.color(atPixel: CGPoint(x: x, y: y))!.usingColorSpace(.sRGB)!
+            if c.redComponent > 0.5 && c.blueComponent < 0.3 { reds += 1 }
+            if c.blueComponent > 0.6 && c.redComponent < 0.3 { blues += 1 }
+        } }
+        XCTAssertGreaterThan(reds, 20)
+        XCTAssertGreaterThan(blues, 5)
+    }
 }

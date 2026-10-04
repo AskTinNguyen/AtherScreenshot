@@ -15,6 +15,7 @@ struct Caption: Equatable {
     var end: Double
     var text: String
     var position = CaptionPosition.bottom
+    var center: CGPoint?            // dragged on the video: center as a fraction of the frame; overrides `position`
     var words: [CaptionWord] = []   // from auto captions: when each word is spoken
 }
 
@@ -36,14 +37,17 @@ struct VideoEdit: Equatable {
     var speed: Double = 1
     var muted = false
     var captions: [Caption] = []
-    var captionSize = 1        // small, medium, large
+    var captionSize = 2        // 0…4
+    var captionColor = 6       // text, index into kColors (white)
+    var captionEdge = 7        // box, bar or outline color (black)
     var marks: [Mark] = []     // text, emoji, callouts, blur, zoom, title cards
     var captionLook = CaptionLook.pill
     var captionStyle = AnimStyle.auto
     var highlightWords = true  // auto captions: the spoken word lights up
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
-    static let captionScale: [CGFloat] = [0.034, 0.045, 0.06]
+    static let captionScale: [CGFloat] = [0.03, 0.037, 0.045, 0.055, 0.068]
+    static let captionSizes = ["Extra small", "Small", "Medium", "Large", "Extra large"]
 
     var outputDuration: Double { max(0, trimEnd - trimStart) / speed }
 }
@@ -104,13 +108,14 @@ enum VideoExport {
         return Prepared(composition: comp, video: vc, size: renderer.out)
     }
 
-    static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill) -> [NSAttributedString.Key: Any] {
+    static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill,
+                                  color: NSColor = .white, edge: NSColor = .black) -> [NSAttributedString.Key: Any] {
         let p = NSMutableParagraphStyle()
         p.alignment = .center
         var a: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size, weight: look == .outline ? .heavy : .semibold),
-                                                .foregroundColor: NSColor.white.withAlphaComponent(dim ? 0.5 : 1), .paragraphStyle: p]
-        if look == .outline {   // white text with a dark edge, no box
-            a[.strokeColor] = NSColor.black
+                                                .foregroundColor: color.withAlphaComponent(dim ? 0.5 : 1), .paragraphStyle: p]
+        if look == .outline {   // text with an edge in the edge color, no box
+            a[.strokeColor] = edge
             a[.strokeWidth] = -2.5
             let sh = NSShadow()
             sh.shadowBlurRadius = size * 0.05
@@ -484,17 +489,30 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     // MARK: inspector row (whatever is selected)
 
-    private func rebuildInspector() {
+    func rebuildInspector() {
         for v in inspector.arrangedSubviews { inspector.removeArrangedSubview(v); v.removeFromSuperview() }
         inspectorActions = []
         let ci = selectedCaptionIndex, mi = selectedMarkIndex
         inspector.isHidden = ci == nil && mi == nil
         hint.isHidden = !inspector.isHidden
         if let ci {
-            inspector.addArrangedSubview(field(edit.captions[ci].text, "Caption text", tag: 1, width: 380))
-            inspector.addArrangedSubview(popup(CaptionPosition.allCases.map(\.label), edit.captions[ci].position.rawValue) { [weak self] i in
-                self?.updateCaption { $0.position = CaptionPosition(rawValue: i) ?? .bottom }
-            })
+            let c = edit.captions[ci]
+            inspector.addArrangedSubview(field(c.text, "Caption text", tag: 1, width: 300))
+            let pos = popup(CaptionPosition.allCases.map(\.label) + (c.center != nil ? ["Custom"] : []), c.center != nil ? 3 : c.position.rawValue) { [weak self] i in
+                guard i < 3 else { return }
+                self?.updateCaption { $0.position = CaptionPosition(rawValue: i) ?? .bottom; $0.center = nil }
+                self?.rebuildInspector()
+            }
+            pos.toolTip = "Or drag the caption on the video"
+            inspector.addArrangedSubview(pos)
+            // Style is shared by every caption, so they stay consistent.
+            let all = NSTextField(labelWithString: "All captions:")
+            all.font = Theme.font(11)
+            all.textColor = Theme.muted
+            inspector.addArrangedSubview(all)
+            inspector.addArrangedSubview(swatchPopup(edit.captionColor, prefix: "Text") { [weak self] i in self?.setCaptions { $0.captionColor = i } })
+            inspector.addArrangedSubview(swatchPopup(edit.captionEdge, prefix: edit.captionLook == .outline ? "Outline" : "Box") { [weak self] i in self?.setCaptions { $0.captionEdge = i } })
+            inspector.addArrangedSubview(popup(VideoEdit.captionSizes, edit.captionSize) { [weak self] i in self?.setCaptions { $0.captionSize = i } })
         } else if let mi {
             let m = edit.marks[mi]
             switch m.kind {
@@ -575,7 +593,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             return it
         }
         for st in [AnimStyle.auto] + m.kind.styles {
-            menu.addItem(item(st == .auto ? "Auto (\(m.kind.defaultStyle.label))" : st.label, on: m.style == st) { [weak self] in self?.updateMark { $0.style = st } })
+            menu.addItem(item(st == .auto ? "Auto (\(m.kind.defaultStyle.label))" : st.label, on: m.style == st) { [weak self] in self?.pickAnimation(m.id) { $0.style = st } })
         }
         if m.kind != .blur && m.kind != .pixelate {
             menu.addItem(.separator())
@@ -583,15 +601,15 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             h.isEnabled = false
             menu.addItem(h)
             for e in Emphasis.allCases {
-                menu.addItem(item(e.label, on: m.emphasis == e, indent: 1) { [weak self] in self?.updateMark { $0.emphasis = e } })
+                menu.addItem(item(e.label, on: m.emphasis == e, indent: 1) { [weak self] in self?.pickAnimation(m.id) { $0.emphasis = e } })
             }
         }
         menu.addItem(.separator())
-        menu.addItem(item("Different exit animation", on: m.exit != nil) { [weak self] in self?.updateMark { $0.exit = $0.exit == nil ? .fade : nil }; self?.rebuildInspector() })
+        menu.addItem(item("Different exit animation", on: m.exit != nil) { [weak self] in self?.pickAnimation(m.id) { $0.exit = $0.exit == nil ? .fade : nil } })
         if m.exit != nil {
             let sub = NSMenu()
             for st in m.kind.styles where st != .drawOn && st != .typewriter {
-                sub.addItem(item(st.label, on: m.exit == st) { [weak self] in self?.updateMark { $0.exit = st }; self?.rebuildInspector() })
+                sub.addItem(item(st.label, on: m.exit == st) { [weak self] in self?.pickAnimation(m.id) { $0.exit = st } })
             }
             let it = NSMenuItem(title: "Exit", action: nil, keyEquivalent: "")
             it.submenu = sub
@@ -604,6 +622,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             for i in self.edit.marks.indices where self.edit.marks[i].kind == m.kind {
                 self.edit.marks[i].style = m.style; self.edit.marks[i].exit = m.exit; self.edit.marks[i].emphasis = m.emphasis
             }
+            let n = self.edit.marks.filter { $0.kind == m.kind }.count
+            Toast.shared.show("Applied to \(n) \(n == 1 ? m.kind.label.lowercased() : m.kind.plural)", m.style == .auto ? "Auto" : m.style.label)
         })
         return p
     }
@@ -638,12 +658,40 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         item("Highlight the spoken word", on: edit.highlightWords) { [weak self] in self?.setCaptions { $0.highlightWords.toggle() } }
         menu.addItem(.separator())
         header("Size")
-        for (i, n) in ["Small", "Medium", "Large"].enumerated() { item("   " + n, on: edit.captionSize == i) { [weak self] in self?.setCaptions { $0.captionSize = i } } }
+        for (i, n) in VideoEdit.captionSizes.enumerated() { item("   " + n, on: edit.captionSize == i) { [weak self] in self?.setCaptions { $0.captionSize = i } } }
+        menu.addItem(.separator())
+        for (title, current, set) in [("Text color", edit.captionColor, { (e: inout VideoEdit, i: Int) in e.captionColor = i }),
+                                      (edit.captionLook == .outline ? "Outline color" : "Box color", edit.captionEdge, { (e: inout VideoEdit, i: Int) in e.captionEdge = i })] {
+            let sub = NSMenu()
+            for (i, n) in kColorNames.enumerated() {
+                let it = NSMenuItem(title: n, action: #selector(MenuAction.fire), keyEquivalent: "")
+                let a = MenuAction { [weak self] in self?.setCaptions { set(&$0, i) } }
+                a.tag = 1
+                actions.append(a)
+                it.target = a
+                it.state = current == i ? .on : .off
+                it.image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { r in kColors[i].setFill(); NSBezierPath(ovalIn: r.insetBy(dx: 1, dy: 1)).fill(); return true }
+                sub.addItem(it)
+            }
+            let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            it.submenu = sub
+            menu.addItem(it)
+        }
     }
 
     private func setCaptions(_ f: (inout VideoEdit) -> Void) {
         pushUndo()
         f(&edit)
+        if selectedCaptionIndex != nil { rebuildInspector() }
+    }
+
+    // Animation picks: update the menu (title and checkmark) and replay the item so the choice shows.
+    private func pickAnimation(_ id: UUID, _ f: (inout Mark) -> Void) {
+        guard let i = edit.marks.firstIndex(where: { $0.id == id }) else { return }
+        pushUndo()
+        f(&edit.marks[i])
+        rebuildInspector()
+        replay(edit.marks[i])
     }
 
     func replay(_ m: Mark) {
@@ -680,7 +728,11 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     private func colorPopup(_ selected: Int, prefix: String) -> NSPopUpButton {
-        let p = popup(kColorNames.map { "\(prefix): \($0)" }, selected) { [weak self] i in self?.updateMark { $0.color = i } }
+        swatchPopup(selected, prefix: prefix) { [weak self] i in self?.updateMark { $0.color = i } }
+    }
+
+    private func swatchPopup(_ selected: Int, prefix: String, _ run: @escaping (Int) -> Void) -> NSPopUpButton {
+        let p = popup(kColorNames.map { "\(prefix): \($0)" }, selected, run)
         for (i, it) in p.itemArray.enumerated() {
             let img = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { r in
                 kColors[i].setFill()
@@ -1013,7 +1065,7 @@ final class VideoStage: NSView {
     var playerLayer: AVPlayerLayer { playerView.playerLayer }
     // Guides and handles draw in a view above the video; a layer-backed view's own drawing sits under its sublayers.
     private let overlay = StageOverlay()
-    private enum Drag { case crop(CGPoint), move(UUID, CGPoint, Mark), handle(UUID, Int, Mark) }
+    private enum Drag { case crop(CGPoint), move(UUID, CGPoint, Mark), handle(UUID, Int, Mark), caption(UUID, CGPoint, CGRect) }
     private var drag: Drag?
 
     override init(frame: NSRect) {
@@ -1117,7 +1169,9 @@ final class VideoStage: NSView {
         }
         if let c = ed.edit.captions.first(where: { $0.active(t) && captionRect($0).contains(vp) }) {
             ed.selected = c.id
-            if e.clickCount == 2 { ed.focusFieldPublic() }
+            if e.clickCount == 2 { ed.focusFieldPublic(); return }
+            ed.pushUndo()
+            drag = .caption(c.id, vp, captionRect(c))
             return
         }
         if ed.selected != nil { ed.selected = nil } else { ed.togglePlay() }
@@ -1144,6 +1198,11 @@ final class VideoStage: NSView {
                 b = CGPoint(x: a.x + (b.x < a.x ? -W : W), y: a.y + (b.y < a.y ? -H : H))
             }
             ed.setCrop(Geo.norm(a, b))
+        case .caption(let id, let from, let r):
+            guard let i = ed.edit.captions.firstIndex(where: { $0.id == id }) else { return }
+            let v = ed.viewRect
+            let mid = CGPoint(x: r.midX + p.x - from.x, y: r.midY + p.y - from.y)
+            ed.edit.captions[i].center = CGPoint(x: min(1, max(0, (mid.x - v.minX) / v.width)), y: min(1, max(0, (mid.y - v.minY) / v.height)))
         case .move(let id, let from, let o):
             guard let i = ed.edit.marks.firstIndex(where: { $0.id == id }), o.kind != .title else { return }
             let dx = p.x - from.x, dy = p.y - from.y
@@ -1168,7 +1227,10 @@ final class VideoStage: NSView {
         }
     }
 
-    override func mouseUp(with e: NSEvent) { drag = nil }
+    override func mouseUp(with e: NSEvent) {
+        if case .caption = drag { editor?.rebuildInspector() }   // the position menu now reads "Custom"
+        drag = nil
+    }
 
     fileprivate func drawOverlay() {
         guard let ed = editor, let ctx = NSGraphicsContext.current?.cgContext else { return }

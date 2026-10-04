@@ -452,6 +452,10 @@ final class FrameRenderer {
     func captionImage(_ c: Caption, in size: CGSize, at t: Double? = nil, reveal: CGFloat = 1) -> (CGImage, CGRect)? {
         let whole = c.text.isEmpty ? "Type a caption…" : c.text
         let look = edit.captionLook
+        let textColor = kColors[min(max(0, edit.captionColor), kColors.count - 1)]
+        let edgeColor = kColors[min(max(0, edit.captionEdge), kColors.count - 1)]
+        let yellow = Theme.rgb(255, 214, 10)
+        let highlight = edit.captionColor == 2 ? (edgeColor.isDark ? NSColor.white : NSColor.black) : yellow   // stands out from yellow text too
         let fontSize = max(14, size.height * VideoEdit.captionScale[edit.captionSize]) * (look == .outline ? 1.25 : 1)
         let maxW = size.width * (look == .bar ? 0.92 : 0.86)
         // The spoken word lights up, when the caption still matches its transcription.
@@ -463,8 +467,8 @@ final class FrameRenderer {
         }
         let shown = typed(whole, (reveal * 30).rounded(.up) / 30)
         func attributed(_ s: String) -> NSAttributedString {
-            let a = NSMutableAttributedString(string: s, attributes: VideoExport.captionAttributes(fontSize, dim: c.text.isEmpty, look: look))
-            if let hot, hot.upperBound <= s.endIndex { a.addAttribute(.foregroundColor, value: Theme.rgb(255, 214, 10), range: NSRange(hot, in: s)) }
+            let a = NSMutableAttributedString(string: s, attributes: VideoExport.captionAttributes(fontSize, dim: c.text.isEmpty, look: look, color: textColor, edge: edgeColor))
+            if let hot, hot.upperBound <= s.endIndex { a.addAttribute(.foregroundColor, value: highlight, range: NSRange(hot, in: s)) }
             return a
         }
         let tb = attributed(whole).boundingRect(with: CGSize(width: maxW, height: 10_000), options: [.usesLineFragmentOrigin])
@@ -472,15 +476,20 @@ final class FrameRenderer {
         var w = ceil(tb.width) + pad * 2, h = ceil(tb.height) + pad * 1.2
         if look == .bar { w = size.width }
         let margin = look == .bar ? 0 : size.height * 0.06
-        let y: CGFloat = c.position == .top ? margin : c.position == .middle ? (size.height - h) / 2 : size.height - margin - h
-        let r = CGRect(x: ((size.width - w) / 2).rounded(), y: y.rounded(), width: w.rounded(.up), height: h.rounded(.up))
-        let key = "c|\(shown)|\(whole)|\(r.size)|\(fontSize)|\(look)|\(hot.map { "\($0)" } ?? "")"
+        var y: CGFloat = c.position == .top ? margin : c.position == .middle ? (size.height - h) / 2 : size.height - margin - h
+        var x = (size.width - w) / 2
+        if let p = c.center {   // dragged: kept fully on screen
+            x = look == .bar ? 0 : min(max(0, p.x * size.width - w / 2), size.width - w)
+            y = min(max(0, p.y * size.height - h / 2), size.height - h)
+        }
+        let r = CGRect(x: x.rounded(), y: y.rounded(), width: w.rounded(.up), height: h.rounded(.up))
+        let key = "c|\(shown)|\(whole)|\(r.size)|\(fontSize)|\(look)|\(hot.map { "\($0)" } ?? "")|\(edit.captionColor)|\(edit.captionEdge)"
         guard let img = cached(key, {
             guard let ctx = makeContext(width: Int(r.width), height: Int(r.height)) else { return nil }
             if look != .outline {
                 let radius = look == .bar ? 0 : fontSize * 0.35
                 ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: r.size), cornerWidth: radius, cornerHeight: radius, transform: nil))
-                ctx.setFillColor(NSColor.black.withAlphaComponent(look == .bar ? 0.7 : 0.62).cgColor)
+                ctx.setFillColor(edgeColor.withAlphaComponent(look == .bar ? 0.7 : 0.62).cgColor)
                 ctx.fillPath()
             }
             withNSContext(ctx, flipped: true) {
