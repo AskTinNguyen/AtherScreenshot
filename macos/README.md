@@ -2,6 +2,10 @@
 
 Native Swift/AppKit port of the Windows app: a menu-bar agent that uses ScreenCaptureKit for capture and recording, Vision for OCR, AVFoundation for MP4, ImageIO for GIF and Carbon for global hotkeys. It has no dependencies, needs macOS 14 or later, and builds to a ~1.6 MB binary.
 
+## Download
+
+[AtherScreenshot-0.0.1-macOS.dmg](../downloads/AtherScreenshot-0.0.1-macOS.dmg) — macOS 14 or later, Apple silicon and Intel. Open the DMG and drag Ather Screenshot to Applications. The build is ad-hoc signed, not notarized, so the first launch is blocked: open System Settings › Privacy & Security and click "Open Anyway" (or run `xattr -dr com.apple.quarantine "/Applications/Ather Screenshot.app"`). Then allow Screen Recording when asked.
+
 ## Build
 
 ```

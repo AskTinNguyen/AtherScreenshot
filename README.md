@@ -2,7 +2,7 @@
 
 A tiny, fast, personal ShareX replacement for Windows 11. Native C++20 + Win32/GDI/GDI+/WIC/Media Foundation/WinRT. A single exe, no dependencies, a few MB of memory at idle.
 
-**macOS:** a native port lives in [`macos/`](macos/README.md) (`cd macos && ./build.sh`).
+**macOS:** a native app lives in [`macos/`](macos/README.md) (`cd macos && ./build.sh`). Download: [AtherScreenshot-0.0.1-macOS.dmg](downloads/AtherScreenshot-0.0.1-macOS.dmg) (macOS 14+, Apple silicon and Intel; checksum in [`downloads/SHA256SUMS-macOS.txt`](downloads/SHA256SUMS-macOS.txt)). The build isn't notarized: after dragging it to Applications, open it once, then allow it in System Settings › Privacy & Security › "Open Anyway".
 
 **Download:** grab `AtherScreenshot-Setup-<version>.exe` from the [latest release](https://github.com/AskTinNguyen/AtherScreenshot/releases/latest) and see [INSTALL.md](INSTALL.md).
 

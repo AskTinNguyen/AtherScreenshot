@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity type="win32" name="Ather.AtherScreenshot" version="1.0.0.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="Ather.AtherScreenshot" version="0.0.1.0" processorArchitecture="amd64"/>
   <description>Ather Screenshot</description>
   <!-- asInvoker: never ask for admin. Also stops Windows' "installer detection" from elevating an exe named *Setup*. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
