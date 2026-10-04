@@ -7,6 +7,7 @@ bool CopyImageToClipboard(HWND owner, const Bitmap& img);
 bool CopyTextToClipboard(HWND owner, const std::wstring& text);
 // CF_HDROP, so the file can be pasted into Explorer, chat apps, etc.
 bool CopyFileToClipboard(HWND owner, const std::wstring& path);
+bool CopyFilesToClipboard(HWND owner, const std::vector<std::wstring>& paths);
 
 // Decodes any WIC-supported image; transparency is flattened onto white.
 BitmapPtr LoadImageFile(const std::wstring& path);
@@ -29,6 +30,10 @@ std::wstring MakeCapturePath(const std::wstring& baseFolder, const wchar_t* ext 
 std::wstring RenameCapture(const std::wstring& path, const std::wstring& newName);
 // Moves a file to the Recycle Bin (undoable).
 bool RecycleFile(const std::wstring& path);
+// Moves files to the Recycle Bin in one undoable step; returns the ones that are gone.
+std::vector<std::wstring> RecycleFiles(const std::vector<std::wstring>& paths, HWND owner = nullptr);
+// Opens Explorer with these files selected (they should share a folder; otherwise one window per folder).
+void RevealInExplorer(const std::vector<std::wstring>& paths);
 // Newest first. Images only (png/jpg), or also recordings (gif/mp4).
 std::vector<std::wstring> RecentCaptures(const std::wstring& baseFolder, size_t max, bool includeRecordings = false);
 bool IsImageFile(const std::wstring& path);

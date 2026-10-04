@@ -18,7 +18,7 @@ using std::min;
 
 #include "capture.h"
 #include "editor.h"
-#include "history.h"
+#include "gallery.h"
 #include "installer.h"
 #include "library.h"
 #include "logo.h"
@@ -133,7 +133,7 @@ const CmdDef kCmds[] = {
     {CmdRegionUpload, L"CaptureRegionUpload", L"Capture region and upload", L"share link imgur s3 url", 0xE898, L"Ctrl+Alt+U", true},
     {CmdUploadLast, L"UploadLastCapture", L"Upload last capture", L"share link imgur s3 url", 0xE898, L"", false},
     {CmdUploadFile, L"UploadFile", L"Upload a file…", L"share link imgur s3 url", 0xE898, L"", false},
-    {CmdHistory, L"History", L"Capture history", L"browse gallery recent search thumbnails library", 0xE81C, L"Ctrl+Alt+H", false},
+    {CmdHistory, L"History", L"Capture gallery", L"history browse recent search thumbnails library tags collections organize", 0xE81C, L"Ctrl+Alt+H", false},
     {CmdScrolling, L"CaptureScrolling", L"Scrolling capture (long page)", L"scroll stitch full page chat long", 0xE8CB, L"Ctrl+Alt+S", true},
     {CmdEditLast, L"EditLastCapture", L"Annotate last capture", L"edit editor draw markup", 0xE70F, L"", false},
     {CmdOpenImage, L"OpenImageInEditor", L"Open image in editor…", L"edit file annotate load", 0xE8E5, L"", false},
@@ -569,7 +569,17 @@ void OpenSettings() {
 }
 
 void OpenHistory() {
-    ShowHistory({g_settings.CapturesFolder(), g_iconBig, [](const std::wstring& path) { UploadAndCopyLink(path); }});
+    GalleryHost h;
+    h.folder = g_settings.CapturesFolder();
+    h.icon = g_iconBig;
+    h.regionHotkey = g_settings.Hotkey(L"CaptureRegion");
+    h.upload = [](const std::wstring& path) { UploadAndCopyLink(path); };
+    h.openImage = [](const std::wstring& path) {
+        if (auto img = LoadImageFile(path)) OpenEditor(img);
+        else Notify(L"Could not open image", FileNameOf(path));
+    };
+    h.openVideo = [](const std::wstring& path) { OpenPath(path); };
+    ShowGallery(h);
 }
 
 void StartScrolling() {
@@ -1179,10 +1189,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool ok = writeIcon && WriteLogoIco(av[2]);
         const bool selftest = n >= 2 && _wcsicmp(av[1], L"--selftest") == 0;
         const bool featureStats = n >= 3 && _wcsicmp(av[1], L"--feature-stats") == 0;
-        const std::wstring filter = (selftest || featureStats) && n >= 3 ? av[2] : L"";
+        const bool gallerySnaps = n >= 3 && _wcsicmp(av[1], L"--gallery-snapshots") == 0;
+        const std::wstring filter = (selftest || featureStats || gallerySnaps) && n >= 3 ? av[2] : L"";
         LocalFree(av);
         if (writeIcon) return ok ? 0 : 1;
         if (featureStats) return FeatureStats(filter);  // developer tool, see library_tests.cpp
+        if (gallerySnaps) return GallerySnapshots(filter);  // developer tool, see gallery.cpp
         if (selftest) {  // unit tests (see selftest.h)
             const int failures = test::Run(filter);
             Gdiplus::GdiplusShutdown(gdipToken);

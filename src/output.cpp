@@ -75,14 +75,19 @@ bool CopyTextToClipboard(HWND owner, const std::wstring& text) {
     return ok;
 }
 
-bool CopyFileToClipboard(HWND owner, const std::wstring& path) {
-    const size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);  // double-NUL terminated list
+bool CopyFileToClipboard(HWND owner, const std::wstring& path) { return CopyFilesToClipboard(owner, {path}); }
+
+bool CopyFilesToClipboard(HWND owner, const std::vector<std::wstring>& paths) {
+    std::wstring list;
+    for (const auto& p : paths) list += p + L'\0';
+    list += L'\0';  // double-NUL terminated list
+    const size_t bytes = sizeof(DROPFILES) + list.size() * sizeof(wchar_t);
     HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
     if (!g) return false;
     auto* df = static_cast<DROPFILES*>(GlobalLock(g));
     df->pFiles = sizeof(DROPFILES);
     df->fWide = TRUE;
-    memcpy(reinterpret_cast<BYTE*>(df) + sizeof(DROPFILES), path.c_str(), path.size() * sizeof(wchar_t));
+    memcpy(reinterpret_cast<BYTE*>(df) + sizeof(DROPFILES), list.data(), list.size() * sizeof(wchar_t));
     GlobalUnlock(g);
     if (!OpenClipboardRetry(owner)) {
         GlobalFree(g);
@@ -261,6 +266,46 @@ bool RecycleFile(const std::wstring& path) {
     op.pFrom = from.c_str();
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+}
+
+std::vector<std::wstring> RecycleFiles(const std::vector<std::wstring>& paths, HWND owner) {
+    std::wstring from;
+    for (const auto& p : paths) from += p + L'\0';
+    from += L'\0';
+    SHFILEOPSTRUCTW op{};
+    op.hwnd = owner;
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    SHFileOperationW(&op);
+    std::vector<std::wstring> gone;
+    for (const auto& p : paths)
+        if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) gone.push_back(p);
+    return gone;
+}
+
+void RevealInExplorer(const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return;
+    // Group by folder: SHOpenFolderAndSelectItems selects items inside one folder.
+    std::vector<std::pair<std::wstring, std::vector<std::wstring>>> byDir;
+    for (const auto& p : paths) {
+        const std::wstring dir = p.substr(0, p.find_last_of(L'\\'));
+        auto it = std::find_if(byDir.begin(), byDir.end(), [&](const auto& d) { return _wcsicmp(d.first.c_str(), dir.c_str()) == 0; });
+        if (it == byDir.end()) byDir.push_back({dir, {p}});
+        else it->second.push_back(p);
+    }
+    for (const auto& [dir, files] : byDir) {
+        PIDLIST_ABSOLUTE folder = ILCreateFromPathW(dir.c_str());
+        if (!folder) continue;
+        std::vector<PIDLIST_ABSOLUTE> items;
+        for (const auto& f : files)
+            if (auto id = ILCreateFromPathW(f.c_str())) items.push_back(id);
+        std::vector<PCUITEMID_CHILD> children;
+        for (auto id : items) children.push_back(ILFindLastID(id));
+        SHOpenFolderAndSelectItems(folder, (UINT)children.size(), children.data(), 0);
+        for (auto id : items) ILFree(id);
+        ILFree(folder);
+    }
 }
 
 struct Found {

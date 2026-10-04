@@ -16,7 +16,7 @@ constexpr UINT_PTR kCaretTimer = 1;
 constexpr wchar_t kIconFont[] = L"Segoe Fluent Icons";
 
 struct Match {
-    int item;
+    int item;  // -1: the "create" row
     int score;
     std::vector<int> pos;  // matched character positions in the title
 };
@@ -30,6 +30,7 @@ struct State {
     POINT lastMouse{-1, -1};
     bool caretOn = true, hiding = false;
     std::function<void(int)> onPick;
+    PaletteOptions opt;
     // text-prompt mode
     bool prompt = false;
     std::wstring promptMessage;
@@ -114,6 +115,14 @@ void Filter() {
     }
     if (!q.empty())
         std::stable_sort(g.results.begin(), g.results.end(), [](const Match& a, const Match& b) { return a.score > b.score; });
+    if (g.opt.onCreate && !q.empty()) {  // offer the typed text itself unless an item already has that name
+        std::wstring typed = g.query;
+        while (!typed.empty() && iswspace(typed.back())) typed.pop_back();
+        while (!typed.empty() && iswspace(typed.front())) typed.erase(0, 1);
+        const bool exists = std::any_of(g.items.begin(), g.items.end(),
+                                        [&](const PaletteItem& it) { return _wcsicmp(it.title.c_str(), typed.c_str()) == 0; });
+        if (!typed.empty() && !exists) g.results.insert(g.results.begin(), Match{-1, 0, {}});
+    }
     g.sel = 0;
     g.scroll = 0;
 }
@@ -187,7 +196,7 @@ void Paint(HDC hdc) {
     int caretX = tx;
     if (g.query.empty()) {
         SetTextColor(dc, theme::kMuted);
-        DrawTextW(dc, g.prompt ? L"Type a name…" : L"Search commands…", -1, &qr,
+        DrawTextW(dc, g.prompt ? L"Type a name…" : g.opt.placeholder.empty() ? L"Search commands…" : g.opt.placeholder.c_str(), -1, &qr,
                   DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     } else {
         SIZE sz{};
@@ -214,7 +223,9 @@ void Paint(HDC hdc) {
         const int idx = g.scroll + r;
         if (idx >= (int)g.results.size()) break;
         const Match& m = g.results[idx];
-        const PaletteItem& it = g.items[m.item];
+        PaletteItem created;
+        if (m.item < 0) created = {-1, g.opt.createLabel + L" “" + g.query + L"”", L"↵", L"", 0xE710};
+        const PaletteItem& it = m.item < 0 ? created : g.items[m.item];
         const bool selected = idx == g.sel;
         RECT row{S(kPad), top + r * rowH, rc.right - S(kPad), top + (r + 1) * rowH};
         const int cy = (row.top + row.bottom) / 2;
@@ -293,6 +304,13 @@ void Refresh(bool refilter) {
 
 void Pick(int idx) {
     if (idx < 0 || idx >= (int)g.results.size()) return;
+    if (g.results[idx].item < 0) {
+        auto create = g.opt.onCreate;
+        std::wstring text = g.query;
+        HidePalette(true);
+        if (create) create(text);
+        return;
+    }
     int id = g.items[g.results[idx].item].id;
     auto cb = g.onPick;
     HidePalette(true);
@@ -456,7 +474,7 @@ void Present();
 
 }  // namespace
 
-void ShowPalette(std::vector<PaletteItem> items, std::function<void(int)> onPick) {
+void ShowPalette(std::vector<PaletteItem> items, std::function<void(int)> onPick, const PaletteOptions& options) {
     EnsureWindow();
     if (IsWindowVisible(g.hwnd)) {
         HidePalette(true);
@@ -466,6 +484,7 @@ void ShowPalette(std::vector<PaletteItem> items, std::function<void(int)> onPick
     g.onSubmit = nullptr;
     g.items = std::move(items);
     g.onPick = std::move(onPick);
+    g.opt = options;
     g.query.clear();
     Present();
 }
@@ -478,6 +497,7 @@ void ShowTextPrompt(const std::wstring& message, const std::wstring& initial, st
     g.onSubmit = std::move(onSubmit);
     g.items.clear();
     g.onPick = nullptr;
+    g.opt = {};
     g.query = initial;
     Present();
 }

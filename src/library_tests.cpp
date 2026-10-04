@@ -128,7 +128,7 @@ int FeatureStats(const std::wstring& folder) {
     auto halves = [](const std::vector<float>& a, const std::vector<float>& b, double* hist, double* dct) {
         double x = 0, y = 0;
         for (size_t i = 0; i < 64; ++i) x += (double)a[i] * b[i];
-        for (size_t i = 64; i < a.size(); ++i) y += (double)a[i] * b[i];
+        for (size_t i = 64; i < 64 + 255 && i < a.size(); ++i) y += (double)a[i] * b[i];
         *hist = x;
         *dct = y;
     };

@@ -441,19 +441,32 @@ std::vector<PaletteColor> Palette(const Bitmap& img, int k) {
 // embedding (the Mac app uses Vision's feature print), so this combines two cheap, size-independent views:
 //   * a 4×4×4 RGB colour histogram (square-rooted, i.e. Hellinger) - what colours, how much of each
 //   * the 255 AC coefficients of a 16×16 grayscale DCT (DC removed) - the layout
+//   * the mean colour of each cell of a 4×4 grid - where the colours are (two screens with the same layout in
+//     different colours must not look like copies)
 // Each half is unit-length; the halves are weighted kHistW²/kDctW² and the whole vector is unit-length, so
-// cosine similarity is a dot product. FeatureDistance scales (1 - cos) by kScale.
+// cosine similarity is a dot product. FeatureDistance is (1 - cos) × kScale plus the grid's RMS colour
+// difference × kGridScale.
 // Calibration (`--feature-stats` on 29 real screenshots, 406 pairs): a half-size re-encoded copy scores
-// ≤ 0.011; different captures have a median of 1.1 and a 5th percentile of 0.53; of the 4 pairs under 0.3,
-// only the one that was a real near-duplicate also had a dHash within 10 bits. That fits the Mac thresholds:
+// ≤ 0.022; different captures have a median of 1.19 and a 5th percentile of 0.59; of the 2 pairs under 0.3,
+// only the one that was a real near-duplicate also had a dHash within 10 bits. Synthetic "cards" with one
+// layout in different colours (the gallery snapshots) stay apart thanks to the colour grid. That fits the Mac thresholds:
 // duplicates need d ≤ 0.3 (plus dHash ≤ 10), and similarity is 100 × (1 − d / 1.25).
-constexpr float kHistW = 0.6f, kDctW = 0.8f, kScale = 1.6f;
+constexpr float kHistW = 0.6f, kDctW = 0.8f, kScale = 1.6f, kGridScale = 1.5f;
+constexpr size_t kHistAt = 0, kDctAt = 64, kGridAt = 64 + 255, kDims = 64 + 255 + 48;
 
 std::vector<float> Feature(const Bitmap& img) {
-    std::vector<float> v(64 + 255, 0.f);
+    std::vector<float> v(kDims, 0.f);
     auto thumb = Resample(img, 64, 64);
     auto gray = Resample(img, 16, 16);
-    if (!thumb || !gray) return {};
+    auto grid = Resample(img, 4, 4);
+    if (!thumb || !gray || !grid) return {};
+    for (int i = 0; i < 16; ++i) {  // where the colours are: mean RGB of a 4×4 grid
+        int r, g, b;
+        Rgb(grid->Bits()[i], r, g, b);
+        v[kGridAt + i * 3] = r / 255.f;
+        v[kGridAt + i * 3 + 1] = g / 255.f;
+        v[kGridAt + i * 3 + 2] = b / 255.f;
+    }
     for (int i = 0; i < 64 * 64; ++i) {
         int r, g, b;
         Rgb(thumb->Bits()[i], r, g, b);
@@ -486,21 +499,24 @@ std::vector<float> Feature(const Bitmap& img) {
             v[k++] = (float)s;
             dn += s * s;
         }
-    if (dn < 1e-9) {  // a flat image has no layout: leave that half at zero, scale the colours to unit length
-        for (int i = 0; i < 64; ++i) v[i] /= kHistW;
-        for (int i = 64; i < (int)v.size(); ++i) v[i] = 0;
+    if (dn < 1e-9) {  // a flat image has no layout: leave that part at zero, scale the colours to unit length
+        for (size_t i = kHistAt; i < kDctAt; ++i) v[i] /= kHistW;
+        for (size_t i = kDctAt; i < kGridAt; ++i) v[i] = 0;
         return v;
     }
     dn = std::sqrt(dn);
-    for (int i = 64; i < (int)v.size(); ++i) v[i] = (float)(v[i] / dn * kDctW);
+    for (size_t i = kDctAt; i < kGridAt; ++i) v[i] = (float)(v[i] / dn * kDctW);
     return v;
 }
 
 float FeatureDistance(const std::vector<float>& a, const std::vector<float>& b) {
-    if (a.size() != b.size() || a.empty()) return 2.f;
+    if (a.size() != kDims || b.size() != kDims) return 2.f;  // missing, or from an older indexer
     double dot = 0;
-    for (size_t i = 0; i < a.size(); ++i) dot += (double)a[i] * b[i];
-    return (float)std::max(0.0, (1 - dot) * kScale);
+    for (size_t i = kHistAt; i < kGridAt; ++i) dot += (double)a[i] * b[i];
+    double grid = 0;
+    for (size_t i = kGridAt; i < kDims; ++i) grid += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+    grid = std::sqrt(grid / 48);  // RMS colour difference per cell, 0…1
+    return (float)(std::max(0.0, 1 - dot) * kScale + grid * kGridScale);
 }
 
 IndexResult Index(const std::wstring& path, bool ocr) {
@@ -718,6 +734,16 @@ void Library::LoadFile() {
             at += dims * 4;
             features_[p] = std::move(f);
         }
+    }
+    // Vectors from an older indexer can't be compared with new ones: index those files again.
+    for (auto it = features_.begin(); it != features_.end();) {
+        if (it->second.size() == indexer::kDims) {
+            ++it;
+            continue;
+        }
+        if (auto m = meta_.find(it->first); m != meta_.end()) m->second.indexed = 0;
+        it = features_.erase(it);
+        featuresDirty_ = true;
     }
 }
 
