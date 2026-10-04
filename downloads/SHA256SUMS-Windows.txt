@@ -1,0 +1,2 @@
+f020acf5a439b38e7127f515bea3015dc64e091a1f0d27df1d26447651699285  AtherScreenshot-0.0.1-portable.zip
+e220ed4825aa8f17c1a85e2e254b9f4b7561a96d2df399473197d985c28f19b2  AtherScreenshot-Setup-0.0.1.exe
