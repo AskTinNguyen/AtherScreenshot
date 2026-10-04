@@ -60,10 +60,14 @@ final class VideoTests: XCTestCase {
         // The caption (1.2–2.5 s in the source → 0.1–0.75 s out) is burned in: a dark pill near the bottom.
         let mid = try await gen.image(at: CMTime(seconds: 0.4, preferredTimescale: 600)).image
         if let o = ProcessInfo.processInfo.environment["ATHER_TEST_OUT"] { try mid.pngData()!.write(to: URL(fileURLWithPath: o).appendingPathComponent("video-frame.png")) }
-        let pill = mid.color(atPixel: CGPoint(x: 160, y: 200 - 12 - 8))!.usingColorSpace(.sRGB)!
-        XCTAssertLessThan(pill.greenComponent, 0.55, "caption background")
+        func darkPixels(_ img: CGImage) -> Int {
+            stride(from: 150, to: 198, by: 4).reduce(0) { n, y in
+                n + (100..<220).filter { x in (img.color(atPixel: CGPoint(x: x, y: y))?.usingColorSpace(.sRGB)?.brightnessComponent ?? 1) < 0.6 }.count
+            }
+        }
+        XCTAssertGreaterThan(darkPixels(mid), 10, "caption background")
         let after = try await gen.image(at: CMTime(seconds: 0.9, preferredTimescale: 600)).image
-        XCTAssertGreaterThan(after.color(atPixel: CGPoint(x: 160, y: 200 - 12 - 8))!.usingColorSpace(.sRGB)!.blueComponent, 0.6, "caption gone")
+        XCTAssertEqual(darkPixels(after), 0, "caption gone")
 
         let gif = FileManager.default.temporaryDirectory.appendingPathComponent("ather-out-\(UUID().uuidString).gif")
         try await VideoExport.gif(asset, e, to: gif, fps: 10)
@@ -83,12 +87,20 @@ final class VideoTests: XCTestCase {
             e.edit.trimEnd = 2.6
             e.edit.crop = CGRect(x: 60, y: 30, width: 480, height: 300)
             e.edit.captions = [Caption(start: 0.5, end: 1.6, text: "Open Settings, then click Deploy"), Caption(start: 1.8, end: 2.4, text: "Done")]
+            e.edit.marks = [
+                Mark(kind: .arrow, start: 0.6, end: 2.0, a: CGPoint(x: 140, y: 250), b: CGPoint(x: 250, y: 160), color: 6, level: 2),
+                Mark(kind: .emoji, start: 0.6, end: 2.0, a: CGPoint(x: 420, y: 70), b: CGPoint(x: 490, y: 140), text: "🎉"),
+                Mark(kind: .bubble, start: 0.8, end: 2.2, a: CGPoint(x: 260, y: 60), b: CGPoint(x: 410, y: 110), text: "Click here", color: 6, level: 1),
+                Mark(kind: .step, start: 0.5, end: 2.5, a: CGPoint(x: 100, y: 80), b: CGPoint(x: 130, y: 110), color: 0, level: 2, step: 1),
+                Mark(kind: .blur, start: 0.5, end: 2.5, a: CGPoint(x: 300, y: 200), b: CGPoint(x: 420, y: 250)),
+                Mark(kind: .zoom, start: 1.8, end: 2.6, a: CGPoint(x: 200, y: 100), b: CGPoint(x: 360, y: 200)),
+            ]
             e.seek(1.0)
         }
-        try await Task.sleep(nanoseconds: 800_000_000)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
         await MainActor.run {
             let e = VideoEditor.instances.last!
-            e.selected = e.edit.captions.first?.id
+            e.selected = e.edit.marks[2].id
             let v = e.window.contentView!
             v.layoutSubtreeIfNeeded()
             let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!

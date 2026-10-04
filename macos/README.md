@@ -53,6 +53,8 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Crop:** press C and drag on the video; pick Free, 16:9, 4:3, 1:1 or 9:16 to keep a shape.
 - **Speed** 0.5–4× (audio keeps its pitch) and **Mute**.
 - **Captions:** T adds one at the playhead; type in the field, drag it on the timeline to move it or its edges to retime it, choose top, middle or bottom and the text size. **Auto captions** transcribes the speech with macOS speech recognition (on this Mac when supported) and splits it into short captions.
+- **Markup (Add ▾):** text, speech bubbles, emoji (quick picks or the full emoji picker), arrows, boxes, ellipses, step numbers, blur or pixelate (to hide private info for a stretch of time), zoom (smoothly zooms into a box, shown while playing) and full-screen title cards. Each item has its own bar on the timeline: drag to move, drag its edges to retime. On the video, drag to move and drag the handles to resize. Items can fade or pop in and out. Shortcuts: A arrow, R box, E emoji, N step, X blur, Z zoom.
+- The preview and the export use the same frame renderer, so what you see is what's saved.
 - **Save** (⌘S) writes a new MP4; **Save GIF** (⌘⇧S) writes a GIF. The original stays untouched, and the result stacks with it in the gallery.
 
 Space plays, ←/→ step a frame (⇧ a second), ⌫ deletes the selected caption, ⌘Z undoes.
@@ -108,4 +110,4 @@ Commands typed in a terminal run directly. Commands from `atherscreenshot://` li
 
 ## Layout (`Sources/AtherScreenshot`)
 
-`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, export) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.
+`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, markup UI) · `VideoRender` (frame renderer for preview and export) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

@@ -5,8 +5,9 @@ import ImageIO
 import Speech
 import UniformTypeIdentifiers
 
-// A small video editor for screen recordings: trim, crop, speed, mute and captions
-// (typed or transcribed on device), saved as a new MP4 or GIF next to the original.
+// A small video editor for screen recordings: trim, crop, speed, mute, captions (typed or
+// transcribed on device) and markup (text, emoji, callouts, blur, zoom, title cards),
+// saved as a new MP4 or GIF next to the original.
 
 struct Caption: Equatable {
     var id = UUID()
@@ -29,6 +30,7 @@ struct VideoEdit: Equatable {
     var muted = false
     var captions: [Caption] = []
     var captionSize = 1        // small, medium, large
+    var marks: [Mark] = []     // text, emoji, callouts, blur, zoom, title cards
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
     static let captionScale: [CGFloat] = [0.034, 0.045, 0.06]
@@ -80,80 +82,22 @@ enum VideoExport {
         let (natural, t, fps) = try await vt.load(.naturalSize, .preferredTransform, .nominalFrameRate)
         let shown = CGRect(origin: .zero, size: natural).applying(t)
         let full = CGRect(x: 0, y: 0, width: abs(shown.width), height: abs(shown.height))
-        var crop = (e.crop ?? full).intersection(full).integral
-        if crop.isNull || crop.width < 16 || crop.height < 16 { crop = full }
-        let size = CGSize(width: floor(crop.width / 2) * 2, height: floor(crop.height / 2) * 2)   // H.264 wants even sizes
 
-        let vc = AVMutableVideoComposition()
-        vc.renderSize = size
-        vc.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps > 1 ? min(60, fps.rounded()) : 30))
-        let ins = AVMutableVideoCompositionInstruction()
-        ins.timeRange = CMTimeRange(start: .zero, duration: comp.duration)
-        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: cv)
-        li.setTransform(t.concatenating(CGAffineTransform(translationX: -shown.minX - crop.minX, y: -shown.minY - crop.minY)), at: .zero)
-        ins.layerInstructions = [li]
-        vc.instructions = [ins]
-
-        let caps = e.captions.filter { $0.end > e.trimStart && $0.start < e.trimEnd && !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
-        if !caps.isEmpty {
-            // Built off the main thread: an explicit transaction makes sure the layers are committed.
-            CATransaction.begin()
-            defer { CATransaction.commit() }
-            let parent = CALayer(), videoLayer = CALayer()
-            parent.frame = CGRect(origin: .zero, size: size)
-            parent.isGeometryFlipped = true
-            videoLayer.frame = parent.frame
-            parent.addSublayer(videoLayer)
-            for c in caps {
-                let l = captionLayer(c.text, position: c.position, in: size, scale: VideoEdit.captionScale[e.captionSize])
-                // One keyframe track over the whole video: hidden, shown for the caption's time, hidden.
-                let total = max(0.1, comp.duration.seconds)
-                let on = max(0, c.start - e.trimStart) / e.speed, off = min(total, (min(c.end, e.trimEnd) - e.trimStart) / e.speed)
-                l.opacity = 0
-                let a = CAKeyframeAnimation(keyPath: "opacity")
-                a.values = [0, 1, 0]
-                a.keyTimes = [0, NSNumber(value: on / total), NSNumber(value: off / total), 1]   // discrete: one more time than values
-                a.calculationMode = .discrete
-                a.beginTime = AVCoreAnimationBeginTimeAtZero
-                a.duration = total
-                a.isRemovedOnCompletion = false
-                a.fillMode = .both
-                l.add(a, forKey: "show")
-                parent.addSublayer(l)
-            }
-            vc.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
+        // Every frame goes through the same renderer the preview uses.
+        let renderer = FrameRenderer(edit: e, full: full.size, preview: false)
+        let (start, speed) = (e.trimStart, e.speed)
+        let vc = AVMutableVideoComposition(asset: comp) { req in
+            req.finish(with: renderer.render(req.sourceImage, at: start + req.compositionTime.seconds * speed), context: nil)
         }
-        return Prepared(composition: comp, video: vc, size: size)
+        vc.renderSize = renderer.out
+        vc.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps > 1 ? min(60, fps.rounded()) : 30))
+        return Prepared(composition: comp, video: vc, size: renderer.out)
     }
 
-    // A caption pill: white text on a translucent dark background.
-    static func captionLayer(_ text: String, position: CaptionPosition, in size: CGSize, scale: CGFloat) -> CALayer {
-        let fontSize = max(14, size.height * scale)
-        let attrs = captionAttributes(fontSize)
-        let maxW = size.width * 0.86
-        let bounds = NSAttributedString(string: text, attributes: attrs).boundingRect(with: CGSize(width: maxW, height: 10_000), options: [.usesLineFragmentOrigin])
-        let pad = fontSize * 0.45
-        let w = ceil(bounds.width) + pad * 2, h = ceil(bounds.height) + pad * 1.2
-        let margin = size.height * 0.06
-        let y: CGFloat = position == .top ? margin : position == .middle ? (size.height - h) / 2 : size.height - margin - h
-        let box = CALayer()
-        box.frame = CGRect(x: (size.width - w) / 2, y: y, width: w, height: h)
-        box.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
-        box.cornerRadius = fontSize * 0.35
-        let tl = CATextLayer()
-        tl.string = NSAttributedString(string: text, attributes: attrs)
-        tl.isWrapped = true
-        tl.alignmentMode = .center
-        tl.contentsScale = 2
-        tl.frame = CGRect(x: pad, y: pad * 0.6, width: w - pad * 2, height: ceil(bounds.height) + 2)
-        box.addSublayer(tl)
-        return box
-    }
-
-    static func captionAttributes(_ size: CGFloat) -> [NSAttributedString.Key: Any] {
+    static func captionAttributes(_ size: CGFloat, dim: Bool = false) -> [NSAttributedString.Key: Any] {
         let p = NSMutableParagraphStyle()
         p.alignment = .center
-        return [.font: NSFont.systemFont(ofSize: size, weight: .semibold), .foregroundColor: NSColor.white, .paragraphStyle: p]
+        return [.font: NSFont.systemFont(ofSize: size, weight: .semibold), .foregroundColor: NSColor.white.withAlphaComponent(dim ? 0.5 : 1), .paragraphStyle: p]
     }
 
     static func run(_ s: AVAssetExportSession) async throws {
@@ -260,6 +204,7 @@ enum VideoExport {
 
 final class VideoEditor: NSObject, NSWindowDelegate {
     static var instances: [VideoEditor] = []
+    static let quickEmoji = ["✅", "❌", "⚠️", "👉", "👀", "💡", "🎉", "🔥", "⭐️", "❤️", "👍", "🤔"]
 
     let url: URL
     let asset: AVURLAsset
@@ -268,12 +213,15 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var duration: Double = 0
     var videoSize = CGSize(width: 16, height: 9)
     var edit = VideoEdit(trimEnd: 0) { didSet { if edit != oldValue { changed() } } }
-    var selected: UUID? { didSet { syncCaptionBar(); timeline.needsDisplay = true; stage.needsDisplay = true } }
+    var selected: UUID? { didSet { if selected != oldValue { rebuildInspector() }; timeline.needsDisplay = true; stage.needsDisplay = true } }
     var cropping = false { didSet { stage.needsDisplay = true; syncToolbar() } }
     var dirty = false
     private var undoStack: [VideoEdit] = []
     private var timeObserver: Any?
     private var busy = false
+    private var previewBox: RendererBox?
+    private var previewComposition: AVVideoComposition?
+    private var refreshPending = false
 
     private let stage = VideoStage()
     private let timeline = Timeline()
@@ -282,13 +230,14 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private let speedPopup = NSPopUpButton()
     private let sizePopup = NSPopUpButton()
     private let aspectPopup = NSPopUpButton()
+    private let addPopup = NSPopUpButton(frame: .zero, pullsDown: true)
     private let muteButton = NSButton()
     private let cropButton = NSButton()
-    private let captionField = NSTextField()
-    private let positionPopup = NSPopUpButton()
-    private let captionBar = NSStackView()
+    private let inspector = NSStackView()
     private let hint = NSTextField(labelWithString: "")
     private var actions: [MenuAction] = []
+    private var inspectorActions: [MenuAction] = []
+    private lazy var timelineHeight = timeline.heightAnchor.constraint(equalToConstant: Timeline.height)
 
     static func open(_ url: URL) {
         if let e = instances.first(where: { $0.url == url }) { activateApp(); e.window.makeKeyAndOrderFront(nil); return }
@@ -300,7 +249,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         asset = AVURLAsset(url: url)
         player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
         let vis = Geo.mouseScreen.visibleFrame
-        let size = NSSize(width: min(1180, vis.width * 0.9), height: min(820, vis.height * 0.9))
+        let size = NSSize(width: min(1240, vis.width * 0.92), height: min(880, vis.height * 0.92))
         window = NSWindow(contentRect: NSRect(x: vis.midX - size.width / 2, y: vis.midY - size.height / 2, width: size.width, height: size.height),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
@@ -309,7 +258,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = Theme.bg
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 900, height: 560)
+        window.minSize = NSSize(width: 980, height: 600)
         window.delegate = self
         stage.editor = self
         timeline.editor = self
@@ -333,9 +282,33 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         edit = VideoEdit(trimEnd: duration)
         undoStack = []
         dirty = false
+        // The preview runs every frame through the export renderer.
+        let box = RendererBox(FrameRenderer(edit: edit, full: videoSize, preview: true))
+        previewBox = box
+        if let vc = try? await AVMutableVideoComposition.videoComposition(with: asset, applyingCIFiltersWithHandler: { req in
+            req.finish(with: box.renderer.render(req.sourceImage, at: req.compositionTime.seconds), context: nil)
+        }) {
+            previewComposition = vc
+            player.currentItem?.videoComposition = vc
+        }
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] t in self?.tick(t.seconds) }
         timeline.loadThumbnails()
         changed()
+    }
+
+    // Hands the latest edit to the preview; while paused, re-renders the current frame.
+    private func refreshPreview() {
+        guard let box = previewBox else { return }
+        let r = FrameRenderer(edit: edit, full: videoSize, preview: true)
+        r.zoomInPreview = player.rate != 0
+        box.renderer = r
+        guard player.rate == 0, !refreshPending, let vc = previewComposition else { return }
+        refreshPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 30) { [weak self] in
+            guard let self else { return }
+            self.refreshPending = false
+            self.player.currentItem?.videoComposition = vc.mutableCopy() as? AVVideoComposition
+        }
     }
 
     // MARK: layout
@@ -347,15 +320,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         top.spacing = 8
         top.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
 
-        cropButton.title = "Crop"
-        cropButton.image = NSImage(systemSymbolName: "crop", accessibilityDescription: "Crop")
-        cropButton.imagePosition = .imageLeading
-        cropButton.contentTintColor = Theme.text
-        cropButton.attributedTitle = NSAttributedString(string: cropButton.title, attributes: [.foregroundColor: Theme.text, .font: Theme.font(12)])
-        cropButton.bezelStyle = .recessed
-        cropButton.setButtonType(.pushOnPushOff)
-        cropButton.toolTip = "Crop (C): drag on the video"
-        bind(cropButton) { [weak self] in self?.cropping.toggle() }
+        style(cropButton, "Crop", "crop", "Crop (C): drag on the video", toggle: true) { [weak self] in self?.cropping.toggle() }
         aspectPopup.addItems(withTitles: ["Free", "16:9", "4:3", "1:1", "9:16"])
         aspectPopup.bezelStyle = .recessed
         aspectPopup.toolTip = "Crop shape"
@@ -369,18 +334,27 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             self.edit.speed = VideoEdit.speeds[self.speedPopup.indexOfSelectedItem]
             if self.player.rate != 0 { self.player.rate = Float(self.edit.speed) }
         }
-        muteButton.bezelStyle = .recessed
-        muteButton.setButtonType(.pushOnPushOff)
-        muteButton.title = "Mute"
-        muteButton.image = NSImage(systemSymbolName: "speaker.slash", accessibilityDescription: "Mute")
-        muteButton.imagePosition = .imageLeading
-        muteButton.contentTintColor = Theme.text
-        muteButton.attributedTitle = NSAttributedString(string: muteButton.title, attributes: [.foregroundColor: Theme.text, .font: Theme.font(12)])
-        bind(muteButton) { [weak self] in guard let self else { return }; self.pushUndo(); self.edit.muted.toggle() }
+        style(muteButton, "Mute", "speaker.slash", "Remove the sound", toggle: true) { [weak self] in guard let self else { return }; self.pushUndo(); self.edit.muted.toggle() }
 
-        let addCaption = barButton("Caption", "captions.bubble", "Add a caption at the playhead (T)") { [weak self] in self?.addCaption() }
+        // One "Add" menu instead of a button per tool.
+        addPopup.bezelStyle = .recessed
+        addPopup.addItem(withTitle: "Add")
+        addPopup.item(at: 0)?.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add")
+        let entries: [(String, String, String, () -> Void)] = [("Caption", "captions.bubble", "T", { [weak self] in self?.addCaption() })]
+            + MarkKind.allCases.map { k in (k.label, k.symbol, k.key, { [weak self] in self?.addMark(k) }) }
+        for (title, symbol, key, run) in entries {
+            let it = NSMenuItem(title: key.isEmpty ? title : "\(title)    \(key)", action: #selector(MenuAction.fire), keyEquivalent: "")
+            it.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            let a = MenuAction(run)
+            actions.append(a)
+            it.target = a
+            addPopup.menu?.addItem(it)
+            if title == "Caption" || title == "Step number" || title == "Pixelate" { addPopup.menu?.addItem(.separator()) }
+        }
+        addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead"
+
         let auto = barButton("Auto captions", "waveform.badge.mic", "Transcribe speech into captions, on this Mac") { [weak self] in self?.autoCaptions() }
-        sizePopup.addItems(withTitles: ["Small text", "Medium text", "Large text"])
+        sizePopup.addItems(withTitles: ["Small captions", "Medium captions", "Large captions"])
         sizePopup.bezelStyle = .recessed
         bind(sizePopup) { [weak self] in guard let self else { return }; self.pushUndo(); self.edit.captionSize = self.sizePopup.indexOfSelectedItem }
 
@@ -399,27 +373,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addCaption, auto, sizePopup, spacer, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, sizePopup, spacer, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
-        // Caption editing row, shown while a caption is selected.
-        captionField.placeholderString = "Caption text"
-        captionField.font = Theme.font(13)
-        captionField.delegate = self
-        captionField.widthAnchor.constraint(greaterThanOrEqualToConstant: 380).isActive = true
-        positionPopup.addItems(withTitles: CaptionPosition.allCases.map(\.label))
-        positionPopup.bezelStyle = .recessed
-        bind(positionPopup) { [weak self] in
-            guard let self, let i = self.selectedIndex else { return }
-            self.pushUndo()
-            self.edit.captions[i].position = CaptionPosition(rawValue: self.positionPopup.indexOfSelectedItem) ?? .bottom
-        }
-        let del = barButton("Delete", "trash", "Delete caption (⌫)") { [weak self] in self?.deleteCaption() }
-        for v in [captionField, positionPopup, del] as [NSView] { captionBar.addArrangedSubview(v) }
-        captionBar.orientation = .horizontal
-        captionBar.spacing = 8
+        inspector.orientation = .horizontal
+        inspector.spacing = 8
         hint.font = Theme.font(11)
         hint.textColor = Theme.muted
-        hint.stringValue = "Space plays · I and O set the start and end · T adds a caption · C crops · ⌘Z undoes"
+        hint.stringValue = "Space plays · I and O trim · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · ⌘Z undo"
 
         playButton.bezelStyle = .regularSquare
         playButton.isBordered = false
@@ -430,8 +390,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         bind(playButton) { [weak self] in self?.togglePlay() }
         timeLabel.font = Theme.mono(11)
         timeLabel.textColor = Theme.textDim
+        timeLabel.maximumNumberOfLines = 2
 
-        for v in [top, stage, captionBar, hint, playButton, timeLabel, timeline] as [NSView] {
+        for v in [top, stage, inspector, hint, playButton, timeLabel, timeline] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
         }
@@ -443,25 +404,37 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             stage.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 8),
             stage.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
             stage.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
-            stage.bottomAnchor.constraint(equalTo: captionBar.topAnchor, constant: -8),
-            captionBar.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-            captionBar.bottomAnchor.constraint(equalTo: timeline.topAnchor, constant: -8),
-            captionBar.heightAnchor.constraint(equalToConstant: 26),
+            stage.bottomAnchor.constraint(equalTo: inspector.topAnchor, constant: -8),
+            inspector.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            inspector.bottomAnchor.constraint(equalTo: timeline.topAnchor, constant: -8),
+            inspector.heightAnchor.constraint(equalToConstant: 26),
+            inspector.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 14),
             hint.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-            hint.centerYAnchor.constraint(equalTo: captionBar.centerYAnchor),
+            hint.centerYAnchor.constraint(equalTo: inspector.centerYAnchor),
             playButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            playButton.centerYAnchor.constraint(equalTo: timeline.topAnchor, constant: 26),
+            playButton.topAnchor.constraint(equalTo: timeline.topAnchor, constant: 10),
             playButton.widthAnchor.constraint(equalToConstant: 30),
             timeLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 10),
             timeLabel.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 10),
             timeline.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 100),
             timeline.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
             timeline.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14),
-            timeline.heightAnchor.constraint(equalToConstant: 92),
+            timelineHeight,
         ])
         window.contentView = root
-        syncCaptionBar()
+        rebuildInspector()
         syncToolbar()
+    }
+
+    private func style(_ b: NSButton, _ title: String, _ symbol: String, _ tip: String, toggle: Bool, _ run: @escaping () -> Void) {
+        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        b.imagePosition = .imageLeading
+        b.bezelStyle = .recessed
+        if toggle { b.setButtonType(.pushOnPushOff) }
+        b.contentTintColor = Theme.text
+        b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: Theme.text, .font: Theme.font(12)])
+        b.toolTip = tip
+        bind(b, run)
     }
 
     private func bind(_ c: NSControl, _ run: @escaping () -> Void) {
@@ -473,12 +446,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     private func barButton(_ title: String, _ symbol: String, _ tip: String, _ run: @escaping () -> Void) -> NSButton {
         let b = NSButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage(), target: nil, action: nil)
-        b.bezelStyle = .recessed
-        b.imagePosition = .imageLeading
-        b.toolTip = tip
-        b.contentTintColor = Theme.text
-        b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: Theme.text, .font: Theme.font(12)])
-        bind(b, run)
+        style(b, title, symbol, tip, toggle: false, run)
         return b
     }
 
@@ -491,10 +459,128 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         return v
     }
 
+    // MARK: inspector row (whatever is selected)
+
+    private func rebuildInspector() {
+        for v in inspector.arrangedSubviews { inspector.removeArrangedSubview(v); v.removeFromSuperview() }
+        inspectorActions = []
+        let ci = selectedCaptionIndex, mi = selectedMarkIndex
+        inspector.isHidden = ci == nil && mi == nil
+        hint.isHidden = !inspector.isHidden
+        if let ci {
+            inspector.addArrangedSubview(field(edit.captions[ci].text, "Caption text", tag: 1, width: 380))
+            inspector.addArrangedSubview(popup(CaptionPosition.allCases.map(\.label), edit.captions[ci].position.rawValue) { [weak self] i in
+                self?.updateCaption { $0.position = CaptionPosition(rawValue: i) ?? .bottom }
+            })
+        } else if let mi {
+            let m = edit.marks[mi]
+            switch m.kind {
+            case .title:
+                inspector.addArrangedSubview(field(m.text, "Title", tag: 1, width: 240))
+                inspector.addArrangedSubview(field(m.subtitle, "Subtitle (optional)", tag: 2, width: 220))
+                inspector.addArrangedSubview(colorPopup(m.color, prefix: "Background"))
+            case .emoji:
+                inspector.addArrangedSubview(field(m.text, "Emoji", tag: 1, width: 70))
+                for e in VideoEditor.quickEmoji {
+                    let b = NSButton(title: e, target: nil, action: nil)
+                    b.bezelStyle = .recessed
+                    b.font = NSFont.systemFont(ofSize: 15)
+                    link(b) { [weak self] in self?.updateMark { $0.text = e } ; self?.rebuildInspector() }
+                    inspector.addArrangedSubview(b)
+                }
+                let more = NSButton(title: "More…", target: nil, action: nil)
+                more.bezelStyle = .recessed
+                link(more) { [weak self] in
+                    guard let self, let f = self.inspector.arrangedSubviews.first as? NSTextField else { return }
+                    self.window.makeFirstResponder(f)
+                    NSApp.orderFrontCharacterPalette(nil)
+                }
+                inspector.addArrangedSubview(more)
+            case .text, .bubble:
+                inspector.addArrangedSubview(field(m.text, m.kind == .bubble ? "Bubble text" : "Text", tag: 1, width: 300))
+                inspector.addArrangedSubview(colorPopup(m.color, prefix: m.kind == .bubble ? "Bubble" : "Color"))
+                inspector.addArrangedSubview(levelPopup(m.level))
+            case .arrow, .box, .ellipse, .step:
+                inspector.addArrangedSubview(colorPopup(m.color, prefix: "Color"))
+                inspector.addArrangedSubview(levelPopup(m.level))
+            case .blur, .pixelate:
+                inspector.addArrangedSubview(popup(["Blur", "Pixelate"], m.kind == .blur ? 0 : 1) { [weak self] i in self?.updateMark { $0.kind = i == 0 ? .blur : .pixelate } })
+                inspector.addArrangedSubview(popup((1...5).map { "Strength \($0)" }, m.level) { [weak self] i in self?.updateMark { $0.level = i } })
+            case .zoom:
+                let l = NSTextField(labelWithString: "Zooms into the box while it plays (shown during playback)")
+                l.font = Theme.font(12)
+                l.textColor = Theme.textDim
+                inspector.addArrangedSubview(l)
+            }
+            if !m.kind.isRegion {
+                inspector.addArrangedSubview(popup(MarkAnimation.allCases.map(\.label), m.animation.rawValue) { [weak self] i in
+                    self?.updateMark { $0.animation = MarkAnimation(rawValue: i) ?? .fade }
+                })
+            }
+        }
+        if ci != nil || mi != nil {
+            let del = NSButton(title: "Delete", image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete") ?? NSImage(), target: nil, action: nil)
+            del.bezelStyle = .recessed
+            del.imagePosition = .imageLeading
+            del.toolTip = "Delete (⌫)"
+            link(del) { [weak self] in self?.deleteSelected() }
+            inspector.addArrangedSubview(del)
+        }
+    }
+
+    private func link(_ c: NSControl, _ run: @escaping () -> Void) {
+        let a = MenuAction(run)
+        inspectorActions.append(a)
+        c.target = a
+        c.action = #selector(MenuAction.fire)
+    }
+
+    private func field(_ value: String, _ placeholder: String, tag: Int, width: CGFloat) -> NSTextField {
+        let f = NSTextField(string: value)
+        f.placeholderString = placeholder
+        f.font = Theme.font(13)
+        f.tag = tag
+        f.delegate = self
+        f.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return f
+    }
+
+    private func popup(_ items: [String], _ selected: Int, _ run: @escaping (Int) -> Void) -> NSPopUpButton {
+        let p = NSPopUpButton()
+        p.addItems(withTitles: items)
+        p.selectItem(at: selected)
+        p.bezelStyle = .recessed
+        link(p) { [weak p] in run(p?.indexOfSelectedItem ?? 0) }
+        return p
+    }
+
+    private func colorPopup(_ selected: Int, prefix: String) -> NSPopUpButton {
+        let p = popup(kColorNames.map { "\(prefix): \($0)" }, selected) { [weak self] i in self?.updateMark { $0.color = i } }
+        for (i, it) in p.itemArray.enumerated() {
+            let img = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { r in
+                kColors[i].setFill()
+                NSBezierPath(ovalIn: r.insetBy(dx: 1, dy: 1)).fill()
+                return true
+            }
+            it.image = img
+        }
+        return p
+    }
+
+    private func levelPopup(_ selected: Int) -> NSPopUpButton {
+        popup((1...kLevels).map { "Size \($0)" }, selected) { [weak self] i in self?.updateMark { $0.level = i } }
+    }
+
     // MARK: state
 
     var now: Double { player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0 }
-    var selectedIndex: Int? { selected.flatMap { id in edit.captions.firstIndex { $0.id == id } } }
+    var selectedCaptionIndex: Int? { selected.flatMap { id in edit.captions.firstIndex { $0.id == id } } }
+    var selectedMarkIndex: Int? { selected.flatMap { id in edit.marks.firstIndex { $0.id == id } } }
+    var viewRect: CGRect {
+        let f = CGRect(origin: .zero, size: videoSize)
+        let c = edit.crop.map { $0.intersection(f) } ?? f
+        return c.isNull || c.width < 16 ? f : c
+    }
 
     func pushUndo() {
         undoStack.append(edit)
@@ -505,16 +591,18 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func undo() {
         guard let e = undoStack.popLast() else { return }
         edit = e
-        if let s = selected, !edit.captions.contains(where: { $0.id == s }) { selected = nil }
+        if let s = selected, !edit.captions.contains(where: { $0.id == s }) && !edit.marks.contains(where: { $0.id == s }) { selected = nil }
+        rebuildInspector()
     }
 
     private func changed() {
+        if timelineHeight.constant != timeline.wantedHeight { timelineHeight.constant = timeline.wantedHeight }
         player.isMuted = edit.muted
         stage.needsDisplay = true
         timeline.needsDisplay = true
         syncToolbar()
-        syncCaptionBar()
         updateTime()
+        refreshPreview()
     }
 
     private func syncToolbar() {
@@ -525,20 +613,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         sizePopup.selectItem(at: edit.captionSize)
     }
 
-    private func syncCaptionBar() {
-        let i = selectedIndex
-        captionBar.isHidden = i == nil
-        hint.isHidden = i != nil
-        if let i {
-            if window.firstResponder !== captionField.currentEditor() { captionField.stringValue = edit.captions[i].text }
-            positionPopup.selectItem(at: edit.captions[i].position.rawValue)
-        }
-    }
-
     private func updateTime() {
-        let out = edit.outputDuration
-        timeLabel.stringValue = "\(clock(now))\n\(clock(out)) out"
-        timeLabel.maximumNumberOfLines = 2
+        timeLabel.stringValue = "\(clock(now))\n\(clock(edit.outputDuration)) out"
     }
 
     func clock(_ t: Double) -> String {
@@ -552,7 +628,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         if player.rate != 0 && t >= edit.trimEnd - 0.01 {
             player.pause()
             seek(edit.trimStart)
-            playButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")
+            playStateChanged()
         }
         timeline.needsDisplay = true
         stage.needsDisplay = true
@@ -566,7 +642,12 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             if now < edit.trimStart || now >= edit.trimEnd - 0.05 { seek(edit.trimStart) }
             player.rate = Float(edit.speed)
         }
+        playStateChanged()
+    }
+
+    private func playStateChanged() {
         playButton.image = NSImage(systemSymbolName: player.rate != 0 ? "pause.fill" : "play.fill", accessibilityDescription: "Play")
+        refreshPreview()   // zoom shows while playing
     }
 
     func seek(_ t: Double) {
@@ -578,6 +659,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     func step(_ frames: Double) {
         player.pause()
+        playStateChanged()
         seek(now + frames / 30)
     }
 
@@ -590,20 +672,72 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         edit = e
     }
 
+    private var insertTime: Double { min(max(now, edit.trimStart), max(edit.trimStart, edit.trimEnd - 0.5)) }
+
     func addCaption() {
         pushUndo()
-        let start = min(max(now, edit.trimStart), max(edit.trimStart, edit.trimEnd - 0.5))
+        let start = insertTime
         let c = Caption(start: start, end: min(edit.trimEnd, start + 3), text: "")
         edit.captions.append(c)
         edit.captions.sort { $0.start < $1.start }
         selected = c.id
-        window.makeFirstResponder(captionField)
+        focusField()
     }
 
-    func deleteCaption() {
-        guard let i = selectedIndex else { return }
+    func addMark(_ k: MarkKind) {
         pushUndo()
-        edit.captions.remove(at: i)
+        let v = viewRect, w = v.width, h = v.height
+        func box(_ fw: CGFloat, _ fh: CGFloat) -> (CGPoint, CGPoint) {
+            (CGPoint(x: v.midX - w * fw / 2, y: v.midY - h * fh / 2), CGPoint(x: v.midX + w * fw / 2, y: v.midY + h * fh / 2))
+        }
+        var (a, b) = box(0.3, 0.22)
+        var color = 0, level = 2, text = ""
+        switch k {
+        case .arrow: (a, b) = (CGPoint(x: v.minX + w * 0.36, y: v.minY + h * 0.66), CGPoint(x: v.minX + w * 0.5, y: v.minY + h * 0.47))
+        case .step:
+            let s = h * 0.08
+            (a, b) = (CGPoint(x: v.midX - s / 2, y: v.midY - s / 2), CGPoint(x: v.midX + s / 2, y: v.midY + s / 2))
+        case .text: (a, b) = (CGPoint(x: v.minX + w * 0.08, y: v.minY + h * 0.1), CGPoint(x: v.minX + w * 0.6, y: v.minY + h * 0.2)); color = 6
+        case .bubble: (a, b) = (CGPoint(x: v.midX - w * 0.16, y: v.minY + h * 0.18), CGPoint(x: v.midX + w * 0.16, y: v.minY + h * 0.3)); color = 6; level = 2
+        case .emoji:
+            let s = h * 0.14
+            (a, b) = (CGPoint(x: v.midX - s / 2, y: v.midY - s / 2), CGPoint(x: v.midX + s / 2, y: v.midY + s / 2)); text = "✅"
+        case .zoom: (a, b) = box(0.4, 0.4)
+        case .title: (a, b) = (v.origin, CGPoint(x: v.maxX, y: v.maxY)); color = 7
+        case .blur, .pixelate: level = 2
+        case .box, .ellipse: break
+        }
+        let start = insertTime
+        var m = Mark(kind: k, start: start, end: min(edit.trimEnd, start + k.defaultSeconds), a: a, b: b, text: text, color: color, level: level)
+        if k == .step { m.step = (edit.marks.filter { $0.kind == .step }.map(\.step).max() ?? 0) + 1 }
+        if k == .emoji || k == .step { m.animation = .pop }
+        if k.isRegion { m.animation = .none }
+        edit.marks.append(m)
+        selected = m.id
+        if k == .text || k == .bubble || k == .title { focusField() }
+    }
+
+    private func focusField() {
+        if let f = inspector.arrangedSubviews.first as? NSTextField { window.makeFirstResponder(f) }
+    }
+
+    func updateMark(_ f: (inout Mark) -> Void) {
+        guard let i = selectedMarkIndex else { return }
+        pushUndo()
+        f(&edit.marks[i])
+    }
+
+    func updateCaption(_ f: (inout Caption) -> Void) {
+        guard let i = selectedCaptionIndex else { return }
+        pushUndo()
+        f(&edit.captions[i])
+    }
+
+    func deleteSelected() {
+        guard selected != nil else { return }
+        pushUndo()
+        edit.captions.removeAll { $0.id == selected }
+        edit.marks.removeAll { $0.id == selected }
         selected = nil
         window.makeFirstResponder(stage)
     }
@@ -644,8 +778,10 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     func save(gif: Bool) {
         guard !busy else { return }
+        window.makeFirstResponder(stage)   // commits a field being edited
         busy = true
         player.pause()
+        playStateChanged()
         let src = Library.shared.meta(url)
         let info = NameInfo(app: src.app, window: src.window)
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).\(gif ? "gif" : "mp4")")
@@ -689,8 +825,14 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         case kVK_ANSI_I: pushUndo(); setTrim(start: now)
         case kVK_ANSI_O: pushUndo(); setTrim(end: now)
         case kVK_ANSI_T: addCaption()
+        case kVK_ANSI_A: addMark(.arrow)
+        case kVK_ANSI_R: addMark(.box)
+        case kVK_ANSI_E: addMark(.emoji)
+        case kVK_ANSI_N: addMark(.step)
+        case kVK_ANSI_X: addMark(.blur)
+        case kVK_ANSI_Z: addMark(.zoom)
         case kVK_ANSI_C: cropping.toggle()
-        case kVK_Delete, kVK_ForwardDelete: deleteCaption()
+        case kVK_Delete, kVK_ForwardDelete: deleteSelected()
         case kVK_Escape:
             if cropping { cropping = false } else if selected != nil { selected = nil } else { window.performClose(nil) }
         default: return false
@@ -722,9 +864,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 extension VideoEditor: NSTextFieldDelegate {
     func controlTextDidBeginEditing(_ obj: Notification) { pushUndo() }   // one undo step per editing session
 
+    // Live: the preview updates as you type.
     func controlTextDidChange(_ obj: Notification) {
-        guard let i = selectedIndex else { return }
-        edit.captions[i].text = captionField.stringValue   // live preview on the video
+        guard let f = obj.object as? NSTextField else { return }
+        if let i = selectedCaptionIndex { edit.captions[i].text = f.stringValue }
+        if let i = selectedMarkIndex {
+            if f.tag == 2 { edit.marks[i].subtitle = f.stringValue } else { edit.marks[i].text = f.stringValue }
+        }
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
@@ -736,15 +882,16 @@ extension VideoEditor: NSTextFieldDelegate {
     }
 }
 
-// MARK: - Stage (video, crop, caption preview)
+// MARK: - Stage (video, crop, markup handles)
 
 final class VideoStage: NSView {
     weak var editor: VideoEditor?
     private let playerView = PlayerView()
     var playerLayer: AVPlayerLayer { playerView.playerLayer }
-    private var dragFrom: CGPoint?
-    // Crop guides and captions draw in a view above the video; a layer-backed view's own drawing sits under its sublayers.
+    // Guides and handles draw in a view above the video; a layer-backed view's own drawing sits under its sublayers.
     private let overlay = StageOverlay()
+    private enum Drag { case crop(CGPoint), move(UUID, CGPoint, Mark), handle(UUID, Int, Mark) }
+    private var drag: Drag?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -758,16 +905,15 @@ final class VideoStage: NSView {
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
     }
+    required init?(coder: NSCoder) { fatalError() }
 
     override var needsDisplay: Bool {
         get { super.needsDisplay }
         set { super.needsDisplay = newValue; if newValue { overlay.needsDisplay = true } }
     }
-    required init?(coder: NSCoder) { fatalError() }
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var wantsUpdateLayer: Bool { false }
 
     override func layout() {
         super.layout()
@@ -782,40 +928,124 @@ final class VideoStage: NSView {
         let w = e.videoSize.width * s, h = e.videoSize.height * s
         return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
     }
-    private func toVideo(_ p: CGPoint) -> CGPoint {
-        let r = videoRect, s = (editor?.videoSize.width ?? 1) / max(1, r.width)
-        return CGPoint(x: (p.x - r.minX) * s, y: (p.y - r.minY) * s)
+    private var scale: CGFloat { videoRect.width / max(1, editor?.videoSize.width ?? 1) }
+    func toVideo(_ p: CGPoint) -> CGPoint {
+        let r = videoRect, s = scale
+        return CGPoint(x: (p.x - r.minX) / s, y: (p.y - r.minY) / s)
     }
-    fileprivate func toView(_ r: CGRect) -> CGRect {
-        let v = videoRect, s = v.width / max(1, editor?.videoSize.width ?? 1)
+    func toView(_ r: CGRect) -> CGRect {
+        let v = videoRect, s = scale
         return CGRect(x: v.minX + r.minX * s, y: v.minY + r.minY * s, width: r.width * s, height: r.height * s)
+    }
+    func toView(_ p: CGPoint) -> CGPoint {
+        let v = videoRect, s = scale
+        return CGPoint(x: v.minX + p.x * s, y: v.minY + p.y * s)
     }
 
     override func keyDown(with e: NSEvent) { if editor?.key(e) != true { super.keyDown(with: e) } }
 
+    // Handle points of a mark, in video coordinates: arrow ends, or the rect's corners.
+    func handles(_ m: Mark) -> [CGPoint] {
+        if m.kind == .title { return [] }
+        if m.kind.isLine { return [m.a, m.b] }
+        let r = m.rect
+        return [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY)]
+    }
+
+    private func hit(_ m: Mark, _ p: CGPoint, slop: CGFloat) -> Bool {
+        if m.kind == .title { return true }
+        if m.kind.isLine {
+            let dx = m.b.x - m.a.x, dy = m.b.y - m.a.y, l2 = dx * dx + dy * dy
+            let t = l2 == 0 ? 0 : max(0, min(1, ((p.x - m.a.x) * dx + (p.y - m.a.y) * dy) / l2))
+            return hypot(p.x - (m.a.x + t * dx), p.y - (m.a.y + t * dy)) <= slop * 1.5
+        }
+        var r = m.rect
+        if m.kind == .bubble { r.size.height *= 1.32 }
+        return r.insetBy(dx: -slop, dy: -slop).contains(p)
+    }
+
     override func mouseDown(with e: NSEvent) {
         window?.makeFirstResponder(self)
         guard let ed = editor else { return }
+        let vp = toVideo(convert(e.locationInWindow, from: nil))
+        let slop = 8 / max(0.01, scale)
         if ed.cropping {
             ed.pushUndo()
-            dragFrom = toVideo(convert(e.locationInWindow, from: nil))
-        } else {
-            ed.togglePlay()
+            drag = .crop(vp)
+            return
         }
+        // Handles of the selected mark first.
+        if let i = ed.selectedMarkIndex, ed.edit.marks[i].active(ed.now) {
+            let m = ed.edit.marks[i]
+            if let h = handles(m).firstIndex(where: { hypot($0.x - vp.x, $0.y - vp.y) <= slop }) {
+                ed.pushUndo()
+                drag = .handle(m.id, h, m)
+                return
+            }
+        }
+        let t = ed.now
+        if let m = ed.edit.marks.reversed().first(where: { $0.active(t) && $0.kind != .title && hit($0, vp, slop: slop) })
+            ?? ed.edit.marks.reversed().first(where: { $0.active(t) && $0.kind == .title }) {
+            ed.selected = m.id
+            if e.clickCount == 2, m.kind.hasText { ed.focusFieldPublic(); return }
+            ed.pushUndo()
+            drag = .move(m.id, vp, m)
+            return
+        }
+        if let c = ed.edit.captions.first(where: { $0.active(t) && captionRect($0).contains(vp) }) {
+            ed.selected = c.id
+            if e.clickCount == 2 { ed.focusFieldPublic() }
+            return
+        }
+        if ed.selected != nil { ed.selected = nil } else { ed.togglePlay() }
+    }
+
+    // Where a caption sits on the video, in video coordinates.
+    func captionRect(_ c: Caption) -> CGRect {
+        guard let ed = editor else { return .zero }
+        let v = ed.viewRect
+        let r = FrameRenderer(edit: ed.edit, full: ed.videoSize, preview: true)
+        guard let (_, pr) = r.captionImage(c, in: v.size) else { return .zero }
+        return pr.offsetBy(dx: v.minX, dy: v.minY)
     }
 
     override func mouseDragged(with e: NSEvent) {
-        guard let ed = editor, let a = dragFrom else { return }
-        var b = toVideo(convert(e.locationInWindow, from: nil))
-        if let k = ed.aspect {   // keep the chosen shape
-            let w = abs(b.x - a.x), h = abs(b.y - a.y)
-            let W = max(w, h * k), H = W / k
-            b = CGPoint(x: a.x + (b.x < a.x ? -W : W), y: a.y + (b.y < a.y ? -H : H))
+        guard let ed = editor, let d = drag else { return }
+        let p = toVideo(convert(e.locationInWindow, from: nil))
+        switch d {
+        case .crop(let a):
+            var b = p
+            if let k = ed.aspect {   // keep the chosen shape
+                let w = abs(b.x - a.x), h = abs(b.y - a.y)
+                let W = max(w, h * k), H = W / k
+                b = CGPoint(x: a.x + (b.x < a.x ? -W : W), y: a.y + (b.y < a.y ? -H : H))
+            }
+            ed.setCrop(Geo.norm(a, b))
+        case .move(let id, let from, let o):
+            guard let i = ed.edit.marks.firstIndex(where: { $0.id == id }), o.kind != .title else { return }
+            let dx = p.x - from.x, dy = p.y - from.y
+            ed.edit.marks[i].a = CGPoint(x: o.a.x + dx, y: o.a.y + dy)
+            ed.edit.marks[i].b = CGPoint(x: o.b.x + dx, y: o.b.y + dy)
+        case .handle(let id, let h, let o):
+            guard let i = ed.edit.marks.firstIndex(where: { $0.id == id }) else { return }
+            if o.kind.isLine {
+                if h == 0 { ed.edit.marks[i].a = p } else { ed.edit.marks[i].b = p }
+            } else {
+                let r = o.rect
+                let anchor = CGPoint(x: h % 2 == 0 ? r.maxX : r.minX, y: h < 2 ? r.maxY : r.minY)
+                var q = p
+                if o.kind == .emoji || o.kind == .step || e.modifierFlags.contains(.shift) {   // keep the shape
+                    let k = r.width / max(1, r.height)
+                    let w = max(abs(q.x - anchor.x), abs(q.y - anchor.y) * k)
+                    q = CGPoint(x: anchor.x + (q.x < anchor.x ? -w : w), y: anchor.y + (q.y < anchor.y ? -w / k : w / k))
+                }
+                ed.edit.marks[i].a = anchor
+                ed.edit.marks[i].b = q
+            }
         }
-        ed.setCrop(Geo.norm(a, b))
     }
 
-    override func mouseUp(with e: NSEvent) { dragFrom = nil }
+    override func mouseUp(with e: NSEvent) { drag = nil }
 
     fileprivate func drawOverlay() {
         guard let ed = editor, let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -840,30 +1070,48 @@ final class VideoStage: NSView {
             NSBezierPath(roundedRect: CGRect(x: v.midX - sz.width / 2 - 12, y: v.midY - sz.height / 2 - 6, width: sz.width + 24, height: sz.height + 12), xRadius: 8, yRadius: 8).fill()
             s.draw(at: CGPoint(x: v.midX - sz.width / 2, y: v.midY - sz.height / 2))
         }
-        // Captions showing at the playhead, as they'll look in the export.
-        let t = ed.now
-        let area = ed.edit.crop.map(toView) ?? v
-        let scale = area.height / max(1, (ed.edit.crop ?? CGRect(origin: .zero, size: ed.videoSize)).height)
-        for c in ed.edit.captions where t >= c.start && t < c.end {
-            let text = c.text.isEmpty ? "Type a caption…" : c.text
-            let full = (ed.edit.crop ?? CGRect(origin: .zero, size: ed.videoSize)).size
-            let l = VideoExport.captionLayer(text, position: c.position, in: full, scale: VideoEdit.captionScale[ed.edit.captionSize])
-            let f = l.frame
-            let box = CGRect(x: area.minX + f.minX * scale, y: area.minY + f.minY * scale, width: f.width * scale, height: f.height * scale)
-            NSColor.black.withAlphaComponent(0.62).setFill()
-            NSBezierPath(roundedRect: box, xRadius: l.cornerRadius * scale, yRadius: l.cornerRadius * scale).fill()
-            let fs = max(14, full.height * VideoEdit.captionScale[ed.edit.captionSize]) * scale
-            var attrs = VideoExport.captionAttributes(fs)
-            if c.text.isEmpty { attrs[.foregroundColor] = NSColor.white.withAlphaComponent(0.5) }
-            let pad = max(14, full.height * VideoEdit.captionScale[ed.edit.captionSize]) * 0.45 * scale
-            NSAttributedString(string: text, attributes: attrs).draw(with: box.insetBy(dx: pad, dy: pad * 0.6), options: [.usesLineFragmentOrigin])
-            if c.id == ed.selected {
-                Theme.accent.setStroke()
-                let ring = NSBezierPath(roundedRect: box.insetBy(dx: -3, dy: -3), xRadius: 8, yRadius: 8)
-                ring.lineWidth = 1.5
-                ring.stroke()
+        // Selection: outline and handles. Zoom and blur regions show their box only while selected.
+        if let i = ed.selectedMarkIndex {
+            let m = ed.edit.marks[i]
+            let on = m.active(ed.now)
+            ctx.setStrokeColor((on ? Theme.accent : Theme.accent.withAlphaComponent(0.4)).cgColor)
+            ctx.setLineWidth(1.5)
+            ctx.setLineDash(phase: 0, lengths: [5, 4])
+            if m.kind == .zoom {
+                ctx.stroke(toView(FrameRenderer.zoomTarget(m.rect, view: ed.viewRect)))
+                ctx.setLineDash(phase: 0, lengths: [2, 3])
+                ctx.stroke(toView(m.rect))
+            } else if m.kind.isLine {
+                ctx.strokeLineSegments(between: [toView(m.a), toView(m.b)])
+            } else if m.kind != .title {
+                var r = m.rect
+                if m.kind == .bubble { r.size.height *= 1.32 }
+                ctx.stroke(toView(r).insetBy(dx: -3, dy: -3))
+            }
+            ctx.setLineDash(phase: 0, lengths: [])
+            if on {
+                for h in handles(m) {
+                    let c = toView(h)
+                    let box = CGRect(x: c.x - 5, y: c.y - 5, width: 10, height: 10)
+                    ctx.setFillColor(NSColor.white.cgColor)
+                    ctx.fillEllipse(in: box)
+                    ctx.setStrokeColor(Theme.accent.cgColor)
+                    ctx.strokeEllipse(in: box)
+                }
             }
         }
+        if let i = ed.selectedCaptionIndex, ed.edit.captions[i].active(ed.now) {
+            Theme.accent.setStroke()
+            let ring = NSBezierPath(roundedRect: toView(captionRect(ed.edit.captions[i])).insetBy(dx: -3, dy: -3), xRadius: 8, yRadius: 8)
+            ring.lineWidth = 1.5
+            ring.stroke()
+        }
+    }
+}
+
+extension VideoEditor {
+    func focusFieldPublic() {
+        if let f = inspector.arrangedSubviews.first(where: { $0 is NSTextField && ($0 as! NSTextField).isEditable }) { window.makeFirstResponder(f) }
     }
 }
 
@@ -886,17 +1134,21 @@ private final class StageOverlay: NSView {
     override func draw(_ dirtyRect: NSRect) { stage?.drawOverlay() }
 }
 
-// MARK: - Timeline (thumbnails, trim handles, playhead, caption lane)
+// MARK: - Timeline (thumbnails, trim handles, playhead, caption and markup lanes)
 
 final class Timeline: NSView {
     weak var editor: VideoEditor?
     private var thumbs: [CGImage] = []
-    private enum Drag { case start, end, playhead, caption(UUID, edge: Int, grab: Double, orig: Caption) }
+    private enum Target { case caption(UUID), mark(UUID) }
+    private enum Drag { case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double) }
     private var drag: Drag?
 
+    static let height: CGFloat = 90 + 3 * 18
     private let stripH: CGFloat = 52
-    private let laneY: CGFloat = 62
-    private let laneH: CGFloat = 26
+    private let capY: CGFloat = 62
+    private let capH: CGFloat = 22
+    private let markY: CGFloat = 90
+    private let rowH: CGFloat = 18
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -920,21 +1172,46 @@ final class Timeline: NSView {
     private func x(_ t: Double) -> CGFloat { bounds.width * CGFloat(t / max(0.001, editor?.duration ?? 1)) }
     private func t(_ x: CGFloat) -> Double { Double(min(max(0, x), bounds.width) / max(1, bounds.width)) * (editor?.duration ?? 0) }
 
+    // Markup bars, one row per overlapping item; the timeline grows to fit (three rows minimum).
+    private func rows() -> [(Mark, Int)] {
+        guard let e = editor else { return [] }
+        var ends: [Double] = []
+        return e.edit.marks.sorted { $0.start < $1.start }.map { m in
+            if let r = ends.firstIndex(where: { $0 <= m.start }) { ends[r] = m.end; return (m, r) }
+            ends.append(m.end)
+            return (m, ends.count - 1)
+        }
+    }
+
+    var rowCount: Int { max(3, min(8, (rows().map(\.1).max() ?? 0) + 1)) }
+    var wantedHeight: CGFloat { markY + CGFloat(rowCount) * rowH }
+
+    private func barRect(_ s: Double, _ e: Double, y: CGFloat, h: CGFloat) -> CGRect {
+        CGRect(x: x(s), y: y, width: max(6, x(e) - x(s)), height: h)
+    }
+
     override func mouseDown(with ev: NSEvent) {
         window?.makeFirstResponder(self)
         guard let e = editor else { return }
         let p = convert(ev.locationInWindow, from: nil)
-        if p.y >= laneY {   // caption lane
+        func grab(_ target: Target, _ s: Double, _ en: Double) {
+            let edge = abs(p.x - x(s)) < 6 ? -1 : abs(p.x - x(en)) < 6 ? 1 : 0
+            e.pushUndo()
+            drag = .item(target, edge: edge, grab: t(p.x), start: s, end: en)
+            if ev.clickCount == 2 { e.seek(s); e.focusFieldPublic() }
+        }
+        if p.y >= markY {
+            if let (m, _) = rows().last(where: { barRect($0.0.start, $0.0.end, y: markY + CGFloat($0.1) * rowH, h: rowH - 2).insetBy(dx: -4, dy: 0).contains(p) }) {
+                e.selected = m.id
+                grab(.mark(m.id), m.start, m.end)
+            } else { e.selected = nil; e.seek(t(p.x)) }
+            return
+        }
+        if p.y >= capY {
             if let c = e.edit.captions.last(where: { x($0.start) - 4 <= p.x && p.x <= x($0.end) + 4 }) {
                 e.selected = c.id
-                let edge = abs(p.x - x(c.start)) < 6 ? -1 : abs(p.x - x(c.end)) < 6 ? 1 : 0
-                e.pushUndo()
-                drag = .caption(c.id, edge: edge, grab: t(p.x), orig: c)
-                if ev.clickCount == 2 { e.window.makeFirstResponder(nil); e.seek(c.start) }
-            } else {
-                e.selected = nil
-                e.seek(t(p.x))
-            }
+                grab(.caption(c.id), c.start, c.end)
+            } else { e.selected = nil; e.seek(t(p.x)) }
             return
         }
         if abs(p.x - x(e.edit.trimStart)) < 8 { e.pushUndo(); drag = .start; return }
@@ -946,29 +1223,32 @@ final class Timeline: NSView {
 
     override func mouseDragged(with ev: NSEvent) {
         guard let e = editor, let d = drag else { return }
-        let p = convert(ev.locationInWindow, from: nil), now = t(p.x)
+        let now = t(convert(ev.locationInWindow, from: nil).x)
         switch d {
         case .start: e.setTrim(start: now); e.seek(e.edit.trimStart)
         case .end: e.setTrim(end: now); e.seek(e.edit.trimEnd)
         case .playhead: e.seek(now)
-        case .caption(let id, let edge, let grab, let o):
-            guard let i = e.edit.captions.firstIndex(where: { $0.id == id }) else { return }
-            var c = o
+        case .item(let target, let edge, let grab, let s0, let e0):
+            var s = s0, en = e0
             switch edge {
-            case -1: c.start = min(now, o.end - 0.2)
-            case 1: c.end = max(now, o.start + 0.2)
+            case -1: s = min(now, e0 - 0.2)
+            case 1: en = max(now, s0 + 0.2)
             default:
-                let len = o.end - o.start
-                c.start = min(max(0, o.start + now - grab), e.duration - len)
-                c.end = c.start + len
+                let len = e0 - s0
+                s = min(max(0, s0 + now - grab), e.duration - len)
+                en = s + len
             }
-            e.edit.captions[i] = c
+            switch target {
+            case .caption(let id): if let i = e.edit.captions.firstIndex(where: { $0.id == id }) { e.edit.captions[i].start = s; e.edit.captions[i].end = en }
+            case .mark(let id): if let i = e.edit.marks.firstIndex(where: { $0.id == id }) { e.edit.marks[i].start = s; e.edit.marks[i].end = en }
+            }
+            e.seek(edge == 1 ? en - 0.01 : s)
         }
         needsDisplay = true
     }
 
     override func mouseUp(with ev: NSEvent) {
-        if case .caption = drag, let e = editor { e.edit.captions.sort { $0.start < $1.start } }
+        if case .item = drag, let e = editor { e.edit.captions.sort { $0.start < $1.start } }
         drag = nil
     }
 
@@ -992,13 +1272,11 @@ final class Timeline: NSView {
                 ctx.restoreGState()
             }
         }
-        // Outside the trim: dimmed.
         NSColor.black.withAlphaComponent(0.65).setFill()
         CGRect(x: 0, y: 0, width: x(e.edit.trimStart), height: stripH).fill()
         CGRect(x: x(e.edit.trimEnd), y: 0, width: bounds.width - x(e.edit.trimEnd), height: stripH).fill()
         ctx.restoreGState()
 
-        // Trim frame and handles.
         let kept = CGRect(x: x(e.edit.trimStart), y: 0, width: x(e.edit.trimEnd) - x(e.edit.trimStart), height: stripH)
         Theme.accent.setStroke()
         let frame = NSBezierPath(roundedRect: kept.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
@@ -1009,30 +1287,47 @@ final class Timeline: NSView {
             NSBezierPath(roundedRect: CGRect(x: hx - 4, y: 8, width: 8, height: stripH - 16), xRadius: 3, yRadius: 3).fill()
         }
 
-        // Caption lane.
-        let lane = CGRect(x: 0, y: laneY, width: bounds.width, height: laneH)
-        NSColor.white.withAlphaComponent(0.04).setFill()
-        NSBezierPath(roundedRect: lane, xRadius: 5, yRadius: 5).fill()
-        if e.edit.captions.isEmpty {
-            let s = NSAttributedString(string: "Captions appear here", attributes: [.font: Theme.font(10), .foregroundColor: Theme.muted])
-            s.draw(at: CGPoint(x: 8, y: lane.midY - s.size().height / 2))
+        func lane(_ r: CGRect, _ empty: String, _ isEmpty: Bool) {
+            NSColor.white.withAlphaComponent(0.04).setFill()
+            NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5).fill()
+            if isEmpty {
+                let s = NSAttributedString(string: empty, attributes: [.font: Theme.font(10), .foregroundColor: Theme.muted])
+                s.draw(at: CGPoint(x: 8, y: r.minY + (min(r.height, 22) - s.size().height) / 2))
+            }
         }
-        for c in e.edit.captions {
-            let r = CGRect(x: x(c.start), y: laneY + 2, width: max(6, x(c.end) - x(c.start)), height: laneH - 4)
-            let sel = c.id == e.selected
-            (sel ? Theme.accent : NSColor.white.withAlphaComponent(0.18)).setFill()
+        func bar(_ r: CGRect, _ label: String, _ symbol: String?, selected: Bool) {
+            (selected ? Theme.accent : NSColor.white.withAlphaComponent(0.18)).setFill()
             NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
-            let s = NSAttributedString(string: c.text.isEmpty ? "…" : c.text, attributes: [.font: Theme.font(10, .medium), .foregroundColor: sel ? Theme.onAccent : Theme.text])
             ctx.saveGState()
-            ctx.clip(to: r.insetBy(dx: 4, dy: 0))
-            s.draw(at: CGPoint(x: r.minX + 5, y: r.midY - s.size().height / 2))
+            ctx.clip(to: r.insetBy(dx: 3, dy: 0))
+            var x0 = r.minX + 5
+            if let symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 9, weight: .semibold)) {
+                let tinted = NSImage(size: img.size, flipped: false) { rr in
+                    img.draw(in: rr)
+                    (selected ? Theme.onAccent : Theme.text).set()
+                    rr.fill(using: .sourceAtop)
+                    return true
+                }
+                tinted.draw(in: CGRect(x: x0, y: r.midY - img.size.height / 2, width: img.size.width, height: img.size.height), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+                x0 += img.size.width + 4
+            }
+            let s = NSAttributedString(string: label, attributes: [.font: Theme.font(10, .medium), .foregroundColor: selected ? Theme.onAccent : Theme.text])
+            s.draw(at: CGPoint(x: x0, y: r.midY - s.size().height / 2))
             ctx.restoreGState()
         }
+        lane(CGRect(x: 0, y: capY, width: bounds.width, height: capH), "Captions", e.edit.captions.isEmpty)
+        for c in e.edit.captions {
+            bar(barRect(c.start, c.end, y: capY + 2, h: capH - 4), c.text.isEmpty ? "…" : c.text, nil, selected: c.id == e.selected)
+        }
+        lane(CGRect(x: 0, y: markY, width: bounds.width, height: rowH * CGFloat(rowCount)), "Text, emoji, callouts, blur, zoom and titles: Add ▾", e.edit.marks.isEmpty)
+        for (m, row) in rows() where row < rowCount {
+            let label = m.kind.hasText && !m.text.isEmpty ? m.text : m.kind == .step ? "Step \(m.step)" : m.kind.label
+            bar(barRect(m.start, m.end, y: markY + CGFloat(row) * rowH + 1, h: rowH - 2), label, m.kind.symbol, selected: m.id == e.selected)
+        }
 
-        // Playhead.
         let px = x(e.now)
         NSColor.white.setFill()
-        CGRect(x: px - 1, y: -2, width: 2, height: laneY + laneH + 2).fill()
+        CGRect(x: px - 1, y: -2, width: 2, height: bounds.height + 2).fill()
         NSBezierPath(ovalIn: CGRect(x: px - 5, y: -4, width: 10, height: 10)).fill()
     }
 }
