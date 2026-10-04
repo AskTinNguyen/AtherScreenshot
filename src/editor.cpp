@@ -19,6 +19,7 @@ using std::min;
 }  // namespace Gdiplus
 #include <gdiplus.h>
 
+#include "collage.h"
 #include "library.h"
 #include "media.h"
 #include "ocr.h"
@@ -533,8 +534,10 @@ BitmapPtr Raster(const Bitmap& base, const DocState& st, RECT* frameOut) {
     const RECT extent{0, 0, base.Width(), base.Height()};
     RECT inter{};
     const bool overlap = IntersectRect(&inter, &f, &extent) != 0;
-    if (!(overlap && EqualRect(&inter, &f))) std::fill_n(out->Bits(), (size_t)W * H, fill);
-    if (overlap)
+    if (!(overlap && EqualRect(&inter, &f)) || (base.Width() == 1 && base.Height() == 1)) std::fill_n(out->Bits(), (size_t)W * H, fill);
+    // A collage starts from a blank 1×1 base: nothing to draw under the layers.
+    const bool blank = base.Width() == 1 && base.Height() == 1 && (base.Bits()[0] >> 24) == 0;
+    if (overlap && !blank)
         for (int y = inter.top; y < inter.bottom; ++y)
             memcpy(out->Bits() + (size_t)(y - f.top) * W + (inter.left - f.left), base.Bits() + (size_t)y * base.Width() + inter.left,
                    (size_t)RectW(inter) * 4);
@@ -899,6 +902,15 @@ private:
     int minClientW_ = 600;
 
     bool hidden_ = false;  // drawn into memory by the snapshot tool, never shown
+    // Collage: the screenshots, where each came from, and the layout options.
+    std::optional<CollageSpec> collage_;
+    std::vector<BitmapPtr> collageImages_;
+    std::vector<std::wstring> collageSources_;
+    void ApplyCollage(bool undoable);
+    void SwapCollage(int a, int b);
+    void CollageMenu(int which, POINT at);
+    void DrawCollageBar(HDC dc);
+    friend bool ather::OpenCollage(const std::vector<std::wstring>&);
     friend int ather::EditorSnapshots(const std::wstring&);
     friend LRESULT CALLBACK EditorProc(HWND, UINT, WPARAM, LPARAM);
     friend void ather::OpenEditor(BitmapPtr, const EditorSource&);
@@ -970,7 +982,8 @@ bool Editor::Create() {
 void Editor::UpdateTitle() {
     if (!hwnd) return;
     const RECT f = Frame();
-    std::wstring t = L"Annotate — " + std::to_wstring(RectW(f)) + L" × " + std::to_wstring(RectH(f));
+    const std::wstring size = std::to_wstring(RectW(f)) + L" × " + std::to_wstring(RectH(f));
+    std::wstring t = collage_ ? L"Collage — " + std::to_wstring(collageImages_.size()) + L" screenshots, " + size : L"Annotate — " + size;
     SetWindowTextW(hwnd, t.c_str());
 }
 
@@ -1045,7 +1058,7 @@ RECT Editor::Shown() const {
 void Editor::FitView() {
     RECT c = Canvas();
     const RECT f = Frame();
-    const int reserve = tool_ == Tool::Canvas ? S(kBarH + 20) : 0;  // room for the floating bar
+    const int reserve = tool_ == Tool::Canvas || collage_ ? S(kBarH + 20) : 0;  // room for the floating bar
     int aw = std::max(1, RectW(c) - 2 * S(kMargin)), ah = std::max(1, RectH(c) - 2 * S(kMargin) - reserve);
     zoom_ = std::min({1.f, (float)aw / RectW(f), (float)ah / RectH(f)});
     viewW_ = std::max(1, (int)std::lround(RectW(f) * zoom_));
@@ -1602,8 +1615,9 @@ void Editor::Save(bool quiet) {
     auto img = Export();
     CaptureNameInfo info{source_.window, source_.app, img->Width(), img->Height()};
     const std::wstring path = MakeCapturePath(g_defaults.capturesFolder, L"png", info);
-    // Joins the gallery with the original's tags and collections, stacked as a version of it.
-    Library::Shared().NoteEdit(path, source_.path, source_.app, source_.window, Edited(*img), Includes());
+    // Joins the gallery with the original's tags and collections, stacked as a version of it. A collage is
+    // tagged "collage" and keeps what all of its screenshots share.
+    Library::Shared().NoteEdit(path, source_.path, source_.app, source_.window, Edited(*img), Includes(), collage_.has_value());
     HWND h = hwnd;
     const uint64_t version = version_;
     SavePngAsync(img, path, [path, h, version, quiet, img](bool ok) {
@@ -1629,7 +1643,7 @@ void Editor::SaveAs() {
     ofn.lpstrDefExt = L"png";
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    Library::Shared().NoteEdit(file, source_.path, source_.app, source_.window, true, Includes());
+    Library::Shared().NoteEdit(file, source_.path, source_.app, source_.window, true, Includes(), collage_.has_value());
     if (SavePng(*img, file)) dirty_ = false;  // a failed save must still warn before closing
     else ShowToast(L"Save failed", file, nullptr, nullptr, 4000);
 }
@@ -1756,7 +1770,11 @@ void Editor::OnLButtonDown(int x, int y, bool dbl) {
     if (texting_ && !styling) CommitText();
     for (const auto& b : barButtons_) {
         if (!PtInRect(&b.r, {x, y})) continue;
-        if (b.act < 0) {
+        if (b.act <= -10) {
+            POINT p{b.r.left, b.r.top};
+            ClientToScreen(hwnd, &p);
+            CollageMenu(-10 - b.act, p);
+        } else if (b.act < 0) {
             POINT p{b.r.left, b.r.top};
             ClientToScreen(hwnd, &p);
             FillMenu(p);
@@ -1971,6 +1989,19 @@ void Editor::OnLButtonUp(int x, int y) {
         return;
     }
     if (wasMoving) {
+        // In a collage, dropping one screenshot on another swaps them.
+        if (collage_ && live_.layer && live_.layer->slot >= 0 && std::hypot(lastPt_.X - moveStart_.X, lastPt_.Y - moveStart_.Y) * Zoom() > 12) {
+            const gp::RectF r = NormRect(live_.pts[0], live_.pts.back());
+            const gp::PointF c(r.X + r.Width / 2, r.Y + r.Height / 2);
+            for (const auto& other : st_.annots) {
+                if (!other.layer || other.layer->slot < 0 || !NormRect(other.pts[0], other.pts.back()).Contains(c)) continue;
+                const int a = live_.layer->slot, b = other.layer->slot;
+                st_ = undo_.back();  // the swap records its own undo step
+                undo_.pop_back();
+                SwapCollage(a, b);
+                return;
+            }
+        }
         st_.annots.insert(st_.annots.begin() + std::min<size_t>(movingIndex_, st_.annots.size()), live_);
         selected_ = movingIndex_;
         Changed(IsRasterTool(live_.type));
@@ -2232,6 +2263,139 @@ void Editor::DrawCanvasBar(HDC dc) {
     SelectObject(dc, of);
 }
 
+// Lays the collage out again (after a change to its options or order).
+void Editor::ApplyCollage(bool undoable) {
+    if (!collage_) return;
+    CommitText();
+    if (undoable) PushUndo();
+    const CollageResult r = LayoutCollage(*collage_, unit_);
+    std::vector<Annot> layers, others;
+    for (const auto& a : st_.annots)
+        if (!(a.layer && a.layer->slot >= 0)) others.push_back(a);
+    for (size_t pos = 0; pos < collage_->order.size(); ++pos) {
+        const int slot = collage_->order[pos];
+        const CollageRect& rc = r.rects[pos];
+        Annot a;
+        a.type = Tool::Image;
+        a.color = kColors[6];
+        a.level = 0;
+        a.unit = unit_;
+        a.pts = {gp::PointF((float)rc.x, (float)rc.y), gp::PointF((float)(rc.x + rc.w), (float)(rc.y + rc.h))};
+        auto l = std::make_shared<ImageLayer>();
+        l->image = collageImages_[slot];
+        l->source = collageSources_[slot];
+        l->radius = (float)r.radius;
+        l->shadow = collage_->shadow;
+        l->slot = slot;
+        a.layer = l;
+        layers.push_back(a);
+    }
+    layers.insert(layers.end(), others.begin(), others.end());
+    st_.annots = layers;
+    st_.crop = gp::RectF(0, 0, (float)r.width, (float)r.height);
+    st_.fill = CollageSpec::kBackgrounds[collage_->background].color;
+    selected_ = -1;
+    Changed(true);
+}
+
+void Editor::SwapCollage(int a, int b) {
+    auto& o = collage_->order;
+    auto i = std::find(o.begin(), o.end(), a), j = std::find(o.begin(), o.end(), b);
+    if (i == o.end() || j == o.end()) return;
+    std::iter_swap(i, j);
+    ApplyCollage(true);
+}
+
+// Layout, Gap, Margin, Background, Corners, Shadow, Size.
+void Editor::CollageMenu(int which, POINT at) {
+    if (!collage_) return;
+    CollageSpec& c = *collage_;
+    HMENU m = CreatePopupMenu();
+    std::vector<std::wstring> items;
+    int cur = 0;
+    switch (which) {
+        case 0:
+            for (int i = 0; i <= (int)CollageLayout::Feature; ++i) items.push_back(CollageLayoutLabel((CollageLayout)i));
+            cur = (int)c.layout;
+            break;
+        case 1:
+        case 2:
+            for (auto n : CollageSpec::kStepNames) items.push_back(n);
+            cur = which == 1 ? c.gap : c.margin;
+            break;
+        case 3:
+            for (const auto& b : CollageSpec::kBackgrounds) items.push_back(b.name);
+            cur = c.background;
+            break;
+        case 4:
+            items = {L"Rounded", L"Square"};
+            cur = c.rounded ? 0 : 1;
+            break;
+        case 5:
+            items = {L"No shadow", L"Shadow"};
+            cur = c.shadow ? 1 : 0;
+            break;
+        case 6:
+            for (int i = 0; i <= (int)CollageSize::Square; ++i) items.push_back(CollageSizeLabel((CollageSize)i));
+            cur = (int)c.size;
+            break;
+    }
+    for (size_t i = 0; i < items.size(); ++i) AppendMenuW(m, MF_STRING, i + 1, items[i].c_str());
+    CheckMenuRadioItem(m, 1, (UINT)items.size(), cur + 1, MF_BYCOMMAND);
+    SetForegroundWindow(hwnd);
+    const int id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN, at.x, at.y, 0, hwnd, nullptr);
+    DestroyMenu(m);
+    if (!id) return;
+    const int v = id - 1;
+    switch (which) {
+        case 0: c.layout = (CollageLayout)v; break;
+        case 1: c.gap = v; break;
+        case 2: c.margin = v; break;
+        case 3: c.background = v; break;
+        case 4: c.rounded = v == 0; break;
+        case 5: c.shadow = v == 1; break;
+        case 6: c.size = (CollageSize)v; break;
+    }
+    ApplyCollage(true);
+}
+
+void Editor::DrawCollageBar(HDC dc) {
+    if (!collage_ || tool_ == Tool::Canvas) return;
+    const CollageSpec& c = *collage_;
+    const std::wstring labels[] = {std::wstring(L"Layout: ") + CollageLayoutLabel(c.layout),
+                                   std::wstring(L"Gap: ") + CollageSpec::kStepNames[c.gap],
+                                   std::wstring(L"Margin: ") + CollageSpec::kStepNames[c.margin],
+                                   std::wstring(L"Background: ") + CollageSpec::kBackgrounds[c.background].name,
+                                   c.rounded ? L"Corners: Rounded" : L"Corners: Square",
+                                   c.shadow ? L"Shadow" : L"No shadow",
+                                   CollageSizeLabel(c.size)};
+    HGDIOBJ of = SelectObject(dc, fBar_);
+    std::vector<int> widths;
+    int total = S(10);
+    for (const auto& l : labels) {
+        SIZE sz{};
+        const std::wstring withArrow = l + L"  \u25BE";
+        GetTextExtentPoint32W(dc, withArrow.c_str(), (int)withArrow.size(), &sz);
+        widths.push_back(sz.cx + S(16));
+        total += sz.cx + S(16) + S(2);
+    }
+    const RECT cv = Canvas();
+    const int h = S(kBarH), x0 = std::max<int>(cv.left + S(8), (cv.left + cv.right) / 2 - total / 2), y0 = cv.bottom - S(14) - h;
+    RECT bar{x0, y0, x0 + total, y0 + h};
+    FillRounded(dc, bar, S(12), RGB(30, 31, 29), RGB(58, 59, 56));
+    int x = bar.left + S(6);
+    SetBkMode(dc, TRANSPARENT);
+    for (size_t i = 0; i < std::size(labels); ++i) {
+        RECT r{x, bar.top + S(5), x + widths[i], bar.bottom - S(5)};
+        if ((int)barButtons_.size() == hoverBar_) FillRounded(dc, r, S(7), theme::kBgRaised);
+        SetTextColor(dc, theme::kText);
+        const std::wstring withArrow = labels[i] + L"  \u25BE";
+        DrawTextW(dc, withArrow.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        barButtons_.push_back({r, -10 - (int)i, labels[i]});
+        x = r.right + S(2);
+    }
+    SelectObject(dc, of);
+}
 void DrawLayerPreview(gp::Graphics& g, const Annot& a) {
     if (!a.layer || !a.layer->image) return;
     const gp::RectF r = NormRect(a.pts[0], a.pts.back());
@@ -2361,6 +2525,7 @@ void Editor::Paint(HDC hdc) {
     DrawToolbar(dc);
     DrawStatus(dc);
     DrawCanvasBar(dc);
+    DrawCollageBar(dc);
     BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
 }
 
@@ -2493,7 +2658,38 @@ bool AddImagesToEditor(const std::vector<std::wstring>& paths) {
     return true;
 }
 
-bool OpenCollage(const std::vector<std::wstring>&) { return false; }
+bool OpenCollage(const std::vector<std::wstring>& paths) {
+    std::vector<BitmapPtr> imgs;
+    std::vector<std::wstring> sources;
+    for (const auto& p : paths)
+        if (auto img = LoadImageFile(p)) {
+            imgs.push_back(img);
+            sources.push_back(p);
+        }
+    if (imgs.size() < 2) {
+        ShowToast(L"Pick at least two images for a collage", L"", nullptr, nullptr, 2500);
+        return false;
+    }
+    auto blank = Bitmap::Create(1, 1);
+    blank->Bits()[0] = 0;  // transparent: a collage has no screenshot underneath
+    auto* e = new Editor(blank, {});
+    std::vector<SIZE> sizes;
+    for (const auto& i : imgs) sizes.push_back({i->Width(), i->Height()});
+    e->collage_ = CollageSpec(sizes);
+    e->collageImages_ = imgs;
+    e->collageSources_ = sources;
+    e->tool_ = Tool::Select;  // move and swap screenshots first
+    POINT pt;
+    GetCursorPos(&pt);
+    e->unit_ = DpiScaleAt(pt);
+    e->ApplyCollage(false);
+    e->dirty_ = true;
+    if (!e->Create()) {
+        delete e;
+        return false;
+    }
+    return true;
+}
 // Developer tool: `--editor-snapshots <dir>` renders the editor in several states to PNGs.
 int EditorSnapshots(const std::wstring& outDir) {
     SHCreateDirectoryExW(nullptr, outDir.c_str(), nullptr);
@@ -2575,6 +2771,32 @@ int EditorSnapshots(const std::wstring& outDir) {
     e->texting_ = true;
     snap(L"editor-typing");
     DestroyWindow(e->hwnd);
+
+    // A collage of four screenshots.
+    auto blank = Bitmap::Create(1, 1);
+    blank->Bits()[0] = 0;
+    auto* c = new Editor(blank, {});
+    c->hidden_ = true;
+    c->collageImages_ = {card(1600, 1000, RGB(255, 59, 48), RGB(255, 149, 0), L"Payment failed"),
+                         card(900, 1400, RGB(88, 86, 214), RGB(175, 82, 222), L"Sign in"),
+                         card(1400, 900, RGB(52, 199, 89), RGB(48, 176, 199), L"Release notes"),
+                         card(1800, 1000, RGB(48, 176, 199), RGB(10, 132, 255), L"Weekly revenue")};
+    c->collageSources_ = {L"", L"", L"", L""};
+    std::vector<SIZE> sizes;
+    for (const auto& i : c->collageImages_) sizes.push_back({i->Width(), i->Height()});
+    c->collage_ = CollageSpec(sizes);
+    c->collage_->shadow = true;
+    c->collage_->background = 1;
+    c->tool_ = Tool::Select;
+    c->ApplyCollage(false);
+    if (!c->Create()) return 1;
+    SetWindowPos(c->hwnd, nullptr, 0, 0, RectW(wr), RectH(wr), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+    e = c;
+    snap(L"editor-collage");
+    c->collage_->layout = CollageLayout::Feature;
+    c->ApplyCollage(true);
+    snap(L"editor-collage-feature");
+    DestroyWindow(c->hwnd);
     return 0;
 }
 
