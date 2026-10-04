@@ -144,6 +144,7 @@ final class GalleryModel: ObservableObject {
     // MARK: selection
 
     func click(_ u: URL) {
+        GalleryWindow.shared?.endTyping()   // clicking a capture takes focus off the search field, so shortcuts apply
         let f = NSEvent.modifierFlags
         if f.contains(.shift), let a = anchor, let i = visible.firstIndex(of: a), let j = visible.firstIndex(of: u) {
             let range = visible[min(i, j)...max(i, j)]
@@ -1824,9 +1825,12 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
         AppDelegate.shared?.windowOpened(window)
         activateApp()
         window.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async { self.endTyping() }   // SwiftUI focuses the search field on open
     }
 
     private var typing: Bool { window.firstResponder is NSTextView }
+
+    func endTyping() { if typing { window.makeFirstResponder(nil) } }
 
     // Exposed for tests.
     func key(_ e: NSEvent) -> Bool {
@@ -1851,7 +1855,7 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
         }
         if typing {
             if code == kVK_Escape { window.makeFirstResponder(nil); return true }
-            if cmd && [kVK_ANSI_I, kVK_ANSI_K, kVK_ANSI_W, kVK_ANSI_S, kVK_ANSI_Slash].contains(code) { return commandKey(code, f) }
+            if cmd && [kVK_ANSI_I, kVK_ANSI_K, kVK_ANSI_W, kVK_ANSI_S, kVK_ANSI_Slash, kVK_ANSI_G].contains(code) { return commandKey(code, f) }
             if (code == kVK_DownArrow || code == kVK_Return) && window.firstResponder is NSTextView && !(window.firstResponder as! NSTextView).isFieldEditorMultiline {
                 window.makeFirstResponder(nil)
                 if m.focus == nil { m.move(1) }
