@@ -687,7 +687,7 @@ namespace {
 
 class EngineNotify : public IMFMediaEngineNotify {
 public:
-    EngineNotify(HWND hwnd, UINT msg) : hwnd_(hwnd), msg_(msg) {}
+    EngineNotify(HWND hwnd, UINT msg, std::shared_ptr<std::atomic<bool>> failed) : hwnd_(hwnd), msg_(msg), failed_(std::move(failed)) {}
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFMediaEngineNotify)) {
             *ppv = static_cast<IMFMediaEngineNotify*>(this);
@@ -704,6 +704,7 @@ public:
         return r;
     }
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD) override {
+        if (event == MF_MEDIA_ENGINE_EVENT_ERROR) *failed_ = true;  // playback stopped for good
         if (event == MF_MEDIA_ENGINE_EVENT_NOTIFYSTABLESTATE) SetEvent((HANDLE)param1);
         else if (IsWindow(hwnd_)) PostMessageW(hwnd_, msg_, event, (LPARAM)param1);
         return S_OK;
@@ -713,12 +714,14 @@ private:
     std::atomic<ULONG> ref_{1};
     HWND hwnd_;
     UINT msg_;
+    std::shared_ptr<std::atomic<bool>> failed_;
 };
 
 }  // namespace
 
 struct VideoPlayer::Impl {
     ComPtr<IMFMediaEngine> engine;
+    std::shared_ptr<std::atomic<bool>> failed = std::make_shared<std::atomic<bool>>(false);
     ComPtr<IWICImagingFactory> wic;
     ComPtr<IWICBitmap> target;
     DWORD w = 0, h = 0;
@@ -736,7 +739,7 @@ std::unique_ptr<VideoPlayer> VideoPlayer::Open(const std::wstring& path, HWND no
     ComPtr<IMFMediaEngineClassFactory> factory;
     ComPtr<IMFAttributes> attr;
     ComPtr<EngineNotify> cb;
-    cb.Attach(new EngineNotify(notify, msg));
+    cb.Attach(new EngineNotify(notify, msg, vp->p_->failed));
     HRESULT hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
     if (SUCCEEDED(hr)) hr = MFCreateAttributes(&attr, 2);
     if (SUCCEEDED(hr)) hr = attr->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, cb.Get());
@@ -759,7 +762,7 @@ std::unique_ptr<VideoPlayer> VideoPlayer::Open(const std::wstring& path, HWND no
 
 void VideoPlayer::Play() { p_->engine->Play(); }
 void VideoPlayer::Pause() { p_->engine->Pause(); }
-bool VideoPlayer::Playing() const { return !p_->engine->IsPaused() && !p_->engine->IsEnded(); }
+bool VideoPlayer::Playing() const { return !*p_->failed && !p_->engine->IsPaused() && !p_->engine->IsEnded(); }
 void VideoPlayer::Seek(double t) { p_->engine->SetCurrentTime(std::max(0.0, t)); }
 double VideoPlayer::Now() const { return p_->engine->GetCurrentTime(); }
 void VideoPlayer::SetMuted(bool m) { p_->engine->SetMuted(m); }

@@ -97,6 +97,13 @@ bool HotkeyAllowed(UINT mods, UINT vk) {
     return (vk >= VK_F1 && vk <= VK_F24) || vk == VK_SNAPSHOT || vk == VK_PAUSE || vk == VK_SCROLL;
 }
 
+// A key that produces text when pressed with these modifiers (so a global hotkey on it would eat typing).
+static bool TypesText(UINT mods, UINT vk) {
+    if (mods & (MOD_CONTROL | MOD_ALT | MOD_WIN)) return false;
+    return (vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z') || vk == VK_SPACE || vk == VK_RETURN || vk == VK_TAB || vk == VK_BACK ||
+           (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE) || (vk >= VK_OEM_1 && vk <= VK_OEM_3) || (vk >= VK_OEM_4 && vk <= VK_OEM_8) || vk == VK_OEM_102;
+}
+
 bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk) {
     mods = 0;
     vk = 0;
@@ -116,7 +123,9 @@ bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk) {
         if (plus == std::wstring::npos) break;
         start = plus + 1;
     }
-    return vk != 0 && HotkeyAllowed(mods, vk);
+    // The recorder only offers HotkeyAllowed shortcuts. Values already in settings.ini keep working unless the key
+    // would swallow typing (letters, digits, space, punctuation); e.g. Insert or Home bound on its own still works.
+    return vk != 0 && (HotkeyAllowed(mods, vk) || !TypesText(mods, vk));
 }
 
 std::wstring Settings::Get(const wchar_t* section, const wchar_t* key, const wchar_t* def) const {
@@ -342,6 +351,10 @@ ATHER_TEST(hotkeys_need_a_modifier_unless_special) {
     CHECK(!ParseHotkey(L"Shift+K", m, vk));    // so would Shift+K
     CHECK(!ParseHotkey(L"Space", m, vk));
     CHECK(!ParseHotkey(L"Ctrl+Nope", m, vk));
+    // Bindings saved by earlier versions keep working when they can't swallow typing.
+    CHECK(ParseHotkey(L"Insert", m, vk) && vk == VK_INSERT);
+    CHECK(ParseHotkey(L"Shift+Home", m, vk));
+    CHECK(!HotkeyAllowed(0, VK_INSERT));  // but the shortcut recorder doesn't offer them
     CHECK(HotkeyToText(MOD_CONTROL | MOD_SHIFT, 'S') == L"Ctrl+Shift+S");
 }
 }  // namespace ather

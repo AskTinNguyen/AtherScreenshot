@@ -82,10 +82,12 @@ public:
     HRESULT Write(const uint32_t* px, int64_t t) override {
         const size_t n = (size_t)w_ * h_;
         if (!last_.empty() && memcmp(last_.data(), px, n * 4) == 0) return S_OK;  // unchanged: the previous frame just lasts longer
-        last_.assign(px, px + n);
         std::lock_guard lock(m_);
         if (FAILED(hr_)) return hr_;  // the encoder gave up (disk full...): stop recording
-        if (q_.size() >= 6) return S_OK;  // encoder behind: drop, timestamps keep playback speed right
+        // Encoder behind: drop this frame. It doesn't become the "unchanged" reference, so if the screen then
+        // stays still, the next identical frame is queued and the GIF ends on what was really shown.
+        if (q_.size() >= 6) return S_OK;
+        last_.assign(px, px + n);
         q_.push_back({last_, t});
         cv_.notify_one();
         return S_OK;

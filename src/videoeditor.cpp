@@ -444,7 +444,8 @@ public:
         double t = 0;
         if (playing) {
             if (auto f = player->NewFrame(&t)) {
-                raw = f;
+                if (f->Width() != videoSize.cx || f->Height() != videoSize.cy) f = Resample(*f, videoSize.cx, videoSize.cy);
+                if (f) raw = f;
                 rawT = t;
                 Rerender();
             }
@@ -789,6 +790,10 @@ public:
 
     void FocusField() {
         SyncFields();
+        if (hwnd) {  // the field is shown by painting: paint now, so it can take the typing
+            InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateWindow(hwnd);
+        }
         if (field1 && (GetWindowLongW(field1, GWL_STYLE) & WS_VISIBLE)) {
             SetFocus(field1);
             SendMessageW(field1, EM_SETSEL, 0, -1);
@@ -1680,7 +1685,7 @@ public:
     // ---- keys ----
 
     bool OnKey(WPARAM vk) {
-        const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, shift = GetKeyState(VK_SHIFT) < 0;
         if (ctrl) {
             switch (vk) {
                 case 'S': Save(shift); return true;
@@ -1772,7 +1777,7 @@ public:
                                  (gif ? L".gif" : L".mp4");
         const uint64_t toast = ShowToast(gif ? L"Saving GIF…" : L"Saving video…", Clock(edit.OutputDuration()) + L" long", nullptr, nullptr, 600000);
         const VideoEdit e = edit;
-        const std::wstring src = path;
+        const std::wstring src = path, srcApp = app, srcWindow = window;
         HWND h = hwnd;
         std::thread([=] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1794,10 +1799,16 @@ public:
                 std::wstring out, tmp, err;
             };
             auto* r = new Res{ok, gif, out, tmp, err};
-            if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {
-                if (ok) MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
-                else DeleteFileW(tmp.c_str());
+            if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {  // the editor was closed meanwhile
                 delete r;
+                if (!ok) {
+                    DeleteFileW(tmp.c_str());
+                } else {
+                    RunOnUi([src, out, tmp, srcApp, srcWindow] {
+                        Library::Shared().NoteEdit(out, src, srcApp, srcWindow, true);
+                        MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+                    });
+                }
             }
         }).detach();
     }
@@ -1860,7 +1871,7 @@ LRESULT CALLBACK FieldProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFocus(e->hwnd);
         return 0;
     }
-    if (m == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0 && (w == 'S' || w == 'W')) return e->OnKey(w), 0;
+    if (m == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0 && (w == 'S' || w == 'W')) return e->OnKey(w), 0;
     if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE)) return 0;  // no beep
     if (m == WM_SETFOCUS) e->PushUndo();  // one undo step per editing session
     return CallWindowProcW(e->editProc, h, m, w, l);
@@ -1970,10 +1981,12 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
                 return 0;
             DestroyWindow(hwnd);
             return 0;
-        case WM_DESTROY: {
+        case WM_DESTROY:
             KillTimer(hwnd, kTimerFrame);
             player.reset();
             fetcher.reset();
+            return 0;
+        case WM_NCDESTROY: {  // after the children: they still need FieldProc to find this editor
             std::erase(g_editors, this);
             for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji})
                 if (f) DeleteObject(f);

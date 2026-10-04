@@ -386,7 +386,9 @@ BitmapPtr Cached(const std::wstring& key, F make) {
 
 std::wstring Typed(const std::wstring& s, double reveal) {
     if (reveal >= 1) return s;
-    return s.substr(0, std::min(s.size(), (size_t)std::ceil(s.size() * reveal)));
+    size_t n = std::min(s.size(), (size_t)std::ceil(s.size() * reveal));
+    if (n > 0 && n < s.size() && IS_HIGH_SURROGATE(s[n - 1])) ++n;  // never split an emoji in half
+    return s.substr(0, n);
 }
 
 std::wstring Trimmed(const std::wstring& s) {
@@ -1085,6 +1087,15 @@ ATHER_TEST(video_captions_appear_and_disappear_on_time) {
     CHECK_EQ(dark(0.5), 0);
     CHECK(dark(1.5) > 10);
     CHECK_EQ(dark(2.5), 0);
+}
+
+// The typewriter never shows half of an emoji (a UTF-16 surrogate pair).
+ATHER_TEST(video_typewriter_keeps_emoji_whole) {
+    const std::wstring t = L"Go \U0001F680!";  // 'G' 'o' ' ' high low '!'
+    for (int i = 0; i <= 60; ++i) {
+        const std::wstring part = Typed(t, i / 60.0);
+        CHECK(part.empty() || !IS_HIGH_SURROGATE(part.back()));
+    }
 }
 
 ATHER_TEST(video_caption_chunking) {

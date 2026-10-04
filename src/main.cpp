@@ -815,7 +815,10 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         }
         case CmdCloseAllPins: CloseAllPins(); break;
         case CmdToggleClipboard: Toggle(g_settings.copyToClipboard, L"Capture", L"CopyToClipboard", L"Copy to clipboard"); break;
-        case CmdToggleSave: Toggle(g_settings.saveToFile, L"Capture", L"SaveToFile", L"Save to file"); break;
+        case CmdToggleSave:
+            Toggle(g_settings.saveToFile, L"Capture", L"SaveToFile", L"Save to file");
+            ApplyEditorDefaults();  // open editors' Done follows it too
+            break;
         case CmdToggleCursor: Toggle(g_settings.captureCursor, L"Capture", L"CaptureCursor", L"Include cursor"); break;
         case CmdToggleStartup: {
             bool on = !IsRunAtStartup();

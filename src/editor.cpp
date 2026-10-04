@@ -150,7 +150,7 @@ std::unique_ptr<gp::Font> TextFont(const Annot& a) {
 }
 
 const gp::StringFormat* TypoFormat() {
-    static gp::StringFormat* f = [] {
+    thread_local gp::StringFormat* f = [] {  // per thread: GDI+ objects can't be shared between threads
         auto* sf = gp::StringFormat::GenericTypographic()->Clone();
         sf->SetFormatFlags(sf->GetFormatFlags() | gp::StringFormatFlagsMeasureTrailingSpaces);
         return sf;
@@ -159,8 +159,12 @@ const gp::StringFormat* TypoFormat() {
 }
 
 gp::Graphics& MeasureGraphics() {
-    static gp::Bitmap* bmp = new gp::Bitmap(1, 1, PixelFormat32bppARGB);
-    static gp::Graphics* g = new gp::Graphics(bmp);
+    thread_local gp::Bitmap* bmp = new gp::Bitmap(1, 1, PixelFormat32bppARGB);  // per thread, like TypoFormat
+    thread_local gp::Graphics* g = [] {
+        auto* gr = new gp::Graphics(bmp);
+        gr->SetTextRenderingHint(gp::TextRenderingHintAntiAlias);  // measure the way text is drawn
+        return gr;
+    }();
     return *g;
 }
 
@@ -209,6 +213,7 @@ gp::RectF Bounds(const Annot& a) {
         default: r = NormRect(a.pts[0], a.pts.back());
     }
     float pad = StrokeW(a) / 2 + 4 * a.unit;
+    if (a.type == Tool::Arrow) pad = std::max(pad, std::max(StrokeW(a) * 3.6f, 12 * a.unit) * 0.58f + 2 * a.unit);  // the head's wings
     r.Inflate(pad, pad);
     return r;
 }
@@ -500,7 +505,8 @@ void DrawLayer(gp::Graphics& g, const Annot& a) {
         // Shrink big images first (box filter), so the texture brush samples a clean image.
         BitmapPtr img = l.image;
         const int tw = std::max(1, (int)std::lround(r.Width)), th = std::max(1, (int)std::lround(r.Height));
-        if (img->Width() > tw * 4 / 3 || img->Height() > th * 4 / 3) img = Resample(*img, tw, th);
+        if (img->Width() > tw * 4 / 3 || img->Height() > th * 4 / 3)
+            if (auto shrunk = Resample(*img, tw, th)) img = shrunk;  // keep the original if there's no memory for the copy
         gp::Bitmap src(img->Width(), img->Height(), img->Width() * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(img->Bits()));
         gp::TextureBrush tb(&src, gp::WrapModeClamp);
         tb.TranslateTransform(local.X, local.Y);
@@ -605,7 +611,7 @@ BitmapPtr Compose(const Bitmap& base, const DocState& st, BitmapPtr pixel = null
         g.TranslateTransform((float)-f.left, (float)-f.top);
         Spotlights(g, st.annots, gp::RectF((float)f.left, (float)f.top, (float)RectW(f), (float)RectH(f)));
         for (const auto& a : st.annots)
-            if (!IsRasterTool(a.type) || a.type == Tool::Magnify) DrawAnnot(g, a);
+            if ((!IsRasterTool(a.type) || a.type == Tool::Magnify) && a.type != Tool::Spotlight) DrawAnnot(g, a);
     }
     return out;
 }
@@ -779,8 +785,22 @@ private:
     void RebuildViewCache();
     void Compose();
     void Changed(bool pixels) {
+        ClampFrame();
         if (pixels) pixel_ = PixelBase(*base_, st_, nullptr);
         Compose();
+    }
+    // Added space can grow without bound (edge drags, "Space below" again and again, huge collages): keep the
+    // document within what can be allocated and saved.
+    void ClampFrame() {
+        if (!st_.crop) return;
+        gp::RectF& c = *st_.crop;
+        constexpr float kMaxSide = 30000, kMaxArea = 200e6f;
+        c.Width = std::clamp(c.Width, 1.f, kMaxSide);
+        c.Height = std::clamp(c.Height, 1.f, kMaxSide);
+        if (c.Width * c.Height > kMaxArea) {
+            if (c.Height >= c.Width) c.Height = kMaxArea / c.Width;
+            else c.Width = kMaxArea / c.Height;
+        }
     }
     void Paint(HDC hdc);
     void DrawToolbar(HDC dc);
@@ -1143,8 +1163,8 @@ void Editor::Restore(DocState st) {
 }
 
 void Editor::Undo() {
+    CommitText();  // first: CancelLive ends text mode and would drop what was typed
     CancelLive();
-    CommitText();
     if (undo_.empty()) return;
     redo_.push_back(st_);
     DocState st = std::move(undo_.back());
@@ -1153,6 +1173,7 @@ void Editor::Undo() {
 }
 
 void Editor::Redo() {
+    CommitText();
     CancelLive();
     if (redo_.empty()) return;
     undo_.push_back(st_);
@@ -1257,8 +1278,10 @@ void Editor::CancelLive() {
 
 BitmapPtr Editor::Export() {
     CommitText();
-    if (styled_) return StyledFrame(*committed_);
-    return committed_->Crop({0, 0, committed_->Width(), committed_->Height()});
+    BitmapPtr out;
+    if (committed_) out = styled_ ? StyledFrame(*committed_) : committed_->Crop({0, 0, committed_->Width(), committed_->Height()});
+    if (!out) ShowToast(L"Not enough memory for this image", L"Remove some added space or layers and try again.", nullptr, nullptr, 4000);
+    return out;
 }
 
 // Presentation export: gradient backdrop, padding, soft shadow and rounded corners.
@@ -1298,6 +1321,10 @@ void Editor::AutoRedact() {
     RECT f;
     BitmapPtr raster = Raster(*base_, st_, &f);  // includes image layers and added space
     if (raster) raster = Flatten(*raster);
+    if (!raster) {
+        redacting_ = false;
+        return (void)ShowToast(L"Auto-redact failed", L"Not enough memory for this image.", nullptr, nullptr, 4000);
+    }
     RecognizeWordsAsync(raster, [h, unit, f](std::vector<OcrWord> words, std::wstring err) {
         Editor* e = FromHwnd(h);
         if (!e) return;
@@ -1640,12 +1667,14 @@ std::vector<std::wstring> Editor::Includes() const {
 
 void Editor::Copy() {
     auto img = Export();
+    if (!img) return;
     if (CopyImageToClipboard(hwnd, *img))
         ShowToast(L"Copied to clipboard", std::to_wstring(img->Width()) + L" × " + std::to_wstring(img->Height()), nullptr, nullptr, 1800);
 }
 
 void Editor::Save(bool quiet) {
     auto img = Export();
+    if (!img) return;
     CaptureNameInfo info{source_.window, source_.app, img->Width(), img->Height()};
     const std::wstring path = MakeCapturePath(g_defaults.capturesFolder, L"png", info);
     // Joins the gallery with the original's tags and collections, stacked as a version of it. A collage is
@@ -1667,6 +1696,7 @@ void Editor::Save(bool quiet) {
 
 void Editor::SaveAs() {
     auto img = Export();
+    if (!img) return;
     wchar_t file[MAX_PATH] = L"annotated.png";
     OPENFILENAMEW ofn{sizeof(ofn)};
     ofn.hwndOwner = hwnd;
@@ -1681,16 +1711,24 @@ void Editor::SaveAs() {
     else ShowToast(L"Save failed", file, nullptr, nullptr, 4000);
 }
 
-void Editor::Pin() { PinImage(Flatten(*Export()), nullptr); }
+void Editor::Pin() {
+    if (auto img = Export())
+        if (auto flat = Flatten(*img)) PinImage(flat, nullptr);
+}
 
 void Editor::Done() {
     auto img = Export();
+    if (!img) return;
     const bool copied = CopyImageToClipboard(hwnd, *img);
     if (g_defaults.saveToFile) {
         Save(true);
         ShowToast(copied ? L"Copied and saved" : L"Saved", std::to_wstring(img->Width()) + L" × " + std::to_wstring(img->Height()), nullptr, nullptr, 2000);
     } else if (copied) {
         ShowToast(L"Copied to clipboard", std::to_wstring(img->Width()) + L" × " + std::to_wstring(img->Height()), nullptr, nullptr, 1800);
+    } else {
+        // Neither copied nor saved: closing would lose the work.
+        ShowToast(L"Couldn't copy the image", L"Another app may be using the clipboard. Try again, or save with Ctrl+S.", nullptr, nullptr, 4000);
+        return;
     }
     dirty_ = false;
     DestroyWindow(hwnd);
@@ -2963,10 +3001,63 @@ ATHER_TEST(editor_crop_outside_image_still_exports_annotations) {
 namespace {
 struct EditorTest {
     static void Redactions();
+    static void UndoWhileTyping();
 };
 }  // namespace
 
 ATHER_TEST(editor_redactions_survive_a_cancelled_drag) { EditorTest::Redactions(); }
+ATHER_TEST(editor_undo_while_typing_keeps_the_previous_step) { EditorTest::UndoWhileTyping(); }
+
+void EditorTest::UndoWhileTyping() {
+    auto* e = new Editor(SolidBmp(400, 300, 0xFFFFFFFF), {});
+    e->hidden_ = true;
+    CHECK(e->Create());
+    if (!e->hwnd) return;
+    Annot arrow;
+    arrow.type = Tool::Arrow;
+    arrow.pts = {gp::PointF(10, 10), gp::PointF(90, 90)};
+    e->PushUndo();
+    e->st_.annots.push_back(arrow);
+    e->texting_ = true;  // typing a note
+    e->live_ = Annot{};
+    e->live_.type = Tool::Text;
+    e->live_.pts = {gp::PointF(20, 200)};
+    e->live_.text = L"Important";
+    e->Undo();  // undoes the note, not the arrow
+    CHECK(e->st_.annots.size() == 1 && e->st_.annots[0].type == Tool::Arrow);
+    e->Redo();  // and the note comes back
+    CHECK(std::any_of(e->st_.annots.begin(), e->st_.annots.end(), [](const Annot& x) { return x.text == L"Important"; }));
+    e->dirty_ = false;
+    DestroyWindow(e->hwnd);
+}
+
+// A spotlight dims everything else; the area itself is left exactly as it was (no preview tint or border).
+ATHER_TEST(editor_spotlight_leaves_its_area_untouched) {
+    auto base = SolidBmp(200, 100, 0xFF808080);
+    DocState st;
+    Annot spot;
+    spot.type = Tool::Spotlight;
+    spot.pts = {gp::PointF(50, 20), gp::PointF(150, 80)};
+    st.annots.push_back(spot);
+    auto out = Compose(*base, st);
+    CHECK(out != nullptr);
+    if (!out) return;
+    CHECK_EQ(Rgb(At(*out, 100, 50)), 0x808080u);  // inside
+    CHECK_EQ(Rgb(At(*out, 50, 50)), 0x808080u);   // on its edge: no dashed border
+    CHECK(Rgb(At(*out, 10, 50)) != 0x808080u);    // outside is dimmed
+}
+
+// Arrow bounds cover the arrowhead, so video markup (drawn into a bitmap of this size) isn't clipped.
+ATHER_TEST(editor_arrow_bounds_include_the_head) {
+    annot::Shape a;
+    a.kind = annot::Kind::Arrow;
+    a.level = 4;
+    a.unit = 1;
+    a.ax = 0, a.ay = 100, a.bx = 300, a.by = 100;
+    const annot::BoxF b = annot::Bounds(a);
+    const float half = std::max(annot::StrokeWidth(a) * 3.6f, 12.f) * 0.58f;
+    CHECK(b.y <= 100 - half && b.y + b.h >= 100 + half);
+}
 
 void EditorTest::Redactions() {
     auto img = SolidBmp(400, 300, 0xFFFFFFFF);
