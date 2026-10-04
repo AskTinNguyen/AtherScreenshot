@@ -508,6 +508,24 @@ ATHER_TEST(gallery_version_stacks_and_compare) {
     CHECK((m.visible == std::vector<std::wstring>{a}));
 }
 
+ATHER_TEST(gallery_related_matches_come_after_exact_ones) {
+    Library l(false);
+    const std::wstring chart = L"C:\\r\\chart.png", sales = L"C:\\r\\sales.png", other = L"C:\\r\\other.png";
+    l.Apply({{chart, 3, 1}, {sales, 2, 1}, {other, 1, 1}});
+    l.TestSetText(chart, L"Weekly revenue chart", 1);  // related to "sales graph" only
+    l.TestSetText(sales, L"sales graph for Q3", 1);     // exact
+    l.TestSetText(other, L"Team chat", 1);
+    GalleryModel m(l);
+    Filter f;
+    f.text = L"sales graph";
+    m.SetFilter(f);
+    CHECK((m.visible == std::vector<std::wstring>{sales, chart}));  // exact first, although older
+    CHECK_EQ(m.relatedCount, 1);
+    f.text = L"statistics";
+    m.SetFilter(f);
+    CHECK(m.visible.size() == 2 && m.relatedCount == 2);  // no exact match ("chart" and "graph" are related)
+}
+
 ATHER_TEST(gallery_scopes_selection_and_navigation) {
     Library l(false);
     std::vector<FileStat> st;

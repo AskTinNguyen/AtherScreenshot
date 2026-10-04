@@ -177,6 +177,22 @@ int FeatureStats(const std::wstring& folder) {
     return 0;
 }
 
+ATHER_TEST(library_auto_tag_setting_tags_everything_once) {
+    Library l(false);
+    const std::wstring a = L"C:\\t\\slack.png", b = L"C:\\t\\phone.png", c = L"C:\\t\\plain.png";
+    l.Apply({{c, 3, 1}, {b, 2, 1}, {a, 1, 1}});
+    l.TestSetApp(a, L"Slack");
+    l.TestSetText(b, L"Sign in to continue", 1);
+    l.DismissSuggestion(L"login", {b});  // turned down: never applied
+    l.SetAutoTag(true);
+    CHECK((l.Meta(a).tags == std::vector<std::wstring>{L"chat"}));
+    CHECK(l.Meta(b).tags.empty());
+    CHECK(l.Meta(c).tags.empty());
+    l.RemoveTag(L"chat", {a});
+    l.SetAutoTag(true);  // already on: not applied again
+    CHECK(l.Meta(a).tags.empty());
+}
+
 ATHER_TEST(library_filter_matching) {
     ItemMeta m;
     m.w = 3000;
