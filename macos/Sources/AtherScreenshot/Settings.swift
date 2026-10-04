@@ -16,7 +16,7 @@ final class Settings: ObservableObject {
             "AfterCapture": "none", "FileNameTemplate": "", "AskForName": false, "AutoRedact": false,
             "VideoFps": 30, "GifFps": 15, "RecordCursor": true, "RecordSystemAudio": true, "RecordMicrophone": false,
             "CountdownSeconds": 3, "ShowClicks": true, "ShowKeys": false,
-            "ScrollDelayMs": 400, "ScrollMaxFrames": 60, "StyledExport": false,
+            "ScrollDelayMs": 400, "ScrollMaxFrames": 60, "StyledExport": false, "AutoTag": false,
             "Uploader": "none", "ImgurClientId": "", "CustomUrl": "", "CustomFileField": "file", "CustomHeaders": "",
             "CustomResponseUrl": "", "S3Endpoint": "", "S3Bucket": "", "S3Region": "auto", "S3AccessKey": "",
             "S3SecretKey": "", "S3PublicUrl": "",

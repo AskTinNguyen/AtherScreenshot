@@ -30,7 +30,8 @@ final class LibraryTests: XCTestCase {
         let url = u("a.png")
         XCTAssertTrue(Filter(text: "invoice 42").matches(url, m))
         XCTAssertTrue(Filter(text: "safari bug").matches(url, m))   // app and tags are searchable too
-        XCTAssertFalse(Filter(text: "receipt").matches(url, m))
+        XCTAssertTrue(Filter(text: "receipt").matches(url, m))   // "invoice" suggests the receipt tag
+        XCTAssertFalse(Filter(text: "terminal").matches(url, m))
         XCTAssertTrue(Filter(tags: ["bug", "UI"]).matches(url, m))
         XCTAssertFalse(Filter(tags: ["bug", "mobile"]).matches(url, m))
         XCTAssertTrue(Filter(tags: ["bug", "mobile"], anyTag: true).matches(url, m))

@@ -47,6 +47,7 @@ struct ItemMeta: Codable {
     var indexed = 0            // indexer version that produced the technical fields
     var editedFrom: String?    // path of the capture this one was edited from
     var includes: [String] = [] // paths of screenshots placed into this one (overlays, collages)
+    var dismissed: [String] = []  // suggested tags turned down
 
     var aspect: CGFloat { w > 0 && h > 0 ? CGFloat(w) / CGFloat(h) : 16 / 10 }
 }
@@ -77,7 +78,7 @@ extension ItemMeta {
         comment = c.value(.comment, comment); collections = c.value(.collections, collections); app = c.value(.app, app)
         window = c.value(.window, window); text = c.value(.text, text); colors = c.value(.colors, colors)
         dhash = c.value(.dhash, dhash); indexed = c.value(.indexed, indexed); editedFrom = c.value(.editedFrom, editedFrom)
-        includes = c.value(.includes, includes)
+        includes = c.value(.includes, includes); dismissed = c.value(.dismissed, dismissed)
     }
 }
 
@@ -185,31 +186,33 @@ struct Filter: Codable, Equatable, Hashable {
          size != nil, !apps.isEmpty, minWidth > 0 || minHeight > 0].filter { $0 }.count
     }
 
-    func matches(_ u: URL, _ m: ItemMeta) -> Bool {
-        if !types.isEmpty && !types.contains(MediaType.of(u)) { return false }
-        if untagged && !m.tags.isEmpty { return false }
+    func matches(_ u: URL, _ m: ItemMeta) -> Bool { match(u, m) != nil }
+
+    // nil: filtered out. `.related` when the search only matched related words.
+    func match(_ u: URL, _ m: ItemMeta) -> SearchQuery.Match? {
+        if !types.isEmpty && !types.contains(MediaType.of(u)) { return nil }
+        if untagged && !m.tags.isEmpty { return nil }
         if !tags.isEmpty {
             let mine = Set(m.tags.map { $0.lowercased() })
             let want = tags.map { $0.lowercased() }
-            if anyTag ? !want.contains(where: mine.contains) : !want.allSatisfy(mine.contains) { return false }
+            if anyTag ? !want.contains(where: mine.contains) : !want.allSatisfy(mine.contains) { return nil }
         }
-        if minRating > 0 && m.rating < minRating { return false }
-        if let shape, !shape.matches(m.aspect) { return false }
-        if let date, m.mtime < date.since.timeIntervalSince1970 { return false }
-        if let size, !size.matches(m.size) { return false }
-        if !apps.isEmpty && !apps.contains(m.app) { return false }
-        if minWidth > 0 && m.w < minWidth { return false }
-        if minHeight > 0 && m.h < minHeight { return false }
+        if minRating > 0 && m.rating < minRating { return nil }
+        if let shape, !shape.matches(m.aspect) { return nil }
+        if let date, m.mtime < date.since.timeIntervalSince1970 { return nil }
+        if let size, !size.matches(m.size) { return nil }
+        if !apps.isEmpty && !apps.contains(m.app) { return nil }
+        if minWidth > 0 && m.w < minWidth { return nil }
+        if minHeight > 0 && m.h < minHeight { return nil }
         if let hex = color, let target = Filter.rgb(hex) {
-            guard m.colors.contains(where: { $0.ratio >= 0.03 && Filter.distance(target, ($0.r, $0.g, $0.b)) < 100 }) else { return false }
+            guard m.colors.contains(where: { $0.ratio >= 0.03 && Filter.distance(target, ($0.r, $0.g, $0.b)) < 100 }) else { return nil }
         }
-        let words = text.lowercased().split(separator: " ").map(String.init)
-        if !words.isEmpty {
-            let hay = [u.lastPathComponent, Library.dateFormat.string(from: Date(timeIntervalSince1970: m.mtime)), MediaType.of(u).words,
-                       m.text ?? "", m.comment, m.tags.joined(separator: " "), m.app, m.window].joined(separator: " ").lowercased()
-            if !words.allSatisfy(hay.contains) { return false }
-        }
-        return true
+        let q = SearchQuery.parse(text)
+        guard !q.isEmpty else { return .exact }
+        let hay = [u.lastPathComponent, Library.dateFormat.string(from: Date(timeIntervalSince1970: m.mtime)), MediaType.of(u).words,
+                   m.text ?? "", m.comment, m.tags.joined(separator: " "), AutoTag.suggest(u, m).joined(separator: " "),
+                   m.app, m.window].joined(separator: " ").lowercased()
+        return q.match(hay, mtime: m.mtime)
     }
 
     static func rgb(_ hex: String) -> (UInt8, UInt8, UInt8)? {
@@ -279,7 +282,17 @@ final class Library: ObservableObject {
     init(persists: Bool = true) {
         self.persists = persists
         if !persists { loaded = true }
+        guard persists else { return }
+        autoTag = Settings.shared.bool("AutoTag")
+        // Turning on "Tag captures automatically" tags the whole library, not just new captures.
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            let on = Settings.shared.bool("AutoTag")
+            if on && !self.autoTag && self.loaded { self.applySuggestions() }
+            self.autoTag = on
+        }
     }
+    private var autoTag = false
 
     // Loads library.json once. Every mutation goes through here first, so nothing can save an
     // empty store over the real one.
@@ -501,6 +514,7 @@ final class Library: ObservableObject {
                         self.featuresDirty = true; self.featureVersion += 1
                         self.techVersion += 1
                     }
+                    if Settings.shared.bool("AutoTag") { self.applySuggestions(to: [u]) }
                     self.progress = (i + 1, todo.count)
                     if (i + 1) % 20 == 0 || i == todo.count - 1 { self.save() }
                 }
@@ -531,6 +545,27 @@ final class Library: ObservableObject {
 
     func addTags(_ tags: [String], to us: [URL]) { edit(us) { $0.tags = Library.normalize($0.tags + tags) } }
     func removeTag(_ tag: String, from us: [URL]) { edit(us) { $0.tags.removeAll { $0.lowercased() == tag.lowercased() } } }
+
+    // Turns a suggested tag down for these captures; it stays searchable but isn't offered again.
+    func dismissSuggestion(_ tag: String, for us: [URL]) { edit(us) { $0.dismissed = Library.normalize($0.dismissed + [tag]) } }
+
+    // "Tag automatically" setting: adds every pending suggestion.
+    func applySuggestions(to us: [URL]? = nil) {
+        loadIfNeeded()
+        var m = meta
+        var changed = false
+        for u in us ?? urls {
+            guard var e = m[u.path] else { continue }
+            let add = AutoTag.pending(u, e)
+            guard !add.isEmpty else { continue }
+            e.tags = Library.normalize(e.tags + add)
+            m[u.path] = e
+            changed = true
+        }
+        guard changed else { return }
+        meta = m
+        save()
+    }
     func setRating(_ r: Int, _ us: [URL]) { edit(us) { $0.rating = min(5, max(0, r)) } }
     func setComment(_ c: String, _ u: URL) { edit([u]) { $0.comment = c } }
 

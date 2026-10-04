@@ -47,6 +47,15 @@ final class GalleryModel: ObservableObject {
         didSet { UserDefaults.standard.set(inspectorDiscovered, forKey: "GalleryInspectorDiscovered") }
     }
     @Published var showShortcuts = false
+    @Published var stackEdits = UserDefaults.standard.object(forKey: "GalleryStacks") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(stackEdits, forKey: "GalleryStacks"); recompute() }
+    }
+    @Published var expanded: Set<String> = [] { didSet { recompute() } }   // stack roots shown open
+    @Published private(set) var stacks: [URL: Int] = [:]       // shown capture → versions in its stack
+    @Published private(set) var relatedCount = 0               // search results that matched only related words
+    @Published var compare: (URL, URL)?
+    private(set) var versionsByRoot: [String: [URL]] = [:]     // every stack with 2+ versions, newest first
+    private(set) var rootOf: [String: String] = [:]
     @Published var showNames = UserDefaults.standard.bool(forKey: "GalleryNames") { didSet { UserDefaults.standard.set(showNames, forKey: "GalleryNames") } }
     @Published private(set) var visible: [URL] = []
     @Published private(set) var groups: [[URL]] = []           // duplicates scope
@@ -123,7 +132,13 @@ final class GalleryModel: ObservableObject {
         } else {
             groups = []
             distances = [:]
-            var list = lib.urls.filter { u in let m = lib.meta(u); return inScope(u, m) && filter.matches(u, m) }
+            var kinds: [URL: SearchQuery.Match] = [:]
+            var list = lib.urls.filter { u in
+                let m = lib.meta(u)
+                guard inScope(u, m), let k = filter.match(u, m) else { return false }
+                kinds[u] = k
+                return true
+            }
             switch sort {
             case .newest: list.sort { lib.meta($0).mtime > lib.meta($1).mtime }
             case .oldest: list.sort { lib.meta($0).mtime < lib.meta($1).mtime }
@@ -135,10 +150,67 @@ final class GalleryModel: ObservableObject {
                 var g = SeededRandom(seed: seed)
                 list.shuffle(using: &g)
             }
-            visible = list
+            // Exact matches first; captures that only matched related words follow.
+            let related = list.filter { kinds[$0] == .related }
+            relatedCount = related.count
+            if !related.isEmpty { list = list.filter { kinds[$0] != .related } + related }
+            visible = collapseStacks(list)
         }
         selection = selection.filter(Set(visible).contains)
         if let f = focus, !visible.contains(f) { focus = nil }
+    }
+
+    // MARK: version stacks
+
+    // Groups each original with its edits (following "edited from" links) and, while browsing,
+    // shows only the newest version of each until the stack is expanded.
+    private func collapseStacks(_ list: [URL]) -> [URL] {
+        var roots: [String: String] = [:]
+        func root(_ u: URL) -> String {
+            if let r = roots[u.path] { return r }
+            var cur = u.path
+            var seen: Set<String> = [cur]
+            while let p = lib.meta[cur]?.editedFrom, lib.meta[p] != nil, seen.insert(p).inserted { cur = p }
+            roots[u.path] = cur
+            return cur
+        }
+        var groups: [String: [URL]] = [:]
+        for u in lib.urls { groups[root(u), default: []].append(u) }
+        versionsByRoot = groups.filter { $0.value.count > 1 }.mapValues { $0.sorted { lib.meta($0).mtime > lib.meta($1).mtime } }
+        rootOf = [:]
+        for (r, vs) in versionsByRoot { for v in vs { rootOf[v.path] = r } }
+        stacks = [:]
+        guard stackEdits, filter.text.isEmpty else { return list }
+        var out: [URL] = []
+        var done = Set<String>()
+        for u in list {
+            guard let r = rootOf[u.path], let vs = versionsByRoot[r] else { out.append(u); continue }
+            guard done.insert(r).inserted else { continue }
+            let shown = vs.filter(Set(list).contains)
+            if expanded.contains(r) {
+                out += shown
+                for v in shown { stacks[v] = vs.count }
+            } else if let cover = shown.first {
+                out.append(cover)
+                stacks[cover] = vs.count
+            }
+        }
+        return out
+    }
+
+    func versions(of u: URL) -> [URL] { rootOf[u.path].flatMap { versionsByRoot[$0] } ?? [] }
+    func isExpanded(_ u: URL) -> Bool { rootOf[u.path].map(expanded.contains) ?? false }
+    func toggleStack(_ u: URL) {
+        guard let r = rootOf[u.path] else { return }
+        if expanded.contains(r) { expanded.remove(r) } else { expanded.insert(r) }
+    }
+
+    func compareSelected() {
+        let ts = targets.filter(isImage)
+        if ts.count == 2 { compare = (ts[1], ts[0]); return }
+        if ts.count == 1, let o = lib.meta(ts[0]).editedFrom, lib.meta[o] != nil { compare = (URL(fileURLWithPath: o), ts[0]); return }
+        if ts.count == 1, let older = versions(of: ts[0]).first(where: { $0 != ts[0] }) { compare = (older, ts[0]); return }
+        Toast.shared.show("Select two screenshots to compare", "Or one edited capture to compare with its original")
     }
 
     // MARK: selection
@@ -245,6 +317,7 @@ final class GalleryModel: ObservableObject {
     // Selects a capture in the gallery, widening the view if it's filtered out.
     func reveal(inGallery u: URL) {
         guard lib.urls.contains(u) else { return Toast.shared.show("The original is no longer in the gallery") }
+        if !visible.contains(u), let r = rootOf[u.path] { expanded.insert(r) }   // hidden inside a collapsed stack
         if !visible.contains(u) { scope = .all; filter = Filter() }
         selection = [u]
         focus = u
@@ -542,6 +615,20 @@ private struct Tile: View {
             }
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(sel ? C(Theme.accent) : (model.focus == url ? Color.white.opacity(0.35) : Color.clear), lineWidth: sel ? 2.5 : 1)
                 .padding(-2))
+            .overlay(alignment: .topTrailing) {
+                if let n = model.stacks[url] {
+                    Button { model.toggleStack(url) } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: model.isExpanded(url) ? "rectangle.compress.vertical" : "square.stack")
+                            Text("\(n)")
+                        }
+                        .font(.system(size: 10, weight: .bold)).padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(.ultraThinMaterial, in: Capsule()).foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain).padding(6)
+                    .help(model.isExpanded(url) ? "Collapse versions" : "\(n) versions: the original and its edits. Click to show all.")
+                }
+            }
             .onHover { hover = $0 }
             if caption {
                 Text(url.lastPathComponent).font(.system(size: 11)).foregroundColor(C(sel ? Theme.text : Theme.textDim)).lineLimit(1).truncationMode(.middle)
@@ -576,6 +663,9 @@ private struct ItemMenu: View {
         Button("Find similar") { model.findSimilar(url) }
         if model.selection.count > 1 && model.selection.contains(url) { Button("Make collage") { model.collage() } }
         if model.editorOpen { Button("Add to open editor") { ensure(); model.addToEditor() } }
+        if model.selection.count == 2 && model.selection.contains(url) { Button("Compare") { model.compareSelected() } }
+        else if model.versions(of: url).count > 1 { Button("Compare with previous version") { model.selection = [url]; model.focus = url; model.compareSelected() } }
+        if model.stacks[url] != nil { Button(model.isExpanded(url) ? "Collapse versions" : "Show all versions") { model.toggleStack(url) } }
         Divider()
         Button("Add tags…") { ensure(); model.tagPicker() }
         Button("Add to collection…") { ensure(); model.collectionPicker() }
@@ -1003,6 +1093,12 @@ private struct TopBar: View {
             .padding(4)
             .glass(20)
             if model.filter.hasConstraints { ActiveFilters(model: model) }
+            else if model.relatedCount > 0 && !model.filter.text.isEmpty {
+                Text(model.relatedCount == model.visible.count ? "No exact matches; showing \(model.relatedCount) related by meaning"
+                     : "Plus \(model.relatedCount) related by meaning, after the exact matches")
+                    .font(.system(size: 11)).foregroundColor(C(Theme.textDim))
+                    .padding(.horizontal, 10).padding(.vertical, 5).glass(12)
+            }
         }
         .onChange(of: model.focusSearch) { searchFocused = true }
     }
@@ -1074,6 +1170,7 @@ private struct TopBar: View {
             Button("Larger thumbnails  ⌘+") { model.zoom(1.15) }.disabled(model.layout == .list)
             Button("Smaller thumbnails  ⌘−") { model.zoom(1 / 1.15) }.disabled(model.layout == .list)
             Toggle("Show names", isOn: $model.showNames)
+            Toggle("Stack edited versions", isOn: $model.stackEdits)
             Divider()
             Toggle("Sidebar  ⌃⌘S", isOn: $model.showSidebar)
             Toggle("Inspector  ⌘I", isOn: $model.showInspector)
@@ -1258,6 +1355,7 @@ private struct ActionBar: View {
                 ForEach(0...5, id: \.self) { r in Button(r == 0 ? "No rating" : String(repeating: "★", count: r)) { model.rate(r) } }
             } label: { Image(systemName: "star") }
                 .menuStyle(.button).buttonStyle(GlassButtonStyle()).menuIndicator(.hidden).fixedSize().help("Rate (0–5)")
+            if n == 2 { action("square.split.2x1", "Compare (C)") { model.compareSelected() } }
             if n > 1 { action("rectangle.3.group", "Make collage (⌘G)") { model.collage() } }
             action("pin", "Pin to screen (⌘P)") { model.pin() }
             action("square.and.arrow.up", "Upload and copy link (⌘U)") { model.upload() }
@@ -1293,7 +1391,7 @@ private struct ShortcutsCard: View {
     @ObservedObject var model: GalleryModel
     private let rows: [(String, String)] = [
         ("Space", "Preview"), ("↩", "Open or annotate"), ("← → ↑ ↓", "Move selection"), ("T", "Add tags"), ("F", "Add to collection"),
-        ("1–5, 0", "Rate, clear rating"), ("/  or  ⌘F", "Search"), ("⌘C", "Copy"), ("⌘T", "Copy text (OCR)"),
+        ("1–5, 0", "Rate, clear rating"), ("C", "Compare versions"), ("/  or  ⌘F", "Search"), ("⌘C", "Copy"), ("⌘T", "Copy text (OCR)"),
         ("⌘P", "Pin to screen"), ("⌘R", "Rename"), ("⌘U", "Upload and copy link"), ("⌘O", "Show in Finder"), ("⌘⌫", "Move to Trash"),
         ("⌘I", "Details"), ("⌃⌘S", "Sidebar"), ("⌘+  ⌘−", "Thumbnail size"), ("⌘⇧S", "Save as smart folder"), ("⌘G", "Make collage"), ("⌘K", "All actions"),
     ]
@@ -1475,6 +1573,24 @@ private struct Inspector: View {
                 ForEach(members) { c in chip(c.name, icon: "folder", open: { model.scope = .collection(c.id) }) { lib.remove([u], fromCollection: c.id) } }
             }
         }
+        let sugg = AutoTag.pending(u, m)
+        if !sugg.isEmpty {
+            FlowLayout(spacing: 5) {
+                ForEach(sugg, id: \.self) { t in
+                    Button { lib.addTags([t], to: [u]) } label: {
+                        Text("+ " + t).font(.system(size: 11)).padding(.horizontal, 8).padding(.vertical, 3)
+                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.22), style: StrokeStyle(lineWidth: 0.75, dash: [3, 2])))
+                            .foregroundColor(C(Theme.textDim))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Suggested tag: click to add. Right-click to stop suggesting it.")
+                    .contextMenu { Button("Don't suggest “\(t)” for this capture") { lib.dismissSuggestion(t, for: [u]) } }
+                }
+                if sugg.count > 1 {
+                    Button("Add all") { lib.addTags(sugg, to: [u]) }.buttonStyle(.plain).font(.system(size: 11)).foregroundColor(C(Theme.muted))
+                }
+            }
+        }
         if addingTag { tagField([u]) }
         if editingComment || !m.comment.isEmpty { commentEditor(u, m) }
         HStack(spacing: 4) {
@@ -1509,6 +1625,29 @@ private struct Inspector: View {
                         }
                     }
                     .font(.system(size: 11))
+                }
+            }
+        }
+
+        let vs = model.versions(of: u)
+        if vs.count > 1 {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Versions").font(.system(size: 11, weight: .medium)).foregroundColor(C(Theme.textDim))
+                    Spacer()
+                    Button { model.compareSelected() } label: { Label("Compare", systemImage: "square.split.2x1") }
+                        .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(C(Theme.muted)).help("Compare with the previous version (C)")
+                }
+                ForEach(vs, id: \.self) { v in
+                    HStack(spacing: 6) {
+                        Image(systemName: v == u ? "circle.inset.filled" : lib.meta(v).editedFrom == nil ? "circle" : "pencil.circle").font(.system(size: 10))
+                        Text(v.deletingPathExtension().lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Text(Library.dateFormat.string(from: Date(timeIntervalSince1970: lib.meta(v).mtime))).foregroundColor(C(Theme.muted)).monospacedDigit()
+                    }
+                    .font(.system(size: 11)).foregroundColor(v == u ? C(Theme.text) : C(Theme.textDim))
+                    .contentShape(Rectangle())
+                    .onTapGesture { if v != u { model.reveal(inGallery: v) } }
                 }
             }
         }
@@ -1727,6 +1866,88 @@ private struct PreviewOverlay: View {
     }
 }
 
+// MARK: - Compare
+
+// Before/after: a draggable divider over the two images, or side by side.
+private struct CompareOverlay: View {
+    @ObservedObject var model: GalleryModel
+    let before: URL
+    let after: URL
+    @State private var split: CGFloat = 0.5
+    @State private var sideBySide = false
+    @State private var a: NSImage?
+    @State private var b: NSImage?
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.94).ignoresSafeArea()
+            VStack(spacing: 12) {
+                HStack(spacing: 10) {
+                    label("Before", before)
+                    Image(systemName: "arrow.right").foregroundColor(C(Theme.muted)).font(.system(size: 11))
+                    label("After", after)
+                    Spacer()
+                    Picker("", selection: $sideBySide) { Text("Slider").tag(false); Text("Side by side").tag(true) }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                    Button { model.compare = (after, before) } label: { Image(systemName: "arrow.left.arrow.right") }
+                        .buttonStyle(GlassButtonStyle()).help("Swap")
+                    Button { model.compare = nil } label: { Image(systemName: "xmark") }.buttonStyle(GlassButtonStyle()).help("Close (Esc)")
+                }
+                .padding(.horizontal, 20).padding(.top, 52)
+                GeometryReader { g in
+                    if sideBySide {
+                        HStack(spacing: 12) {
+                            pane(a).frame(width: (g.size.width - 12) / 2)
+                            pane(b).frame(width: (g.size.width - 12) / 2)
+                        }
+                    } else {
+                        let box = fitted(g.size)
+                        ZStack(alignment: .topLeading) {
+                            pane(b).frame(width: box.width, height: box.height)
+                            pane(a).frame(width: box.width, height: box.height)
+                                .mask(alignment: .leading) { Rectangle().frame(width: box.width * split) }
+                            Rectangle().fill(Color.white).frame(width: 2, height: box.height).offset(x: box.width * split - 1)
+                            Circle().fill(Color.white).frame(width: 26, height: 26)
+                                .overlay(Image(systemName: "arrow.left.and.right").font(.system(size: 11, weight: .bold)).foregroundColor(.black))
+                                .offset(x: box.width * split - 13, y: box.height / 2 - 13)
+                        }
+                        .frame(width: box.width, height: box.height)
+                        .contentShape(Rectangle())
+                        .gesture(DragGesture(minimumDistance: 0).onChanged { v in split = min(1, max(0, v.location.x / max(1, box.width))) })
+                        .position(x: g.size.width / 2, y: g.size.height / 2)
+                    }
+                }
+                .padding(.horizontal, 20).padding(.bottom, 20)
+            }
+        }
+        .task {
+            a = NSImage(contentsOf: before)
+            b = NSImage(contentsOf: after)
+        }
+    }
+
+    // One frame for both images, sized by the larger of the two.
+    private func fitted(_ s: CGSize) -> CGSize {
+        let sizes = [a?.size, b?.size].compactMap { $0 }
+        let w = sizes.map(\.width).max() ?? 16, h = sizes.map(\.height).max() ?? 10
+        let k = min(s.width / max(1, w), s.height / max(1, h), 2)
+        return CGSize(width: w * k, height: h * k)
+    }
+
+    private func pane(_ img: NSImage?) -> some View {
+        Group {
+            if let img { Image(nsImage: img).resizable().interpolation(.high).aspectRatio(contentMode: .fit) } else { Color.clear }
+        }
+    }
+
+    private func label(_ title: String, _ u: URL) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.system(size: 10, weight: .bold)).foregroundColor(C(Theme.muted))
+            Text(u.deletingPathExtension().lastPathComponent).font(.system(size: 12, weight: .medium)).foregroundColor(C(Theme.text)).lineLimit(1)
+        }
+    }
+}
+
 // MARK: - Window
 
 struct GalleryView: View {
@@ -1741,7 +1962,7 @@ struct GalleryView: View {
                         .transition(.move(edge: .leading).combined(with: .opacity))
                     hairline
                 }
-                Browser(model: model, top: model.filter.hasConstraints ? 92 : 56)
+                Browser(model: model, top: model.filter.hasConstraints || (model.relatedCount > 0 && !model.filter.text.isEmpty) ? 92 : 56)
                     .background(C(Theme.bg))
                     .overlay(alignment: .top) { TopBar(model: model, lib: lib).padding(.top, 8).padding(.horizontal, 12) }
                     .overlay(alignment: .bottom) {
@@ -1760,6 +1981,7 @@ struct GalleryView: View {
             .animation(.snappy(duration: 0.2), value: model.selection.isEmpty)
             if model.showShortcuts { ShortcutsCard(model: model).transition(.opacity) }
             if let p = model.preview { PreviewOverlay(model: model, url: p) }
+            if let c = model.compare { CompareOverlay(model: model, before: c.0, after: c.1).id(c.0.path + c.1.path) }
         }
         .ignoresSafeArea()
         .background(C(Theme.bg))
@@ -1843,6 +2065,10 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
             if code == kVK_Escape || (cmd && code == kVK_ANSI_Slash) || (shift && code == kVK_ANSI_Slash) { m.showShortcuts = false; return true }
             return true
         }
+        if m.compare != nil {
+            if code == kVK_Escape || code == kVK_Space || code == kVK_ANSI_C { m.compare = nil }
+            return true
+        }
         if m.preview != nil {
             switch code {
             case kVK_LeftArrow, kVK_UpArrow: m.step(-1)
@@ -1878,6 +2104,7 @@ final class GalleryWindow: NSObject, NSWindowDelegate {
             else { window.close() }
         case kVK_ANSI_T: m.tagPicker()
         case kVK_ANSI_F: m.collectionPicker()
+        case kVK_ANSI_C: m.compareSelected()
         case kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5:
             m.rate(Int(e.charactersIgnoringModifiers ?? "0") ?? 0)
         case kVK_Delete, kVK_ForwardDelete: break

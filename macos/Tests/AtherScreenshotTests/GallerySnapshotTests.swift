@@ -76,6 +76,13 @@ final class GallerySnapshotTests: XCTestCase {
         lib.testSetApp(url("Dashboard").path, "Safari")
         lib.testSetApp(url("Terminal").path, "Terminal")
         lib.setComment("Numbers look off for Tuesday — check with data team.", url("Dashboard"))
+        // An edited version: stacks with the original.
+        let edited = caps.appendingPathComponent("Dashboard annotated.png")
+        lib.noteEdit(edited, from: url("Dashboard"), info: NameInfo(), edited: true)
+        try card(1800, 1000, .systemOrange, .systemPurple, "Weekly revenue ✎", "Annotated: Tuesday dip circled").pngData()!.write(to: edited)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: edited.path)
+        for _ in 0..<40 where !lib.urls.contains(edited) || lib.meta(edited).indexed == 0 { wait(0.25) }
+        XCTAssertEqual(lib.meta(edited).editedFrom, url("Dashboard").path)
 
         // New files appear without a manual refresh (the captures folder is watched).
         let fresh = caps.appendingPathComponent("Edited later.png")
@@ -154,6 +161,11 @@ final class GallerySnapshotTests: XCTestCase {
         model.preview = url("Login screen")
         wait(1)
         snap(host, "gallery-preview", out: out)
+        model.preview = nil
+        model.compare = (url("Dashboard"), edited)
+        wait(1)
+        snap(host, "gallery-compare", out: out)
+        model.compare = nil
         model.preview = nil
         w.setContentSize(NSSize(width: 700, height: 600))
         wait(1)
