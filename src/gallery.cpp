@@ -592,6 +592,8 @@ public:
     double pvX = 0, pvY = 0;
     bool pvDragging = false;
     POINT pvLast{}, pvDown{};
+    RECT lastHoverRect{};
+    int lastHoverTile = -1;
     // compare
     BitmapPtr cmpA, cmpB;
     std::wstring cmpKey;
@@ -2704,7 +2706,14 @@ void Gallery::OnMouseMove(POINT p, WPARAM keys) {
     }
     TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
     TrackMouseEvent(&tme);
-    InvalidateRect(hwnd, nullptr, FALSE);  // hover states
+    // Hover states only change when the pointer moves onto another control or tile: repaint then, not on
+    // every pixel of movement (a full paint walks the whole library for the sidebar and inspector).
+    const RECT hoverRect = hi >= 0 ? hots[hi].r : RECT{};
+    if (!EqualRect(&hoverRect, &lastHoverRect) || tile != lastHoverTile) {
+        lastHoverRect = hoverRect;
+        lastHoverTile = tile;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
 }
 
 void Gallery::OnRightClick(POINT p) {
@@ -3559,6 +3568,8 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_MOUSEMOVE: OnMouseMove({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, w); return 0;
         case WM_MOUSELEAVE:
             hover = -1;
+            lastHoverRect = {};
+            lastHoverTile = -1;
             tipShown = false;
             KillTimer(hwnd, kTimerTip);
             InvalidateRect(hwnd, nullptr, FALSE);

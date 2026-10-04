@@ -285,7 +285,22 @@ MatchKind Filter::Match(const std::wstring& path, const ItemMeta& m, double now)
     if (minRating > 0 && m.rating < minRating) return MatchKind::None;
     if (!ShapeMatches(shape, m.Aspect())) return MatchKind::None;
     if (now == 0) now = NowEpoch();
-    if (date != DateFilter::Any && m.mtime < DateSince(date, now)) return MatchKind::None;
+    // Parsing the query (dates, related words) is the same for every item of one recompute: do it once.
+    thread_local struct {
+        std::wstring text;
+        double now = -1;
+        DateFilter date = DateFilter::Any;
+        double since = 0;
+        std::optional<SearchQuery> q;
+    } prepared;
+    if (!prepared.q || prepared.now != now || prepared.text != text || prepared.date != date) {
+        prepared.text = text;
+        prepared.now = now;
+        prepared.date = date;
+        prepared.since = date != DateFilter::Any ? DateSince(date, now) : 0;
+        prepared.q = SearchQuery::Parse(text, now);
+    }
+    if (date != DateFilter::Any && m.mtime < prepared.since) return MatchKind::None;
     if (!SizeMatches(size, m.size)) return MatchKind::None;
     if (!apps.empty() && std::find(apps.begin(), apps.end(), m.app) == apps.end()) return MatchKind::None;
     if (minWidth > 0 && m.w < minWidth) return MatchKind::None;
@@ -297,7 +312,7 @@ MatchKind Filter::Match(const std::wstring& path, const ItemMeta& m, double now)
         });
         if (!any) return MatchKind::None;
     }
-    const SearchQuery q = SearchQuery::Parse(text, now);
+    const SearchQuery& q = *prepared.q;
     if (q.IsEmpty()) return MatchKind::Exact;
     std::wstring hay = FileNameOf(path) + L" " + FormatLibraryDate(m.mtime) + L" " + MediaTypeWords(MediaTypeOf(path)) + L" " +
                        m.text.value_or(L"") + L" " + m.comment;

@@ -258,6 +258,17 @@ private:
     std::thread worker_;
 };
 
+// Results posted back from worker threads (one definition, shared by sender and receiver).
+struct TranscribeResult {
+    bool ok = false;
+    std::vector<Caption> caps;
+    std::wstring err;
+};
+struct SaveResult {
+    bool ok, gif;
+    std::wstring out, tmp, err;
+};
+
 // ---------- the window ----------
 
 struct Hot {
@@ -448,12 +459,12 @@ public:
                 if (f) raw = f;
                 rawT = t;
                 Rerender();
+                Invalidate();  // only when there's a new frame (the playhead moves with it)
             }
             if (player->Now() >= edit.trimEnd - 0.01 || !player->Playing()) {
                 Pause();
                 Seek(edit.trimStart);
             }
-            Invalidate();
         } else {
             player->NewFrame(&t);  // drains the engine; paused frames come from the fetcher
         }
@@ -1406,7 +1417,8 @@ public:
     void Paint(HDC target) {
         const RECT c = Client();
         const int w = std::max(1L, c.right), h = std::max(1L, c.bottom);
-        auto back = Bitmap::Create(w, h);
+        if (!backBuffer || backBuffer->Width() != w || backBuffer->Height() != h) backBuffer = Bitmap::Create(w, h);  // reused while the size holds
+        BitmapPtr back = backBuffer;
         if (!back) return;
         {
             MemDC dc(back->Handle());
@@ -1425,6 +1437,7 @@ public:
         BitBlt(target, 0, 0, w, h, src, 0, 0, SRCCOPY);
     }
     bool tipShown = false;
+    BitmapPtr backBuffer;
 
     // ---- mouse ----
 
@@ -1733,12 +1746,7 @@ public:
         HWND h = hwnd;
         std::thread([p, a, b, h] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            struct Res {
-                bool ok;
-                std::vector<Caption> caps;
-                std::wstring err;
-            };
-            auto* r = new Res{};
+            auto* r = new TranscribeResult{};
             r->ok = Transcribe(p, a, b, &r->caps, &r->err);
             CoUninitialize();
             if (!PostMessageW(h, WM_TRANSCRIBED, 0, (LPARAM)r)) delete r;
@@ -1794,11 +1802,7 @@ public:
             };
             const bool ok = gif ? ExportGif(src, e, tmp, &err, 12, progress) : ExportMp4(src, e, tmp, &err, progress);
             CoUninitialize();
-            struct Res {
-                bool ok, gif;
-                std::wstring out, tmp, err;
-            };
-            auto* r = new Res{ok, gif, out, tmp, err};
+            auto* r = new SaveResult{ok, gif, out, tmp, err};
             if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {  // the editor was closed meanwhile
                 delete r;
                 if (!ok) {
@@ -1957,21 +1961,12 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_TRANSCRIBED: {
-            struct Res {
-                bool ok;
-                std::vector<Caption> caps;
-                std::wstring err;
-            };
-            std::unique_ptr<Res> r(reinterpret_cast<Res*>(l));
+            std::unique_ptr<TranscribeResult> r(reinterpret_cast<TranscribeResult*>(l));
             Transcribed(r->ok, std::move(r->caps), r->err);
             return 0;
         }
         case WM_SAVED: {
-            struct Res {
-                bool ok, gif;
-                std::wstring out, tmp, err;
-            };
-            std::unique_ptr<Res> r(reinterpret_cast<Res*>(l));
+            std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(l));
             Saved(r->ok, r->gif, r->out, r->tmp, r->err);
             return 0;
         }
@@ -1988,6 +1983,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_NCDESTROY: {  // after the children: they still need FieldProc to find this editor
             std::erase(g_editors, this);
+            if (g_editors.empty()) ClearRenderCache();  // rendered titles and captions can be large
             for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji})
                 if (f) DeleteObject(f);
             delete this;

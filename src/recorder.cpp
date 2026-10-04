@@ -54,8 +54,6 @@ public:
 class Mp4Sink : public Sink {
 public:
     HRESULT Begin(int w, int h, int fps, const std::wstring& path, bool audio) override {
-        w_ = w;
-        h_ = h;
         frameDur_ = kTicksPerSecond / fps;
         return writer_.Begin(path, w, h, fps, audio ? AudioCapture::kRate : 0, AudioCapture::kChannels);
     }
@@ -65,7 +63,6 @@ public:
 
 private:
     Mp4Writer writer_;
-    int w_ = 0, h_ = 0;
     int64_t frameDur_ = 0;
 };
 

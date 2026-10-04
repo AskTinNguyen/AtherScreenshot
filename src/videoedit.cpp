@@ -367,8 +367,12 @@ BitmapPtr SampleRect(const Bitmap& src, VRect r, int w, int h) {
 }
 
 // Rendered pieces (marks, captions, titles) keyed by everything that changes their pixels.
+// Bounded by memory as well as count: a title card is a full output frame (33 MB at 4K), and editing makes a
+// new one for every keystroke.
 std::mutex g_cacheMu;
 std::unordered_map<std::wstring, BitmapPtr> g_cache;
+size_t g_cacheBytes = 0;
+constexpr size_t kCacheMaxBytes = 256u << 20, kCacheMaxEntries = 400;
 
 template <class F>
 BitmapPtr Cached(const std::wstring& key, F make) {
@@ -378,9 +382,13 @@ BitmapPtr Cached(const std::wstring& key, F make) {
     }
     BitmapPtr img = make();
     if (!img) return nullptr;
+    const size_t bytes = (size_t)img->Width() * img->Height() * 4;
     std::lock_guard lock(g_cacheMu);
-    if (g_cache.size() > 400) g_cache.clear();
-    g_cache[key] = img;
+    if (g_cache.size() >= kCacheMaxEntries || g_cacheBytes + bytes > kCacheMaxBytes) {
+        g_cache.clear();
+        g_cacheBytes = 0;
+    }
+    if (g_cache.emplace(key, img).second) g_cacheBytes += bytes;
     return img;
 }
 
@@ -400,12 +408,17 @@ double Ease(double x) { return x * x * (3 - 2 * x); }
 
 }  // namespace
 
+void ClearRenderCache() {
+    std::lock_guard lock(g_cacheMu);
+    g_cache.clear();
+    g_cacheBytes = 0;
+}
+
 void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
     if (r.w <= 0 || r.h <= 0 || mo.alpha <= 0.001) return;
     const Bitmap* src = &img;
     BitmapPtr blurred;
     double clipX = img.Width() * (mo.wipe && mo.reveal < 1 ? std::max(0.0, mo.reveal) : 1.0);  // wipe: source columns kept
-    double padSrc = 0;
     if (mo.blur > 0.3) {  // blur in: a blurred copy with room to spread
         const double k = img.Width() / r.w;
         const int pad = (int)std::ceil(mo.blur * 3 * k);
@@ -417,7 +430,6 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
             auto px = BlurArea(*blurred, {0, 0, blurred->Width(), blurred->Height()}, mo.blur * k);
             memcpy(blurred->Bits(), px.data(), px.size() * 4);
             src = blurred.get();
-            padSrc = pad;
             clipX = 1e9;
             r = r.Inset(-pad / k, -pad / k);
         }
@@ -431,7 +443,6 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
     const int x1 = std::min(W, (int)std::ceil(c.MaxX())), y1 = std::min(H, (int)std::ceil(c.MaxY()));
     const int sw = src->Width(), sh = src->Height();
     const bool exact = c.x == std::floor(c.x) && c.y == std::floor(c.y) && std::fabs(c.w - sw) < 1e-6 && std::fabs(c.h - sh) < 1e-6;
-    (void)padSrc;
     for (int y = y0; y < y1; ++y) {
         uint32_t* row = dst.Bits() + (size_t)y * W;
         for (int x = x0; x < x1; ++x) {

@@ -178,5 +178,7 @@ private:
 // Draws `img` stretched into `r` (destination pixels, fractional) on premultiplied `dst` with motion applied:
 // scale about the center, offset, wipe, blur and alpha.
 void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo);
+// Frees the rendered marks, captions and title cards kept between frames.
+void ClearRenderCache();
 
 }  // namespace ather
