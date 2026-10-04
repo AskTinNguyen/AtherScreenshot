@@ -13,6 +13,8 @@ void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon);
 bool OpenVideoEditor(const std::wstring& path);
 bool IsVideoFile(const std::wstring& path);
 int VideoEditorCount();
+// True while an editor is saving a video or GIF (quitting waits for it).
+bool VideoEditorsBusy();
 // Developer tool: renders the editor in a few states to PNGs (`--video-snapshots <dir>`).
 int VideoEditorSnapshots(const std::wstring& outDir);
 

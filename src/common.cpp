@@ -81,6 +81,35 @@ static HWND g_uiWindow = nullptr;
 
 void SetUiWindow(HWND hwnd) { g_uiWindow = hwnd; }
 
+static LRESULT CALLBACK DispatchProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_APP_RUN) {
+        std::unique_ptr<std::function<void()>> fn(reinterpret_cast<std::function<void()>*>(l));
+        (*fn)();
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+HWND StartUiDispatcher() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DispatchProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"AtherScreenshotDispatch";
+    RegisterClassW(&wc);
+    HWND h = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    if (h) SetUiWindow(h);
+    return h;
+}
+
+void StopUiDispatcher(HWND h) {
+    if (!h) return;
+    // Run what's still queued, then stop accepting work.
+    MSG msg;
+    while (PeekMessageW(&msg, h, WM_APP_RUN, WM_APP_RUN, PM_REMOVE)) DispatchMessageW(&msg);
+    if (g_uiWindow == h) g_uiWindow = nullptr;
+    DestroyWindow(h);
+}
+
 void RunOnUi(std::function<void()> fn) {
     auto* p = new std::function<void()>(std::move(fn));
     if (!g_uiWindow || !PostMessageW(g_uiWindow, WM_APP_RUN, 0, (LPARAM)p)) delete p;
@@ -116,10 +145,16 @@ std::wstring FileNameOf(const std::wstring& path) {
 }
 
 std::wstring SupportFolder() {
-    wchar_t over[MAX_PATH];
     std::wstring dir;
-    const DWORD n = GetEnvironmentVariableW(L"ATHER_SUPPORT_DIR", over, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) {
+    const DWORD n = GetEnvironmentVariableW(L"ATHER_SUPPORT_DIR", nullptr, 0);
+    if (n > 0) {
+        // Set (tests): always honored, whatever its length, so a test can never fall back to the real folder.
+        std::wstring over(n, L'\0');
+        const DWORD got = GetEnvironmentVariableW(L"ATHER_SUPPORT_DIR", over.data(), n);
+        over.resize(got < n ? got : 0);
+        if (over.empty()) {  // set but unreadable: refuse rather than touch real data
+            FatalAppExitW(0, L"ATHER_SUPPORT_DIR is set but can't be read.");
+        }
         dir = over;
     } else {
         PWSTR p = nullptr;

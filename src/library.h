@@ -147,8 +147,11 @@ public:
     void Refresh(std::function<void()> done = nullptr);
     // Reconciles metadata with a listing: new files get entries, changed files get re-indexed, files gone
     // from the captures folder lose theirs. `stats` is newest first.
-    void Apply(const std::vector<FileStat>& stats);
-    static std::vector<FileStat> ListCaptures(const std::wstring& folder);  // recursive, newest first
+    // `complete` false: part of the folder couldn't be listed (drive missing, folder renamed, no access), so
+    // nothing is pruned — an unreadable folder must never look like an empty one.
+    void Apply(const std::vector<FileStat>& stats, bool complete = true);
+    // Recursive, newest first. `complete` is false when the folder or one of its subfolders couldn't be read.
+    static std::vector<FileStat> ListCaptures(const std::wstring& folder, bool* complete = nullptr);
     static bool IsInside(const std::wstring& path, const std::wstring& dir);  // component-wise, case-insensitive
     bool IsInLibrary(const std::wstring& path) const { return IsInside(path, folder_); }
 
@@ -244,6 +247,8 @@ private:
     std::unordered_map<std::wstring, ItemMeta> pending_;      // metadata for files about to be written
     std::unordered_map<std::wstring, std::wstring> legacyOcr_;  // lower-case path -> text (old ocr-index.txt)
     bool featuresDirty_ = false;
+    bool readOnly_ = false;        // library.json or features.bin exists but couldn't be read: never overwrite it
+    uint64_t featuresSnapSeq_ = 0;  // newest snapshot that carried features
     uint64_t version_ = 0, techVersion_ = 0;
     int generation_ = 0;  // bumped by renames and deletes so an in-flight scan can't undo them
     std::pair<int, int> progress_{0, 0};

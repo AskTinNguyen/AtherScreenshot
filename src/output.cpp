@@ -325,7 +325,7 @@ bool RecycleFile(const std::wstring& path) {
     SHFILEOPSTRUCTW op{};
     op.wFunc = FO_DELETE;
     op.pFrom = from.c_str();
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT;  // asks before a permanent delete
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
 
@@ -337,7 +337,7 @@ std::vector<std::wstring> RecycleFiles(const std::vector<std::wstring>& paths, H
     op.hwnd = owner;
     op.wFunc = FO_DELETE;
     op.pFrom = from.c_str();
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT;  // asks before a permanent delete
     SHFileOperationW(&op);
     std::vector<std::wstring> gone;
     for (const auto& p : paths)

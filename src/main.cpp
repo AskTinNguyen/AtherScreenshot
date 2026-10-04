@@ -1256,7 +1256,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.lpszClassName = kMainClass;
     RegisterClassExW(&wc);
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kMainClass, kAppName, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
-    SetUiWindow(g_hwnd);
+    HWND dispatcher = StartUiDispatcher();  // outlives g_hwnd, so work posted while quitting still runs
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     bool firstRun = g_settings.Load(HotkeyDefs());
@@ -1292,16 +1292,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    // Let an in-flight recording finalize so the file isn't left truncated.
+    // Let an in-flight recording finalize so the file isn't left truncated, and let video exports finish
+    // (their completion registers the saved file with the library). Work posted back meanwhile still runs:
+    // the dispatcher window outlives g_hwnd.
     StopRecording(false);
-    for (ULONGLONG end = GetTickCount64() + 20000; RecorderBusy() && GetTickCount64() < end;) {
+    auto pump = [&] {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    };
+    for (ULONGLONG end = GetTickCount64() + 20000; RecorderBusy() && GetTickCount64() < end;) {
+        pump();
+        Sleep(10);
+    }
+    for (ULONGLONG end = GetTickCount64() + 120000; VideoEditorsBusy() && GetTickCount64() < end;) {
+        pump();
         Sleep(10);
     }
     WaitForPendingSaves(5000);  // first: their completions may register library changes
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    pump();
+    lib.Flush();  // writes anything not yet on disk, synchronously
     lib.StopBackgroundWork();
-    lib.Flush();
+    StopUiDispatcher(dispatcher);
     Gdiplus::GdiplusShutdown(gdipToken);
     CoUninitialize();
     if (mutex) CloseHandle(mutex);

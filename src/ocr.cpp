@@ -1,5 +1,7 @@
 #include "ocr.h"
 
+#include "media.h"
+
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Imaging.h>
@@ -118,9 +120,31 @@ std::wstring RecognizeTextBlocking(const Bitmap& img) {
     } catch (...) {  // already initialized on this thread
     }
     try {
-        for (const auto& l : RunOcr(img, err).lines) {
-            if (!text.empty()) text += L' ';
-            text += l;
+        // Long scrolling captures are taller (or wider) than the OCR engine accepts: read them in overlapping
+        // strips, narrowing anything wider than the limit first.
+        const int maxDim = (int)wmo::OcrEngine::MaxImageDimension();
+        BitmapPtr narrowed;
+        const Bitmap* src = &img;
+        if (maxDim > 0 && img.Width() > maxDim) {
+            const double k = (double)maxDim / img.Width();
+            narrowed = Resample(img, maxDim, std::max(1, (int)(img.Height() * k)));
+            if (narrowed) src = narrowed.get();
+        }
+        auto add = [&](const Bitmap& part) {
+            for (const auto& l : RunOcr(part, err).lines) {
+                if (!text.empty()) text += L' ';
+                text += l;
+            }
+        };
+        if (maxDim <= 0 || src->Height() <= maxDim) {
+            add(*src);
+        } else {
+            const int strip = maxDim - 64, overlap = 64;  // a line cut by one strip is whole in the next
+            for (int y = 0; y < src->Height(); y += strip) {
+                const int h = std::min(src->Height() - y, strip + overlap);
+                if (auto part = src->Crop({0, y, src->Width(), y + h})) add(*part);
+                if (y + h >= src->Height()) break;
+            }
         }
     } catch (...) {
     }

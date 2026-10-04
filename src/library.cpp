@@ -562,6 +562,8 @@ struct Library::Workers {
     std::atomic<bool> alive{true};
     std::mutex ioMu;            // one writer at a time, newest snapshot wins
     uint64_t lastWrittenSeq = 0;
+    uint64_t lastFeaturesSeq = 0;               // features.bin is written by its own sequence
+    std::atomic<bool> featuresFailed{false};    // a features write failed: write them again
     HANDLE watchStop = nullptr;
     std::thread watcher;
     ~Workers() {
@@ -645,18 +647,29 @@ const LibCollection* Library::FindCollection(const std::wstring& id) const {
     return nullptr;
 }
 
-static std::string ReadAll(const std::wstring& path, bool* exists) {
+// `failed`: the file exists (or may exist) but couldn't be read — locked by another program, no access,
+// offline. Only "file not found" counts as absent, so a locked library is never replaced by an empty one.
+static std::string ReadAll(const std::wstring& path, bool* exists, bool* failed = nullptr) {
     *exists = false;
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return {};
+    if (failed) *failed = false;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        if (failed) *failed = err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND;
+        return {};
+    }
     *exists = true;
     LARGE_INTEGER size{};
     GetFileSizeEx(f, &size);
     std::string data((size_t)size.QuadPart, '\0');
     DWORD read = 0;
-    if (size.QuadPart > 0) ReadFile(f, data.data(), (DWORD)size.QuadPart, &read, nullptr);
+    const BOOL ok = size.QuadPart <= 0 || ReadFile(f, data.data(), (DWORD)size.QuadPart, &read, nullptr);
     CloseHandle(f);
-    data.resize(read);
+    if (!ok || (LONGLONG)read != size.QuadPart) {
+        if (failed) *failed = true;
+        return {};
+    }
     return data;
 }
 
@@ -681,8 +694,13 @@ void Library::LoadIfNeeded() {
 }
 
 void Library::LoadFile() {
-    bool exists = false;
-    const std::string data = ReadAll(FilePath(), &exists);
+    bool exists = false, failed = false;
+    const std::string data = ReadAll(FilePath(), &exists, &failed);
+    if (failed) {
+        // Locked or unreadable right now: work in memory this session and never write over it.
+        readOnly_ = true;
+        return;
+    }
     if (exists) {
         bool ok = false;
         Json j = Json::Parse(data, &ok);
@@ -710,7 +728,8 @@ void Library::LoadFile() {
         ImportLegacyOcr();
     }
     // features.bin: "ATHF", version, count, then per item: path (UTF-16, length-prefixed) and floats.
-    const std::string fb = ReadAll(SupportFolder() + L"\\features.bin", &exists);
+    const std::string fb = ReadAll(SupportFolder() + L"\\features.bin", &exists, &failed);
+    if (failed) readOnly_ = true;
     size_t at = 12;
     auto u32 = [&](size_t o) {
         uint32_t v;
@@ -722,13 +741,13 @@ void Library::LoadFile() {
         for (uint32_t i = 0; i < count && at + 4 <= fb.size(); ++i) {
             const uint32_t plen = u32(at);
             at += 4;
-            if (at + plen * 2 + 4 > fb.size()) break;
+            if ((uint64_t)at + (uint64_t)plen * 2 + 4 > fb.size()) break;
             std::wstring p(plen, L'\0');
             memcpy(p.data(), fb.data() + at, plen * 2);
             at += plen * 2;
             const uint32_t dims = u32(at);
             at += 4;
-            if (at + dims * 4 > fb.size()) break;
+            if ((uint64_t)at + (uint64_t)dims * 4 > fb.size()) break;
             std::vector<float> f(dims);
             memcpy(f.data(), fb.data() + at, dims * 4);
             at += dims * 4;
@@ -766,7 +785,7 @@ void Library::ImportLegacyOcr() {
 }
 
 void Library::Save() {
-    if (!persists_ || !loaded_) return;
+    if (!persists_ || !loaded_ || readOnly_) return;
     if (saveTimer_) {
         KillTimer(nullptr, saveTimer_);
         Timers().erase(saveTimer_);
@@ -785,45 +804,63 @@ void Library::Save() {
         snap->meta = self->meta_;
         snap->collections = self->collections_;
         snap->smartFolders = self->smartFolders_;
-        if (self->featuresDirty_) {  // the big file only when it changed
+        if (self->featuresDirty_ || self->shared_->featuresFailed) {  // the big file only when it changed
             snap->withFeatures = true;
             snap->features = self->features_;
             self->featuresDirty_ = false;
+            self->shared_->featuresFailed = false;
+            self->featuresSnapSeq_ = snap->seq;
         }
         auto sh = self->shared_;
         std::thread([self, snap, sh] {
             if (sh->alive) self->WriteSnapshot(snap);
+            // Not written (quitting, or the write failed): Flush and the next save pick it up again.
         }).detach();
     });
     if (saveTimer_) Timers()[saveTimer_] = this;
 }
 
 void Library::Flush() {
-    if (!persists_ || !loaded_) return;
+    if (!persists_ || !loaded_ || readOnly_) return;
+    const bool armed = saveTimer_ != 0;
     if (saveTimer_) {
         KillTimer(nullptr, saveTimer_);
         Timers().erase(saveTimer_);
         saveTimer_ = 0;
-        auto snap = std::make_shared<Snapshot>();
-        snap->seq = ++saveSeq_;
-        snap->file = FilePath();
-        snap->featuresFile = SupportFolder() + L"\\features.bin";
-        snap->meta = meta_;
-        snap->collections = collections_;
-        snap->smartFolders = smartFolders_;
-        snap->withFeatures = featuresDirty_;
-        if (featuresDirty_) snap->features = features_;
-        featuresDirty_ = false;
-        WriteSnapshot(snap);
-    } else {
-        std::lock_guard lock(shared_->ioMu);  // wait for a write that's already under way
     }
+    // Anything not yet on disk — a pending timer, or a snapshot whose writer thread hasn't run (or was told to
+    // stop) — is written now, synchronously.
+    bool behind, featuresBehind;
+    {
+        std::lock_guard lock(shared_->ioMu);
+        behind = armed || shared_->lastWrittenSeq < saveSeq_;
+        featuresBehind = shared_->lastFeaturesSeq < featuresSnapSeq_ || shared_->featuresFailed;
+    }
+    if (!behind && !featuresBehind && !featuresDirty_) return;
+    auto snap = std::make_shared<Snapshot>();
+    snap->seq = ++saveSeq_;
+    snap->file = FilePath();
+    snap->featuresFile = SupportFolder() + L"\\features.bin";
+    snap->meta = meta_;
+    snap->collections = collections_;
+    snap->smartFolders = smartFolders_;
+    snap->withFeatures = featuresDirty_ || featuresBehind;
+    if (snap->withFeatures) {
+        snap->features = features_;
+        featuresSnapSeq_ = snap->seq;
+    }
+    featuresDirty_ = false;
+    shared_->featuresFailed = false;
+    WriteSnapshot(snap);
 }
 
 void Library::WriteSnapshot(const std::shared_ptr<Snapshot>& s) {
     std::lock_guard lock(shared_->ioMu);
-    if (s->seq < shared_->lastWrittenSeq) return;  // a newer snapshot is already on disk
-    shared_->lastWrittenSeq = s->seq;
+    // features.bin has its own sequence: a newer snapshot without features must not make an older one's
+    // features get dropped.
+    const bool writeFeatures = s->withFeatures && s->seq > shared_->lastFeaturesSeq;
+    const bool writeLibrary = s->seq > shared_->lastWrittenSeq;
+    if (!writeLibrary && !writeFeatures) return;
     Json items = Json::Object();
     std::vector<const std::wstring*> keys;
     for (const auto& kv : s->meta) keys.push_back(&kv.first);
@@ -850,9 +887,11 @@ void Library::WriteSnapshot(const std::shared_ptr<Snapshot>& s) {
     root.Set("items", std::move(items));
     root.Set("collections", std::move(cols));
     root.Set("smartFolders", std::move(smart));
-    const std::string text = root.Dump();
-    WriteAtomically(s->file, text.data(), text.size());
-    if (s->withFeatures) {
+    if (writeLibrary) {
+        const std::string text = root.Dump();
+        if (WriteAtomically(s->file, text.data(), text.size())) shared_->lastWrittenSeq = s->seq;
+    }
+    if (writeFeatures) {
         std::string b = "ATHF";
         auto put = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
         put(1);
@@ -863,7 +902,8 @@ void Library::WriteSnapshot(const std::shared_ptr<Snapshot>& s) {
             put((uint32_t)f.size());
             b.append(reinterpret_cast<const char*>(f.data()), f.size() * 4);
         }
-        WriteAtomically(s->featuresFile, b.data(), b.size());
+        if (WriteAtomically(s->featuresFile, b.data(), b.size())) shared_->lastFeaturesSeq = s->seq;
+        else shared_->featuresFailed = true;
     }
 }
 
@@ -877,15 +917,20 @@ bool Library::IsInside(const std::wstring& path, const std::wstring& dir) {
     return (sep == L'\\' || sep == L'/') && CompareStringOrdinal(path.c_str(), (int)d.size(), d.c_str(), (int)d.size(), TRUE) == CSTR_EQUAL;
 }
 
-std::vector<FileStat> Library::ListCaptures(const std::wstring& folder) {
+std::vector<FileStat> Library::ListCaptures(const std::wstring& folder, bool* complete) {
     std::vector<FileStat> out;
+    if (complete) *complete = true;
     std::vector<std::wstring> dirs{folder};
     while (!dirs.empty()) {
         const std::wstring dir = dirs.back();
         dirs.pop_back();
         WIN32_FIND_DATAW fd;
         HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-        if (h == INVALID_HANDLE_VALUE) continue;
+        if (h == INVALID_HANDLE_VALUE) {
+            // A missing or unreadable folder is not an empty one (an existing folder always lists "." and "..").
+            if (complete) *complete = false;
+            continue;
+        }
         do {
             if (fd.cFileName[0] == L'.') continue;  // ., .., and dot-files/folders
             if ((fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) && (fd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)) continue;
@@ -897,6 +942,7 @@ std::vector<FileStat> Library::ListCaptures(const std::wstring& folder) {
             if (!IsMediaFile(p)) continue;
             out.push_back({p, FileTimeToEpoch(fd.ftLastWriteTime), (int64_t)((uint64_t)fd.nFileSizeHigh << 32 | fd.nFileSizeLow)});
         } while (FindNextFileW(h, &fd));
+        if (GetLastError() != ERROR_NO_MORE_FILES && complete) *complete = false;  // the listing stopped early
         FindClose(h);
     }
     std::sort(out.begin(), out.end(), [](const FileStat& a, const FileStat& b) {
@@ -912,23 +958,50 @@ void Library::Refresh(std::function<void()> done) {
     const std::wstring folder = folder_;
     auto sh = shared_;
     std::thread([this, gen, folder, sh, done] {
-        auto stats = ListCaptures(folder);
-        RunOnUi([this, gen, sh, done, stats = std::move(stats)] {
+        bool complete = true;
+        auto stats = ListCaptures(folder, &complete);
+        RunOnUi([this, gen, folder, complete, sh, done, stats = std::move(stats)] {
             if (!sh->alive) return;
-            // A rename or delete happened while listing: this listing is stale, take a new one.
-            if (gen != generation_) return Refresh(done);
-            Apply(stats);
+            // A rename or delete happened while listing, or the folder setting changed: this listing is stale.
+            if (gen != generation_ || folder != folder_) return Refresh(done);
+            Apply(stats, complete);
             if (done) done();
             IndexInBackground();
         });
     }).detach();
 }
 
-void Library::Apply(const std::vector<FileStat>& stats) {
+void Library::Apply(const std::vector<FileStat>& stats, bool complete) {
     LoadIfNeeded();
+    // Windows paths are case-insensitive: an entry whose key differs from the listed path only in case (the
+    // folder setting was retyped, a drive letter changed case) moves to the listed spelling instead of being
+    // dropped as gone.
+    std::unordered_map<std::wstring, std::wstring> byLower;
+    for (const auto& s : stats)
+        if (!meta_.count(s.path)) byLower.emplace(LowerText(s.path), s.path);
+    if (!byLower.empty())
+        for (auto it = meta_.begin(); it != meta_.end();) {
+            auto m = byLower.find(LowerText(it->first));
+            if (m == byLower.end() || m->second == it->first) {
+                ++it;
+                continue;
+            }
+            const std::wstring to = m->second, from = it->first;
+            byLower.erase(m);
+            ItemMeta moved = std::move(it->second);
+            it = meta_.erase(it);
+            meta_[to] = std::move(moved);
+            if (auto f = features_.find(from); f != features_.end()) {
+                auto v = std::move(f->second);
+                features_.erase(f);
+                features_[to] = std::move(v);
+                featuresDirty_ = true;
+            }
+        }
     std::unordered_set<std::wstring> live;
     for (const auto& s : stats) {
         live.insert(s.path);
+        const bool known = meta_.count(s.path) != 0;
         ItemMeta& e = meta_[s.path];
         if (e.mtime != s.mtime) {  // changed on disk: re-index everything derived from the pixels
             e.indexed = 0;
@@ -936,9 +1009,12 @@ void Library::Apply(const std::vector<FileStat>& stats) {
         }
         e.mtime = s.mtime;
         e.size = s.size;
-        if (!e.text && !legacyOcr_.empty()) {
+        if (!known && !e.text && !legacyOcr_.empty()) {  // text from the old History window, once per file
             auto it = legacyOcr_.find(LowerText(s.path));
-            if (it != legacyOcr_.end()) e.text = it->second;
+            if (it != legacyOcr_.end()) {
+                if (!it->second.empty()) e.text = it->second;  // empty: OCR failed back then, try again
+                legacyOcr_.erase(it);
+            }
         }
         auto p = pending_.find(s.path);
         if (p != pending_.end()) {
@@ -956,10 +1032,11 @@ void Library::Apply(const std::vector<FileStat>& stats) {
             pending_.erase(p);
         }
     }
-    for (auto it = meta_.begin(); it != meta_.end();) {
-        if (!live.count(it->first) && IsInside(it->first, folder_)) it = meta_.erase(it);
-        else ++it;
-    }
+    if (complete)
+        for (auto it = meta_.begin(); it != meta_.end();) {
+            if (!live.count(it->first) && IsInside(it->first, folder_)) it = meta_.erase(it);
+            else ++it;
+        }
     bool deadFeatures = false;
     for (auto it = features_.begin(); it != features_.end();) {
         if (!meta_.count(it->first)) {
@@ -1044,11 +1121,12 @@ void Library::Watch() {
     } else {
         shared_->watchStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
-    watchedFolder_ = folder_;
-    CreateDirectoryW(folder_.c_str(), nullptr);
+    // A missing folder isn't created here: recreating a renamed or unplugged folder empty would make it look
+    // like every capture was deleted. The next Refresh tries again.
     HANDLE dir = CreateFileW(folder_.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
     if (dir == INVALID_HANDLE_VALUE) return;
+    watchedFolder_ = folder_;
     auto sh = shared_;
     HANDLE stop = shared_->watchStop;
     shared_->watcher = std::thread([this, dir, stop, sh] {
@@ -1068,15 +1146,24 @@ void Library::Watch() {
             if (w != WAIT_OBJECT_0 + 1) {
                 CancelIoEx(dir, &ov);
                 GetOverlappedResult(dir, &ov, &got, TRUE);
-                break;
+                CloseHandle(ov.hEvent);
+                CloseHandle(dir);
+                return;  // stopped
             }
             if (!sh->alive) break;
+            if (!GetOverlappedResult(dir, &ov, &got, FALSE)) break;  // the folder went away (deleted, unplugged, network)
             RunOnUi([this, sh] {
                 if (sh->alive) ChangedOnDisk();
             });
         }
         CloseHandle(ov.hEvent);
         CloseHandle(dir);
+        // The watch died: forget it so the next scan sets up a new one, and rescan now.
+        RunOnUi([this, sh] {
+            if (!sh->alive) return;
+            watchedFolder_.clear();
+            ChangedOnDisk();
+        });
     });
 }
 

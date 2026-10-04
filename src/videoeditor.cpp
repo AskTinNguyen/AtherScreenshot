@@ -298,6 +298,7 @@ public:
     double rawT = 0;
     std::vector<BitmapPtr> thumbs;
     bool busy = false;
+    bool saving = false;  // an export is running (quitting waits for it)
     std::wstring lastSaveError;  // tests
 
     HWND field1 = nullptr, field2 = nullptr;
@@ -1760,7 +1761,7 @@ public:
     void Save(bool gif) {
         if (busy) return;
         SetFocus(hwnd);  // commits a field being edited
-        busy = true;
+        busy = saving = true;
         Pause();
         const std::wstring out = MakeCapturePath(g_folder, gif ? L"gif" : L"mp4", {window, app});
         SHCreateDirectoryExW(nullptr, out.substr(0, out.find_last_of(L'\\')).c_str(), nullptr);
@@ -1802,7 +1803,7 @@ public:
     }
 
     void Saved(bool ok, bool gif, const std::wstring& out, const std::wstring& tmp, const std::wstring& err) {
-        busy = false;
+        busy = saving = false;
         lastSaveError = ok ? L"" : err;
         Invalidate();
         if (!ok) {
@@ -2066,6 +2067,10 @@ bool IsVideoFile(const std::wstring& path) {
 }
 
 int VideoEditorCount() { return (int)g_editors.size(); }
+
+bool VideoEditorsBusy() {
+    return std::any_of(g_editors.begin(), g_editors.end(), [](const VideoEditor* e) { return e->saving; });
+}
 
 bool OpenVideoEditor(const std::wstring& path) {
     for (auto* e : g_editors)

@@ -486,6 +486,118 @@ ATHER_TEST(library_imports_legacy_ocr_index) {
     DeleteFileW(idx.c_str());
 }
 
+// An unreadable folder (unplugged drive, renamed folder, no access) must never look like an empty one.
+ATHER_TEST(library_incomplete_listing_keeps_metadata) {
+    Library l(false);
+    l.SetFolder(L"C:\\Caps");
+    const std::wstring a = L"C:\\Caps\\2026-10\\a.png";
+    l.Apply({{a, 1, 1}});
+    l.AddTags({L"keep"}, {a});
+    l.Apply({}, false);  // the listing failed
+    CHECK(l.Has(a));
+    CHECK(l.Meta(a).tags == std::vector<std::wstring>{L"keep"});
+    bool complete = true;
+    const auto none = Library::ListCaptures(test::TempDir() + L"\\does-not-exist", &complete);
+    CHECK(none.empty());
+    CHECK(!complete);
+    const std::wstring empty = test::TempDir();
+    Library::ListCaptures(empty, &complete);
+    CHECK(complete);  // an existing empty folder is a real, complete listing
+}
+
+// Windows paths are case-insensitive: retyping the folder in another case keeps everything.
+ATHER_TEST(library_case_change_keeps_metadata) {
+    Library l(false);
+    l.SetFolder(L"C:\\Caps");
+    const std::wstring a = L"C:\\Caps\\2026-10\\a.png";
+    l.Apply({{a, 1, 1}});
+    l.AddTags({L"keep"}, {a});
+    l.SetRating(4, {a});
+    l.SetFolder(L"c:\\caps");
+    const std::wstring lower = L"c:\\caps\\2026-10\\a.png";
+    l.Apply({{lower, 1, 1}});
+    CHECK(l.Has(lower));
+    CHECK(!l.Has(a));
+    CHECK(l.Meta(lower).tags == std::vector<std::wstring>{L"keep"});
+    CHECK_EQ(l.Meta(lower).rating, 4);
+}
+
+// A library.json that exists but can't be read right now (locked by another program) is never replaced.
+ATHER_TEST(library_locked_file_is_never_overwritten) {
+    const std::wstring file = SupportFolder() + L"\\library.json";
+    WriteText(file, R"({"version":1,"items":{"C:\\Caps\\x.png":{"tags":["precious"]}},"collections":[],"smartFolders":[]})");
+    HANDLE lock = CreateFileW(file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);  // no sharing
+    CHECK(lock != INVALID_HANDLE_VALUE);
+    {
+        Library l(true);
+        l.SetFolder(L"C:\\Caps");
+        l.Apply({{L"C:\\Caps\\y.png", 1, 1}});
+        l.AddTags({L"new"}, {L"C:\\Caps\\y.png"});
+        l.Flush();
+    }
+    CloseHandle(lock);
+    CHECK(ReadText(file).find("precious") != std::string::npos);  // untouched
+    DeleteFileW(file.c_str());
+}
+
+// A corrupt features.bin length can't trigger a huge allocation or a crash.
+ATHER_TEST(library_corrupt_features_file_is_ignored) {
+    const std::wstring fb = SupportFolder() + L"\\features.bin";
+    DeleteFileW((SupportFolder() + L"\\library.json").c_str());
+    std::string b = "ATHF";
+    auto put = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
+    put(1);
+    put(1);
+    put(0x80000001u);  // path length that wraps when doubled in 32 bits
+    b.append("xx");
+    WriteText(fb, b);
+    {
+        Library l(true);
+        l.LoadIfNeeded();
+        CHECK(!l.HasFeatures());
+    }
+    DeleteFileW(fb.c_str());
+}
+
+// Text from the old History index is used once, for files seen for the first time; a file changed later is
+// read again, and an empty legacy entry (OCR failed back then) is retried.
+ATHER_TEST(library_legacy_ocr_is_used_once) {
+    const std::wstring idx = SupportFolder() + L"\\ocr-index.txt";
+    const std::wstring lines = L"c:\\caps\\old.png\tOld text\nc:\\caps\\blank.png\t\n";
+    HANDLE f = CreateFileW(idx.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    DWORD wr;
+    WriteFile(f, lines.data(), (DWORD)(lines.size() * 2), &wr, nullptr);
+    CloseHandle(f);
+    DeleteFileW((SupportFolder() + L"\\library.json").c_str());
+    {
+        Library l(true);
+        l.SetFolder(L"C:\\Caps");
+        l.Apply({{L"C:\\Caps\\old.png", 5, 5}, {L"C:\\Caps\\blank.png", 5, 5}});
+        CHECK(l.Meta(L"C:\\Caps\\old.png").text == std::optional<std::wstring>(L"Old text"));
+        CHECK(!l.Meta(L"C:\\Caps\\blank.png").text);  // will be OCR'd
+        l.Apply({{L"C:\\Caps\\old.png", 9, 5}, {L"C:\\Caps\\blank.png", 5, 5}});  // edited on disk
+        CHECK(!l.Meta(L"C:\\Caps\\old.png").text);  // not the stale legacy text
+    }
+    DeleteFileW(idx.c_str());
+    DeleteFileW((SupportFolder() + L"\\library.json").c_str());
+}
+
+// Flush at quit writes whatever isn't on disk yet, even when the debounced save already took its snapshot.
+ATHER_TEST(library_flush_writes_pending_changes) {
+    const std::wstring file = SupportFolder() + L"\\library.json";
+    DeleteFileW(file.c_str());
+    {
+        Library l(true);
+        l.SetFolder(L"C:\\Caps");
+        l.Apply({{L"C:\\Caps\\z.png", 1, 1}});
+        l.AddTags({L"late"}, {L"C:\\Caps\\z.png"});
+        l.StopBackgroundWork();  // as at quit: background writers are told to stop
+        l.Flush();
+    }
+    CHECK(ReadText(file).find("late") != std::string::npos);
+    DeleteFileW(file.c_str());
+}
+
 ATHER_TEST(library_lists_and_indexes_real_files) {
     const std::wstring dir = test::TempDir();
     CreateDirectoryW((dir + L"\\2026-10").c_str(), nullptr);

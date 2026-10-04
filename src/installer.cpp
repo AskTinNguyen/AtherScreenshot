@@ -57,12 +57,24 @@ void StopRunningInstance() {
     DWORD pid = 0;
     GetWindowThreadProcessId(other, &pid);
     HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
-    std::wstring cmd = L"AtherScreenshot.exe quit";
+    // The running app only obeys forwarded commands that carry its per-user token (cli-token in the support
+    // folder, which this user can read). Versions from before the token accept the bare command line.
+    std::wstring token;
+    HANDLE tf = CreateFileW((SupportFolder() + L"\\cli-token").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (tf != INVALID_HANDLE_VALUE) {
+        char buf[256] = {};
+        DWORD read = 0;
+        ReadFile(tf, buf, sizeof(buf) - 1, &read, nullptr);
+        CloseHandle(tf);
+        token.assign(buf, buf + read);
+    }
+    const std::wstring cmd = token.size() >= 32 ? token + L'\x1e' + L"AtherScreenshot.exe quit" : L"AtherScreenshot.exe quit";
     COPYDATASTRUCT cds{kCopyDataCli, (DWORD)((cmd.size() + 1) * sizeof(wchar_t)), (PVOID)cmd.c_str()};
     DWORD_PTR result = 0;
     SendMessageTimeoutW(other, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 3000, &result);
     if (proc) {
-        if (WaitForSingleObject(proc, 8000) == WAIT_TIMEOUT) {  // hung: last resort
+        // Quitting finishes a recording or a video export first, so allow it time before giving up.
+        if (WaitForSingleObject(proc, 30000) == WAIT_TIMEOUT) {  // hung: last resort
             if (HANDLE kill = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
                 TerminateProcess(kill, 0);
                 CloseHandle(kill);
