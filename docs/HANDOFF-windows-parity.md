@@ -353,7 +353,7 @@ Opening an MP4 (from the gallery, the "Video saved" toast, or open recent) opens
 - Every milestone works from the keyboard and mouse, with no new dependencies, and `build.bat` and `package.bat` succeed.
 - **Data:** the Windows gallery reads a `library.json` written by the Mac app, and the other way round. Paths differ, so the entries simply don't match on the other machine, but neither side crashes or loses data.
 - **Docs:** README (Windows) documents the new features in the same style as `macos/README.md`. INSTALL.md is updated.
-- **Release:** `package.bat` produces `AtherScreenshot-Setup-0.0.1.exe` and the portable zip. Don't publish a GitHub release unless the owner asks. Note that an old `v1.0.0` release and tag exist on GitHub from before the reset; leave them alone unless told otherwise.
+- **Release:** `package.bat` produces `AtherScreenshot-Setup-0.0.1.exe` and the portable zip. Don't publish a GitHub release unless the owner asks. (The old `v1.0.0` release and tag were deleted when the version was reset.)
 
 ## Don'ts
 
