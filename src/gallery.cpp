@@ -243,7 +243,10 @@ public:
             pending_.insert(key);
             std::lock_guard lock(sh_->mu);
             sh_->jobs.push_front({path, bucket, key});  // most recently painted first
-            if (sh_->jobs.size() > 400) sh_->jobs.pop_back();
+            if (sh_->jobs.size() > 400) {  // the oldest request is dropped; it's asked for again when painted again
+                pending_.erase(sh_->jobs.back().key);
+                sh_->jobs.pop_back();
+            }
             sh_->cv.notify_one();
         }
         for (int b : {256, 512, 1024})
@@ -418,86 +421,114 @@ BitmapPtr RenderTile(const Bitmap& src, int w, int h, bool fill, float radius, C
 
 // ---------- GIF frames for the preview ----------
 
+// An animated GIF in the preview, decoded one frame at a time as it plays (a long recording can have
+// thousands of full-size frames; decoding them all up front froze the window and took gigabytes).
 struct GifAnim {
+    struct State {
+        IWICImagingFactory* f = nullptr;
+        IWICBitmapDecoder* dec = nullptr;
+        UINT count = 0, next = 0;
+        int W = 0, H = 0;
+        BitmapPtr canvas, restore;  // composited picture; what to restore after a "previous" disposal
+        int disposal = 0;
+        RECT last{};  // area of the frame shown last, for its disposal
+        ~State() {
+            if (dec) dec->Release();
+            if (f) f->Release();
+        }
+    };
     std::wstring path;
-    std::vector<BitmapPtr> frames;
-    std::vector<int> delays;
-    int index = 0;
+    std::shared_ptr<State> st;
+    bool Valid() const { return st && st->count > 0; }
+    bool Animated() const { return st && st->count > 1; }
+
+    // The next frame of the animation (looping), and how long to show it.
+    BitmapPtr Next(int* delayMs) {
+        *delayMs = 100;
+        if (!Valid()) return nullptr;
+        State& a = *st;
+        if (a.next >= a.count) {  // loop: start from a clean canvas
+            a.next = 0;
+            a.canvas.reset();
+            a.restore.reset();
+            a.disposal = 0;
+        }
+        if (a.canvas) {  // dispose of the previous frame
+            if (a.disposal == 2)
+                for (int y = std::max(0L, a.last.top); y < std::min((LONG)a.H, a.last.bottom); ++y)
+                    std::fill_n(a.canvas->Bits() + (size_t)y * a.W + std::max(0L, a.last.left),
+                                std::max(0L, std::min((LONG)a.W, a.last.right) - std::max(0L, a.last.left)), 0xFF000000u);
+            if (a.disposal == 3 && a.restore) a.canvas = a.restore;
+        }
+        IWICBitmapFrameDecode* fr = nullptr;
+        if (FAILED(a.dec->GetFrame(a.next++, &fr))) return a.canvas ? a.canvas->Crop({0, 0, a.W, a.H}) : nullptr;
+        UINT fw = 0, fh = 0;
+        fr->GetSize(&fw, &fh);
+        int left = 0, top = 0, delay = 10, disposal = 0;
+        IWICMetadataQueryReader* q = nullptr;
+        if (SUCCEEDED(fr->GetMetadataQueryReader(&q))) {
+            PROPVARIANT v;
+            PropVariantInit(&v);
+            if (SUCCEEDED(q->GetMetadataByName(L"/imgdesc/Left", &v)) && v.vt == VT_UI2) left = v.uiVal;
+            PropVariantClear(&v);
+            if (SUCCEEDED(q->GetMetadataByName(L"/imgdesc/Top", &v)) && v.vt == VT_UI2) top = v.uiVal;
+            PropVariantClear(&v);
+            if (SUCCEEDED(q->GetMetadataByName(L"/grctlext/Delay", &v)) && v.vt == VT_UI2 && v.uiVal > 0) delay = v.uiVal;
+            PropVariantClear(&v);
+            if (SUCCEEDED(q->GetMetadataByName(L"/grctlext/Disposal", &v)) && v.vt == VT_UI1) disposal = v.bVal;
+            PropVariantClear(&v);
+            q->Release();
+        }
+        if (!a.W || !a.H) a.W = (int)fw, a.H = (int)fh;
+        if (!a.canvas) {
+            a.canvas = Bitmap::Create(a.W, a.H);
+            if (!a.canvas) {
+                fr->Release();
+                return nullptr;
+            }
+            std::fill_n(a.canvas->Bits(), (size_t)a.W * a.H, 0xFF000000u);
+        }
+        a.restore = disposal == 3 ? a.canvas->Crop({0, 0, a.W, a.H}) : nullptr;
+        IWICFormatConverter* conv = nullptr;
+        std::vector<uint32_t> px((size_t)fw * fh);
+        if (SUCCEEDED(a.f->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(fr, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+            conv->CopyPixels(nullptr, fw * 4, (UINT)px.size() * 4, reinterpret_cast<BYTE*>(px.data()));
+        if (conv) conv->Release();
+        fr->Release();
+        for (UINT y = 0; y < fh; ++y)
+            for (UINT x = 0; x < fw; ++x) {
+                const uint32_t c = px[(size_t)y * fw + x];
+                const int cx = left + (int)x, cy = top + (int)y;
+                if ((c >> 24) >= 128 && cx < a.W && cy < a.H) a.canvas->Bits()[(size_t)cy * a.W + cx] = c | 0xFF000000u;
+            }
+        a.disposal = disposal;
+        a.last = {left, top, left + (LONG)fw, top + (LONG)fh};
+        *delayMs = std::max(20, delay * 10);
+        return a.canvas->Crop({0, 0, a.W, a.H});  // the canvas keeps changing: show a copy
+    }
 };
 
 GifAnim LoadGif(const std::wstring& path) {
-    GifAnim a;
-    a.path = path;
-    IWICImagingFactory* f = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) return a;
-    IWICBitmapDecoder* dec = nullptr;
-    UINT n = 0;
-    int W = 0, H = 0;
-    if (SUCCEEDED(f->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) &&
-        SUCCEEDED(dec->GetFrameCount(&n))) {
-        IWICMetadataQueryReader* gq = nullptr;
-        if (SUCCEEDED(dec->GetMetadataQueryReader(&gq))) {
-            PROPVARIANT v;
-            PropVariantInit(&v);
-            if (SUCCEEDED(gq->GetMetadataByName(L"/logscrdesc/Width", &v)) && v.vt == VT_UI2) W = v.uiVal;
-            PropVariantClear(&v);
-            if (SUCCEEDED(gq->GetMetadataByName(L"/logscrdesc/Height", &v)) && v.vt == VT_UI2) H = v.uiVal;
-            PropVariantClear(&v);
-            gq->Release();
-        }
-        BitmapPtr canvas;
-        for (UINT i = 0; i < n && i < 2000; ++i) {
-            IWICBitmapFrameDecode* fr = nullptr;
-            if (FAILED(dec->GetFrame(i, &fr))) break;
-            UINT fw = 0, fh = 0;
-            fr->GetSize(&fw, &fh);
-            int left = 0, top = 0, delay = 10, disposal = 0;
-            IWICMetadataQueryReader* q = nullptr;
-            if (SUCCEEDED(fr->GetMetadataQueryReader(&q))) {
-                PROPVARIANT v;
-                PropVariantInit(&v);
-                if (SUCCEEDED(q->GetMetadataByName(L"/imgdesc/Left", &v)) && v.vt == VT_UI2) left = v.uiVal;
-                PropVariantClear(&v);
-                if (SUCCEEDED(q->GetMetadataByName(L"/imgdesc/Top", &v)) && v.vt == VT_UI2) top = v.uiVal;
-                PropVariantClear(&v);
-                if (SUCCEEDED(q->GetMetadataByName(L"/grctlext/Delay", &v)) && v.vt == VT_UI2 && v.uiVal > 0) delay = v.uiVal;
-                PropVariantClear(&v);
-                if (SUCCEEDED(q->GetMetadataByName(L"/grctlext/Disposal", &v)) && v.vt == VT_UI1) disposal = v.bVal;
-                PropVariantClear(&v);
-                q->Release();
-            }
-            if (!W || !H) W = (int)fw, H = (int)fh;
-            if (!canvas) {
-                canvas = Bitmap::Create(W, H);
-                if (!canvas) break;
-                std::fill_n(canvas->Bits(), (size_t)W * H, 0xFF000000u);
-            }
-            IWICFormatConverter* conv = nullptr;
-            std::vector<uint32_t> px((size_t)fw * fh);
-            if (SUCCEEDED(f->CreateFormatConverter(&conv)) &&
-                SUCCEEDED(conv->Initialize(fr, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
-                conv->CopyPixels(nullptr, fw * 4, (UINT)px.size() * 4, reinterpret_cast<BYTE*>(px.data()));
-            if (conv) conv->Release();
-            auto before = disposal == 3 ? canvas->Crop({0, 0, W, H}) : nullptr;
-            for (UINT y = 0; y < fh; ++y)
-                for (UINT x = 0; x < fw; ++x) {
-                    const uint32_t p = px[(size_t)y * fw + x];
-                    const int cx = left + (int)x, cy = top + (int)y;
-                    if ((p >> 24) >= 128 && cx < W && cy < H) canvas->Bits()[(size_t)cy * W + cx] = p | 0xFF000000u;
-                }
-            a.frames.push_back(canvas->Crop({0, 0, W, H}));
-            a.delays.push_back(std::max(20, delay * 10));
-            if (disposal == 2)
-                for (UINT y = 0; y < fh; ++y)
-                    for (UINT x = 0; x < fw; ++x)
-                        if (left + (int)x < W && top + (int)y < H) canvas->Bits()[(size_t)(top + y) * W + left + x] = 0xFF000000u;
-            if (disposal == 3 && before) canvas = before;
-            fr->Release();
-        }
-        dec->Release();
+    GifAnim g;
+    g.path = path;
+    auto st = std::make_shared<GifAnim::State>();
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&st->f))) ||
+        FAILED(st->f->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &st->dec)) ||
+        FAILED(st->dec->GetFrameCount(&st->count)))
+        return g;
+    IWICMetadataQueryReader* gq = nullptr;
+    if (SUCCEEDED(st->dec->GetMetadataQueryReader(&gq))) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(gq->GetMetadataByName(L"/logscrdesc/Width", &v)) && v.vt == VT_UI2) st->W = v.uiVal;
+        PropVariantClear(&v);
+        if (SUCCEEDED(gq->GetMetadataByName(L"/logscrdesc/Height", &v)) && v.vt == VT_UI2) st->H = v.uiVal;
+        PropVariantClear(&v);
+        gq->Release();
     }
-    f->Release();
-    return a;
+    g.st = std::move(st);
+    return g;
 }
 
 // ---------- the window ----------
@@ -560,7 +591,7 @@ public:
     double pvZoom = 0;  // 0 = fit
     double pvX = 0, pvY = 0;
     bool pvDragging = false;
-    POINT pvLast{};
+    POINT pvLast{}, pvDown{};
     // compare
     BitmapPtr cmpA, cmpB;
     std::wstring cmpKey;
@@ -586,6 +617,7 @@ public:
     }
     void Recompute() {
         model.Recompute();
+        hots.clear();  // they point into the old list: a click before the repaint must not act on the wrong capture
         UpdateSearchCue();
         Changed();
     }
@@ -669,6 +701,7 @@ public:
     BitmapPtr TileBitmap(const std::wstring& path, int w, int h, bool fill);
 
     // input
+    bool OverlayUp() const { return showShortcuts || model.compare.has_value() || !model.preview.empty(); }
     int HotAt(POINT p) const {
         for (int i = (int)hots.size() - 1; i >= 0; --i)
             if (PtInRect(&hots[i].r, p)) return i;
@@ -1140,6 +1173,7 @@ void Gallery::PaintTopBar(HDC dc, const RECT& c) {
     const int x0 = std::max<int>(c.left + S(12), (c.left + c.right) / 2 - barW / 2);
     RECT bar{x0, S(8), x0 + barW, S(8) + S(36)};
     Glass(dc, bar, Sf(18), s);
+    AddHot(bar, nullptr, L"", nullptr, nullptr, IDC_ARROW);  // its empty parts aren't the tiles underneath
     int x = bar.left + S(4);
     const int y = bar.top + S(4);
     x = GlassButton(dc, x, y, L"\xE90C", model.showSidebar, [this] { ToggleSidebar(); },
@@ -1161,7 +1195,7 @@ void Gallery::PaintTopBar(HDC dc, const RECT& c) {
     Text(dc, fIcon, L"\xE721", {pill.left + S(10), pill.top, pill.left + S(28), pill.bottom}, theme::kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     const int editL = pill.left + S(32), editR = pill.right - (model.filter().text.empty() ? S(12) : S(30));
     const int eh = S(18);
-    SetWindowPos(search, nullptr, editL, (pill.top + pill.bottom) / 2 - eh / 2, editR - editL, eh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(search, nullptr, editL, (pill.top + pill.bottom) / 2 - eh / 2, editR - editL, eh, SWP_NOZORDER | SWP_NOACTIVATE | (OverlayUp() ? 0 : SWP_SHOWWINDOW));
     if (!model.filter().text.empty()) {
         RECT xr{pill.right - S(28), pill.top, pill.right - S(6), pill.bottom};
         Text(dc, fIconSmall, L"\xE711", xr, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1289,6 +1323,7 @@ void Gallery::PaintActionBar(HDC dc, const RECT& c) {
     const int x0 = (c.left + c.right) / 2 - w / 2, y0 = c.bottom - S(14) - S(36);
     RECT bar{x0, y0, x0 + w, y0 + S(36)};
     Glass(dc, bar, Sf(18), s);
+    AddHot(bar, nullptr, L"", nullptr, nullptr, IDC_ARROW);  // its empty parts aren't the tiles underneath
     int x = bar.left + S(4);
     const int y = bar.top + S(4);
     x = GlassButton(dc, x, y, L"\xE711", false, [this] {
@@ -1525,6 +1560,7 @@ void Gallery::PaintInspector(HDC dc, const RECT& r) {
     const RECT body{r.left, S(52), r.right, r.bottom};
     HRGN clip = CreateRectRgn(body.left, body.top, body.right, body.bottom);
     SelectClipRgn(dc, clip);
+    const size_t firstBodyHot = hots.size();  // clipped to the body below: scrolled-out controls can't take clicks
     const int L = r.left + S(14), R = r.right - S(14);
     int y = body.top - inspScroll;
     bool tagEditShown = false, commentShown = false;
@@ -1580,7 +1616,7 @@ void Gallery::PaintInspector(HDC dc, const RECT& r) {
     auto tagField = [&](const std::vector<std::wstring>& targets) {
         RECT fr{L, y, R, y + S(28)};
         FillRR(dc, fr, Sf(6), A(RGB(44, 45, 42)));
-        SetWindowPos(tagEdit, nullptr, fr.left + S(8), fr.top + S(5), RectW(fr) - S(16), S(18), SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetWindowPos(tagEdit, nullptr, fr.left + S(8), fr.top + S(5), RectW(fr) - S(16), S(18), SWP_NOZORDER | SWP_NOACTIVATE | (OverlayUp() ? 0 : SWP_SHOWWINDOW));
         tagEditShown = true;
         y = fr.bottom + S(6);
         // Matching existing tags under the field.
@@ -1689,7 +1725,7 @@ void Gallery::PaintInspector(HDC dc, const RECT& r) {
             RECT cr{L, y, R, y + lines + S(12)};
             FillRR(dc, cr, Sf(6), A(RGB(44, 45, 42)));
             SetWindowPos(commentEdit, nullptr, cr.left + S(8), cr.top + S(6), RectW(cr) - S(16), RectH(cr) - S(12),
-                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                         SWP_NOZORDER | SWP_NOACTIVATE | (OverlayUp() ? 0 : SWP_SHOWWINDOW));
             commentShown = true;
             y = cr.bottom + S(8);
         }
@@ -1888,6 +1924,17 @@ void Gallery::PaintInspector(HDC dc, const RECT& r) {
     inspH = y + inspScroll - body.top + S(20);
     SelectClipRgn(dc, nullptr);
     DeleteObject(clip);
+    // Controls scrolled out of the body are hidden by the clip; drop their hot rects too (they sat over the
+    // close button and the header), and trim the partly visible ones.
+    for (size_t i = firstBodyHot; i < hots.size();) {
+        RECT vis;
+        if (!IntersectRect(&vis, &hots[i].r, &body)) {
+            hots.erase(hots.begin() + (std::ptrdiff_t)i);
+            continue;
+        }
+        hots[i].r = vis;
+        ++i;
+    }
     if (!tagEditShown && Shown(tagEdit)) {
         if (GetFocus() == tagEdit) SetFocus(hwnd);
         ShowWindow(tagEdit, SW_HIDE);
@@ -2053,6 +2100,7 @@ void Gallery::PaintFilterPanel(HDC dc) {
     RECT panel{x0, y0, x0 + w, y};
     g_filterPanel = panel;
     Glass(dc, panel, Sf(12), s);
+    AddHot(panel, nullptr, L"", nullptr, nullptr, IDC_ARROW);
     // A little arrow towards the button.
     for (size_t i = 0; i < labels.size(); ++i) {
         const RECT& r = chipRects[i];
@@ -2205,9 +2253,10 @@ void Gallery::PaintPreview(HDC dc) {
         const MediaType mt = MediaTypeOf(u);
         if (mt == MediaType::Gif) {
             gif = LoadGif(u);
-            if (!gif.frames.empty()) {
-                previewImg = gif.frames[0];
-                if (gif.frames.size() > 1) SetTimer(hwnd, kTimerGif, gif.delays[0], nullptr);
+            if (gif.Valid()) {
+                int delay = 100;
+                previewImg = gif.Next(&delay);
+                if (gif.Animated()) SetTimer(hwnd, kTimerGif, delay, nullptr);
             }
         } else if (mt == MediaType::Video) {
             VideoInfo vi;
@@ -2242,21 +2291,6 @@ void Gallery::PaintPreview(HDC dc) {
         SelectClipRgn(dc, nullptr);
         DeleteObject(clip);
         const bool video = MediaTypeOf(u) == MediaType::Video;
-        if (video && !(previewVideo && previewVideo->Playing())) {  // paused or ended: a play button; Enter opens the video editor
-            const int cx = (area.left + area.right) / 2, cy = (area.top + area.bottom) / 2;
-            RECT pb{cx - S(36), cy - S(36), cx + S(36), cy + S(36)};
-            FillRR(dc, pb, Sf(36), gp::Color(170, 0, 0, 0));
-            Text(dc, fBig, L"\xE768", pb, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            AddHot(pb, [this, u] {
-                if (previewVideo) {
-                    previewVideo->Play();
-                    SetTimer(hwnd, kTimerVideo, 15, nullptr);
-                    Changed(false);
-                } else {
-                    Open(u);
-                }
-            }, previewVideo ? L"Play" : L"Edit video (Enter)");
-        }
         Hot h2;
         h2.r = area;
         h2.cursor = pvZoom > 0 ? IDC_SIZEALL : IDC_ARROW;
@@ -2272,6 +2306,22 @@ void Gallery::PaintPreview(HDC dc) {
             Changed(false);
         };
         hots.push_back(h2);
+        // After the image's own hot rect, so it's on top and takes the click.
+        if (video && !(previewVideo && previewVideo->Playing())) {  // paused or ended: a play button; Enter opens the video editor
+            const int cx = (area.left + area.right) / 2, cy = (area.top + area.bottom) / 2;
+            RECT pb{cx - S(36), cy - S(36), cx + S(36), cy + S(36)};
+            FillRR(dc, pb, Sf(36), gp::Color(170, 0, 0, 0));
+            Text(dc, fBig, L"\xE768", pb, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            AddHot(pb, [this, u] {
+                if (previewVideo) {
+                    previewVideo->Play();
+                    SetTimer(hwnd, kTimerVideo, 15, nullptr);
+                    Changed(false);
+                } else {
+                    Open(u);
+                }
+            }, previewVideo ? L"Play" : L"Edit video (Enter)");
+        }
     } else {
         Text(dc, fUi, L"Can't show this file", area, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -2542,6 +2592,7 @@ void Gallery::OnMouseDown(POINT p, bool dbl) {
         return;
     }
     const Hot h = hots[hi];
+    if (h.tile >= (int)model.visible.size()) return;  // painted for a list that has changed since
     if (h.tile >= 0) {
         EndTyping();
         const std::wstring u = model.visible[h.tile];
@@ -2565,10 +2616,13 @@ void Gallery::OnMouseDown(POINT p, bool dbl) {
         SetCapture(hwnd);
         return;
     }
-    if (h.tile == -3) {  // preview image
+    if (h.tile == -3) {  // preview image: drag pans; a click without dragging runs its click (pause a video)
         if (dbl && h.dbl) return h.dbl();
         g_panning = true;
         pvLast = p;
+        pvDown = p;
+        g_pressed = h;
+        g_havePressed = (bool)h.click;
         SetCapture(hwnd);
         return;
     }
@@ -2582,9 +2636,14 @@ void Gallery::OnMouseDown(POINT p, bool dbl) {
     if (dbl && h.dbl) return h.dbl();
     g_pressed = h;
     g_havePressed = true;
+    SetCapture(hwnd);  // so a release outside the window is seen, and the press can't fire later
 }
 
 void Gallery::OnMouseUp(POINT p) {
+    const bool havePressed = g_havePressed, wasPanning = g_panning;
+    const Hot pressedHot = g_pressed;
+    g_havePressed = false;
+    g_pressed = Hot{};
     if (GetCapture() == hwnd) ReleaseCapture();
     draggingScroll = g_panning = g_splitting = false;
     if (pressTile >= 0 && pressTile < (int)model.visible.size() && !g_dragStarted) {
@@ -2596,10 +2655,9 @@ void Gallery::OnMouseUp(POINT p) {
         }
     }
     pressTile = -1;
-    if (g_havePressed) {
-        g_havePressed = false;
-        Hot h = g_pressed;
-        if (PtInRect(&h.r, p) && h.click) h.click();
+    if (havePressed && PtInRect(&pressedHot.r, p) && pressedHot.click) {
+        if (wasPanning && std::abs(p.x - pvDown.x) + std::abs(p.y - pvDown.y) > S(4)) return;  // that was a pan
+        pressedHot.click();
     }
 }
 
@@ -2653,6 +2711,7 @@ void Gallery::OnRightClick(POINT p) {
     const int hi = HotAt(p);
     if (hi < 0) return;
     const Hot h = hots[hi];
+    if (h.tile >= (int)model.visible.size()) return;  // painted for a list that has changed since
     if (h.tile >= 0) {
         const std::wstring u = model.visible[h.tile];
         if (!model.selection.count(u)) {
@@ -3460,10 +3519,10 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
                 }
                 case kTimerGif:
                     KillTimer(hwnd, kTimerGif);
-                    if (!gif.frames.empty() && model.preview == gif.path) {
-                        gif.index = (gif.index + 1) % (int)gif.frames.size();
-                        previewImg = gif.frames[gif.index];
-                        SetTimer(hwnd, kTimerGif, gif.delays[gif.index], nullptr);
+                    if (gif.Animated() && model.preview == gif.path) {
+                        int delay = 100;
+                        if (auto f = gif.Next(&delay)) previewImg = f;
+                        SetTimer(hwnd, kTimerGif, delay, nullptr);
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
                     break;
@@ -3512,6 +3571,10 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
         }
         case WM_CAPTURECHANGED:
             draggingScroll = g_panning = g_splitting = false;
+            if ((HWND)l != hwnd) {  // the press was lost (released elsewhere, another window took the mouse)
+                g_havePressed = false;
+                g_pressed = Hot{};
+            }
             return 0;
         case WM_SETCURSOR:
             if (LOWORD(l) == HTCLIENT && (HWND)w == hwnd) {
@@ -3556,7 +3619,11 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
             WINDOWPLACEMENT wp{sizeof(wp)};
             if (GetWindowPlacement(hwnd, &wp)) {
                 const std::wstring ini = SupportFolder() + L"\\gallery.ini";
-                const RECT& r = wp.rcNormalPosition;
+                // rcNormalPosition is in workspace coordinates; CreateWindowEx takes screen coordinates.
+                RECT r = wp.rcNormalPosition;
+                MONITORINFO mi{sizeof(mi)};
+                if (GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi))
+                    OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
                 wchar_t v[96];
                 swprintf_s(v, L"%ld,%ld,%ld,%ld,%d", r.left, r.top, r.right, r.bottom, wp.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
                 WritePrivateProfileStringW(L"Window", L"Placement", v, ini.c_str());
@@ -3564,6 +3631,8 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
             model.lib.Unsubscribe(libListener);
             thumbs.Stop();
             previewVideo.reset();
+            g_havePressed = false;  // holds a click bound to this window
+            g_pressed = Hot{};
             return 0;
         }
     }
@@ -3628,6 +3697,11 @@ bool Gallery::Create() {
     if (!CreateWindowExW(WS_EX_ACCEPTFILES, kClass, L"Capture gallery", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, w, h, nullptr, nullptr,
                          GetModuleHandleW(nullptr), this))
         return false;
+    // The saved position can be on another monitor than the cursor: use that monitor's scale.
+    if (const UINT dpi = GetDpiForWindow(hwnd); dpi && std::fabs(dpi / 96.f - s) > 0.01f) {
+        s = dpi / 96.f;
+        Fonts();
+    }
     BOOL dark = TRUE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     COLORREF cap = theme::kBg;

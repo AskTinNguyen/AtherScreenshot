@@ -2,6 +2,7 @@
 
 #include <dwmapi.h>
 #include <objbase.h>
+#include <ole2.h>
 #include <shellapi.h>
 
 #include <commdlg.h>
@@ -1226,7 +1227,8 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    // OLE, not just COM: dragging captures out of the gallery (DoDragDrop) needs it. Single-threaded apartment.
+    OleInitialize(nullptr);
     Gdiplus::GdiplusStartupInput gdipInput;
     ULONG_PTR gdipToken = 0;
     Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, nullptr);
@@ -1264,7 +1266,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (selftest) {  // unit tests (see selftest.h)
             const int failures = test::Run(filter);
             Gdiplus::GdiplusShutdown(gdipToken);
-            CoUninitialize();
+            OleUninitialize();
             return failures;
         }
     }
@@ -1361,7 +1363,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     lib.StopBackgroundWork();
     StopUiDispatcher(dispatcher);
     Gdiplus::GdiplusShutdown(gdipToken);
-    CoUninitialize();
+    OleUninitialize();
     if (mutex) CloseHandle(mutex);
     return 0;
 }
