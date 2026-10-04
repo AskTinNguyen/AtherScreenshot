@@ -1,4 +1,19 @@
-# AtherScreenshot
+<h1 align="center">AtherScreenshot</h1>
+
+<p align="center">
+  <b>Capture. Mark up. Find. Edit video.</b><br>
+  A tiny, native screenshot and screen-recording app for <b>macOS</b> and <b>Windows</b>.<br>
+  No sign-in, no bloat, no dependencies.
+</p>
+
+<p align="center">
+  <a href="#download">Download</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#default-shortcuts">Shortcuts</a> ·
+  <a href="#guide">Guide</a> ·
+  <a href="#build-from-source">Build</a> ·
+  <a href="macos/README.md">macOS docs</a>
+</p>
 
 <p align="center">
   <a href="marketing/AtherScreenshot-hype.mp4"><img src="marketing/hype-preview.gif" alt="AtherScreenshot in 60 seconds" width="720"></a>
@@ -6,47 +21,56 @@
   <a href="marketing/AtherScreenshot-hype.mp4"><b>▶ Watch the 60-second video (with sound)</b></a>
 </p>
 
-A tiny, fast, personal ShareX replacement for Windows 11. Native C++20 + Win32/GDI/GDI+/WIC/Media Foundation/WinRT. A single exe, no dependencies, a few MB of memory at idle.
+## Download
 
-**macOS:** a native app lives in [`macos/`](macos/README.md) (`cd macos && ./build.sh`). Download: [AtherScreenshot-0.0.1-macOS.dmg](downloads/AtherScreenshot-0.0.1-macOS.dmg) (macOS 14+, Apple silicon and Intel; checksum in [`downloads/SHA256SUMS-macOS.txt`](downloads/SHA256SUMS-macOS.txt)). The build isn't notarized: after dragging it to Applications, open it once, then allow it in System Settings › Privacy & Security › "Open Anyway".
+Version **0.0.1**
 
-**Download (Windows):** [AtherScreenshot-Setup-0.0.1.exe](downloads/AtherScreenshot-Setup-0.0.1.exe) (Windows 10/11, x64), or the [portable zip](downloads/AtherScreenshot-0.0.1-portable.zip); checksums in [`downloads/SHA256SUMS-Windows.txt`](downloads/SHA256SUMS-Windows.txt). See [INSTALL.md](INSTALL.md). The exe isn't code-signed, so SmartScreen asks once: More info › Run anyway. To build it yourself, run `package.bat` (below).
+| Platform | Download | Size | Requirements |
+|---|---|---|---|
+| **macOS** | [**AtherScreenshot-0.0.1-macOS.dmg**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-macOS.dmg) | 3.7 MB | macOS 14+, Apple silicon and Intel |
+| **Windows** | [**AtherScreenshot-Setup-0.0.1.exe**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-Setup-0.0.1.exe) | 2.7 MB | Windows 10/11, x64 |
+| Windows (portable) | [AtherScreenshot-0.0.1-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
 
-## Build
+Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256SUMS-Windows.txt)
 
-```
-build.bat          # release -> build\AtherScreenshot.exe
-build.bat debug
-```
+**First launch.** The builds aren't signed yet, so your OS asks once:
 
-## Package for the team
-
-```
-package.bat            # -> dist\AtherScreenshot-Setup-<ver>.exe, -portable.zip, SHA256SUMS.txt, INSTALL.md
-package.bat publish    # also creates a GitHub Release with gh (needs a git repo with a GitHub remote)
-```
-
-- **Setup exe:** the exe is its own installer. Run it from anywhere and it offers INSTALL (per-user, no admin), UPDATE, or "Run without installing". Install adds a Start menu shortcut, an optional startup entry, and an uninstall entry in Settings › Apps (which runs `AtherScreenshot.exe --uninstall`). Captures and settings are kept on uninstall.
-- **Version:** bump it in `src/version.h`. The exe metadata, the installer and the file names all follow it.
-- **Icon:** `res/app.ico` is generated from the vector A⁵ logo in `src/logo.cpp`. Delete the file and `build.bat` regenerates it.
-- **Signing:** builds aren't code-signed, so teammates see a SmartScreen "unknown publisher" prompt the first time. With a code-signing certificate, `set SIGN_PFX=…` and `set SIGN_PASSWORD=…` before `package.bat` to sign.
-- **Dev builds:** `build\AtherScreenshot.portable` marks the dev build folder as portable, so `build\AtherScreenshot.exe` runs in place without offering to install.
-
-Requires Visual Studio with the C++ workload (found automatically through vswhere).
-
-## Default hotkeys
-
-| Hotkey | Action |
+| | What to do |
 |---|---|
-| `Ctrl+Alt+K` | Command palette (every command below is in it; Ctrl+K inside closes it) |
-| `PrintScreen` | Capture region |
-| `Ctrl+PrintScreen` / `Ctrl+Shift+PrintScreen` | Capture all monitors / current monitor |
-| `Alt+PrintScreen` | Capture active window |
-| `Ctrl+Alt+E` | Capture region and annotate |
-| `Ctrl+Alt+S` | Scrolling capture (long pages) |
-| `Ctrl+Alt+U` | Capture region and upload (link copied) |
-| `Ctrl+Alt+H` | Capture gallery |
-| `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` | Record MP4 / GIF (press again to stop) |
+| **macOS** | Drag the app to Applications and open it once. Then go to System Settings › Privacy & Security › **Open Anyway**. Allow Screen Recording when asked. |
+| **Windows** | When SmartScreen says "Windows protected your PC", click **More info › Run anyway**, then **INSTALL**. Installing is per-user and needs no admin. See [INSTALL.md](INSTALL.md). |
+
+## Features
+
+| | |
+|---|---|
+| 📸 **Capture** | Region, window, full screen, scrolling pages, delay timer, screen ruler, color picker, OCR text, and auto-redaction of emails, keys and card numbers |
+| ✏️ **Annotate** | Arrows, shapes, text, steps, highlighter, blur and pixelate, spotlight, magnifier, crop and styled export |
+| 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
+| 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks and keystrokes |
+| 🎬 **Edit video** | Trim, crop, speed, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter) |
+| 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
+| 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
+| ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3) |
+| ⌨️ **Automate** | Command palette, rebindable shortcuts, command line and `atherscreenshot://` links |
+
+OCR, tags and search run on your computer. Upload is off until you set it up. Auto captions are transcribed on the device too; on a Mac without on-device speech recognition, macOS uses Apple's servers.
+
+## Default shortcuts
+
+| Action | macOS | Windows |
+|---|---|---|
+| Command palette (every command) | `⌃⌥K` | `Ctrl+Alt+K` |
+| Capture region | `⌃⌥4` | `PrintScreen` |
+| Capture all displays / current display | `⌃⌥3` / `⌃⌥⇧3` | `Ctrl+PrintScreen` / `Ctrl+Shift+PrintScreen` |
+| Capture active window | `⌃⌥W` | `Alt+PrintScreen` |
+| Capture and annotate | `⌃⌥E` | `Ctrl+Alt+E` |
+| Scrolling capture | `⌃⌥S` | `Ctrl+Alt+S` |
+| Capture and upload | `⌃⌥U` | `Ctrl+Alt+U` |
+| Capture gallery | `⌃⌥H` | `Ctrl+Alt+H` |
+| Record MP4 / GIF (press again to stop) | `⌃⌥5` / `⌃⌥G` | `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` |
+
+macOS reserves `⌘⇧3/4/5`, so the Mac defaults use `⌃⌥`. In the gallery and editors, `Ctrl` on Windows replaces `⌘` on the Mac.
 
 Everything is configurable in the **Settings** window (palette → "Settings", or the tray menu):
 - **Searchable:** type to filter the settings.
@@ -54,9 +78,13 @@ Everything is configurable in the **Settings** window (palette → "Settings", o
 - **Reset:** right-click any setting to reset it.
 - **Shortcuts:** click a shortcut field and press the keys (Esc cancels, Backspace clears). A shortcut already used by another command moves over to the new one. A shortcut taken by another app or Windows shows a warning on its row.
 
-Values are stored in `%APPDATA%\AtherScreenshot\settings.ini`.
+Values are stored in `%APPDATA%\AtherScreenshot\settings.ini` on Windows, and in UserDefaults (`com.ather.screenshot`) under the same key names on the Mac.
 
-## Capturing
+## Guide
+
+This guide describes the Windows app. The Mac app works the same way; its docs and permissions are in [macos/README.md](macos/README.md), and the differences are listed under [Platform differences](#platform-differences).
+
+### Capturing
 
 - **Region selector:** click snaps to the window or monitor under the cursor, drag selects a region, `Space` takes the monitor, `Ctrl+A` takes everything, arrows nudge 1 px (`Shift` = 10 px), `Esc` or right-click cancels.
 - **Scrolling capture:** select the scrollable area. The app scrolls it with the mouse wheel and stitches the frames, keeping sticky headers and footers only once. It stops at the end, on `Esc`, or after `[Scrolling] MaxFrames`.
@@ -64,7 +92,7 @@ Values are stored in `%APPDATA%\AtherScreenshot\settings.ini`.
 - **Auto-redact:** "Capture region with auto-redact", or `AutoRedact=1` for every capture. It runs OCR and pixelates emails, IPs, API keys/tokens/JWTs, card numbers (Luhn-checked) and phone numbers. It can only redact what Windows OCR reads; it skipped a line of repeated `1111` digits in testing, so check important redactions.
 - **File names:** `FileNameTemplate` with `{yyyy} {MM} {dd} {HH} {mm} {ss} {ms} {app} {window} {w} {h}`. `AskForName=1` prompts after each capture; "Rename last capture…" renames afterwards.
 
-## Annotation editor
+### Annotation editor
 
 Open it with `Ctrl+Alt+E`, by clicking the capture toast, from the gallery, from a pin's menu, with "Open image in editor…", or with `AtherScreenshot.exe edit <file>`.
 
@@ -88,7 +116,7 @@ Other shortcuts:
 - `Ctrl+Shift+C` / `Ctrl+Shift+V` copy or paste annotations between editors.
 - `Ctrl+K` lists every editor command.
 
-### Editor extras
+#### Editor extras
 
 - **Insert image (I):** drop a screenshot from the gallery or Explorer onto the editor, paste one with `Ctrl+V`, or press I to pick from recent captures.
   - It becomes a layer: drag to move, drag a corner to resize (`Shift` for free resize), and `Ctrl+]` / `Ctrl+[` to bring it forward or send it back.
@@ -105,7 +133,7 @@ Other shortcuts:
   - Collages are tagged "collage" and keep the tags and collections their screenshots share.
   - Both list the screenshots they include.
 
-## Recording
+### Recording
 
 Select a region, or use "Record a window", which follows one window wherever it moves, even when it's covered. A 3-2-1 countdown runs first (click it to cancel). The control bar has Pause/Resume, Stop and Discard. The bar, frame and countdown never appear in the video.
 
@@ -115,7 +143,7 @@ Select a region, or use "Record a window", which follows one window wherever it 
 - **Click and keystroke overlay:** click ripples (`ShowClicks`) and a keystroke pill (`ShowKeys`, off by default because it would show anything you type, including passwords).
 - When a recording finishes, the file is copied to the clipboard so you can paste it into chats.
 
-## Video editor
+### Video editor
 
 Opening an MP4 (from the gallery, the "Recording saved" notification, or Open recent in the palette) opens a small editor instead of a player:
 
@@ -147,7 +175,7 @@ Opening an MP4 (from the gallery, the "Recording saved" notification, or Open re
 
 Space plays, ←/→ step a frame (`Shift`: a second), `Del` deletes the selected item, `Ctrl+Z` undoes, `Esc` leaves crop, then deselects, then closes.
 
-## Capture gallery
+### Capture gallery
 
 `Ctrl+Alt+H`. An Eagle-style library for everything in the captures folder. Metadata lives in `%APPDATA%\AtherScreenshot\library.json`, in the same format as the Mac app's, and image features in `features.bin`. The image files are never modified.
 
@@ -186,6 +214,9 @@ Space plays, ←/→ step a frame (`Shift`: a second), `Del` deletes the selecte
   - New and moved files are picked up as they appear.
   - Captures remember which app and window they came from.
 
+<details>
+<summary><b>Gallery keyboard shortcuts</b></summary>
+
 | Key | Action |
 |---|---|
 | Space | Preview (←/→ next/previous, Space/Esc close) |
@@ -202,7 +233,9 @@ Space plays, ←/→ step a frame (`Shift`: a second), `Del` deletes the selecte
 | `Ctrl+/` or `?` | Keyboard shortcuts |
 | `Ctrl+K` | All actions |
 
-## Upload
+</details>
+
+### Upload
 
 Set `[Upload] Uploader=` to one of:
 - `imgur` + `ImgurClientId`
@@ -211,7 +244,7 @@ Set `[Upload] Uploader=` to one of:
 
 The link is copied to the clipboard. You can also set `AfterCapture=upload`.
 
-## Command line and links
+### Command line and links
 
 ```
 AtherScreenshot.exe region|fullscreen|monitor|window|last|scroll|ruler|ocr|color
@@ -225,7 +258,9 @@ Any `[Hotkeys]` key name works as a command too (e.g. `CaptureRegionPin`). If th
 
 Commands typed in a terminal run directly. Commands from `atherscreenshot://` links (which any web page can open) or from tools without a console ask for confirmation first. They can never upload, or open, pin or edit files, even when "After capture" is set to upload.
 
-## Differences from the Mac app
+## Platform differences
+
+How the Windows app differs from the Mac app:
 
 - **Shortcuts:**
   - Ctrl replaces ⌘.
@@ -243,7 +278,40 @@ Commands typed in a terminal run directly. Commands from `atherscreenshot://` li
   - The selected item shows fully while paused (the Mac version shows its first, faded frame).
 - **Recording:** system audio and microphone are mixed into one AAC track (two tracks on the Mac).
 
-## Layout
+## Build from source
+
+**Windows** (Visual Studio with the C++ workload, found automatically through vswhere):
+
+```
+build.bat          # release -> build\AtherScreenshot.exe
+build.bat debug
+```
+
+**macOS** (Xcode or the Command Line Tools):
+
+```
+cd macos
+./build.sh            # release -> build/Ather Screenshot.app
+./build.sh package    # universal DMG and zip in dist/
+xcrun swift test
+```
+
+### Package for the team (Windows)
+
+```
+package.bat            # -> dist\AtherScreenshot-Setup-<ver>.exe, -portable.zip, SHA256SUMS.txt, INSTALL.md
+package.bat publish    # also creates a GitHub Release with gh (needs a git repo with a GitHub remote)
+```
+
+- **Setup exe:** the exe is its own installer. Run it from anywhere and it offers INSTALL (per-user, no admin), UPDATE, or "Run without installing". Install adds a Start menu shortcut, an optional startup entry, and an uninstall entry in Settings › Apps (which runs `AtherScreenshot.exe --uninstall`). Captures and settings are kept on uninstall.
+- **Version:** bump it in `src/version.h`. The exe metadata, the installer and the file names all follow it.
+- **Icon:** `res/app.ico` is generated from the vector A⁵ logo in `src/logo.cpp`. Delete the file and `build.bat` regenerates it.
+- **Signing:** builds aren't code-signed, so teammates see a SmartScreen "unknown publisher" prompt the first time. With a code-signing certificate, `set SIGN_PFX=…` and `set SIGN_PASSWORD=…` before `package.bat` to sign.
+- **Dev builds:** `build\AtherScreenshot.portable` marks the dev build folder as portable, so `build\AtherScreenshot.exe` runs in place without offering to install.
+
+
+<details>
+<summary><b>Project layout (Windows source)</b></summary>
 
 - `src/main.cpp`: commands, hotkeys, tray, capture pipeline, CLI and links.
 - **Capture and recording:**
@@ -277,3 +345,5 @@ Commands typed in a terminal run directly. Commands from `atherscreenshot://` li
   - `upload`: Imgur, custom, S3
   - `settings`
 - **Tests:** `AtherScreenshot.exe --selftest [filter]` or `test.bat [--nobuild] [filter]`. Tests use a temporary support folder and never touch `%APPDATA%`.
+
+</details>
