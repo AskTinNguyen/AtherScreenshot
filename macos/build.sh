@@ -36,7 +36,9 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 IDENTITY="${SIGN_IDENTITY:--}"
 if [ "$IDENTITY" = "-" ]; then
-  codesign --force --sign - "$APP"
+  # Ad-hoc signatures are pinned to their hash, so every rebuild would lose the Screen Recording
+  # grant. Requiring only the bundle id keeps the grant across rebuilds.
+  codesign --force --sign - -r='designated => identifier "com.ather.screenshot"' "$APP"
 else
   codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 fi

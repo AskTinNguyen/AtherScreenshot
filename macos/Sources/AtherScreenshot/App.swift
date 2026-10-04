@@ -426,13 +426,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: capture pipeline
 
-    private func permissionOK() -> Bool {
-        if Capture.hasPermission() { return true }
-        _ = Capture.ensurePermission()
-        Toast.shared.show("Screen Recording permission needed", CaptureError.permission.errorDescription!, ms: 9000) {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+    private func withPermission(_ body: @escaping () -> Void) {
+        if Capture.hasPermission() { return body() }
+        Task { @MainActor in
+            if await Capture.resolvePermission() { return body() }
+            _ = Capture.ensurePermission()
+            Toast.shared.show("Screen Recording permission needed", CaptureError.permission.errorDescription!, ms: 9000) {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+            }
         }
-        return false
     }
 
     private func frontInfo() -> NameInfo {
@@ -441,12 +443,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func snapshotThen(_ body: @escaping (Snapshot) -> Void) {
-        guard permissionOK() else { return }
-        Toast.shared.hide()
-        let cursor = s.bool("CaptureCursor")
-        Task { @MainActor in
-            do { body(try await Capture.snapshot(cursor: cursor)) }
-            catch { Toast.shared.show("Capture failed", error.localizedDescription) }
+        withPermission {
+            Toast.shared.hide()
+            let cursor = self.s.bool("CaptureCursor")
+            Task { @MainActor in
+                do { body(try await Capture.snapshot(cursor: cursor)) }
+                catch { Toast.shared.show("Capture failed", error.localizedDescription) }
+            }
         }
     }
 
@@ -476,29 +479,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func captureActiveWindow(_ after: After) {
         let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
-        guard permissionOK() else { return }
-        guard let w = Capture.activeWindow() else { return Toast.shared.show("No window to capture") }
-        let cursor = s.bool("CaptureCursor")
-        Task { @MainActor in
-            do {
-                let img = try await Capture.window(w.id, cursor: cursor)
-                self.nameInfo = NameInfo(app: w.app, window: w.title)
-                self.deliver(img, scale: CGFloat(img.width) / max(1, w.frame.width), where: w.frame, after, allowUpload: allow)
-            } catch { Toast.shared.show("Capture failed", error.localizedDescription) }
+        withPermission {
+            guard let w = Capture.activeWindow() else { return Toast.shared.show("No window to capture") }
+            let cursor = self.s.bool("CaptureCursor")
+            Task { @MainActor in
+                do {
+                    let img = try await Capture.window(w.id, cursor: cursor)
+                    self.nameInfo = NameInfo(app: w.app, window: w.title)
+                    self.deliver(img, scale: CGFloat(img.width) / max(1, w.frame.width), where: w.frame, after, allowUpload: allow)
+                } catch { Toast.shared.show("Capture failed", error.localizedDescription) }
+            }
         }
     }
 
     private func captureLastRegion(_ after: After) {
         let allow = uploadAllowed  // fixed now; later commands must not change it for this capture
         guard let r = lastRegion else { return captureRegion(after) }
-        guard permissionOK() else { return }
-        let cursor = s.bool("CaptureCursor")
-        nameInfo = Capture.window(at: r.center, in: Capture.windows()).map { NameInfo(app: $0.app, window: $0.title) } ?? NameInfo()
-        Task { @MainActor in
-            do {
-                let img = try await Capture.rect(r, cursor: cursor)
-                self.deliver(img, scale: CGFloat(img.width) / max(1, r.width), where: r, after, allowUpload: allow)
-            } catch { Toast.shared.show("Capture failed", error.localizedDescription) }
+        withPermission {
+            let cursor = self.s.bool("CaptureCursor")
+            self.nameInfo = Capture.window(at: r.center, in: Capture.windows()).map { NameInfo(app: $0.app, window: $0.title) } ?? NameInfo()
+            Task { @MainActor in
+                do {
+                    let img = try await Capture.rect(r, cursor: cursor)
+                    self.deliver(img, scale: CGFloat(img.width) / max(1, r.width), where: r, after, allowUpload: allow)
+                } catch { Toast.shared.show("Capture failed", error.localizedDescription) }
+            }
         }
     }
 

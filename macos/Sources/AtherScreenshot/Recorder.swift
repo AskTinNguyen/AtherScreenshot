@@ -124,7 +124,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func startStream() async throws {
-        guard Capture.hasPermission() else { throw CaptureError.permission }
+        guard await Capture.resolvePermission() else { throw CaptureError.permission }
         let content = try await Capture.content()
         let cfg = SCStreamConfiguration()
         let filter: SCContentFilter

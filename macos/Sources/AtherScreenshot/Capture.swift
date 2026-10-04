@@ -67,7 +67,17 @@ enum CaptureError: LocalizedError {
 }
 
 enum Capture {
-    static func hasPermission() -> Bool { CGPreflightScreenCaptureAccess() }
+    // CGPreflightScreenCaptureAccess answers once per process: a grant made while we run still reads
+    // as denied until relaunch. ScreenCaptureKit checks live, so resolvePermission() asks it too.
+    private static var grantedLive = false
+    static func hasPermission() -> Bool { grantedLive || CGPreflightScreenCaptureAccess() }
+
+    static func resolvePermission() async -> Bool {
+        if hasPermission() { return true }
+        guard (try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)) != nil else { return false }
+        grantedLive = true
+        return true
+    }
 
     // Asks once; macOS shows its own prompt the first time.
     static func ensurePermission() -> Bool {
