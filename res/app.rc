@@ -4,8 +4,8 @@
 1 ICON "app.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION ATHER_VERSION_MAJOR, ATHER_VERSION_MINOR, ATHER_VERSION_PATCH, 0
- PRODUCTVERSION ATHER_VERSION_MAJOR, ATHER_VERSION_MINOR, ATHER_VERSION_PATCH, 0
+ FILEVERSION ATHER_VERSION_MAJOR, ATHER_VERSION_MINOR, ATHER_VERSION_PATCH, ATHER_VERSION_BUILD
+ PRODUCTVERSION ATHER_VERSION_MAJOR, ATHER_VERSION_MINOR, ATHER_VERSION_PATCH, ATHER_VERSION_BUILD
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Ather"
             VALUE "FileDescription", "Ather Screenshot"
-            VALUE "FileVersion", ATHER_VERSION_STR
+            VALUE "FileVersion", ATHER_BUILD_STR
             VALUE "InternalName", "AtherScreenshot"
             VALUE "LegalCopyright", "Ather"
             VALUE "OriginalFilename", "AtherScreenshot.exe"
             VALUE "ProductName", "Ather Screenshot"
-            VALUE "ProductVersion", ATHER_VERSION_STR
+            VALUE "ProductVersion", ATHER_BUILD_STR
         END
     END
     BLOCK "VarFileInfo"

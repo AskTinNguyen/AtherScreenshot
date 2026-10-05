@@ -1,5 +1,6 @@
 #include "output.h"
 
+#include <commdlg.h>
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -176,6 +177,38 @@ bool CopyFilesToClipboard(HWND owner, const std::vector<std::wstring>& paths) {
     CloseClipboard();
     if (!ok) GlobalFree(g);
     return ok;
+}
+
+std::vector<std::wstring> PickFiles(HWND owner, const std::wstring& filter, bool multiple, const wchar_t* title, const std::wstring& folder) {
+    std::vector<wchar_t> buf(multiple ? 1 << 18 : MAX_PATH * 4, L'\0');  // room for thousands of names
+    OPENFILENAMEW ofn{sizeof(ofn)};
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter.c_str();
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = (DWORD)buf.size();
+    ofn.lpstrTitle = title;
+    ofn.lpstrInitialDir = folder.empty() ? nullptr : folder.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | (multiple ? OFN_ALLOWMULTISELECT : 0);
+    if (!GetOpenFileNameW(&ofn)) return {};
+    // One file: its full path. Several: the folder, then each name.
+    std::vector<std::wstring> parts;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) parts.push_back(p);
+    if (parts.size() <= 1) return parts;
+    std::vector<std::wstring> files;
+    for (size_t i = 1; i < parts.size(); ++i) files.push_back(parts[0] + L"\\" + parts[i]);
+    return files;
+}
+
+std::vector<std::wstring> DroppedFiles(HANDLE handle) {
+    const auto drop = (HDROP)handle;
+    std::vector<std::wstring> files;
+    const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < n; ++i) {
+        const UINT len = DragQueryFileW(drop, i, nullptr, 0);  // long paths too
+        std::wstring p(len, L'\0');
+        if (len && DragQueryFileW(drop, i, p.data(), len + 1)) files.push_back(p);
+    }
+    return files;
 }
 
 BitmapPtr LoadImageFile(const std::wstring& path) {

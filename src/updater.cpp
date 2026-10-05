@@ -1,25 +1,24 @@
 #include "updater.h"
 
-#include <bcrypt.h>
 #include <shellapi.h>
-#include <winhttp.h>
 
 #include <algorithm>
 #include <fstream>
 #include <thread>
 
 #include "json.h"
+#include "net.h"
 #include "selftest.h"
 #include "version.h"
 
-#pragma comment(lib, "winhttp")
-#pragma comment(lib, "bcrypt")
 #pragma comment(lib, "version")
 
 namespace ather {
 namespace {
 
-constexpr wchar_t kManifestUrl[] = L"https://raw.githubusercontent.com/AskTinNguyen/AtherScreenshot/main/downloads/latest.json";
+// The newest GitHub Release carries the manifest (package.bat publish). Copies before build 0.0.2.1 read
+// downloads/latest.json on main instead, which package.bat keeps in step.
+constexpr wchar_t kManifestUrl[] = L"https://github.com/AskTinNguyen/AtherScreenshot/releases/latest/download/latest.json";
 constexpr wchar_t kRepoPath[] = L"/AskTinNguyen/AtherScreenshot/";
 constexpr uint64_t kMaxExe = 64ull << 20, kMaxManifest = 64 << 10;
 
@@ -29,39 +28,12 @@ std::wstring EnvVar(const wchar_t* name) {
     return n && n < std::size(buf) ? std::wstring(buf, n) : L"";
 }
 
-std::wstring SelfExe() {
-    wchar_t p[MAX_PATH * 2];
-    GetModuleFileNameW(nullptr, p, (DWORD)std::size(p));
-    return p;
-}
-
-struct Url {
-    std::wstring host, path;
-    INTERNET_PORT port = 0;
-    bool https = false;
-};
-
-std::optional<Url> Crack(const std::wstring& url) {
-    URL_COMPONENTS uc{sizeof(uc)};
-    wchar_t host[256] = {}, path[2048] = {};
-    uc.lpszHostName = host;
-    uc.dwHostNameLength = (DWORD)std::size(host);
-    uc.lpszUrlPath = path;
-    uc.dwUrlPathLength = (DWORD)std::size(path);
-    uc.dwExtraInfoLength = 1;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return std::nullopt;
-    if (uc.nScheme != INTERNET_SCHEME_HTTPS && uc.nScheme != INTERNET_SCHEME_HTTP) return std::nullopt;
-    Url u{host, path, uc.nPort, uc.nScheme == INTERNET_SCHEME_HTTPS};
-    if (uc.lpszExtraInfo && uc.dwExtraInfoLength) u.path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
-    return u;
-}
-
 bool IsLocalhost(const std::wstring& host) { return _wcsicmp(host.c_str(), L"localhost") == 0 || host == L"127.0.0.1"; }
 
 // Updates come only from this repository on GitHub, over HTTPS (redirects to GitHub's file hosts are followed,
 // HTTPS only). With a test manifest, this PC is allowed too.
 bool AllowedUrl(const std::wstring& url, bool allowLocalhost) {
-    const auto u = Crack(url);
+    const auto u = CrackUrl(url);
     if (!u) return false;
     if (allowLocalhost && IsLocalhost(u->host)) return true;
     if (!u->https) return false;
@@ -69,99 +41,14 @@ bool AllowedUrl(const std::wstring& url, bool allowLocalhost) {
     return github && _wcsnicmp(u->path.c_str(), kRepoPath, wcslen(kRepoPath)) == 0;
 }
 
-// GET, handing the body to `sink` as it arrives. `progress(received, total)`; total is 0 when unknown.
+// GET, handing the body to `sink` as it arrives; anything but 200 is an error.
 bool HttpGet(const std::wstring& url, uint64_t maxBytes, const std::function<bool(const char*, size_t)>& sink,
              const std::function<void(uint64_t, uint64_t)>& progress, std::wstring* error) {
-    const auto u = Crack(url);
-    if (!u) {
-        *error = L"Bad address: " + url;
-        return false;
-    }
-    const std::wstring agent = std::wstring(L"AtherScreenshot/") + ATHER_VERSION_WSTR;
-    HINTERNET s = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    HINTERNET c = s ? WinHttpConnect(s, u->host.c_str(), u->port, 0) : nullptr;
-    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", u->path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                         (u->https ? WINHTTP_FLAG_SECURE : 0) | WINHTTP_FLAG_REFRESH)
-                    : nullptr;
-    bool ok = r != nullptr;
-    if (ok) {
-        WinHttpSetTimeouts(r, 10000, 15000, 30000, 30000);
-        DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
-        WinHttpSetOption(r, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
-        ok = WinHttpSendRequest(r, L"Cache-Control: no-cache\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr);
-        if (!ok) *error = L"Can't reach GitHub (network error " + std::to_wstring(GetLastError()) + L").";
-    }
-    DWORD status = 0;
-    if (ok) {
-        DWORD size = sizeof(status);
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
-        if (status != 200) {
-            ok = false;
-            *error = L"The update server answered " + std::to_wstring(status) + L".";
-        }
-    }
-    if (ok) {
-        uint64_t total = 0, got = 0;
-        wchar_t len[32] = {};
-        DWORD size = sizeof(len);
-        if (WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, len, &size, WINHTTP_NO_HEADER_INDEX))
-            total = _wcstoui64(len, nullptr, 10);
-        std::vector<char> buf(64 * 1024);
-        for (;;) {
-            DWORD n = 0;
-            if (!WinHttpReadData(r, buf.data(), (DWORD)buf.size(), &n)) {
-                ok = false;
-                *error = L"The download was interrupted.";
-                break;
-            }
-            if (n == 0) break;
-            got += n;
-            if (got > maxBytes) {
-                ok = false;
-                *error = L"The download is larger than expected.";
-                break;
-            }
-            if (!sink(buf.data(), n)) {
-                ok = false;
-                *error = L"Couldn't save the download.";
-                break;
-            }
-            if (progress) progress(got, total);
-        }
-    }
-    if (r) WinHttpCloseHandle(r);
-    if (c) WinHttpCloseHandle(c);
-    if (s) WinHttpCloseHandle(s);
-    if (!ok && error->empty()) *error = L"Can't reach GitHub.";
-    return ok;
-}
-
-std::wstring Sha256File(const std::wstring& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return L"";
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE h = nullptr;
-    std::wstring hex;
-    if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) &&
-        BCRYPT_SUCCESS(BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0))) {
-        std::vector<char> buf(64 * 1024);
-        bool ok = true;
-        while (ok && in) {
-            in.read(buf.data(), (std::streamsize)buf.size());
-            if (in.gcount() > 0) ok = BCRYPT_SUCCESS(BCryptHashData(h, (PUCHAR)buf.data(), (ULONG)in.gcount(), 0));
-        }
-        UCHAR digest[32];
-        if (ok && BCRYPT_SUCCESS(BCryptFinishHash(h, digest, sizeof(digest), 0))) {
-            wchar_t b[3];
-            for (UCHAR x : digest) {
-                swprintf_s(b, L"%02x", x);
-                hex += b;
-            }
-        }
-    }
-    if (h) BCryptDestroyHash(h);
-    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-    return hex;
+    const HttpStream stream{maxBytes, sink, progress};
+    const HttpResult r = Http(L"GET", url, {{L"Cache-Control", L"no-cache"}}, {}, &stream);
+    if (!r.error.empty()) *error = r.error.rfind(L"Network error", 0) == 0 ? L"Can't reach GitHub (" + r.error + L")." : r.error;
+    else if (r.status != 200) *error = L"The update server answered " + std::to_wstring(r.status) + L".";
+    return error->empty();
 }
 
 // The version written in an exe's VERSIONINFO (ProductVersion), e.g. "0.0.3".
@@ -266,7 +153,7 @@ void CheckForUpdateAsync(std::function<void(std::optional<UpdateInfo>, std::wstr
         std::optional<UpdateInfo> found;
         if (HttpGet(url, kMaxManifest, [&](const char* p, size_t n) { return body.append(p, n), true; }, nullptr, &err)) {
             if (auto info = ParseUpdateManifest(body, !custom.empty())) {
-                if (CompareVersions(info->version, ATHER_VERSION_WSTR) > 0) found = info;
+                if (CompareVersions(info->version, ATHER_BUILD_WSTR) > 0) found = info;  // the build, not just the version
             } else {
                 err = L"The update information on GitHub couldn't be read.";
             }
@@ -277,7 +164,7 @@ void CheckForUpdateAsync(std::function<void(std::optional<UpdateInfo>, std::wstr
 
 void DownloadUpdateAsync(const UpdateInfo& info, std::function<void(double)> progress, std::function<void(std::wstring, std::wstring)> done) {
     std::thread([info, progress, done] {
-        const std::wstring self = SelfExe();
+        const std::wstring self = SelfExePath();
         const std::wstring staged = self + L".update";
         std::wstring err;
         HANDLE f = CreateFileW(staged.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -304,7 +191,7 @@ void DownloadUpdateAsync(const UpdateInfo& info, std::function<void(double)> pro
 }
 
 bool InstallStagedUpdate(const std::wstring& staged, std::wstring* error) {
-    const std::wstring target = SelfExe();
+    const std::wstring target = SelfExePath();
     if (!SwapExe(target, staged, error)) return false;
     std::wstring cmd = L"\"" + target + L"\" --after-update " + std::to_wstring(GetCurrentProcessId());
     const std::wstring dir = target.substr(0, target.find_last_of(L'\\'));
@@ -339,7 +226,7 @@ bool FinishUpdate(const std::wstring& cmdline) {
 }
 
 void CleanUpUpdateFiles() {
-    const std::wstring self = SelfExe();
+    const std::wstring self = SelfExePath();
     for (const wchar_t* ext : {L".old", L".update"}) {
         const std::wstring f = self + ext;
         // The old exe can still be mapped for a moment after its process exits.
@@ -366,6 +253,8 @@ ATHER_TEST(updater_manifest_only_from_this_repo_over_https) {
     CHECK(u && u->version == L"0.0.3" && u->size == 2795520 && u->notes == L"New things");
     CHECK(ParseUpdateManifest("\xEF\xBB\xBF" + m(good)).has_value());  // BOM
     CHECK(ParseUpdateManifest(m("https://raw.githubusercontent.com/AskTinNguyen/AtherScreenshot/main/downloads/x.exe")).has_value());
+    CHECK(ParseUpdateManifest(m("https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.3/x.exe")).has_value());
+    CHECK(ParseUpdateManifest(m(good, std::string(64, 'a'), "0.0.2.1")).has_value());  // a build number
     CHECK(!ParseUpdateManifest(m("http://github.com/AskTinNguyen/AtherScreenshot/raw/main/x.exe")));      // not HTTPS
     CHECK(!ParseUpdateManifest(m("https://github.com/SomeoneElse/AtherScreenshot/raw/main/x.exe")));      // another repo
     CHECK(!ParseUpdateManifest(m("https://evil.example/AskTinNguyen/AtherScreenshot/x.exe")));            // another host
@@ -379,11 +268,11 @@ ATHER_TEST(updater_manifest_only_from_this_repo_over_https) {
 ATHER_TEST(updater_verifies_and_swaps_the_exe) {
     const std::wstring dir = test::TempDir();
     const std::wstring staged = dir + L"\\new.exe", target = dir + L"\\app.exe";
-    CHECK(CopyFileW(SelfExe().c_str(), staged.c_str(), FALSE));  // a real exe of this version
+    CHECK(CopyFileW(SelfExePath().c_str(), staged.c_str(), FALSE));  // a real exe of this version
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     GetFileAttributesExW(staged.c_str(), GetFileExInfoStandard, &fa);
     UpdateInfo info;
-    info.version = ATHER_VERSION_WSTR;
+    info.version = ATHER_BUILD_WSTR;  // what the exe's VERSIONINFO says
     info.size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
     info.sha256 = Sha256File(staged);
     std::wstring err;
@@ -464,7 +353,7 @@ ATHER_TEST(updater_finds_downloads_and_verifies_from_a_test_server) {
         });
         pump(downloaded);
         CHECK(staged.empty() && err.find(L"checksum") != std::wstring::npos);
-        CHECK(GetFileAttributesW((SelfExe() + L".update").c_str()) == INVALID_FILE_ATTRIBUTES);
+        CHECK(GetFileAttributesW((SelfExePath() + L".update").c_str()) == INVALID_FILE_ATTRIBUTES);
     }
     StopUiDispatcher(dispatcher);
 }

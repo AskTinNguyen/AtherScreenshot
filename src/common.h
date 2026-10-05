@@ -78,6 +78,8 @@ constexpr UINT WM_APP_RUN = WM_APP + 100;
 void SetUiWindow(HWND hwnd);
 // A message-only window that runs RunOnUi work on this thread. It outlives the main window, so work posted
 // while the app shuts down (save completions, library scans, the recorder finishing) still runs.
+// The running exe.
+std::wstring SelfExePath();
 HWND StartUiDispatcher();
 void StopUiDispatcher(HWND h);
 void RunOnUi(std::function<void()> fn);

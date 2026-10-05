@@ -1498,21 +1498,8 @@ void Editor::PickImage() {
         Editor* e = FromHwnd(h);
         if (!e) return;
         if (id > 0 && id <= (int)recent.size()) return e->InsertImages({recent[id - 1]});
-        std::vector<wchar_t> buf(32768, L'\0');
-        OPENFILENAMEW ofn{sizeof(ofn)};
-        ofn.hwndOwner = h;
-        ofn.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff\0All files\0*.*\0";
-        ofn.lpstrFile = buf.data();
-        ofn.nMaxFile = (DWORD)buf.size();
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
-        if (!GetOpenFileNameW(&ofn)) return;
-        std::vector<std::wstring> parts;
-        for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) parts.push_back(p);
-        std::vector<std::wstring> files;
-        if (parts.size() == 1) files = parts;
-        else
-            for (size_t i = 1; i < parts.size(); ++i) files.push_back(parts[0] + L"\\" + parts[i]);
-        e->InsertImages(files);
+        const auto files = PickFiles(h, MediaFilter(true, false));
+        if (!files.empty()) e->InsertImages(files);
     }, opt);
 }
 
@@ -1522,12 +1509,8 @@ bool Editor::PasteImage() {
     std::vector<std::wstring> files;
     BitmapPtr img;
     if (HANDLE hd = GetClipboardData(CF_HDROP)) {
-        auto drop = (HDROP)hd;
-        const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-        for (UINT i = 0; i < n; ++i) {
-            wchar_t p[MAX_PATH * 2];
-            if (DragQueryFileW(drop, i, p, (UINT)std::size(p)) && IsMediaFile(p) && MediaTypeOf(p) == MediaType::Image) files.push_back(p);
-        }
+        for (const auto& p : DroppedFiles((HDROP)hd))
+            if (IsMediaFile(p) && MediaTypeOf(p) == MediaType::Image) files.push_back(p);
     }
     if (files.empty())
         if (HBITMAP hb = (HBITMAP)GetClipboardData(CF_BITMAP)) {
@@ -2117,11 +2100,8 @@ void Editor::OnDropFiles(HDROP drop) {
     POINT pt{};
     DragQueryPoint(drop, &pt);
     std::vector<std::wstring> files;
-    const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-    for (UINT i = 0; i < n; ++i) {
-        wchar_t path[MAX_PATH * 2];
-        if (DragQueryFileW(drop, i, path, (UINT)std::size(path)) && MediaTypeOf(path) == MediaType::Image && IsMediaFile(path)) files.push_back(path);
-    }
+    for (const auto& p : DroppedFiles(drop))
+        if (MediaTypeOf(p) == MediaType::Image && IsMediaFile(p)) files.push_back(p);
     DragFinish(drop);
     if (files.empty()) return (void)ShowToast(L"Drop an image to add it", L"PNG, JPEG, BMP, WebP or TIFF", nullptr, nullptr, 2200);
     const gp::PointF at = ToImg(pt.x, pt.y);

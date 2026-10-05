@@ -2791,12 +2791,7 @@ void Gallery::StartDrag() {
 void Gallery::OnDropFiles(HDROP drop) {
     POINT p{};
     DragQueryPoint(drop, &p);
-    std::vector<std::wstring> files;
-    const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-    for (UINT i = 0; i < n; ++i) {
-        wchar_t path[MAX_PATH * 2];
-        if (DragQueryFileW(drop, i, path, (UINT)std::size(path))) files.push_back(path);
-    }
+    const std::vector<std::wstring> files = DroppedFiles(drop);
     DragFinish(drop);
     std::wstring col;
     for (const auto& [r, id] : collectionDrops)
@@ -3201,21 +3196,8 @@ void Gallery::Compare() {
 }
 
 void Gallery::ImportPanel() {
-    std::vector<wchar_t> buf(32768, L'\0');
-    OPENFILENAMEW ofn{sizeof(ofn)};
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = L"Images and videos\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff;*.heic;*.mp4;*.mov;*.m4v;*.wmv;*.avi;*.mkv\0All files\0*.*\0";
-    ofn.lpstrFile = buf.data();
-    ofn.nMaxFile = (DWORD)buf.size();
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
-    if (!GetOpenFileNameW(&ofn)) return;
-    std::vector<std::wstring> parts;
-    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) parts.push_back(p);
-    std::vector<std::wstring> files;
-    if (parts.size() == 1) files = parts;
-    else
-        for (size_t i = 1; i < parts.size(); ++i) files.push_back(parts[0] + L"\\" + parts[i]);
-    ImportFiles(files);
+    const auto files = PickFiles(hwnd, MediaFilter(true, true));
+    if (!files.empty()) ImportFiles(files);
 }
 
 void Gallery::ImportFiles(const std::vector<std::wstring>& files, const std::wstring& collection) {

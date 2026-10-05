@@ -21,6 +21,10 @@ const wchar_t* MediaTypeName(MediaType t);   // "image" | "gif" | "video" (the J
 const wchar_t* MediaTypeLabel(MediaType t);  // Screenshots | GIFs | Videos
 const wchar_t* MediaTypeWords(MediaType t);  // searchable words
 bool IsMediaFile(const std::wstring& path);
+// The one list of types this app opens: "png", "jpg"… (pictures) and "mp4", "mov"… (videos).
+std::vector<std::wstring> MediaExtensions(bool pictures, bool videos);
+// An open-dialog filter for them ("Pictures and videos", then each kind on its own, then all files).
+std::wstring MediaFilter(bool pictures, bool videos);
 
 struct PaletteColor {
     uint8_t r = 0, g = 0, b = 0;

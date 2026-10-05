@@ -68,7 +68,7 @@ The scope is deliberately small: clips play back to back. There are no transitio
 
 ## 4. In-app updates
 
-- **Manifest:** `downloads/latest.json` on GitHub (`raw.githubusercontent.com/AskTinNguyen/AtherScreenshot/main/downloads/latest.json`). Windows reads `windows`. Add a `macos` entry with the same fields (`version`, `url`, `sha256`, `size`, `notes`), written by `build.sh package`.
+- **Manifest:** `latest.json` on the newest GitHub Release (`github.com/AskTinNguyen/AtherScreenshot/releases/latest/download/latest.json`; `package.bat publish` writes it and keeps a copy in `downloads/` for older copies). Windows reads `windows`, and compares its build number (`0.0.2.1`), not just the version people see. Add a `macos` entry with the same fields (`version`, `url`, `sha256`, `size`, `notes`), written by `build.sh package`.
 - **Behavior (match Windows):**
   - Check a minute after launch and then daily, unless `[Updates] CheckAutomatically` is off. There's also a "Check for updates…" command.
   - Announce each new version once with a notification; the menu-bar menu shows "Update to version …".

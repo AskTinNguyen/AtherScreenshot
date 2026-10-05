@@ -42,7 +42,7 @@ std::optional<Clip> ClipOf(const std::wstring& path);
 // The edit's clips in its frame, or the whole `source` file when the edit has no clips.
 Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
 
-// Reads a sequence like one video: frames in order with timeline times, fitted into the sequence frame.
+// Reads a sequence like one video: frames in order with timeline times (Fit puts one into the sequence frame).
 class SequenceReader {
 public:
     SequenceReader();
@@ -53,7 +53,10 @@ public:
     double Fps() const;  // the highest of the clips (≤ 60)
     bool HasAudio() const;
     bool Seek(double t);
+    // Frames come at their clip's own size (letterboxing every frame read would waste time on the ones a caller
+    // skips); Fit makes the one it keeps sequence-sized.
     bool Read(BitmapPtr* frame, double* t);
+    BitmapPtr Fit(const BitmapPtr& frame) const;
 
 private:
     struct Impl;

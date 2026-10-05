@@ -634,20 +634,9 @@ void OpenFileToEdit(const std::wstring& file) {
 }
 
 void OpenImageInEditor() {
-    wchar_t file[MAX_PATH] = L"";
-    std::wstring dir = g_settings.CapturesFolder();
-    OPENFILENAMEW ofn{sizeof(ofn)};
-    ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFilter = L"Pictures and videos\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.heic;*.mp4;*.mov;*.m4v;*.wmv;*.avi;*.mkv\0"
-                      L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.heic\0Videos\0*.mp4;*.mov;*.m4v;*.wmv;*.avi;*.mkv\0"
-                      L"All files\0*.*\0";
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrInitialDir = dir.c_str();
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     SetForegroundWindow(g_hwnd);
-    if (!GetOpenFileNameW(&ofn)) return;
-    OpenFileToEdit(file);
+    const auto files = PickFiles(g_hwnd, MediaFilter(true, true), false, nullptr, g_settings.CapturesFolder());
+    if (!files.empty()) OpenFileToEdit(files[0]);
 }
 
 void CaptureActiveWindow(After after) {

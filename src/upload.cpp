@@ -1,32 +1,13 @@
 #include "upload.h"
 
-#include <bcrypt.h>
-#include <winhttp.h>
+#include "json.h"
+#include "net.h"
 
 #include <cwctype>
 #include <thread>
 
-#pragma comment(lib, "winhttp")
-#pragma comment(lib, "bcrypt")
-
 namespace ather {
 namespace {
-
-std::string ToUtf8(const std::wstring& s) {
-    if (s.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0, nullptr, nullptr);
-    std::string out(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-std::wstring FromUtf8(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring out(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n);
-    return out;
-}
 
 std::wstring Trim(std::wstring s) {
     while (!s.empty() && iswspace(s.back())) s.pop_back();
@@ -56,68 +37,6 @@ std::wstring ContentType(const std::wstring& path) {
     return L"application/octet-stream";
 }
 
-struct HttpResult {
-    DWORD status = 0;
-    std::string body;
-    std::wstring error;
-};
-
-HttpResult Http(const std::wstring& method, const std::wstring& url,
-                const std::vector<std::pair<std::wstring, std::wstring>>& headers, const std::string& body) {
-    HttpResult res;
-    URL_COMPONENTS uc{sizeof(uc)};
-    wchar_t host[256] = {}, path[2048] = {};
-    uc.lpszHostName = host;
-    uc.dwHostNameLength = 256;
-    uc.lpszUrlPath = path;
-    uc.dwUrlPathLength = 2048;
-    uc.dwExtraInfoLength = 1;  // keep the query string attached to the path
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
-        res.error = L"Invalid URL: " + url;
-        return res;
-    }
-    std::wstring fullPath = path;
-    if (uc.lpszExtraInfo && uc.dwExtraInfoLength) fullPath.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
-    HINTERNET s = WinHttpOpen(L"AtherScreenshot/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                              WINHTTP_NO_PROXY_BYPASS, 0);
-    HINTERNET c = s ? WinHttpConnect(s, host, uc.nPort, 0) : nullptr;
-    HINTERNET r = c ? WinHttpOpenRequest(c, method.c_str(), fullPath.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
-                    : nullptr;
-    bool ok = r != nullptr;
-    if (ok) WinHttpSetTimeouts(r, 10000, 15000, 120000, 120000);
-    for (const auto& [k, v] : headers) {
-        std::wstring line = k + L": " + v;
-        if (ok) ok = WinHttpAddRequestHeaders(r, line.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    }
-    if (ok)
-        ok = WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)body.data(), (DWORD)body.size(),
-                                (DWORD)body.size(), 0) &&
-             WinHttpReceiveResponse(r, nullptr);
-    if (ok) {
-        DWORD size = sizeof(res.status);
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                            &res.status, &size, WINHTTP_NO_HEADER_INDEX);
-        for (DWORD avail = 0; WinHttpQueryDataAvailable(r, &avail) && avail;) {
-            size_t old = res.body.size();
-            res.body.resize(old + avail);
-            DWORD got = 0;
-            WinHttpReadData(r, res.body.data() + old, avail, &got);
-            res.body.resize(old + got);
-            if (res.body.size() > 4 * 1024 * 1024) break;
-        }
-    } else {
-        wchar_t msg[96];
-        swprintf_s(msg, L"Network error %lu", GetLastError());
-        res.error = msg;
-    }
-    if (r) WinHttpCloseHandle(r);
-    if (c) WinHttpCloseHandle(c);
-    if (s) WinHttpCloseHandle(s);
-    return res;
-}
-
 std::string Multipart(const std::string& boundary, const std::wstring& field, const std::wstring& path,
                       const std::string& bytes) {
     std::string b = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + ToUtf8(field) +
@@ -126,45 +45,6 @@ std::string Multipart(const std::string& boundary, const std::wstring& field, co
     b += bytes;
     b += "\r\n--" + boundary + "--\r\n";
     return b;
-}
-
-std::wstring HttpError(const HttpResult& r) {
-    if (!r.error.empty()) return r.error;
-    std::wstring body = FromUtf8(r.body.substr(0, 300));
-    return L"HTTP " + std::to_wstring(r.status) + (body.empty() ? L"" : L": " + body);
-}
-
-// ---- AWS Signature V4 (S3-compatible PUT) ----
-
-std::string Hmac(const std::string& key, const std::string& data) {
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    std::string out(32, '\0');
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0) {
-        BCryptHash(alg, (PUCHAR)key.data(), (ULONG)key.size(), (PUCHAR)data.data(), (ULONG)data.size(),
-                   (PUCHAR)out.data(), 32);
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-    return out;
-}
-
-std::string Sha256(const std::string& data) {
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    std::string out(32, '\0');
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0) {
-        BCryptHash(alg, nullptr, 0, (PUCHAR)data.data(), (ULONG)data.size(), (PUCHAR)out.data(), 32);
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-    return out;
-}
-
-std::string Hex(const std::string& b) {
-    static const char* d = "0123456789abcdef";
-    std::string s;
-    for (unsigned char c : b) {
-        s += d[c >> 4];
-        s += d[c & 15];
-    }
-    return s;
 }
 
 std::string UriEncode(const std::string& s, bool keepSlash) {
@@ -189,18 +69,14 @@ void UploadS3(const std::wstring& path, const UploadConfig& cfg, std::wstring& u
     }
     std::wstring endpoint = cfg.s3Endpoint;
     while (!endpoint.empty() && endpoint.back() == L'/') endpoint.pop_back();
-    URL_COMPONENTS uc{sizeof(uc)};
-    wchar_t host[256] = {};
-    uc.lpszHostName = host;
-    uc.dwHostNameLength = 256;
-    if (!WinHttpCrackUrl(endpoint.c_str(), 0, 0, &uc)) {
+    const auto u = CrackUrl(endpoint);
+    if (!u) {
         err = L"Invalid S3Endpoint";
         return;
     }
-    std::wstring hostHeader = host;
-    const bool defaultPort = (uc.nScheme == INTERNET_SCHEME_HTTPS && uc.nPort == 443) ||
-                             (uc.nScheme == INTERNET_SCHEME_HTTP && uc.nPort == 80);
-    if (!defaultPort) hostHeader += L":" + std::to_wstring(uc.nPort);
+    std::wstring hostHeader = u->host;
+    const bool defaultPort = (u->https && u->port == 443) || (!u->https && u->port == 80);
+    if (!defaultPort) hostHeader += L":" + std::to_wstring(u->port);
 
     SYSTEMTIME t;
     GetSystemTime(&t);
@@ -219,12 +95,12 @@ void UploadS3(const std::wstring& path, const UploadConfig& cfg, std::wstring& u
                                          amzDate + "\n\n" + signedHeaders + "\nUNSIGNED-PAYLOAD";
     const std::string scope = std::string(dateStamp) + "/" + region + "/s3/aws4_request";
     const std::string toSign = std::string("AWS4-HMAC-SHA256\n") + amzDate + "\n" + scope + "\n" + Hex(Sha256(canonicalRequest));
-    std::string k = Hmac("AWS4" + ToUtf8(cfg.s3SecretKey), dateStamp);
-    k = Hmac(k, region);
-    k = Hmac(k, "s3");
-    k = Hmac(k, "aws4_request");
+    std::string k = HmacSha256("AWS4" + ToUtf8(cfg.s3SecretKey), dateStamp);
+    k = HmacSha256(k, region);
+    k = HmacSha256(k, "s3");
+    k = HmacSha256(k, "aws4_request");
     const std::string auth = "AWS4-HMAC-SHA256 Credential=" + ToUtf8(cfg.s3AccessKey) + "/" + scope +
-                             ", SignedHeaders=" + signedHeaders + ", Signature=" + Hex(Hmac(k, toSign));
+                             ", SignedHeaders=" + signedHeaders + ", Signature=" + Hex(HmacSha256(k, toSign));
 
     HttpResult r = Http(L"PUT", endpoint + FromUtf8(canonicalUri),
                         {{L"Content-Type", FromUtf8(ct)},

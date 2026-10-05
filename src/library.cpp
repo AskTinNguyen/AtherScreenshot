@@ -89,11 +89,44 @@ static std::wstring ExtOf(const std::wstring& path) {
     return LowerText(path.substr(dot + 1));
 }
 
+namespace {
+const wchar_t* const kPictureExts[] = {L"png", L"jpg", L"jpeg", L"gif", L"bmp", L"webp", L"tif", L"tiff", L"heic"};
+const wchar_t* const kVideoExts[] = {L"mp4", L"mov", L"m4v", L"wmv", L"avi", L"mkv"};
+}  // namespace
+
 MediaType MediaTypeOf(const std::wstring& path) {
     const std::wstring e = ExtOf(path);
     if (e == L"gif") return MediaType::Gif;
-    if (e == L"mp4" || e == L"mov" || e == L"m4v" || e == L"wmv" || e == L"avi" || e == L"mkv") return MediaType::Video;
+    for (const wchar_t* k : kVideoExts)
+        if (e == k) return MediaType::Video;
     return MediaType::Image;
+}
+
+std::vector<std::wstring> MediaExtensions(bool pictures, bool videos) {
+    std::vector<std::wstring> out;
+    if (pictures) out.insert(out.end(), std::begin(kPictureExts), std::end(kPictureExts));
+    if (videos) out.insert(out.end(), std::begin(kVideoExts), std::end(kVideoExts));
+    return out;
+}
+
+std::wstring MediaFilter(bool pictures, bool videos) {
+    auto patterns = [](bool p, bool v) {
+        std::wstring s;
+        for (const auto& e : MediaExtensions(p, v)) s += (s.empty() ? L"*." : L";*.") + e;
+        return s;
+    };
+    std::wstring f;
+    auto add = [&](const wchar_t* label, const std::wstring& pat) {
+        f += label;
+        f += L'\0';
+        f += pat;
+        f += L'\0';
+    };
+    if (pictures && videos) add(L"Pictures and videos", patterns(true, true));
+    if (pictures) add(L"Pictures", patterns(true, false));
+    if (videos) add(L"Videos", patterns(false, true));
+    add(L"All files", L"*.*");
+    return f;  // ends in \0, and c_str() adds the second one the dialog needs
 }
 
 const wchar_t* MediaTypeName(MediaType t) { return t == MediaType::Image ? L"image" : t == MediaType::Gif ? L"gif" : L"video"; }
@@ -103,10 +136,8 @@ const wchar_t* MediaTypeWords(MediaType t) {
 }
 
 bool IsMediaFile(const std::wstring& path) {
-    static const wchar_t* const kExts[] = {L"png", L"jpg", L"jpeg", L"gif", L"mp4", L"mov", L"m4v", L"wmv", L"avi", L"mkv",
-                                           L"heic", L"tif", L"tiff", L"webp", L"bmp"};
     const std::wstring e = ExtOf(path);
-    for (const wchar_t* k : kExts)
+    for (const auto& k : MediaExtensions(true, true))
         if (e == k) return true;
     return false;
 }

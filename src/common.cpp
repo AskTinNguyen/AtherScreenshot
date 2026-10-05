@@ -90,6 +90,12 @@ static LRESULT CALLBACK DispatchProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+std::wstring SelfExePath() {
+    wchar_t p[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, p, (DWORD)std::size(p));
+    return std::wstring(p, n);
+}
+
 HWND StartUiDispatcher() {
     WNDCLASSW wc{};
     wc.lpfnWndProc = DispatchProc;

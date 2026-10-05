@@ -205,10 +205,6 @@ struct SequenceReader::Impl {
         if (!reader->Open(seq.clips[i].path)) reader.reset();  // unreadable: the clip is skipped
         else reader->Seek(src);
     }
-    BitmapPtr Fit(const BitmapPtr& f) const {
-        if (!f || (f->Width() == seq.size.cx && f->Height() == seq.size.cy)) return f;
-        return FitInto(*f, seq.size.cx, seq.size.cy);
-    }
 };
 
 SequenceReader::SequenceReader() : p_(std::make_unique<Impl>()) {}
@@ -229,6 +225,12 @@ bool Sequence::HasAudio() const {
 }
 
 double SequenceReader::Fps() const { return p_->seq.Fps(); }
+
+BitmapPtr SequenceReader::Fit(const BitmapPtr& f) const {
+    const SIZE sz = p_->seq.size;
+    if (!f || (f->Width() == sz.cx && f->Height() == sz.cy)) return f;
+    return FitInto(*f, sz.cx, sz.cy);
+}
 bool SequenceReader::HasAudio() const { return p_->seq.HasAudio(); }
 
 bool SequenceReader::Open(const Sequence& s) {
@@ -268,7 +270,7 @@ bool SequenceReader::Read(BitmapPtr* frame, double* t) {
         BitmapPtr f;
         double ts = 0;
         if (!p.reader || !p.reader->Read(&f, &ts) || ts >= c.out - 1e-4) {  // this clip is done
-            if (p.pre) p.queue.push_back({p.Fit(p.pre), p.starts[p.cur]});
+            if (p.pre) p.queue.push_back({p.pre, p.starts[p.cur]});
             p.pre = nullptr;
             if (p.cur + 1 < n) p.Enter(p.cur + 1, p.seq.clips[p.cur + 1].in);
             else p.cur = n, p.reader.reset();
@@ -278,9 +280,9 @@ bool SequenceReader::Read(BitmapPtr* frame, double* t) {
             p.pre = f;
             continue;
         }
-        if (p.pre && ts > c.in + 1e-3) p.queue.push_back({p.Fit(p.pre), p.starts[p.cur]});
+        if (p.pre && ts > c.in + 1e-3) p.queue.push_back({p.pre, p.starts[p.cur]});
         p.pre = nullptr;
-        p.queue.push_back({p.Fit(f), p.starts[p.cur] + (ts - c.in)});
+        p.queue.push_back({f, p.starts[p.cur] + (ts - c.in)});
     }
 }
 
@@ -630,7 +632,11 @@ public:
         }
         const BitmapPtr& src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
         if (!src) return nullptr;
-        return renderer_->Render(*src, st);
+        if (src != fitFor_) {  // fitted once per source frame, and only for frames that are used
+            fitFor_ = src;
+            fit_ = reader_.Fit(src);
+        }
+        return fit_ ? renderer_->Render(*fit_, st) : nullptr;
     }
 
 private:
@@ -646,6 +652,7 @@ private:
     }
 
     SequenceReader reader_;
+    BitmapPtr fitFor_, fit_;
     VideoEdit e_;
     double fps_ = 30;
     std::unique_ptr<FrameRenderer> renderer_;
@@ -737,7 +744,7 @@ std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide
             last = f;
             if (ft >= t - 0.04) break;
         }
-        if (!last) continue;
+        if (!last || !(last = r.Fit(last))) continue;
         const double k = std::min(1.0, (double)maxSide / std::max(last->Width(), last->Height()));
         out.push_back(k < 1 ? Resample(*last, std::max(1, (int)std::lround(last->Width() * k)), std::max(1, (int)std::lround(last->Height() * k))) : last);
     }
@@ -1073,15 +1080,21 @@ void SequencePlayer::Play() {
 }
 
 void SequencePlayer::Advance() {
-    if (VideoPlayer* p = Cur()) p->Pause();
+    VideoPlayer* const old = Cur();
+    const size_t from = cur_;
     for (size_t i = cur_ + 1; i < seq_.clips.size(); ++i) {
         cur_ = i;
         VideoPlayer* p = Cur();
         if (!p || p->Failed()) continue;  // can't play: on to the next one
+        // The same file going on where the last piece stopped (a split): it just keeps playing, no seek and no
+        // stutter. Anything else is a jump.
+        if (p == old && i == from + 1 && std::fabs(seq_.clips[i].in - seq_.clips[from].out) < 0.05) return;
+        if (old && old != p) old->Pause();
         p->Seek(seq_.clips[i].in);
         Start(p);
         return;
     }
+    if (old) old->Pause();
     ended_ = true;
 }
 
@@ -1227,7 +1240,7 @@ ATHER_TEST(video_sequence_joins_clips_into_one_video) {
     int n = 0;
     bool ordered = true;
     while (sr.Read(&f, &t)) {
-        ordered = ordered && t >= prev - 1e-9 && f->Width() == 640;
+        ordered = ordered && t >= prev - 1e-9 && sr.Fit(f)->Width() == 640;
         prev = t;
         ++n;
     }

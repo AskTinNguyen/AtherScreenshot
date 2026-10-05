@@ -5,7 +5,7 @@
 
 namespace ather {
 
-// Updates in place: a small manifest (downloads/latest.json on GitHub, written by package.bat) names the newest
+// Updates in place: a small manifest (latest.json on the newest GitHub Release, written by package.bat) names the newest
 // Windows version, its exe, SHA-256 and size. The app checks it, downloads the exe next to itself, verifies it
 // (size, hash, and the version inside the exe), swaps it for the running one, and restarts. Installed and
 // portable copies both work without admin rights, because the exe lives in a folder the user owns.

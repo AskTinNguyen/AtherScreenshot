@@ -11,6 +11,7 @@
 #pragma comment(lib, "shlwapi")
 #include <wrl/client.h>
 
+#include "library.h"
 #include "logo.h"
 #include "version.h"
 
@@ -35,12 +36,6 @@ std::wstring KnownFolder(REFKNOWNFOLDERID id) {
 
 std::wstring InstallDir() { return KnownFolder(FOLDERID_UserProgramFiles) + L"\\AtherScreenshot"; }
 std::wstring ShortcutPath() { return KnownFolder(FOLDERID_Programs) + L"\\Ather Screenshot.lnk"; }
-
-std::wstring SelfPath() {
-    wchar_t p[MAX_PATH * 2];
-    GetModuleFileNameW(nullptr, p, (DWORD)std::size(p));
-    return p;
-}
 
 std::wstring InstalledVersion() {
     wchar_t v[64] = {};
@@ -97,8 +92,6 @@ void SetDword(HKEY k, const wchar_t* name, DWORD v) {
 constexpr wchar_t kFileProgId[] = L"Software\\Classes\\AtherScreenshot.File";
 constexpr wchar_t kAppKey[] = L"Software\\Classes\\Applications\\AtherScreenshot.exe";
 constexpr wchar_t kEditVerb[] = L"AtherScreenshot.Edit";
-const wchar_t* const kEditableTypes[] = {L".png", L".jpg", L".jpeg", L".bmp", L".gif", L".webp", L".tif", L".tiff", L".heic",
-                                         L".mp4", L".mov", L".m4v", L".wmv", L".avi", L".mkv"};
 
 void SetKeyString(const std::wstring& path, const wchar_t* name, const std::wstring& v) {
     HKEY k;
@@ -114,8 +107,9 @@ void RegisterFileTypes(const std::wstring& exe) {
     SetKeyString(std::wstring(kFileProgId) + L"\\shell\\open\\command", nullptr, open);
     SetKeyString(kAppKey, L"FriendlyAppName", kProductName);
     SetKeyString(std::wstring(kAppKey) + L"\\shell\\open\\command", nullptr, open);
-    for (const wchar_t* ext : kEditableTypes) {
-        SetKeyString(std::wstring(kAppKey) + L"\\SupportedTypes", ext, L"");
+    for (const std::wstring& type : MediaExtensions(true, true)) {
+        const std::wstring ext = L"." + type;
+        SetKeyString(std::wstring(kAppKey) + L"\\SupportedTypes", ext.c_str(), L"");
         SetKeyString(std::wstring(L"Software\\Classes\\") + ext + L"\\OpenWithProgids", L"AtherScreenshot.File", L"");
         const std::wstring verb = std::wstring(L"Software\\Classes\\SystemFileAssociations\\") + ext + L"\\shell\\" + kEditVerb;
         SetKeyString(verb, L"MUIVerb", L"Edit with Ather Screenshot");
@@ -127,7 +121,8 @@ void RegisterFileTypes(const std::wstring& exe) {
 void UnregisterFileTypes() {
     RegDeleteTreeW(HKEY_CURRENT_USER, kFileProgId);
     RegDeleteTreeW(HKEY_CURRENT_USER, kAppKey);
-    for (const wchar_t* ext : kEditableTypes) {
+    for (const std::wstring& type : MediaExtensions(true, true)) {
+        const std::wstring ext = L"." + type;
         RegDeleteKeyValueW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\") + ext + L"\\OpenWithProgids").c_str(), L"AtherScreenshot.File");
         RegDeleteTreeW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\SystemFileAssociations\\") + ext + L"\\shell\\" + kEditVerb).c_str());
     }
@@ -151,7 +146,7 @@ std::wstring Install(bool startWithWindows) {
         return L"Could not create " + dir;
     StopRunningInstance();
     bool copied = false;
-    for (int i = 0; i < 20 && !(copied = CopyFileW(SelfPath().c_str(), target.c_str(), FALSE)); ++i) Sleep(250);
+    for (int i = 0; i < 20 && !(copied = CopyFileW(SelfExePath().c_str(), target.c_str(), FALSE)); ++i) Sleep(250);
     if (!copied) return L"Could not copy the app (is it still running?).";
     CreateShortcut(target, ShortcutPath());
 
@@ -475,7 +470,7 @@ std::wstring InstalledExePath() { return InstallDir() + L"\\AtherScreenshot.exe"
 
 void RefreshInstallRecord() {
     const std::wstring target = InstalledExePath();
-    if (_wcsicmp(SelfPath().c_str(), target.c_str()) != 0) return;  // portable: nothing registered
+    if (_wcsicmp(SelfExePath().c_str(), target.c_str()) != 0) return;  // portable: nothing registered
     if (InstalledVersion() == ATHER_VERSION_WSTR) return;           // up to date
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
@@ -497,7 +492,7 @@ bool RunInstallFlow(const std::wstring& cmdline, HICON icon, int* exitCode) {
     }
     int argc = 0;
     LocalFree(CommandLineToArgvW(cmdline.c_str(), &argc));
-    const std::wstring self = SelfPath();
+    const std::wstring self = SelfExePath();
     if (argc > 1 || _wcsicmp(self.c_str(), InstalledExePath().c_str()) == 0) return false;  // CLI use, or already installed
     // A portable marker next to the exe (e.g. the dev build folder, or "Run without installing") skips the installer.
     const std::wstring marker = self.substr(0, self.find_last_of(L'\\')) + L"\\AtherScreenshot.portable";

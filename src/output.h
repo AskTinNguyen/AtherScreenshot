@@ -14,6 +14,12 @@ bool CopyTextToClipboard(HWND owner, const std::wstring& text);
 bool CopyFileToClipboard(HWND owner, const std::wstring& path);
 bool CopyFilesToClipboard(HWND owner, const std::vector<std::wstring>& paths);
 
+// An open dialog; the chosen files, or none when cancelled. `filter` is a dialog filter (see MediaFilter).
+std::vector<std::wstring> PickFiles(HWND owner, const std::wstring& filter, bool multiple = true, const wchar_t* title = nullptr,
+                                    const std::wstring& folder = L"");
+// The files in a drop or in a pasted CF_HDROP (the caller still calls DragFinish for a real drop).
+std::vector<std::wstring> DroppedFiles(HANDLE drop);  // an HDROP
+
 // Decodes any WIC-supported image; transparency is flattened onto white.
 BitmapPtr LoadImageFile(const std::wstring& path);
 

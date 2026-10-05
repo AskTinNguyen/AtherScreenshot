@@ -28,10 +28,10 @@ Windows **0.0.2** · macOS **0.0.1** (the Mac gets the 0.0.2 features next)
 | Platform | Download | Size | Requirements |
 |---|---|---|---|
 | **macOS** | [**AtherScreenshot-0.0.1-macOS.dmg**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-macOS.dmg) | 3.7 MB | macOS 14+, Apple silicon and Intel |
-| **Windows** | [**AtherScreenshot-Setup-0.0.2.exe**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-Setup-0.0.2.exe) | 2.7 MB | Windows 10/11, x64 |
-| Windows (portable) | [AtherScreenshot-0.0.2-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.2-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
+| **Windows** | [**AtherScreenshot-Setup-0.0.2.exe**](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe) | 2.7 MB | Windows 10/11, x64 |
+| Windows (portable) | [AtherScreenshot-0.0.2-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
 
-Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256SUMS-Windows.txt) · Earlier files are on the [v0.0.1 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
+Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/SHA256SUMS.txt) · Windows files are on the [v0.0.2 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.2); earlier ones on [v0.0.1](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
 
 **First launch.** The builds aren't signed yet, so your OS asks once:
 
@@ -252,7 +252,7 @@ The link is copied to the clipboard. You can also set `AfterCapture=upload`.
 ### Updates (Windows)
 
 From 0.0.2, the Windows app updates itself; earlier versions need one manual download.
-- **Checks:** about a minute after it starts and then once a day, it reads [`downloads/latest.json`](downloads/latest.json) from GitHub. Nothing else is sent. Turn this off in Settings › Updates (`[Updates] CheckAutomatically=0`); "Check for updates…" in the tray menu and the palette checks now.
+- **Checks:** about a minute after it starts and then once a day, it reads `latest.json` from the newest [GitHub Release](https://github.com/AskTinNguyen/AtherScreenshot/releases/latest). Nothing else is sent. Turn this off in Settings › Updates (`[Updates] CheckAutomatically=0`); "Check for updates…" in the tray menu and the palette checks now.
 - **Installing:** when there's a newer version, a notification offers it, and the tray menu shows "Update to version …". Click and it downloads the new exe (about 3 MB) in the background, checks its size, SHA-256 and the version inside it, swaps it in and restarts. Settings, captures and the gallery stay; there's no installer window and no admin prompt. It waits while you're recording or have an editor open.
 - **Safety:** it only downloads over HTTPS from this repository on GitHub, and if anything fails it keeps the version you have and offers the download page instead.
 
@@ -312,12 +312,10 @@ xcrun swift test
 
 ```
 package.bat            # -> dist\AtherScreenshot-Setup-<ver>.exe, -portable.zip, SHA256SUMS.txt, INSTALL.md
-package.bat publish    # also creates a GitHub Release with gh (needs a git repo with a GitHub remote)
-package.bat downloads  # also puts the exe, zip, checksums and latest.json into downloads\ for an update
+package.bat publish    # also puts them on the GitHub Release v<version> and writes downloads\latest.json
 ```
 
-- **Shipping an update:** bump `src/version.h`, then `set UPDATE_NOTES=One line about what's new` and run `package.bat downloads`. Commit and push `downloads\`. Running copies (0.0.2 and later) find it within a day, or right away with "Check for updates…".
-
+- **Shipping an update:** bump the version in `src/version.h`, or for a re-release of the same version raise `ATHER_VERSION_BUILD`/`ATHER_BUILD_STR` (the version people see stays the same; the updater compares the build). Then `set UPDATE_NOTES=One line about what's new`, run `package.bat publish`, and commit and push `downloads\latest.json` (copies before build 0.0.2.1 read it there). Running copies find the update within a day, or right away with "Check for updates…". Binaries live on GitHub Releases, not in the repo.
 - **Setup exe:** the exe is its own installer. Run it from anywhere and it offers INSTALL (per-user, no admin), UPDATE, or "Run without installing". Install adds a Start menu shortcut, an optional startup entry, and an uninstall entry in Settings › Apps (which runs `AtherScreenshot.exe --uninstall`). Captures and settings are kept on uninstall.
 - **Version:** bump it in `src/version.h`. The exe metadata, the installer and the file names all follow it.
 - **Icon:** `res/app.ico` is generated from the vector A⁵ logo in `src/logo.cpp`. Delete the file and `build.bat` regenerates it.
