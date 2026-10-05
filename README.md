@@ -249,6 +249,13 @@ Set `[Upload] Uploader=` to one of:
 
 The link is copied to the clipboard. You can also set `AfterCapture=upload`.
 
+### Updates (Windows)
+
+From 0.0.2, the Windows app updates itself; earlier versions need one manual download.
+- **Checks:** about a minute after it starts and then once a day, it reads [`downloads/latest.json`](downloads/latest.json) from GitHub. Nothing else is sent. Turn this off in Settings › Updates (`[Updates] CheckAutomatically=0`); "Check for updates…" in the tray menu and the palette checks now.
+- **Installing:** when there's a newer version, a notification offers it, and the tray menu shows "Update to version …". Click and it downloads the new exe (about 3 MB) in the background, checks its size, SHA-256 and the version inside it, swaps it in and restarts. Settings, captures and the gallery stay; there's no installer window and no admin prompt. It waits while you're recording or have an editor open.
+- **Safety:** it only downloads over HTTPS from this repository on GitHub, and if anything fails it keeps the version you have and offers the download page instead.
+
 ### Command line and links
 
 ```
@@ -306,7 +313,10 @@ xcrun swift test
 ```
 package.bat            # -> dist\AtherScreenshot-Setup-<ver>.exe, -portable.zip, SHA256SUMS.txt, INSTALL.md
 package.bat publish    # also creates a GitHub Release with gh (needs a git repo with a GitHub remote)
+package.bat downloads  # also puts the exe, zip, checksums and latest.json into downloads\ for an update
 ```
+
+- **Shipping an update:** bump `src/version.h`, then `set UPDATE_NOTES=One line about what's new` and run `package.bat downloads`. Commit and push `downloads\`. Running copies (0.0.2 and later) find it within a day, or right away with "Check for updates…".
 
 - **Setup exe:** the exe is its own installer. Run it from anywhere and it offers INSTALL (per-user, no admin), UPDATE, or "Run without installing". Install adds a Start menu shortcut, an optional startup entry, and an uninstall entry in Settings › Apps (which runs `AtherScreenshot.exe --uninstall`). Captures and settings are kept on uninstall.
 - **Version:** bump it in `src/version.h`. The exe metadata, the installer and the file names all follow it.

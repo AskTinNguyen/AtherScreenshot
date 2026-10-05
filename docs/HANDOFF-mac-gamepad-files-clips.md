@@ -1,12 +1,13 @@
 # Handoff: three Windows features for the macOS app
 
-The Windows build gained three features after 0.0.1. This brings them to the Mac, written the Mac way. The Windows code is the reference this time: when this note and the C++ disagree, the C++ is right. Keep the version at 0.0.1, add no third-party dependencies, keep the settings key names, and keep the product quiet: controls show only when needed.
+The Windows build gained these features after 0.0.1. This brings them to the Mac, written the Mac way. The Windows code is the reference this time: when this note and the C++ disagree, the C++ is right. Keep the version at 0.0.1, add no third-party dependencies, keep the settings key names, and keep the product quiet: controls show only when needed.
 
 | # | Feature | Windows reference |
 |---|---|---|
 | 1 | Game controller overlay in recordings | `src/gamepad.h/.cpp`, `recorder.cpp` (frame loop), `settings.cpp`, `settingsui.cpp` |
 | 2 | Edit pictures and videos from anywhere | `main.cpp` (`OpenFileToEdit`, `RunCli`), `installer.cpp` (`RegisterFileTypes`), `videoio.cpp` / `media.cpp` (rotation) |
 | 3 | Join several videos in the video editor | `videoedit.h/.cpp` (`Clip`, `ApplyClips`), `videoio.h/.cpp` (`SequenceReader`, `SequenceAudio`, `SequencePlayer`), `videoeditor.cpp` (clip lane) |
+| 4 | In-app updates | `src/updater.h/.cpp`, `main.cpp` (`CheckForUpdates`, `InstallUpdate`), `package.bat` (`latest.json`) |
 
 ## 1. Game controller overlay
 
@@ -63,3 +64,15 @@ The scope is deliberately small: clips play back to back. There are no transitio
   - The selected clip's inspector row reads "Clip 2 of 3: name · 0:01.0" and offers Split at playhead (S), Earlier, Later and Remove (Delete). The last clip can't be removed.
   - The hint row mentions "S split · drop videos to join them".
 - **Tests to mirror:** `video_sequence_joins_clips_into_one_video` (export of mixed sizes and sound), `video_editor_joins_splits_and_reorders_clips` and `video_editor_clip_lane_mouse`.
+
+## 4. In-app updates
+
+- **Manifest:** `downloads/latest.json` on GitHub (`raw.githubusercontent.com/AskTinNguyen/AtherScreenshot/main/downloads/latest.json`). Windows reads `windows`. Add a `macos` entry with the same fields (`version`, `url`, `sha256`, `size`, `notes`), written by `build.sh package`.
+- **Behavior (match Windows):**
+  - Check a minute after launch and then daily, unless `[Updates] CheckAutomatically` is off. There's also a "Check for updates…" command.
+  - Announce each new version once with a notification; the menu-bar menu shows "Update to version …".
+  - Install only on a click, and never during a recording or with an editor open.
+  - Download only over HTTPS from this repository. Verify the size and SHA-256, and check that the bundle's `CFBundleShortVersionString` matches the manifest.
+  - Replace the app bundle in place, relaunch, and show "Updated to …". On any failure, keep the current version and offer the download page.
+- **No new dependencies:** Sparkle would be a third-party dependency, so do it by hand. Download the zip, unzip it with `ditto`, and check `codesign --verify` against the running app's team identifier once the builds are signed. Swap the bundle through a short helper that waits for the app to quit.
+

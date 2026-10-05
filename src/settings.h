@@ -51,6 +51,7 @@ public:
     bool styledExport = false;
     // gallery
     bool autoTag = false;  // [Gallery] AutoTag: apply suggested tags
+    bool checkUpdates = true;  // [Updates] CheckAutomatically
     // upload
     std::wstring uploader = L"none";  // none | imgur | custom | s3
     std::wstring imgurClientId;

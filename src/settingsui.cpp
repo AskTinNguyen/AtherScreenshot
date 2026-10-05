@@ -188,6 +188,10 @@ void Window::Build() {
     add(Kind::Toggle, L"Editor", L"StyledExport", L"Styled export by default",
         L"Background, padding, shadow and rounded corners (Ctrl+E in the editor)", L"0");
 
+    header(L"Updates");
+    add(Kind::Toggle, L"Updates", L"CheckAutomatically", L"Check for updates automatically",
+        L"Once a day, from GitHub. A new version installs only when you click", L"1");
+
     header(L"Gallery");
     add(Kind::Toggle, L"Gallery", L"AutoTag", L"Tag captures automatically",
         L"Adds suggested tags like chat, code, error or receipt. Turning it on tags your whole library once.", L"0");

@@ -28,6 +28,7 @@ using std::min;
 #include "ocr.h"
 #include "scroll.h"
 #include "selftest.h"
+#include "updater.h"
 #include "upload.h"
 #include "output.h"
 #include "overlay.h"
@@ -102,6 +103,8 @@ enum Cmd : int {
     CmdEditSettings,
     CmdReloadSettings,
     CmdAbout,
+    CmdCheckUpdates,
+    CmdInstallUpdate,  // tray and notification only: never from a link or the command line
     CmdExit,
     CmdRecentBase = 1000,
 };
@@ -162,6 +165,7 @@ const CmdDef kCmds[] = {
     {CmdEditSettings, L"EditSettings", L"Settings", L"preferences options config hotkeys shortcuts keyboard", 0xE713, L"", false},
     {CmdReloadSettings, L"ReloadSettings", L"Reload settings", L"config refresh", 0xE72C, L"", false},
     {CmdAbout, L"About", L"About Ather Screenshot", L"version info help", 0xE946, L"", false},
+    {CmdCheckUpdates, L"CheckForUpdates", L"Check for updates…", L"update upgrade new version download latest", 0xE895, L"", false},
     {CmdExit, L"Quit", L"Quit Ather Screenshot", L"exit close", 0xE7E8, L"", false},
 };
 
@@ -172,7 +176,7 @@ constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 constexpr UINT WM_APP_PALETTE = WM_APP + 2;
 constexpr ULONG_PTR kCopyDataCli = 0xA7E1;  // WM_COPYDATA tag for forwarded command lines
-constexpr UINT_PTR kDeferTimer = 1, kDelayTimer = 2, kLibraryTimer = 3;
+constexpr UINT_PTR kDeferTimer = 1, kDelayTimer = 2, kLibraryTimer = 3, kUpdateTimer = 4;
 
 HWND g_hwnd = nullptr;
 HICON g_icon = nullptr;     // small: tray
@@ -195,6 +199,8 @@ std::vector<int> g_mru;
 std::vector<std::wstring> g_recents;
 
 void Execute(int id, bool deferCapture, bool untrusted = false);
+void CheckForUpdates(bool manual);
+void InstallUpdate();
 
 const CmdDef* FindCmd(int id) {
     for (const auto& c : kCmds)
@@ -704,6 +710,66 @@ After TakeCliAfter() {
     return a;
 }
 
+// ---- updates ----
+
+std::optional<UpdateInfo> g_update;  // a newer version found by the last check
+std::wstring g_updateAnnounced;      // the version the automatic check already announced
+bool g_updating = false;
+
+void CheckForUpdates(bool manual) {
+    CheckForUpdateAsync([manual](std::optional<UpdateInfo> info, std::wstring err) {
+        if (!err.empty()) {
+            if (manual) Notify(L"Couldn't check for updates", err);
+            return;
+        }
+        g_update = info;
+        if (!info) {
+            if (manual) Notify(L"Ather Screenshot is up to date", L"Version " ATHER_VERSION_WSTR);
+            return;
+        }
+        if (!manual && g_updateAnnounced == info->version) return;  // once per version, unless asked
+        g_updateAnnounced = info->version;
+        wchar_t size[32];
+        swprintf_s(size, L"%.1f MB", info->size / 1048576.0);
+        ShowToast(L"Ather Screenshot " + info->version + L" is available", (info->notes.empty() ? L"" : info->notes + L"\n") +
+                      L"Click to update (" + size + L"). Settings and captures stay.",
+                  nullptr, [] { InstallUpdate(); }, 15000);
+    });
+}
+
+// The update restarts the app, so it waits until nothing is in progress.
+bool UpdateBlocked() {
+    if (RecorderBusy()) return Notify(L"Finish the recording first", L"Then update from the tray menu."), true;
+    if (EditorCount() > 0 || VideoEditorCount() > 0)
+        return Notify(L"Close the editors first", L"Updating restarts Ather Screenshot. Save and close the editors, then update from the tray menu."), true;
+    return false;
+}
+
+void InstallUpdate() {
+    if (!g_update || g_updating || UpdateBlocked()) return;
+    g_updating = true;
+    const UpdateInfo info = *g_update;
+    const uint64_t toast = ShowToast(L"Downloading Ather Screenshot " + info.version + L"…", L"0%", nullptr, nullptr, 600000);
+    DownloadUpdateAsync(info, [toast](double p) { UpdateToastBody(toast, std::to_wstring((int)std::lround(p * 100)) + L"%"); },
+                        [toast, info](std::wstring staged, std::wstring err) {
+                            g_updating = false;
+                            std::wstring e = err;
+                            if (e.empty() && UpdateBlocked()) {  // something started while it downloaded
+                                DeleteFileW(staged.c_str());
+                                return;
+                            }
+                            if (e.empty() && InstallStagedUpdate(staged, &e)) {
+                                UpdateToastBody(toast, L"Restarting…");
+                                Execute(CmdExit, false);  // the new version starts once this one has quit
+                                return;
+                            }
+                            HideToast();
+                            ShowToast(L"The update didn't install", e + L"\nClick to download it from GitHub instead.", nullptr,
+                                      [] { ShellExecuteW(nullptr, L"open", L"https://github.com/AskTinNguyen/AtherScreenshot#download", nullptr, nullptr, SW_SHOWNORMAL); },
+                                      12000);
+                        });
+}
+
 void Execute(int id, bool deferCapture, bool untrusted) {
     g_uploadAllowed = !untrusted;
     if (id >= CmdRecentBase) {
@@ -852,6 +918,8 @@ void Execute(int id, bool deferCapture, bool untrusted) {
                       RenderLogo(160, true), nullptr, g_settings.toastMs + 1500);
             break;
         }
+        case CmdCheckUpdates: CheckForUpdates(true); break;
+        case CmdInstallUpdate: InstallUpdate(); break;
         case CmdExit: DestroyWindow(g_hwnd); break;
     }
 }
@@ -1167,6 +1235,12 @@ void ShowTrayMenu() {
                    CmdToggleMic, CmdToggleStartup})
         add(id);
     sep();
+    if (g_update) {
+        const std::wstring label = L"Update to version " + g_update->version + L"…";
+        AppendMenuW(menu, MF_STRING, CmdInstallUpdate, label.c_str());
+    } else {
+        add(CmdCheckUpdates);
+    }
     for (int id : {CmdEditSettings, CmdExit}) add(id);
     POINT pt;
     GetCursorPos(&pt);
@@ -1226,6 +1300,10 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (w == kLibraryTimer) Library::Shared().Refresh();
             else if (w == kDeferTimer) Execute(g_deferredCmd, false, g_deferredUntrusted);
             else if (w == kDelayTimer) Execute(g_delayedCmd, false, g_delayedUntrusted);
+            else if (w == kUpdateTimer) {
+                if (g_settings.checkUpdates) CheckForUpdates(false);
+                SetTimer(h, kUpdateTimer, 24 * 60 * 60 * 1000, nullptr);  // and again tomorrow
+            }
             return 0;
         case WM_DESTROY:
             RemoveTrayIcon();
@@ -1289,11 +1367,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     // Install / update / uninstall flow (when launched from Downloads etc.).
     if (int code = 0; RunInstallFlow(GetCommandLineW(), g_iconBig, &code)) return code;
+    // Started by the in-app updater: wait for the old version to quit, then run as usual.
+    const bool justUpdated = FinishUpdate(GetCommandLineW());
 
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\AtherScreenshot.Instance");
     const bool alreadyRunning = GetLastError() == ERROR_ALREADY_EXISTS;  // read before any other API call
     int argc = 0;
     LocalFree(CommandLineToArgvW(GetCommandLineW(), &argc));
+    if (alreadyRunning && justUpdated) return 0;  // the old version never quit: leave it running, don't hand it our flag
     if (alreadyRunning) {
         // Already running: forward the command line, or with no arguments open the palette.
         if (HWND other = FindWindowW(kMainClass, nullptr)) {
@@ -1336,6 +1417,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (std::find(gone.begin(), gone.end(), g_lastPath) != gone.end()) g_lastPath.clear();
     };
     SetTimer(g_hwnd, kLibraryTimer, 4000, nullptr);  // scan and index in the background once things settle
+    SetTimer(g_hwnd, kUpdateTimer, 60 * 1000, nullptr);  // look for a new version once things have settled
     RegisterHotkeys();
     AddTrayIcon();
     if (!g_hotkeyErrors.empty()) {
@@ -1345,7 +1427,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                g_settings.Hotkey(L"CaptureRegion") + L" to capture  ·  " + g_settings.Hotkey(L"CommandPalette") +
                    L" for commands");
     }
-    if (argc > 1) {  // first launch with a command: run it too
+    if (justUpdated) {
+        RefreshInstallRecord();
+        Notify(L"Updated to Ather Screenshot " ATHER_VERSION_WSTR, L"Your settings, captures and gallery are just as you left them.");
+    } else if (argc > 1) {  // first launch with a command: run it too
         bool fromLink = false;
         auto args = SplitArgs(GetCommandLineW(), &fromLink);
         CliRequest req = ParseCli(args);

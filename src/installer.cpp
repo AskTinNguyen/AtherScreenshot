@@ -473,6 +473,21 @@ bool HasArg(const std::wstring& cmdline, const wchar_t* flag) {
 
 std::wstring InstalledExePath() { return InstallDir() + L"\\AtherScreenshot.exe"; }
 
+void RefreshInstallRecord() {
+    const std::wstring target = InstalledExePath();
+    if (_wcsicmp(SelfPath().c_str(), target.c_str()) != 0) return;  // portable: nothing registered
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        GetFileAttributesExW(target.c_str(), GetFileExInfoStandard, &fa);
+        SetString(k, L"DisplayVersion", ATHER_VERSION_WSTR);
+        SetDword(k, L"EstimatedSize", fa.nFileSizeLow / 1024 + 1);
+        RegCloseKey(k);
+    }
+    RegisterFileTypes(target);  // a new version may open more kinds of files
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+}
+
 bool RunInstallFlow(const std::wstring& cmdline, HICON icon, int* exitCode) {
     *exitCode = 0;
     if (HasArg(cmdline, L"--uninstall")) {

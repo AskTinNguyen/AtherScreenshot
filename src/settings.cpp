@@ -198,6 +198,9 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"\r\n[Editor]\r\n"
         L"; Export with padding, rounded corners and a shadow\r\n"
         L"StyledExport=0\r\n"
+        L"\r\n[Updates]\r\n"
+        L"; Look for a new version on GitHub once a day. Updates install only when you click.\r\n"
+        L"CheckAutomatically=1\r\n"
         L"\r\n[Gallery]\r\n"
         L"; Add suggested tags (chat, code, error, receipt...) to captures automatically\r\n"
         L"AutoTag=0\r\n"
@@ -262,6 +265,7 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Scrolling", L"MaxFrames", L"60"},
         {L"Editor", L"StyledExport", L"0"},
         {L"Gallery", L"AutoTag", L"0"},
+        {L"Updates", L"CheckAutomatically", L"1"},
         {L"Upload", L"Uploader", L"none"},
         {L"Upload", L"ImgurClientId", L""},
         {L"Upload", L"CustomUrl", L""},
@@ -305,6 +309,7 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     scrollMaxFrames = std::clamp(_wtoi(Get(L"Scrolling", L"MaxFrames", L"60").c_str()), 2, 400);
     styledExport = GetBool(L"Editor", L"StyledExport", false);
     autoTag = GetBool(L"Gallery", L"AutoTag", false);
+    checkUpdates = GetBool(L"Updates", L"CheckAutomatically", true);
     uploader = Lower(Get(L"Upload", L"Uploader", L"none"));
     imgurClientId = Get(L"Upload", L"ImgurClientId", L"");
     customUrl = Get(L"Upload", L"CustomUrl", L"");
