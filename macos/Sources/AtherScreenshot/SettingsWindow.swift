@@ -19,6 +19,7 @@ private struct Row: Identifiable {
     let section: String
     var keywords = ""
     let kind: Kind
+    var shownWhen: String? = nil  // a toggle this row belongs to: hidden while it's off (unless searched for)
     var id: String { key }
 }
 
@@ -51,6 +52,10 @@ private let rows: [Row] = {
         Row(key: "CountdownSeconds", title: "Countdown before recording", section: "Recording", kind: .number(0...10, 1, "s")),
         Row(key: "ShowClicks", title: "Show clicks in recordings", section: "Recording", keywords: "mouse ripple", kind: .toggle),
         Row(key: "ShowKeys", title: "Show keystrokes in recordings (shows everything you type)", section: "Recording", keywords: "keyboard", kind: .toggle),
+        Row(key: "ShowGamepad", title: "Show game controller (while one is connected)", section: "Recording", keywords: "gamepad xbox playstation joystick input overlay", kind: .toggle),
+        Row(key: "GamepadCorner", title: "Controller corner", section: "Recording", keywords: "gamepad position",
+            kind: .choice(PadCorner.allCases.map { ($0.rawValue, $0.title) }), shownWhen: "ShowGamepad"),
+        Row(key: "GamepadOpacity", title: "Controller opacity", section: "Recording", keywords: "gamepad transparent", kind: .number(10...100, 10, "%"), shownWhen: "ShowGamepad"),
         Row(key: "StyledExport", title: "Styled export by default", section: "Editor", keywords: "gradient shadow rounded background", kind: .toggle),
         Row(key: "Uploader", title: "Uploader", section: "Upload", keywords: "share link",
             kind: .choice([("none", "None"), ("imgur", "Imgur"), ("custom", "Custom (multipart POST)"), ("s3", "S3 / R2 / MinIO")])),
@@ -80,7 +85,7 @@ struct SettingsView: View {
 
     private var visible: [Row] {
         let w = query.lowercased().split(separator: " ").map(String.init)
-        guard !w.isEmpty else { return rows }
+        guard !w.isEmpty else { return rows.filter { $0.shownWhen.map(s.bool) ?? true } }
         return rows.filter { r in
             let hay = "\(r.title) \(r.section) \(r.keywords) \(r.key)".lowercased()
             return w.allSatisfy { hay.contains($0) }

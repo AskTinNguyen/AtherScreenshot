@@ -264,7 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let more = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         let save = menu
-        for c in [Cmd.toggleClipboard, .toggleSave, .toggleCursor, .toggleAutoRedact, .toggleSystemAudio, .toggleMic, .toggleClicks, .toggleKeys, .toggleLogin] {
+        for c in [Cmd.toggleClipboard, .toggleSave, .toggleCursor, .toggleAutoRedact, .toggleSystemAudio, .toggleMic, .toggleClicks, .toggleKeys, .toggleGamepad, .toggleLogin] {
             let d = cmdDef(c)
             let i = NSMenuItem(title: d.title, action: #selector(menuCommand(_:)), keyEquivalent: "")
             i.representedObject = c.rawValue
@@ -299,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleMic: return s.bool("RecordMicrophone")
         case .toggleClicks: return s.bool("ShowClicks")
         case .toggleKeys: return s.bool("ShowKeys")
+        case .toggleGamepad: return s.bool("ShowGamepad")
         case .toggleLogin: return SMAppService.mainApp.status == .enabled
         default: return nil
         }
@@ -386,6 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleMic: notifyToggle(c, s.toggle("RecordMicrophone"))
         case .toggleClicks: notifyToggle(c, s.toggle("ShowClicks"))
         case .toggleKeys: notifyToggle(c, s.toggle("ShowKeys"))
+        case .toggleGamepad: notifyToggle(c, s.toggle("ShowGamepad"))
         case .toggleLogin:
             setLaunchAtLogin(SMAppService.mainApp.status != .enabled)
             notifyToggle(c, SMAppService.mainApp.status == .enabled)

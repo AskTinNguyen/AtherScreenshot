@@ -14,6 +14,7 @@ enum Cmd: String, CaseIterable {
     case toggleMic = "ToggleMicrophone"
     case toggleClicks = "ToggleShowClicks"
     case toggleKeys = "ToggleShowKeys"
+    case toggleGamepad = "ToggleShowGamepad"
     case regionRedact = "CaptureRegionRedact"
     case renameLast = "RenameLastCapture"
     case toggleAutoRedact = "ToggleAutoRedact"
@@ -71,6 +72,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .toggleMic, title: "Record microphone", keywords: "toggle mic voice", icon: "mic", hotkey: "", capture: false),
     CmdDef(cmd: .toggleClicks, title: "Show clicks in recordings", keywords: "toggle mouse ripple", icon: "cursorarrow.click", hotkey: "", capture: false),
     CmdDef(cmd: .toggleKeys, title: "Show keystrokes in recordings", keywords: "toggle keyboard keys", icon: "keyboard", hotkey: "", capture: false),
+    CmdDef(cmd: .toggleGamepad, title: "Show game controller in recordings", keywords: "toggle gamepad controller xbox playstation joystick input overlay", icon: "gamecontroller", hotkey: "", capture: false),
     CmdDef(cmd: .regionRedact, title: "Capture region with auto-redact", keywords: "privacy hide email key token password ocr pixelate", icon: "eye.slash", hotkey: "", capture: true),
     CmdDef(cmd: .renameLast, title: "Rename last capture…", keywords: "name file title", icon: "character.cursor.ibeam", hotkey: "", capture: false),
     CmdDef(cmd: .toggleAutoRedact, title: "Auto-redact every capture", keywords: "toggle privacy ocr pixelate", icon: "eye.slash", hotkey: "", capture: false),
