@@ -10,7 +10,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static var shared: AppDelegate!
 
     static func main() {
-        let args = Array(CommandLine.arguments.dropFirst())
+        var args = Array(CommandLine.arguments.dropFirst())
+        // Relaunched by the update helper (the old copy has quit by then).
+        let afterUpdate = args.first == "--after-update", updateFailed = args.first == "--update-failed"
+        if afterUpdate || updateFailed { args.removeFirst() }
         if args.first == "--write-iconset", args.count >= 2 {
             exit(Logo.writeIconset(URL(fileURLWithPath: args[1])) ? 0 : 1)
         }
@@ -49,6 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let d = AppDelegate()
         shared = d
         d.launchArgs = args
+        d.afterUpdate = afterUpdate
+        d.updateFailed = updateFailed
         app.delegate = d
         app.setActivationPolicy(.accessory)
         app.run()
@@ -72,6 +77,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let s = Settings.shared
     private var statusItem: NSStatusItem!
     private var launchArgs: [String] = []
+    private var afterUpdate = false
+    private var updateFailed = false
     private var trackedWindows: [NSWindow] = []
     private var hotkeysSuspended = false
 
@@ -107,8 +114,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.runCli((parts.last ?? "").components(separatedBy: "\u{1f}"), trusted: trusted)
         }
         try? FileManager.default.createDirectory(at: s.capturesFolder, withIntermediateDirectories: true)
+        Updater.cleanUp()  // only this, the running instance, clears an earlier update's leftovers
+        UpdateController.shared.start()
 
-        if !launchArgs.isEmpty {
+        if afterUpdate {
+            Toast.shared.show("Updated to Ather Screenshot \(AppDelegate.version)", "Your settings, captures and gallery are just as you left them.", ms: 6000)
+        } else if updateFailed {
+            UpdateController.shared.failed("The new version couldn't be put in place, so this one kept running.")
+        } else if !launchArgs.isEmpty {
             runCli(launchArgs, trusted: AppDelegate.interactiveLaunch)
         } else if !UserDefaults.standard.bool(forKey: "Welcomed") {
             UserDefaults.standard.set(true, forKey: "Welcomed")
@@ -125,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for u in urls {
-            if u.isFileURL { Editor.open(url: u) }
+            if u.isFileURL { openToEdit(u) }
             else if u.scheme == "atherscreenshot" {  // atherscreenshot://region?pin
                 var args = [u.host ?? ""]
                 for q in URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems ?? [] {
@@ -141,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Finish an active recording and pending writes before quitting, so nothing is lost.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        UpdateController.shared.quitting = true  // a download finishing now must not install or relaunch
         let finishWrites = {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
@@ -264,7 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let more = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         let save = menu
-        for c in [Cmd.toggleClipboard, .toggleSave, .toggleCursor, .toggleAutoRedact, .toggleSystemAudio, .toggleMic, .toggleClicks, .toggleKeys, .toggleLogin] {
+        for c in [Cmd.toggleClipboard, .toggleSave, .toggleCursor, .toggleAutoRedact, .toggleSystemAudio, .toggleMic, .toggleClicks, .toggleKeys, .toggleGamepad, .toggleLogin] {
             let d = cmdDef(c)
             let i = NSMenuItem(title: d.title, action: #selector(menuCommand(_:)), keyEquivalent: "")
             i.representedObject = c.rawValue
@@ -277,6 +291,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(.openFolder)
         add(.settings, "Settings…")
         menu.addItem(.separator())
+        if let u = UpdateController.shared.available {
+            // Not a palette command: it starts the update itself.
+            let item = NSMenuItem(title: "Update to version \(u.version)…", action: #selector(menuInstallUpdate), keyEquivalent: "")
+            item.target = self
+            item.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+            menu.addItem(item)
+        } else {
+            add(.checkUpdates)
+        }
         add(.about)
         add(.quit)
     }
@@ -287,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.execute(c) }
     }
     @objc private func menuAbout() { execute(.about) }
+    @objc func menuInstallUpdate() { UpdateController.shared.install() }
     @objc private func menuSettings() { execute(.settings) }
 
     func toggleState(_ c: Cmd) -> Bool? {
@@ -299,6 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleMic: return s.bool("RecordMicrophone")
         case .toggleClicks: return s.bool("ShowClicks")
         case .toggleKeys: return s.bool("ShowKeys")
+        case .toggleGamepad: return s.bool("ShowGamepad")
         case .toggleLogin: return SMAppService.mainApp.status == .enabled
         default: return nil
         }
@@ -313,8 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for u in Output.listCaptures().prefix(5) {
             items.append(PaletteItem(id: "recent", title: "Open recent: \(u.lastPathComponent)", keywords: "recent last history file", icon: "clock",
                                      hint: Library.dateFormat.string(from: (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date())) {
-                if ["mp4", "mov"].contains(u.pathExtension.lowercased()) { VideoEditor.open(u) }
-                else if u.pathExtension.lowercased() == "gif" { Output.open(u) } else { Editor.open(url: u) }
+                if u.pathExtension.lowercased() == "gif" { Output.open(u) } else { self.openToEdit(u) }
             })
         }
         return items
@@ -357,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .stopRecording:
             if Recorder.isActive { Recorder.current?.stop() } else if ScrollCapture.active != nil { ScrollCapture.cancel() } else { Toast.shared.show("Not recording") }
         case .pauseRecording: Recorder.current?.togglePause()
+        case .checkUpdates: UpdateController.shared.check(manual: true)
         case .history: GalleryWindow.show()
         case .editLast:
             if let img = lastImage { Editor.open(img, scale: lastScale) } else if let u = lastImageURL { Editor.open(url: u) } else { Toast.shared.show("Nothing captured yet") }
@@ -386,6 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleMic: notifyToggle(c, s.toggle("RecordMicrophone"))
         case .toggleClicks: notifyToggle(c, s.toggle("ShowClicks"))
         case .toggleKeys: notifyToggle(c, s.toggle("ShowKeys"))
+        case .toggleGamepad: notifyToggle(c, s.toggle("ShowGamepad"))
         case .toggleLogin:
             setLaunchAtLogin(SMAppService.mainApp.status != .enabled)
             notifyToggle(c, SMAppService.mainApp.status == .enabled)
@@ -678,9 +704,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func openImage() {
         activateApp()
         let p = NSOpenPanel()
-        p.allowedContentTypes = [.image]
+        p.allowedContentTypes = MediaFiles.contentTypes(pictures: true, videos: true)
         p.directoryURL = s.capturesFolder
-        if p.runModal() == .OK, let u = p.url { Editor.open(url: u) }
+        if p.runModal() == .OK, let u = p.url { openToEdit(u) }
+    }
+
+    // Any file opened from outside: videos go to the video editor, everything else to the image editor.
+    // Edits are saved as new captures; the original is never changed.
+    func openToEdit(_ u: URL) {
+        if MediaFiles.isVideo(u) { VideoEditor.open(u) } else { Editor.open(url: u) }
     }
 
     func promptRename(_ url: URL) {
@@ -748,14 +780,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             i += 1
         }
         switch first.lowercased() {
-        case "edit": files.forEach { Editor.open(url: URL(fileURLWithPath: $0)) }; return
-        case "pin": files.compactMap { CGImage.load(URL(fileURLWithPath: $0)) }.forEach { Pin.show($0) }; return
+        case "edit": files.forEach { openToEdit(URL(fileURLWithPath: $0)) }; return
+        case "pin":
+            for f in files.map({ URL(fileURLWithPath: $0) }) {
+                if MediaFiles.isVideo(f) { Toast.shared.show("Videos can't be pinned", f.lastPathComponent) }
+                else if let img = CGImage.load(f) { Pin.show(img) }
+            }
+            return
         case "upload": files.forEach { upload(URL(fileURLWithPath: $0)) }; return
         default: break
         }
         let cmd = kCliNames[first.lowercased()] ?? Cmd.allCases.first { $0.rawValue.lowercased() == first.lowercased() }
         guard let cmd else {
-            if trusted, FileManager.default.fileExists(atPath: first) { Editor.open(url: URL(fileURLWithPath: first)) }
+            if trusted, FileManager.default.fileExists(atPath: first) { openToEdit(URL(fileURLWithPath: first)) }
             else { Toast.shared.show("Unknown command", first) }
             return
         }

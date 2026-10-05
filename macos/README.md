@@ -4,18 +4,19 @@ Native Swift/AppKit port of the Windows app: a menu-bar agent that uses ScreenCa
 
 ## Download
 
-[AtherScreenshot-0.0.1-macOS.dmg](../downloads/AtherScreenshot-0.0.1-macOS.dmg) — macOS 14 or later, Apple silicon and Intel. Open the DMG and drag Ather Screenshot to Applications. The build is ad-hoc signed, not notarized, so the first launch is blocked: open System Settings › Privacy & Security and click "Open Anyway" (or run `xattr -dr com.apple.quarantine "/Applications/Ather Screenshot.app"`). Then allow Screen Recording when asked.
+[AtherScreenshot-0.0.2-macOS.dmg](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.dmg) — macOS 14 or later, Apple silicon and Intel ([all files](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.2)). Later versions install from inside the app (see Updates). Open the DMG and drag Ather Screenshot to Applications. The build is ad-hoc signed, not notarized, so the first launch is blocked: open System Settings › Privacy & Security and click "Open Anyway" (or run `xattr -dr com.apple.quarantine "/Applications/Ather Screenshot.app"`). Then allow Screen Recording when asked.
 
 ## Build
 
 ```
 ./build.sh            # release → build/Ather Screenshot.app
 ./build.sh debug
-./build.sh package    # universal arm64 + x86_64, plus dist/*.zip, *.dmg, SHA256SUMS.txt
+./build.sh package    # universal arm64 + x86_64, plus dist/*.zip (the update), *.dmg, SHA256SUMS.txt
+./build.sh publish    # package, then add the Mac side to the GitHub Release v<version> (needs gh; owner only)
 xcrun swift test      # unit tests; ATHER_TEST_OUT=<dir> also renders the editor, palette, toast and settings to PNGs
 ```
 
-Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
+Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.1), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
 
 ## Permissions
 
@@ -64,7 +65,18 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - The preview and the export use the same frame renderer, so what you see is what's saved.
 - **Save** (⌘S) writes a new MP4; **Save GIF** (⌘⇧S) writes a GIF. The original stays untouched, and the result stacks with it in the gallery.
 
-Space plays, ←/→ step a frame (⇧ a second), ⌫ deletes the selected caption, ⌘Z undoes.
+- **Any video:** open MP4, MOV, M4V or anything else AVFoundation reads (Open With in Finder, the palette's "Open a picture or video to edit…", or `AtherScreenshot edit <file>`). Phone videos stored sideways play, export and show in the gallery upright. A file whose frames this Mac can't decode is refused instead of opening blank.
+- **Join videos:** Add ▾ › Video clip… (⌘O) or drop videos on the editor to add them after the selected clip. Any shape works: each clip is fitted into the first video's frame with black bars. With two or more clips a clip lane appears above the thumbnails: click selects a clip, drag reorders it, and drag a selected clip's edge to trim it. The clip row offers Split at playhead (S), Earlier, Later and Remove. Captions and markup stay on their footage when clips move, split or go.
+
+Space plays, ←/→ step a frame (⇧ a second), S splits, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag.
+
+## Game controller in recordings
+
+Settings › Recording › Show game controller (or "Show game controller in recordings" in the palette) draws the first connected controller into a corner of recordings: sticks, triggers, bumpers, D-pad, face buttons and View/Menu light up as you use them. Xbox, PlayStation (shown as ✕○□△) and MFi pads work through the GameController framework. It's only in the video, never on screen, and nothing is drawn while no controller is connected. The corner and opacity settings appear once it's on.
+
+## Updates
+
+The app checks the GitHub Release a minute after launch and then daily (Settings › Updates), or now with "Check for updates…". A new build is announced once; click the notification, or "Update to version …" in the menu-bar menu. It never installs during a recording, a capture or with an editor open, and asks before closing pinned screenshots. The download must come from this repository over HTTPS and match its size, SHA-256, bundle id, build and signature. The app then quits, a helper swaps the bundle and relaunches it. If anything fails, the current version keeps running and the download page is offered. Run from Applications: a copy started from the disk image can't replace itself.
 
 ## Capture gallery (⌃⌥H)
 
@@ -100,6 +112,8 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 - History became the capture gallery above (⌘⌫ moves to Trash, ⌘O shows in Finder).
 - System audio and microphone are recorded as two AAC tracks instead of one mixed track.
 - A recorded region that spans displays is clamped to the display under its center.
+- The game controller overlay reads Xbox, PlayStation and MFi pads directly (Windows uses XInput: Xbox and compatible pads).
+- Updates replace the app bundle (Windows replaces the exe).
 - There is no installer: drag the app to /Applications. "Launch at login" uses SMAppService.
 
 ## Command line and URL scheme
@@ -117,4 +131,4 @@ Commands typed in a terminal run directly. Commands from `atherscreenshot://` li
 
 ## Layout (`Sources/AtherScreenshot`)
 
-`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, markup UI) · `VideoRender` (frame renderer for preview and export) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key overlay) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.
+`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, markup and clip lane UI) · `VideoSequence` (clips, the one list of media types, the sequence composition and its compositor) · `VideoRender` (frame renderer for preview and export) · `Gamepad` (controller input and drawing) · `Updater` (manifest, download, verify, swap) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key and controller overlays) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

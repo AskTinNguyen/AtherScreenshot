@@ -285,7 +285,7 @@ final class Editor: NSObject, NSWindowDelegate {
         var items = [PaletteItem(id: "pick.file", title: "Choose a file…", keywords: "open finder disk", icon: "folder", hint: "") { [weak self] in
             guard let self else { return }
             let p = NSOpenPanel()
-            p.allowedContentTypes = [.image]
+            p.allowedContentTypes = MediaFiles.contentTypes(pictures: true, videos: false)
             p.allowsMultipleSelection = true
             p.beginSheetModal(for: self.window) { r in if r == .OK { self.insertImages(p.urls) } }
         }]

@@ -11,7 +11,7 @@ import UniformTypeIdentifiers
 
 struct Caption: Equatable {
     var id = UUID()
-    var start: Double          // seconds in the source video
+    var start: Double          // seconds on the timeline
     var end: Double
     var text: String
     var position = CaptionPosition.bottom
@@ -44,6 +44,8 @@ struct VideoEdit: Equatable {
     var captionLook = CaptionLook.pill
     var captionStyle = AnimStyle.auto
     var highlightWords = true  // auto captions: the spoken word lights up
+    var clips: [Clip] = []     // played back to back; every time above is timeline time
+    var frame = CGSize.zero    // the sequence frame: the first video's upright size, kept when clips change
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
     static let captionScale: [CGFloat] = [0.03, 0.037, 0.045, 0.055, 0.068]
@@ -71,41 +73,12 @@ enum VideoExport {
         let size: CGSize
     }
 
-    static func displaySize(_ asset: AVAsset) async throws -> CGSize {
-        guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.noVideo }
-        let (n, t) = try await vt.load(.naturalSize, .preferredTransform)
-        let r = CGRect(origin: .zero, size: n).applying(t)
-        return CGSize(width: abs(r.width), height: abs(r.height))
-    }
-
-    static func prepare(_ asset: AVAsset, _ e: VideoEdit) async throws -> Prepared {
-        guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.noVideo }
-        let comp = AVMutableComposition()
-        let range = CMTimeRange(start: CMTime(seconds: e.trimStart, preferredTimescale: 600), end: CMTime(seconds: e.trimEnd, preferredTimescale: 600))
-        guard let cv = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw Failure.noVideo }
-        try cv.insertTimeRange(range, of: vt, at: .zero)
-        if !e.muted {
-            for at in try await asset.loadTracks(withMediaType: .audio) {
-                let ca = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-                try ca?.insertTimeRange(range, of: at, at: .zero)
-            }
-        }
-        if e.speed != 1 {
-            comp.scaleTimeRange(CMTimeRange(start: .zero, duration: range.duration), toDuration: CMTimeMultiplyByFloat64(range.duration, multiplier: 1 / e.speed))
-        }
-        let (natural, t, fps) = try await vt.load(.naturalSize, .preferredTransform, .nominalFrameRate)
-        let shown = CGRect(origin: .zero, size: natural).applying(t)
-        let full = CGRect(x: 0, y: 0, width: abs(shown.width), height: abs(shown.height))
-
+    static func prepare(_ e: VideoEdit) async throws -> Prepared {
         // Every frame goes through the same renderer the preview uses.
-        let renderer = FrameRenderer(edit: e, full: full.size, preview: false)
-        let (start, speed) = (e.trimStart, e.speed)
-        let vc = AVMutableVideoComposition(asset: comp) { req in
-            req.finish(with: renderer.render(req.sourceImage, at: start + req.compositionTime.seconds * speed), context: nil)
-        }
-        vc.renderSize = renderer.out
-        vc.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps > 1 ? min(60, fps.rounded()) : 30))
-        return Prepared(composition: comp, video: vc, size: renderer.out)
+        let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
+        let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), speed: e.speed, muted: e.muted,
+                                              box: RendererBox(renderer))
+        return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
 
     static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill,
@@ -131,8 +104,8 @@ enum VideoExport {
         if s.status != .completed { throw Failure.failed(s.error?.localizedDescription ?? "Export failed.") }
     }
 
-    static func mp4(_ asset: AVAsset, _ e: VideoEdit, to url: URL) async throws {
-        let p = try await prepare(asset, e)
+    static func mp4(_ e: VideoEdit, to url: URL) async throws {
+        let p = try await prepare(e)
         guard let s = AVAssetExportSession(asset: p.composition, presetName: AVAssetExportPresetHighestQuality) else { throw Failure.failed("Can't export this video.") }
         s.videoComposition = p.video
         s.audioTimePitchAlgorithm = .spectral   // sped-up audio keeps its pitch
@@ -143,10 +116,10 @@ enum VideoExport {
     }
 
     // Renders the edit to MP4 first, then samples it into a GIF (≤ 960 px wide).
-    static func gif(_ asset: AVAsset, _ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
+    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try await mp4(asset, e, to: tmp)
+        try await mp4(e, to: tmp)
         let src = AVURLAsset(url: tmp)
         let duration = try await src.load(.duration).seconds
         let gen = AVAssetImageGenerator(asset: src)
@@ -166,7 +139,7 @@ enum VideoExport {
     }
 
     // Speech in the trimmed range, as caption-sized chunks. On device when the Mac supports it.
-    static func transcribe(_ asset: AVAsset, from start: Double, to end: Double) async throws -> [Caption] {
+    static func transcribe(_ clips: [Clip], frame: CGSize, from start: Double, to end: Double) async throws -> [Caption] {
         let status = await withCheckedContinuation { k in SFSpeechRecognizer.requestAuthorization { k.resume(returning: $0) } }
         guard status == .authorized else {
             throw Failure.failed("Allow Ather Screenshot in System Settings › Privacy & Security › Speech Recognition.")
@@ -174,12 +147,12 @@ enum VideoExport {
         guard let rec = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US")), rec.isAvailable else {
             throw Failure.failed("Speech recognition isn't available for your language.")
         }
-        let tracks = try await asset.loadTracks(withMediaType: .audio)
-        guard !tracks.isEmpty else { throw Failure.failed("This recording has no audio. Turn on system audio or the microphone in Settings › Recording.") }
-        // Mix the audio tracks of the trimmed range into one file.
-        let comp = AVMutableComposition()
-        let range = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600), end: CMTime(seconds: end, preferredTimescale: 600))
-        for t in tracks { try comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)?.insertTimeRange(range, of: t, at: .zero) }
+        // The sequence's sound in the trimmed range, mixed into one file.
+        let seq = try await VideoSequence.build(clips, frame: frame, range: start...max(start, end), box: RendererBox(FrameRenderer(edit: VideoEdit(trimEnd: 0), full: frame, preview: true)))
+        let comp = seq.composition
+        guard !comp.tracks(withMediaType: .audio).isEmpty else {
+            throw Failure.failed("This video has no sound. For recordings, turn on system audio or the microphone in Settings › Recording.")
+        }
         let audio = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).m4a")
         defer { try? FileManager.default.removeItem(at: audio) }
         guard let s = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetAppleM4A) else { throw Failure.failed("Can't read the audio.") }
@@ -235,8 +208,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     static let quickEmoji = ["✅", "❌", "⚠️", "👉", "👀", "💡", "🎉", "🔥", "⭐️", "❤️", "👍", "🤔"]
 
     let url: URL
-    let asset: AVURLAsset
-    let player: AVPlayer
+    let player = AVPlayer()
     let window: NSWindow
     var duration: Double = 0
     var videoSize = CGSize(width: 16, height: 9)
@@ -249,10 +221,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var busy = false
     private var previewBox: RendererBox?
     private var previewComposition: AVVideoComposition?
+    private var builtClips: [Clip] = []          // what the preview player plays now
+    private var unplayable: Set<UUID> = []        // clips whose file can't be read: playback skips them
+    private var pendingSeek: Double?              // where to go once the rebuilt sequence is in the player
     private var refreshPending = false
 
     private let stage = VideoStage()
-    private let timeline = Timeline()
+    let timeline = Timeline()
     private let playButton = NSButton()
     private let timeLabel = NSTextField(labelWithString: "")
     private let speedPopup = NSPopUpButton()
@@ -274,8 +249,6 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     private init(_ url: URL) {
         self.url = url
-        asset = AVURLAsset(url: url)
-        player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
         let vis = Geo.mouseScreen.visibleFrame
         let size = NSSize(width: min(1240, vis.width * 0.92), height: min(880, vis.height * 0.92))
         window = NSWindow(contentRect: NSRect(x: vis.midX - size.width / 2, y: vis.midY - size.height / 2, width: size.width, height: size.height),
@@ -300,28 +273,53 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     @MainActor private func load() async {   // touches the window after each await
+        let clip: Clip
         do {
-            duration = try await asset.load(.duration).seconds
-            videoSize = try await VideoExport.displaySize(asset)
+            clip = try await VideoSource.probe(url)
         } catch {
             Toast.shared.show("Can't open this video", error.localizedDescription)
             return window.close()
         }
-        edit = VideoEdit(trimEnd: duration)
+        builtClips = [clip]  // built just below
+        edit = VideoEdit(trimEnd: clip.duration, clips: [clip], frame: CGSize(width: clip.w, height: clip.h))
         undoStack = []
         dirty = false
-        // The preview runs every frame through the export renderer.
-        let box = RendererBox(FrameRenderer(edit: edit, full: videoSize, preview: true))
-        previewBox = box
-        if let vc = try? await AVMutableVideoComposition.videoComposition(with: asset, applyingCIFiltersWithHandler: { req in
-            req.finish(with: box.renderer.render(req.sourceImage, at: req.compositionTime.seconds), context: nil)
-        }) {
-            previewComposition = vc
-            player.currentItem?.videoComposition = vc
-        }
+        await rebuildPlayer()
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] t in self?.tick(t.seconds) }
-        timeline.loadThumbnails()
         changed()
+    }
+
+    // The preview plays the sequence through the export renderer. Rebuilt when the clips change.
+    @MainActor func rebuildPlayer() async {
+        let clips = edit.clips
+        builtClips = clips
+        duration = VideoSequence.total(clips)
+        videoSize = edit.frame
+        let box = RendererBox(FrameRenderer(edit: edit, full: videoSize, preview: true))
+        do {
+            let b = try await VideoSequence.build(clips, frame: edit.frame, box: box)
+            guard clips == edit.clips else { return }  // changed again meanwhile: that rebuild wins
+            // The playhead stays where playback is (an undo while playing doesn't jump back to where Play was
+            // pressed), unless a clip change asked for a spot.
+            let at = pendingSeek ?? now
+            pendingSeek = nil
+            let rate = player.rate
+            previewBox = box
+            box.renderer = FrameRenderer(edit: edit, full: videoSize, preview: true)
+            let item = AVPlayerItem(asset: b.composition)
+            item.videoComposition = b.video
+            previewComposition = b.video
+            unplayable = b.unplayable
+            player.replaceCurrentItem(with: item)
+            await player.seek(to: CMTime(seconds: min(max(0, at), duration), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            if rate != 0 { player.rate = rate }
+            timeline.needsDisplay = true
+            stage.needsDisplay = true
+            updateTime()
+        } catch {
+            Toast.shared.show("Can't play this video", error.localizedDescription)
+        }
+        timeline.loadThumbnails()
     }
 
     // Hands the latest edit to the preview; while paused, re-renders the current frame.
@@ -370,6 +368,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         addPopup.item(at: 0)?.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add")
         let entries: [(String, String, String, () -> Void)] = [("Caption", "captions.bubble", "T", { [weak self] in self?.addCaption() })]
             + MarkKind.allCases.map { k in (k.label, k.symbol, k.key, { [weak self] in self?.addMark(k) }) }
+            + [("Video clip…", "film.stack", "⌘O", { [weak self] in self?.addClipDialog() })]
         for (title, symbol, key, run) in entries {
             let it = NSMenuItem(title: key.isEmpty ? title : "\(title)    \(key)", action: #selector(MenuAction.fire), keyEquivalent: "")
             it.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
@@ -377,9 +376,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             actions.append(a)
             it.target = a
             addPopup.menu?.addItem(it)
-            if title == "Caption" || title == "Step number" || title == "Pixelate" { addPopup.menu?.addItem(.separator()) }
+            if title == "Caption" || title == "Step number" || title == "Pixelate" || title == MarkKind.allCases.last?.label { addPopup.menu?.addItem(.separator()) }
         }
-        addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead"
+        addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead, or join another video"
 
         let auto = barButton("Auto captions", "waveform.badge.mic", "Transcribe speech into captions, on this Mac") { [weak self] in self?.autoCaptions() }
         captionsMenu.bezelStyle = .recessed
@@ -407,7 +406,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         inspector.spacing = 8
         hint.font = Theme.font(11)
         hint.textColor = Theme.muted
-        hint.stringValue = "Space plays · I and O trim · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · ⌘Z undo"
+        hint.stringValue = "Space plays · I and O trim · S split · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · drop videos to join them"
 
         playButton.bezelStyle = .regularSquare
         playButton.isBordered = false
@@ -492,8 +491,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func rebuildInspector() {
         for v in inspector.arrangedSubviews { inspector.removeArrangedSubview(v); v.removeFromSuperview() }
         inspectorActions = []
-        let ci = selectedCaptionIndex, mi = selectedMarkIndex
-        inspector.isHidden = ci == nil && mi == nil
+        let ci = selectedCaptionIndex, mi = selectedMarkIndex, k = selectedClipIndex
+        inspector.isHidden = ci == nil && mi == nil && k == nil
         hint.isHidden = !inspector.isHidden
         if let ci {
             let c = edit.captions[ci]
@@ -562,6 +561,26 @@ final class VideoEditor: NSObject, NSWindowDelegate {
                 link(replay) { [weak self] in self?.replay(m) }
                 inspector.addArrangedSubview(replay)
             }
+        }
+        if let k, ci == nil, mi == nil {
+            let c = edit.clips[k]
+            let label = NSTextField(labelWithString: "Clip \(k + 1) of \(edit.clips.count):  \(c.name)  ·  \(clock(c.duration))")
+            label.font = Theme.font(12)
+            label.textColor = Theme.text
+            label.lineBreakMode = .byTruncatingMiddle
+            inspector.addArrangedSubview(label)
+            func button(_ title: String, _ symbol: String, _ tip: String, _ run: @escaping () -> Void) {
+                let b = NSButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage(), target: nil, action: nil)
+                b.bezelStyle = .recessed
+                b.imagePosition = .imageLeading
+                b.toolTip = tip
+                link(b, run)
+                inspector.addArrangedSubview(b)
+            }
+            button("Split at playhead", "scissors", "Cut this clip in two at the playhead (S)") { [weak self] in self?.splitAtPlayhead() }
+            if k > 0 { button("Earlier", "arrow.left", "Play this clip before the one on its left") { [weak self] in self?.moveClip(k, to: k - 1) } }
+            if k + 1 < edit.clips.count { button("Later", "arrow.right", "Play this clip after the one on its right") { [weak self] in self?.moveClip(k, to: k + 1) } }
+            if edit.clips.count > 1 { button("Remove", "trash", "Take this clip out (⌫)") { [weak self] in self?.removeClip(k) } }
         }
         if ci != nil || mi != nil {
             let del = NSButton(title: "Delete", image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete") ?? NSImage(), target: nil, action: nil)
@@ -753,6 +772,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var now: Double { player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0 }
     var selectedCaptionIndex: Int? { selected.flatMap { id in edit.captions.firstIndex { $0.id == id } } }
     var selectedMarkIndex: Int? { selected.flatMap { id in edit.marks.firstIndex { $0.id == id } } }
+    var selectedClipIndex: Int? { selected.flatMap { id in edit.clips.firstIndex { $0.id == id } } }
     var viewRect: CGRect {
         let f = CGRect(origin: .zero, size: videoSize)
         let c = edit.crop.map { $0.intersection(f) } ?? f
@@ -768,11 +788,16 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func undo() {
         guard let e = undoStack.popLast() else { return }
         edit = e
-        if let s = selected, !edit.captions.contains(where: { $0.id == s }) && !edit.marks.contains(where: { $0.id == s }) { selected = nil }
+        if let s = selected, !edit.captions.contains(where: { $0.id == s }) && !edit.marks.contains(where: { $0.id == s }) && !edit.clips.contains(where: { $0.id == s }) { selected = nil }
         rebuildInspector()
     }
 
     private func changed() {
+        duration = VideoSequence.total(edit.clips)
+        if edit.clips != builtClips, !edit.clips.isEmpty {
+            builtClips = edit.clips
+            Task { @MainActor in await self.rebuildPlayer() }
+        }
         if timelineHeight.constant != timeline.wantedHeight { timelineHeight.constant = timeline.wantedHeight }
         player.isMuted = edit.muted
         stage.needsDisplay = true
@@ -802,6 +827,14 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     // MARK: playback
 
     private func tick(_ t: Double) {
+        if player.rate != 0, !unplayable.isEmpty, let (k, _) = VideoSequence.locate(edit.clips, t), unplayable.contains(edit.clips[k].id) {
+            // A clip that can't play: on to the next one that can, instead of stopping there.
+            let starts = VideoSequence.starts(edit.clips)
+            if let next = (k + 1..<edit.clips.count).first(where: { !unplayable.contains(edit.clips[$0].id) }), starts[next] < edit.trimEnd {
+                seek(starts[next])
+            } else { player.pause(); seek(edit.trimStart); playStateChanged() }
+            return
+        }
         if player.rate != 0 && t >= edit.trimEnd - 0.01 {
             player.pause()
             seek(edit.trimStart)
@@ -847,6 +880,92 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         if let start { e.trimStart = min(max(0, start), e.trimEnd - 0.1) }
         if let end { e.trimEnd = max(min(duration, end), e.trimStart + 0.1) }
         edit = e
+    }
+
+    // MARK: clips
+
+    func setClips(_ clips: [Clip], seekTo t: Double? = nil) {
+        guard !clips.isEmpty, clips != edit.clips else { return }
+        player.pause()
+        playStateChanged()
+        pushUndo()
+        var e = edit
+        e.applyClips(clips)
+        pendingSeek = t
+        edit = e
+    }
+
+    // Joins videos after the selected clip (or at the end). Any shape works: each is fitted into the frame.
+    func addClips(_ urls: [URL]) {
+        Task { @MainActor in
+            var add: [Clip] = []
+            var bad: [String] = []
+            for u in urls {
+                if MediaFiles.isVideo(u), let c = try? await VideoSource.probe(u) { add.append(c) } else { bad.append(u.lastPathComponent) }
+            }
+            if !bad.isEmpty { Toast.shared.show("Can't add that as a video", bad.joined(separator: ", "), ms: 4000) }
+            guard !add.isEmpty else { return }
+            var clips = edit.clips
+            let at = selectedClipIndex.map { $0 + 1 } ?? clips.count
+            clips.insert(contentsOf: add, at: at)
+            setClips(clips, seekTo: VideoSequence.starts(clips)[at])
+            selected = add[0].id
+        }
+    }
+
+    func addClipDialog() {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.allowedContentTypes = MediaFiles.contentTypes(pictures: false, videos: true)
+        p.message = "Add videos after this one"
+        p.beginSheetModal(for: window) { [weak self] r in if r == .OK { self?.addClips(p.urls) } }
+    }
+
+    // Cuts the clip under the playhead in two (then a middle part can be removed, or the halves reordered).
+    func splitAtPlayhead() {
+        let t = now
+        guard let (k, ft) = VideoSequence.locate(edit.clips, t) else { return }
+        let c = edit.clips[k]
+        guard ft - c.inPoint >= 0.1, c.outPoint - ft >= 0.1 else { return Toast.shared.show("Move the playhead into a clip to split it", ms: 2000) }
+        var clips = edit.clips
+        var second = c
+        second.id = UUID()
+        second.inPoint = ft
+        clips[k].outPoint = ft
+        clips.insert(second, at: k + 1)
+        setClips(clips, seekTo: t)
+        selected = second.id
+    }
+
+    func moveClip(_ from: Int, to: Int) {
+        guard from != to, edit.clips.indices.contains(from), edit.clips.indices.contains(to) else { return }
+        var clips = edit.clips
+        let c = clips.remove(at: from)
+        clips.insert(c, at: to)
+        setClips(clips, seekTo: VideoSequence.starts(clips)[to])
+    }
+
+    func removeClip(_ i: Int) {
+        guard edit.clips.indices.contains(i), edit.clips.count > 1 else { return }  // the last clip stays
+        var clips = edit.clips
+        clips.remove(at: i)
+        setClips(clips, seekTo: VideoSequence.starts(clips)[min(i, clips.count - 1)])
+        selected = nil
+    }
+
+    // The shortest a clip can be trimmed to; a clip already shorter keeps its own length, so a click on its edge
+    // never pushes it past the end of its file.
+    static func shortest(_ c: Clip) -> Double { min(0.2, c.duration) }
+
+    func trimClip(_ i: Int, in newIn: Double? = nil, out newOut: Double? = nil) {
+        guard edit.clips.indices.contains(i) else { return }
+        var clips = edit.clips
+        var c = clips[i]
+        let s = VideoEditor.shortest(c)
+        if let newIn { c.inPoint = min(max(0, newIn), c.outPoint - s) }
+        if let newOut { c.outPoint = min(max(newOut, c.inPoint + s), max(c.length, c.inPoint + s)) }
+        clips[i] = c
+        setClips(clips)
     }
 
     private var insertTime: Double { min(max(now, edit.trimStart), max(edit.trimStart, edit.trimEnd - 0.5)) }
@@ -909,6 +1028,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     func deleteSelected() {
+        if let k = selectedClipIndex { return removeClip(k) }
         guard selected != nil else { return }
         pushUndo()
         edit.captions.removeAll { $0.id == selected }
@@ -935,11 +1055,17 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         guard !busy else { return }
         busy = true
         Toast.shared.show("Transcribing…", "Turning speech into captions on this Mac", ms: 120_000)
-        let (a, s, e) = (asset, edit.trimStart, edit.trimEnd)
+        let (clips, frame, s, e) = (edit.clips, edit.frame, edit.trimStart, edit.trimEnd)
         Task { @MainActor in
             defer { self.busy = false }
             do {
-                let caps = try await VideoExport.transcribe(a, from: s, to: e)
+                var caps = try await VideoExport.transcribe(clips, frame: frame, from: s, to: e)
+                if self.edit.clips != clips {  // the clips changed while it ran: move the captions with their footage
+                    var then = VideoEdit(trimEnd: VideoSequence.total(clips), clips: clips, frame: frame)
+                    then.captions = caps
+                    then.applyClips(self.edit.clips)
+                    caps = then.captions
+                }
                 Toast.shared.hide()
                 guard !caps.isEmpty else { return Toast.shared.show("No speech found", "Add captions by hand with T.") }
                 self.pushUndo()
@@ -961,11 +1087,11 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         let info = NameInfo(app: src.app, window: src.window)
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).\(gif ? "gif" : "mp4")")
         Toast.shared.show(gif ? "Saving GIF…" : "Saving video…", "\(clock(edit.outputDuration)) long", ms: 600_000)
-        let (a, e) = (asset, edit)
+        let e = edit
         Task { @MainActor in
             defer { self.busy = false }
             do {
-                if gif { try await VideoExport.gif(a, e, to: tmp) } else { try await VideoExport.mp4(a, e, to: tmp) }
+                if gif { try await VideoExport.gif(e, to: tmp) } else { try await VideoExport.mp4(e, to: tmp) }
                 let out = Output.newCaptureURL(ext: gif ? "gif" : "mp4", info: info)
                 Library.shared.noteEdit(out, from: self.url, info: info, edited: true)
                 try FileManager.default.moveItem(at: tmp, to: out)
@@ -984,8 +1110,14 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func key(_ e: NSEvent) -> Bool {
         let cmd = e.modifierFlags.contains(.command), shift = e.modifierFlags.contains(.shift)
         let code = Int(e.keyCode)
+        // While the mouse holds a clip drag, keys don't edit: only Esc, which cancels it.
+        if timeline.isDragging {
+            if code == kVK_Escape { timeline.cancelDrag() }
+            return true
+        }
         if cmd {
             switch code {
+            case kVK_ANSI_O: addClipDialog()
             case kVK_ANSI_S: save(gif: shift)
             case kVK_ANSI_Z: undo()
             case kVK_ANSI_W: window.performClose(nil)
@@ -997,6 +1129,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         case kVK_Space: togglePlay()
         case kVK_LeftArrow: step(shift ? -30 : -1)
         case kVK_RightArrow: step(shift ? 30 : 1)
+        case kVK_ANSI_S: splitAtPlayhead()
         case kVK_ANSI_I: pushUndo(); setTrim(start: now)
         case kVK_ANSI_O: pushUndo(); setTrim(end: now)
         case kVK_ANSI_T: addCaption()
@@ -1079,8 +1212,21 @@ final class VideoStage: NSView {
         overlay.stage = self
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
+        registerForDraggedTypes([.fileURL])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    // Dropping videos joins them after the selected clip.
+    private func videos(_ info: NSDraggingInfo) -> [URL] {
+        (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []).filter(MediaFiles.isVideo)
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { videos(sender).isEmpty ? [] : .copy }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let v = videos(sender)
+        guard !v.isEmpty else { return false }
+        editor?.addClips(v)
+        return true
+    }
 
     override var needsDisplay: Bool {
         get { super.needsDisplay }
@@ -1325,37 +1471,76 @@ final class Timeline: NSView {
     weak var editor: VideoEditor?
     private var thumbs: [CGImage] = []
     private enum Target { case caption(UUID), mark(UUID) }
-    private enum Drag { case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double) }
+    private enum Drag {
+        case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double)
+        case clipIn(Int, grab: Double, value: Double), clipOut(Int, grab: Double, value: Double)  // applied on mouse-up
+        case clipMove(Int, downX: CGFloat, target: Int?)
+    }
     private var drag: Drag?
 
     static let height: CGFloat = 90 + 3 * 18
     private let stripH: CGFloat = 52
-    private let capY: CGFloat = 62
     private let capH: CGFloat = 22
-    private let markY: CGFloat = 90
     private let rowH: CGFloat = 18
+    // The clip lane sits above the thumbnails, and only once there's more than one clip.
+    var laneH: CGFloat { (editor?.edit.clips.count ?? 0) > 1 ? 24 : 0 }
+    private var stripY: CGFloat { laneH }
+    private var capY: CGFloat { laneH + 62 }
+    private var markY: CGFloat { laneH + 90 }
+
+    var isDragging: Bool { drag != nil }
+
+    // Esc, or the window losing the mouse mid-drag. Item drags keep what they did (one undo step);
+    // clip drags only apply on release, so nothing changes.
+    func cancelDrag() {
+        guard drag != nil else { return }
+        drag = nil
+        needsDisplay = true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        if let w = window { NotificationCenter.default.addObserver(self, selector: #selector(lostMouse), name: NSWindow.didResignKeyNotification, object: w) }
+    }
+    @objc private func lostMouse() { cancelDrag() }
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with e: NSEvent) { if editor?.key(e) != true { super.keyDown(with: e) } }
 
+    // Frames straight from each clip's file, upright, without the sequence's black bars. A newer edit cancels
+    // the job in flight, so stale frames are never decoded or shown.
+    private var thumbJob: Task<Void, Never>?
     func loadThumbnails() {
+        thumbJob?.cancel()
         guard let e = editor, e.duration > 0 else { return }
-        let gen = AVAssetImageGenerator(asset: e.asset)
-        gen.appliesPreferredTrackTransform = true
-        gen.maximumSize = CGSize(width: 240, height: 240)
+        let clips = e.edit.clips, total = e.duration
         let count = 16
-        let times = (0..<count).map { CMTime(seconds: e.duration * (Double($0) + 0.5) / Double(count), preferredTimescale: 600) }
-        Task { @MainActor in
+        thumbJob = Task { @MainActor in
+            var gens: [String: AVAssetImageGenerator] = [:]
             var out: [CGImage] = []
-            for t in times { if let img = try? await gen.image(at: t).image { out.append(img) } }
+            for i in 0..<count {
+                guard !Task.isCancelled else { return }
+                guard let (k, ft) = VideoSequence.locate(clips, total * (Double(i) + 0.5) / Double(count)) else { continue }
+                let path = clips[k].path
+                let gen = gens[path] ?? {
+                    let g = AVAssetImageGenerator(asset: AVURLAsset(url: clips[k].url))
+                    g.appliesPreferredTrackTransform = true
+                    g.maximumSize = CGSize(width: 240, height: 240)
+                    gens[path] = g
+                    return g
+                }()
+                if let img = try? await gen.image(at: CMTime(seconds: ft, preferredTimescale: 600)).image { out.append(img) }
+            }
+            guard !Task.isCancelled else { return }
             self.thumbs = out
             self.needsDisplay = true
         }
     }
 
-    private func x(_ t: Double) -> CGFloat { bounds.width * CGFloat(t / max(0.001, editor?.duration ?? 1)) }
-    private func t(_ x: CGFloat) -> Double { Double(min(max(0, x), bounds.width) / max(1, bounds.width)) * (editor?.duration ?? 0) }
+    func x(_ t: Double) -> CGFloat { bounds.width * CGFloat(t / max(0.001, editor?.duration ?? 1)) }
+    func t(_ x: CGFloat) -> Double { Double(min(max(0, x), bounds.width) / max(1, bounds.width)) * (editor?.duration ?? 0) }
 
     // Markup bars, one row per overlapping item; the timeline grows to fit (three rows minimum).
     private func rows() -> [(Mark, Int)] {
@@ -1379,6 +1564,31 @@ final class Timeline: NSView {
         window?.makeFirstResponder(self)
         guard let e = editor else { return }
         let p = convert(ev.locationInWindow, from: nil)
+        // The playhead knob sits over the clip lane: it scrubs, whatever is under it.
+        let onKnob = abs(p.x - x(e.now)) <= 7 && p.y < 8
+        if laneH > 0, p.y < laneH, !onKnob {
+            // The selected clip's edges win over the neighbour's body.
+            if let k = e.selectedClipIndex {
+                let st = VideoSequence.starts(e.edit.clips)[k], c = e.edit.clips[k]
+                let d0 = abs(p.x - x(st)), d1 = abs(p.x - x(st + c.duration))
+                if min(d0, d1) < 6 {
+                    e.player.pause()
+                    drag = d0 <= d1 ? .clipIn(k, grab: t(p.x), value: c.inPoint) : .clipOut(k, grab: t(p.x), value: c.outPoint)
+                    return
+                }
+            }
+            if let (k, _) = VideoSequence.locate(e.edit.clips, t(p.x)) {
+                e.selected = e.edit.clips[k].id
+                drag = .clipMove(k, downX: p.x, target: nil)
+            } else { e.selected = nil }
+            needsDisplay = true
+            return
+        }
+        if onKnob {
+            drag = .playhead
+            e.player.pause()
+            return
+        }
         func grab(_ target: Target, _ s: Double, _ en: Double) {
             let edge = abs(p.x - x(s)) < 6 ? -1 : abs(p.x - x(en)) < 6 ? 1 : 0
             e.pushUndo()
@@ -1413,6 +1623,21 @@ final class Timeline: NSView {
         case .start: e.setTrim(start: now); e.seek(e.edit.trimStart)
         case .end: e.setTrim(end: now); e.seek(e.edit.trimEnd)
         case .playhead: e.seek(now)
+        case .clipIn(let k, let grab, _), .clipOut(let k, let grab, _):
+            guard e.edit.clips.indices.contains(k) else { return cancelDrag() }
+            let c = e.edit.clips[k], s = VideoEditor.shortest(c)
+            let isIn: Bool = { if case .clipIn = d { return true }; return false }()
+            let v = (isIn ? c.inPoint : c.outPoint) + (now - grab)
+            let value = isIn ? min(max(0, v), c.outPoint - s) : min(max(v, c.inPoint + s), max(c.length, c.inPoint + s))
+            drag = isIn ? .clipIn(k, grab: grab, value: value) : .clipOut(k, grab: grab, value: value)
+            if value >= c.inPoint && value <= c.outPoint { e.seek(VideoSequence.starts(e.edit.clips)[k] + value - c.inPoint) }  // the frame at the cut
+        case .clipMove(let k, let downX, let target):
+            let px = convert(ev.locationInWindow, from: nil).x
+            guard e.edit.clips.indices.contains(k), target != nil || abs(px - downX) >= 5 else { break }
+            let starts = VideoSequence.starts(e.edit.clips)
+            // How many of the other clips end up before it.
+            let n = e.edit.clips.indices.filter { $0 != k && x(starts[$0] + e.edit.clips[$0].duration / 2) < px }.count
+            drag = .clipMove(k, downX: downX, target: n)
         case .item(let target, let edge, let grab, let s0, let e0):
             var s = s0, en = e0
             switch edge {
@@ -1433,13 +1658,22 @@ final class Timeline: NSView {
     }
 
     override func mouseUp(with ev: NSEvent) {
-        if case .item = drag, let e = editor { e.edit.captions.sort { $0.start < $1.start } }
+        let d = drag
         drag = nil
+        guard let e = editor else { return }
+        switch d {
+        case .item: e.edit.captions.sort { $0.start < $1.start }
+        case .clipIn(let k, _, let v): e.trimClip(k, in: v)
+        case .clipOut(let k, _, let v): e.trimClip(k, out: v)
+        case .clipMove(let k, _, let target?): e.moveClip(k, to: target)
+        default: break
+        }
+        needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let e = editor, let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let strip = CGRect(x: 0, y: 0, width: bounds.width, height: stripH)
+        let strip = CGRect(x: 0, y: stripY, width: bounds.width, height: stripH)
         ctx.saveGState()
         ctx.addPath(CGPath(roundedRect: strip, cornerWidth: 6, cornerHeight: 6, transform: nil))
         ctx.clip()
@@ -1448,7 +1682,7 @@ final class Timeline: NSView {
         if !thumbs.isEmpty {
             let w = strip.width / CGFloat(thumbs.count)
             for (i, img) in thumbs.enumerated() {
-                let cell = CGRect(x: CGFloat(i) * w, y: 0, width: w, height: stripH)
+                let cell = CGRect(x: CGFloat(i) * w, y: stripY, width: w, height: stripH)
                 let s = max(cell.width / CGFloat(img.width), cell.height / CGFloat(img.height))
                 let dw = CGFloat(img.width) * s, dh = CGFloat(img.height) * s
                 ctx.saveGState()
@@ -1458,19 +1692,20 @@ final class Timeline: NSView {
             }
         }
         NSColor.black.withAlphaComponent(0.65).setFill()
-        CGRect(x: 0, y: 0, width: x(e.edit.trimStart), height: stripH).fill()
-        CGRect(x: x(e.edit.trimEnd), y: 0, width: bounds.width - x(e.edit.trimEnd), height: stripH).fill()
+        CGRect(x: 0, y: stripY, width: x(e.edit.trimStart), height: stripH).fill()
+        CGRect(x: x(e.edit.trimEnd), y: stripY, width: bounds.width - x(e.edit.trimEnd), height: stripH).fill()
         ctx.restoreGState()
 
-        let kept = CGRect(x: x(e.edit.trimStart), y: 0, width: x(e.edit.trimEnd) - x(e.edit.trimStart), height: stripH)
+        let kept = CGRect(x: x(e.edit.trimStart), y: stripY, width: x(e.edit.trimEnd) - x(e.edit.trimStart), height: stripH)
         Theme.accent.setStroke()
         let frame = NSBezierPath(roundedRect: kept.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
         frame.lineWidth = 2.5
         frame.stroke()
         Theme.accent.setFill()
         for hx in [kept.minX, kept.maxX] {
-            NSBezierPath(roundedRect: CGRect(x: hx - 4, y: 8, width: 8, height: stripH - 16), xRadius: 3, yRadius: 3).fill()
+            NSBezierPath(roundedRect: CGRect(x: hx - 4, y: stripY + 8, width: 8, height: stripH - 16), xRadius: 3, yRadius: 3).fill()
         }
+        if laneH > 0 { drawClips(e, strip) }
 
         func lane(_ r: CGRect, _ empty: String, _ isEmpty: Bool) {
             NSColor.white.withAlphaComponent(0.04).setFill()
@@ -1514,5 +1749,44 @@ final class Timeline: NSView {
         NSColor.white.setFill()
         CGRect(x: px - 1, y: -2, width: 2, height: bounds.height + 2).fill()
         NSBezierPath(ovalIn: CGRect(x: px - 5, y: -4, width: 10, height: 10)).fill()
+    }
+
+    // One bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
+    private func drawClips(_ e: VideoEditor, _ strip: CGRect) {
+        let starts = VideoSequence.starts(e.edit.clips), h = laneH - 4
+        for (i, c) in e.edit.clips.enumerated() {
+            let t0 = starts[i], t1 = t0 + c.duration
+            var r = CGRect(x: x(t0) + 1, y: 0, width: x(t1) - x(t0) - 2, height: h)
+            switch drag {  // the proposed cut
+            case .clipIn(i, _, let v)?: r = CGRect(x: x(t0 + v - c.inPoint), y: 0, width: r.maxX - x(t0 + v - c.inPoint), height: h)
+            case .clipOut(i, _, let v)?: r.size.width = x(t0 + v - c.inPoint) - r.minX
+            default: break
+            }
+            let sel = e.selected == c.id
+            var lifted = false
+            if case .clipMove(i, _, _?)? = drag { lifted = true }
+            (sel ? Theme.accent.withAlphaComponent(lifted ? 0.45 : 1) : NSColor.white.withAlphaComponent(lifted ? 0.08 : 0.18)).setFill()
+            NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
+            NSGraphicsContext.current?.cgContext.saveGState()
+            NSGraphicsContext.current?.cgContext.clip(to: r.insetBy(dx: 3, dy: 0))
+            let label = NSAttributedString(string: "\(c.name)  \(e.clock(c.duration))", attributes: [.font: Theme.font(10, .medium), .foregroundColor: sel ? Theme.onAccent : Theme.text])
+            label.draw(at: CGPoint(x: r.minX + 7, y: r.midY - label.size().height / 2))
+            NSGraphicsContext.current?.cgContext.restoreGState()
+            if sel {  // trim grips
+                Theme.onAccent.setFill()
+                for hx in [r.minX, r.maxX] { NSBezierPath(roundedRect: CGRect(x: hx - 2, y: 4, width: 4, height: h - 8), xRadius: 2, yRadius: 2).fill() }
+            }
+            if i > 0 {
+                NSColor.black.withAlphaComponent(0.9).setFill()
+                CGRect(x: x(t0) - 1, y: strip.minY, width: 2, height: strip.height).fill()
+            }
+        }
+        if case .clipMove(let k, _, let target?)? = drag, e.edit.clips.indices.contains(k) {  // where the clip would go
+            var order = e.edit.clips
+            order.remove(at: k)
+            let mx = x(target < order.count ? VideoSequence.starts(order)[target] : VideoSequence.total(order))
+            Theme.accent.setFill()
+            CGRect(x: mx - 1.5, y: -2, width: 3, height: strip.maxY + 2).fill()
+        }
     }
 }

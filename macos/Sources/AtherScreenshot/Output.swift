@@ -9,7 +9,6 @@ struct NameInfo {
 
 enum Output {
     static let defaultTemplate = "Ather_{yyyy}{MM}{dd}_{HH}{mm}{ss}_{ms}"
-    static let mediaExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "mp4", "mov", "heic", "tiff", "webp"]
 
     static func sanitize(_ s: String, maxLen: Int = 150) -> String {
         var out = String(s.map { c -> Character in
@@ -101,7 +100,7 @@ enum Output {
         for case let rel as String in e {
             let name = (rel as NSString).lastPathComponent
             guard !name.hasPrefix("."), !rel.split(separator: "/").contains(where: { $0.hasPrefix(".") }),
-                  mediaExtensions.contains((rel as NSString).pathExtension.lowercased()) else { continue }
+                  MediaFiles.all.contains((rel as NSString).pathExtension.lowercased()) else { continue }
             let u = base.appendingPathComponent(rel)
             let date = (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             items.append((u, date))

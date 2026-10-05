@@ -1,11 +1,14 @@
-# Ather Screenshot 0.0.2 (Windows)
+# Ather Screenshot 0.0.2 (Windows and macOS)
 
-**Get it:** download `AtherScreenshot-Setup-0.0.2.exe` below and run it. Pick **INSTALL** (per user, no admin rights) or **Run without installing**.
+**Get it on Windows:** download `AtherScreenshot-Setup-0.0.2.exe` below and run it. Pick **INSTALL** (per user, no admin rights) or **Run without installing**.
 - **Earlier 0.0.2:** if you have the 0.0.2 build from earlier, the app offers this update by itself, or right away with "Check for updates…" in the tray.
 - **0.0.1:** copies of 0.0.1 need this one download. After that, updates come in the app.
 - **SmartScreen:** the exe isn't code-signed yet, so SmartScreen asks once: **More info › Run anyway**.
 
-The macOS app is still 0.0.1 ([v0.0.1](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1)); it gets these features next.
+**Get it on macOS:** download `AtherScreenshot-0.0.2-macOS.dmg` below (macOS 14 or later, Apple silicon and Intel), open it and drag Ather Screenshot to Applications.
+- **Gatekeeper:** the app isn't notarized yet, so open it once, then allow it in System Settings › Privacy & Security › **Open Anyway**.
+- **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
+- **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
 ## What's new
 

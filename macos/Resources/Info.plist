@@ -33,6 +33,13 @@
             <key>LSHandlerRank</key><string>Alternate</string>
             <key>LSItemContentTypes</key><array><string>public.image</string></array>
         </dict>
+        <dict>
+            <!-- Alternate: listed in Open With, never taking over as the default player. -->
+            <key>CFBundleTypeName</key><string>Video</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key><array><string>public.movie</string></array>
+        </dict>
     </array>
 </dict>
 </plist>

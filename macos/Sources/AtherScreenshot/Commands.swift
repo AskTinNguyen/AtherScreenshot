@@ -14,6 +14,7 @@ enum Cmd: String, CaseIterable {
     case toggleMic = "ToggleMicrophone"
     case toggleClicks = "ToggleShowClicks"
     case toggleKeys = "ToggleShowKeys"
+    case toggleGamepad = "ToggleShowGamepad"
     case regionRedact = "CaptureRegionRedact"
     case renameLast = "RenameLastCapture"
     case toggleAutoRedact = "ToggleAutoRedact"
@@ -43,6 +44,7 @@ enum Cmd: String, CaseIterable {
     case toggleCursor = "ToggleCaptureCursor"
     case toggleLogin = "ToggleLaunchAtLogin"
     case settings = "EditSettings"
+    case checkUpdates = "CheckForUpdates"
     case about = "About"
     case quit = "Quit"
 }
@@ -71,6 +73,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .toggleMic, title: "Record microphone", keywords: "toggle mic voice", icon: "mic", hotkey: "", capture: false),
     CmdDef(cmd: .toggleClicks, title: "Show clicks in recordings", keywords: "toggle mouse ripple", icon: "cursorarrow.click", hotkey: "", capture: false),
     CmdDef(cmd: .toggleKeys, title: "Show keystrokes in recordings", keywords: "toggle keyboard keys", icon: "keyboard", hotkey: "", capture: false),
+    CmdDef(cmd: .toggleGamepad, title: "Show game controller in recordings", keywords: "toggle gamepad controller xbox playstation joystick input overlay", icon: "gamecontroller", hotkey: "", capture: false),
     CmdDef(cmd: .regionRedact, title: "Capture region with auto-redact", keywords: "privacy hide email key token password ocr pixelate", icon: "eye.slash", hotkey: "", capture: true),
     CmdDef(cmd: .renameLast, title: "Rename last capture…", keywords: "name file title", icon: "character.cursor.ibeam", hotkey: "", capture: false),
     CmdDef(cmd: .toggleAutoRedact, title: "Auto-redact every capture", keywords: "toggle privacy ocr pixelate", icon: "eye.slash", hotkey: "", capture: false),
@@ -80,7 +83,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .history, title: "Capture gallery", keywords: "history browse recent search thumbnails library tags collections organize", icon: "square.grid.2x2", hotkey: "Ctrl+Alt+H", capture: false),
     CmdDef(cmd: .scrolling, title: "Scrolling capture (long page)", keywords: "scroll stitch full page chat long", icon: "arrow.up.and.down.text.horizontal", hotkey: "Ctrl+Alt+S", capture: true),
     CmdDef(cmd: .editLast, title: "Annotate last capture", keywords: "edit editor draw markup", icon: "pencil.and.outline", hotkey: "", capture: false),
-    CmdDef(cmd: .openImage, title: "Open image in editor…", keywords: "edit file annotate load", icon: "photo", hotkey: "", capture: false),
+    CmdDef(cmd: .openImage, title: "Open a picture or video to edit…", keywords: "edit file annotate load image video mp4 mov import", icon: "photo", hotkey: "", capture: false),
     CmdDef(cmd: .fullscreen, title: "Capture full screen", keywords: "all monitors desktop entire everything displays", icon: "rectangle.on.rectangle", hotkey: "Ctrl+Alt+3", capture: true),
     CmdDef(cmd: .monitor, title: "Capture current display", keywords: "monitor screen", icon: "display", hotkey: "Ctrl+Alt+Shift+3", capture: true),
     CmdDef(cmd: .window, title: "Capture active window", keywords: "app foreground focused", icon: "macwindow", hotkey: "Ctrl+Alt+W", capture: true),
@@ -100,6 +103,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .toggleCursor, title: "Include mouse cursor", keywords: "toggle setting pointer", icon: "cursorarrow", hotkey: "", capture: false),
     CmdDef(cmd: .toggleLogin, title: "Launch at login", keywords: "toggle startup boot autostart", icon: "power", hotkey: "", capture: false),
     CmdDef(cmd: .settings, title: "Settings", keywords: "preferences options config hotkeys shortcuts keyboard", icon: "gearshape", hotkey: "", capture: false),
+    CmdDef(cmd: .checkUpdates, title: "Check for updates…", keywords: "update upgrade new version download latest", icon: "arrow.down.circle", hotkey: "", capture: false),
     CmdDef(cmd: .about, title: "About Ather Screenshot", keywords: "version info help", icon: "info.circle", hotkey: "", capture: false),
     CmdDef(cmd: .quit, title: "Quit Ather Screenshot", keywords: "exit close", icon: "power.circle", hotkey: "", capture: false),
 ]

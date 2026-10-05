@@ -113,7 +113,7 @@ enum CaptionLook: Int, CaseIterable {
 struct Mark: Equatable {
     var id = UUID()
     var kind: MarkKind
-    var start: Double            // seconds in the source video
+    var start: Double            // seconds on the timeline
     var end: Double
     var a: CGPoint               // rect corners, or arrow tail → head; video pixels, top-left origin
     var b: CGPoint

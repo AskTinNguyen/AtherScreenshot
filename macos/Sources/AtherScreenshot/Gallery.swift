@@ -517,7 +517,7 @@ final class GalleryModel: ObservableObject {
     func importPanel() {
         let p = NSOpenPanel()
         p.allowsMultipleSelection = true
-        p.allowedContentTypes = [.image, .movie, .gif]
+        p.allowedContentTypes = MediaFiles.contentTypes(pictures: true, videos: true)
         if p.runModal() == .OK { importFiles(p.urls) }
     }
 

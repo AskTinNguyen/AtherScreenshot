@@ -50,6 +50,16 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var gifInterval = CMTime(value: 1, timescale: 15)
     private var stopTime = CMTime.invalid
     private var frameCount = 0
+    // Game controller overlay, burned into the frames (touched on `queue`).
+    private var pad: GamepadMonitor?
+    private var padCorner = PadCorner.bottomRight
+    private var padOpacity: CGFloat = 1
+    private var padScale: CGFloat = 1             // frame pixels per point
+    private var padTimer: DispatchSourceTimer?
+    private var padSeen = 0                       // the monitor's change count when the last frame was drawn
+    private var lastFrame: CVPixelBuffer?         // the last frame sent, with the pad drawn on it
+    private var lastFramePTS = CMTime.invalid     // raw host time it was captured at
+    private var underPad: (rect: CGRect, bytes: Data)?  // what the last frame looked like under the pad
 
     private let tmpURL: URL
     private var startDate = Date()
@@ -90,6 +100,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func startCapture() {
         phase = .starting
+        if s.bool("ShowGamepad") {
+            pad = GamepadMonitor()
+            padCorner = PadCorner.parse(s.string("GamepadCorner"))
+            padOpacity = CGFloat(max(10, min(100, s.int("GamepadOpacity")))) / 100
+        }
         if case .region(let r) = target { chrome.showFrame(around: r) }
         chrome.showBar(near: regionRect, recorder: self)
         Task { @MainActor in
@@ -158,6 +173,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             pxSize = CGSize(width: pxSize.width * k, height: pxSize.height * k)
         }
         let W = max(2, Int(pxSize.width) & ~1), H = max(2, Int(pxSize.height) & ~1)
+        padScale = CGFloat(W) / max(1, regionRect.width)
         let fps = gif ? max(1, min(50, s.int("GifFps"))) : max(1, min(120, s.int("VideoFps")))
         cfg.width = W
         cfg.height = H
@@ -218,6 +234,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if mic, #available(macOS 15.0, *) { try st.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue) }
         try await st.startCapture()
         stream = st
+        if pad != nil { startPadTimer(fps: fps) }
     }
 
     // MARK: samples
@@ -247,23 +264,116 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         case .screen:
             guard let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = atts.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete else { return }
+            if let px = sb.imageBuffer { drawPad(on: px, at: sb.presentationTimeStamp) }
             if gif { return gifFrame(sb) }
-            guard let w = writer, let v = videoIn, let sb2 = retimed(sb) else { return }
-            if !sessionStarted {
-                w.startSession(atSourceTime: sb2.presentationTimeStamp)
-                sessionStarted = true
-            }
-            let pts = sb2.presentationTimeStamp
-            if lastVideoPTS.isValid && pts <= lastVideoPTS { return }  // the writer fails on non-increasing timestamps
-            if v.isReadyForMoreMediaData, v.append(sb2) {
-                frameCount += 1
-                lastVideoPTS = pts
-            }
+            appendVideo(sb)
         case .audio:
             appendAudio(sb, to: audioIn, last: &lastAudioPTS)
         default:
             if #available(macOS 15.0, *), type == .microphone { appendAudio(sb, to: micIn, last: &lastMicPTS) }
         }
+    }
+
+    private func appendVideo(_ sb: CMSampleBuffer) {
+        guard let w = writer, let v = videoIn, let sb2 = retimed(sb) else { return }
+        if !sessionStarted {
+            w.startSession(atSourceTime: sb2.presentationTimeStamp)
+            sessionStarted = true
+        }
+        let pts = sb2.presentationTimeStamp
+        if lastVideoPTS.isValid && pts <= lastVideoPTS { return }  // the writer fails on non-increasing timestamps
+        if v.isReadyForMoreMediaData, v.append(sb2) {
+            frameCount += 1
+            lastVideoPTS = pts
+        }
+    }
+
+    // MARK: game controller
+
+    // Draws the latched pad state onto a fresh frame, keeping a clean copy of what's under it.
+    private func drawPad(on px: CVPixelBuffer, at pts: CMTime) {
+        guard let pad else { return }
+        padSeen = pad.changeCount
+        let state = pad.take()
+        let w = CVPixelBufferGetWidth(px), h = CVPixelBufferGetHeight(px)
+        let rect = Gamepad.footprint(frameW: w, frameH: h, corner: padCorner, scale: padScale)
+        underPad = Recorder.copyRows(px, rect).map { (rect, $0) }
+        Gamepad.draw(into: px, state: state, corner: padCorner, scale: padScale, opacity: padOpacity)
+        lastFrame = px
+        lastFramePTS = pts
+    }
+
+    // ScreenCaptureKit sends frames only when the screen changes. While it's still, a press must still show:
+    // resend the last frame with the new pad state. While paused, keep emptying the latch, so presses made
+    // during the pause don't all show at once after it.
+    private func startPadTimer(fps: Int) {
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        let interval = 1.0 / Double(fps)
+        t.schedule(deadline: .now() + interval, repeating: interval)
+        t.setEventHandler { [weak self] in self?.padTick(interval: interval) }
+        t.resume()
+        padTimer = t
+    }
+
+    private func padTick(interval: Double) {
+        guard let pad, !finished else { return }
+        if paused { _ = pad.take(); return }
+        guard pad.changeCount != padSeen, let last = lastFrame, let under = underPad, lastFramePTS.isValid else { return }
+        let now = Recorder.hostNow
+        guard CMTimeGetSeconds(CMTimeSubtract(now, lastFramePTS)) >= interval * 0.9 else { return }  // a real frame is due anyway
+        guard let copy = Recorder.copy(last) else { return }
+        Recorder.pasteRows(copy, under.rect, under.bytes)
+        drawPad(on: copy, at: now)
+        var fmt: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: copy, formatDescriptionOut: &fmt)
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: now, decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        guard let fmt, CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: copy, formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &sb) == noErr,
+              let sb else { return }
+        if resumeAt.isValid, now < resumeAt { return }
+        if gif { gifFrame(sb) } else { appendVideo(sb) }
+    }
+
+    static func copyRows(_ px: CVPixelBuffer, _ r: CGRect) -> Data? {
+        guard !r.isEmpty else { return nil }
+        CVPixelBufferLockBaseAddress(px, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(px) else { return nil }
+        let bpr = CVPixelBufferGetBytesPerRow(px), x = Int(r.minX) * 4, n = Int(r.width) * 4
+        var d = Data(count: n * Int(r.height))
+        d.withUnsafeMutableBytes { dst in
+            for row in 0..<Int(r.height) {
+                memcpy(dst.baseAddress! + row * n, base + (Int(r.minY) + row) * bpr + x, n)
+            }
+        }
+        return d
+    }
+
+    static func pasteRows(_ px: CVPixelBuffer, _ r: CGRect, _ d: Data) {
+        CVPixelBufferLockBaseAddress(px, [])
+        defer { CVPixelBufferUnlockBaseAddress(px, []) }
+        guard let base = CVPixelBufferGetBaseAddress(px) else { return }
+        let bpr = CVPixelBufferGetBytesPerRow(px), x = Int(r.minX) * 4, n = Int(r.width) * 4
+        d.withUnsafeBytes { src in
+            for row in 0..<Int(r.height) { memcpy(base + (Int(r.minY) + row) * bpr + x, src.baseAddress! + row * n, n) }
+        }
+    }
+
+    static func copy(_ px: CVPixelBuffer) -> CVPixelBuffer? {
+        let w = CVPixelBufferGetWidth(px), h = CVPixelBufferGetHeight(px)
+        var out: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs, &out) == kCVReturnSuccess, let out else { return nil }
+        CVPixelBufferLockBaseAddress(px, .readOnly)
+        CVPixelBufferLockBaseAddress(out, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(out, [])
+            CVPixelBufferUnlockBaseAddress(px, .readOnly)
+        }
+        guard let src = CVPixelBufferGetBaseAddress(px), let dst = CVPixelBufferGetBaseAddress(out) else { return nil }
+        let sb = CVPixelBufferGetBytesPerRow(px), db = CVPixelBufferGetBytesPerRow(out)
+        for row in 0..<h { memcpy(dst + row * db, src + row * sb, min(sb, db)) }
+        return out
     }
 
     private func appendAudio(_ sb: CMSampleBuffer, to input: AVAssetWriterInput?, last: inout CMTime) {
@@ -321,6 +431,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func finishedCleanup() {
         if Recorder.current === self { Recorder.current = nil }
+        queue.async {
+            self.padTimer?.cancel()
+            self.padTimer = nil
+            self.lastFrame = nil
+            self.underPad = nil
+            self.pad = nil
+        }
         AppDelegate.shared?.recordingChanged()
         let f = Recorder.onFinished
         Recorder.onFinished = []
