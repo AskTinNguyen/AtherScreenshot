@@ -23,15 +23,15 @@
 
 ## Download
 
-Windows **0.0.2** · macOS **0.0.1** (the Mac gets the 0.0.2 features next)
+Version **0.0.2** for macOS and Windows. Both update themselves from inside the app.
 
 | Platform | Download | Size | Requirements |
 |---|---|---|---|
-| **macOS** | [**AtherScreenshot-0.0.1-macOS.dmg**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-macOS.dmg) | 3.7 MB | macOS 14+, Apple silicon and Intel |
+| **macOS** | [**AtherScreenshot-0.0.2-macOS.dmg**](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.dmg) | 4.0 MB | macOS 14+, Apple silicon and Intel |
 | **Windows** | [**AtherScreenshot-Setup-0.0.2.exe**](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe) | 2.7 MB | Windows 10/11, x64 |
 | Windows (portable) | [AtherScreenshot-0.0.2-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
 
-Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/SHA256SUMS.txt) · Windows files are on the [v0.0.2 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.2); earlier ones on [v0.0.1](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
+Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/SHA256SUMS-macOS.txt) · [Windows](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/SHA256SUMS.txt) · All files are on the [v0.0.2 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.2); earlier ones on [v0.0.1](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
 
 **First launch.** The builds aren't signed yet, so your OS asks once:
 
@@ -47,8 +47,8 @@ Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](https://github.c
 | 📸 **Capture** | Region, window, full screen, scrolling pages, delay timer, screen ruler, color picker, OCR text, and auto-redaction of emails, keys and card numbers |
 | ✏️ **Annotate** | Arrows, shapes, text, steps, highlighter, blur and pixelate, spotlight, magnifier, crop and styled export |
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
-| 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller (Windows) |
-| 🎬 **Edit video** | Trim, crop, speed, join several videos (Windows), auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
+| 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
+| 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3) |
@@ -288,7 +288,10 @@ How the Windows app differs from the Mac app:
   - Auto captions use Windows speech recognition (SAPI dictation), on this PC.
   - The emoji field uses Win+. for the full picker.
   - The selected item shows fully while paused (the Mac version shows its first, faded frame).
-- **Recording:** system audio and microphone are mixed into one AAC track (two tracks on the Mac).
+- **Recording:**
+  - System audio and microphone are mixed into one AAC track (two tracks on the Mac).
+  - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.
+- **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 
 ## Build from source
 

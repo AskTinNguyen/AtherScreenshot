@@ -74,7 +74,8 @@ if [ "$MODE" = "publish" ]; then
   REPO=AskTinNguyen/AtherScreenshot
   TAG="v$VERSION"
   gh release view "$TAG" --repo "$REPO" >/dev/null || { echo "No release $TAG yet: publish Windows first (package.bat publish)."; exit 1; }
-  gh release upload "$TAG" "$DMG" "$ZIP" --repo "$REPO" --clobber
+  cp dist/SHA256SUMS.txt dist/SHA256SUMS-macOS.txt  # the release's SHA256SUMS.txt is the Windows one
+  gh release upload "$TAG" "$DMG" "$ZIP" dist/SHA256SUMS-macOS.txt --repo "$REPO" --clobber
   WORK=$(mktemp -d)
   gh release download "$TAG" --repo "$REPO" --pattern latest.json --dir "$WORK" 2>/dev/null || echo '{}' > "$WORK/latest.json"
   # Only the macos entry changes; windows (and anything else) stays as it is.
