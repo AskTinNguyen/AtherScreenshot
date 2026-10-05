@@ -46,14 +46,14 @@ private:
     std::thread thread_;
 };
 
-// Where the overlay goes: (x, y) is the top-left of its 240 × 150 design box, `u` pixels per design unit.
+// Where the overlay goes: (x, y) is the top-left of its 240 × 172 design box, `u` pixels per design unit.
 struct PadLayout {
     float x = 0, y = 0, u = 1;
     POINT At(float dx, float dy) const { return {(LONG)(x + dx * u), (LONG)(y + dy * u)}; }
 };
 PadLayout GamepadLayout(int frameW, int frameH, PadCorner corner, float dpi);
 // Design-box positions of a few controls (for tests).
-constexpr float kPadA[2] = {180, 75}, kPadLeftStick[2] = {60, 64}, kPadLT[2] = {63, 12};
+constexpr float kPadA[2] = {196.7f, 67.1f}, kPadLeftStick[2] = {43, 49}, kPadLT[2] = {46, -2};
 
 // Draws the controller onto opaque BGRA frame pixels at `opacity` (0…1). Does nothing for a disconnected pad.
 void DrawGamepad(Bitmap& frame, const PadState& s, PadCorner corner, float dpi, float opacity = 1);
