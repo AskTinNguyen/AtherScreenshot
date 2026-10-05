@@ -61,13 +61,23 @@ final class Settings: ObservableObject {
     var capturesFolder: URL {
         let custom = string("SaveFolder")
         if !custom.isEmpty { return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true) }
+        if Settings.underTests { return Settings.testFolder.appendingPathComponent("Captures", isDirectory: true) }
         let pictures = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first!
         return pictures.appendingPathComponent(kAppName, isDirectory: true)
     }
 
+    // Tests never touch the real library or captures: without an explicit folder they get a temporary one.
+    static let underTests = NSClassFromString("XCTestCase") != nil
+    static let testFolder: URL = {
+        let u = FileManager.default.temporaryDirectory.appendingPathComponent("ather-tests-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: u.appendingPathComponent("Support"), withIntermediateDirectories: true)
+        return u
+    }()
+
     static var supportFolder: URL {
         // Tests point this elsewhere so they never touch the real library.
         if let o = ProcessInfo.processInfo.environment["ATHER_SUPPORT_DIR"] { return URL(fileURLWithPath: o, isDirectory: true) }
+        if underTests { return testFolder.appendingPathComponent("Support", isDirectory: true) }
         let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent(kAppName, isDirectory: true)
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)

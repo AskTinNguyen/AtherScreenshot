@@ -95,6 +95,67 @@ enum VideoSource {
     }
 }
 
+// MARK: - Retiming
+
+extension VideoEdit {
+    // Replaces the clips and moves everything on the timeline with the footage it sits on (ApplyClips in
+    // videoedit.cpp, same rules): an item stays at the same moment of the same file, looked up in any clip with
+    // the same `source` that still shows it (the same clip first, which keeps things in place across a split).
+    // Otherwise it falls back to its clip, clamped, and goes when that clip is gone or both its ends were cut off
+    // on the same side. Items keep their length; the trim follows its footage.
+    mutating func applyClips(_ clips: [Clip]) {
+        let before = self.clips
+        let oldTotal = VideoSequence.total(before), newTotal = VideoSequence.total(clips)
+        let starts = VideoSequence.starts(clips)
+        struct Landing { var t: Double?; var side = 0; var clip: UUID? }
+        func land(_ t: Double) -> Landing {
+            var l = Landing()
+            guard let spot = VideoSequence.locate(before, t) else { return l }
+            let oc = before[spot.index], src = spot.fileTime
+            var found: Int?
+            for (i, nc) in clips.enumerated() {
+                guard nc.source == oc.source, nc.path.lowercased() == oc.path.lowercased(), src >= nc.inPoint - 1e-6, src <= nc.outPoint + 1e-6 else { continue }
+                if found == nil || nc.id == oc.id { found = i }
+            }
+            if found == nil { found = clips.firstIndex { $0.id == oc.id } }
+            guard let k = found else { return l }
+            let nc = clips[k]
+            l.clip = nc.id
+            l.side = src < nc.inPoint - 1e-6 ? -1 : src > nc.outPoint + 1e-6 ? 1 : 0
+            l.t = starts[k] + min(max(0, src - nc.inPoint), nc.duration)
+            return l
+        }
+        func move(_ start: inout Double, _ end: inout Double) -> Bool {
+            let a = land(start), b = land(max(start, end - 1e-6))
+            guard let at = a.t else { return false }
+            if a.side != 0 && b.clip == a.clip && b.side == a.side { return false }
+            let len = end - start
+            start = min(at, max(0, newTotal - 0.1))
+            end = min(newTotal, start + len)
+            return end > start
+        }
+        marks = marks.compactMap { m in
+            var m = m
+            return move(&m.start, &m.end) ? m : nil
+        }
+        captions = captions.compactMap { c in
+            var c = c
+            let s0 = c.start
+            guard move(&c.start, &c.end) else { return nil }
+            for i in c.words.indices { c.words[i].start += c.start - s0; c.words[i].end += c.start - s0 }
+            return c
+        }
+        captions = captions.enumerated().sorted { ($0.element.start, $0.offset) < ($1.element.start, $1.offset) }.map(\.element)
+        // An untouched end stays at the end; otherwise both ends follow their footage.
+        let wholeStart = trimStart <= 1e-6, wholeEnd = trimEnd >= oldTotal - 1e-6
+        let ts = land(trimStart), te = land(max(0, trimEnd - 1e-6))
+        trimStart = wholeStart || ts.t == nil ? 0 : ts.t!
+        trimEnd = wholeEnd || te.t == nil ? newTotal : min(newTotal, te.t! + (te.side != 0 ? 0 : 1e-6))  // looked up just before itself
+        if trimEnd - trimStart < 0.1 { trimStart = 0; trimEnd = newTotal }
+        self.clips = clips
+    }
+}
+
 // MARK: - The sequence: clips end to end, as one composition
 
 // Timeline time is the clips laid end to end. The preview player, export, GIF, thumbnails, frame grabs and auto
@@ -122,6 +183,7 @@ enum VideoSequence {
     struct Built {
         let composition: AVMutableComposition
         let video: AVMutableVideoComposition
+        let unplayable: Set<UUID>  // clips whose file couldn't be read: black in the composition, skipped while playing
     }
 
     private static let scale: CMTimeScale = 60000
@@ -132,49 +194,57 @@ enum VideoSequence {
         let comp = AVMutableComposition()
         guard let vtrack = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw VideoSource.Failure.noVideo }
         var audio: [AVMutableCompositionTrack] = []
-        struct Piece { let clip: Clip; let timelineStart: Double }
+        struct Piece { let index: Int; let timelineStart: Double; let at: CMTime; let duration: CMTime }
         var pieces: [Piece] = []
+        var unplayable: Set<UUID> = []
         var cursor = CMTime.zero
         let a = range?.lowerBound ?? 0, b = range?.upperBound ?? .infinity
         var timeline = 0.0
-        for c in clips {
+        for (i, c) in clips.enumerated() {
             defer { timeline += c.duration }
             let from = max(a, timeline), to = min(b, timeline + c.duration)
             guard to - from > 0.0005 else { continue }
-            let asset = AVURLAsset(url: c.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-            guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw VideoSource.Failure.noVideo }
             let src = CMTimeRange(start: CMTime(seconds: c.inPoint + from - timeline, preferredTimescale: scale),
                                   duration: CMTime(seconds: to - from, preferredTimescale: scale))
-            try vtrack.insertTimeRange(src, of: vt, at: cursor)
-            if !muted && c.hasAudio {
-                let tracks = try await asset.loadTracks(withMediaType: .audio).filter { VideoSource.decodes(asset, $0) }
+            let asset = AVURLAsset(url: c.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+            do {
+                guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw VideoSource.Failure.noVideo }
+                try vtrack.insertTimeRange(src, of: vt, at: cursor)
+            } catch {
+                // Moved, deleted or unreadable since it was added: keep its time (so everything after stays in
+                // sync) and let playback skip it.
+                vtrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: src.duration))
+                unplayable.insert(c.id)
+            }
+            if !muted && c.hasAudio && !unplayable.contains(c.id) {
+                let tracks = (try? await asset.loadTracks(withMediaType: .audio))?.filter { VideoSource.decodes(asset, $0) } ?? []
                 for (k, at) in tracks.enumerated() {
                     if k >= audio.count, let t = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) { audio.append(t) }
                     guard k < audio.count else { break }
                     // Clips without sound leave a silent gap, so the sound stays in sync after them.
                     let end = audio[k].timeRange.end
                     if end < cursor { audio[k].insertEmptyTimeRange(CMTimeRange(start: end, end: cursor)) }
-                    let len = min(src.duration, CMTimeSubtract(try await at.load(.timeRange).end, src.start))
-                    if len > .zero { try audio[k].insertTimeRange(CMTimeRange(start: src.start, duration: len), of: at, at: cursor) }
+                    let len = min(src.duration, CMTimeSubtract((try? await at.load(.timeRange).end) ?? .zero, src.start))
+                    if len > .zero { try? audio[k].insertTimeRange(CMTimeRange(start: src.start, duration: len), of: at, at: cursor) }
                 }
             }
-            pieces.append(Piece(clip: c, timelineStart: from))
+            pieces.append(Piece(index: i, timelineStart: from, at: cursor, duration: src.duration))
             cursor = CMTimeAdd(cursor, src.duration)
         }
-        guard !pieces.isEmpty else { throw VideoSource.Failure.noVideo }
+        guard !pieces.isEmpty, unplayable.count < pieces.count else { throw VideoSource.Failure.noVideo }
         if speed != 1 {
             comp.scaleTimeRange(CMTimeRange(start: .zero, duration: cursor), toDuration: CMTimeMultiplyByFloat64(cursor, multiplier: 1 / speed))
         }
-        // One instruction per piece, from the track's own segments, so a clip boundary lands exactly where the
-        // composition switches files (rounding of the speed change included).
-        let segments = vtrack.segments.filter { !$0.isEmpty }
+        // One instruction per piece, back to back (consecutive pieces of one file may share a track segment, so
+        // these come from the pieces, not the segments). Each knows its neighbours, in case a frame right at a cut
+        // comes from the other side.
         var instructions: [SequenceInstruction] = []
-        for (i, seg) in segments.enumerated() where i < pieces.count {
-            var r = seg.timeMapping.target
-            if let last = instructions.last { r = CMTimeRange(start: last.timeRange.end, end: r.end) }  // no gaps
-            if i == segments.count - 1 || i == pieces.count - 1 { r = CMTimeRange(start: r.start, end: max(r.end, comp.duration)) }
-            instructions.append(SequenceInstruction(range: r, track: vtrack.trackID, clip: pieces[i].clip, frame: frame,
-                                                    timelineStart: pieces[i].timelineStart, speed: speed, box: box))
+        for (n, p) in pieces.enumerated() {
+            let start = instructions.last?.timeRange.end ?? .zero
+            let end = n == pieces.count - 1 ? comp.duration : CMTimeMultiplyByFloat64(CMTimeAdd(p.at, p.duration), multiplier: 1 / speed)
+            let near = [n > 0 ? pieces[n - 1].index : nil, n + 1 < pieces.count ? pieces[n + 1].index : nil].compactMap { $0 }.map { clips[$0] }
+            instructions.append(SequenceInstruction(range: CMTimeRange(start: start, end: max(start, end)), track: vtrack.trackID, clip: clips[p.index],
+                                                    neighbours: near, frame: frame, timelineStart: p.timelineStart, speed: speed, box: box))
         }
         let vc = AVMutableVideoComposition()
         vc.customVideoCompositorClass = SequenceCompositor.self
@@ -182,7 +252,7 @@ enum VideoSequence {
         vc.renderSize = box.renderer.out
         let fps = clips.first.map { $0.fps > 1 ? min(60, $0.fps.rounded()) : 30 } ?? 30
         vc.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        return Built(composition: comp, video: vc)
+        return Built(composition: comp, video: vc, unplayable: unplayable)
     }
 
     // A clip's frame turned upright and fitted into the sequence frame with black bars (CI coordinates, y up).
@@ -213,16 +283,18 @@ final class SequenceInstruction: NSObject, AVVideoCompositionInstructionProtocol
     let passthroughTrackID = kCMPersistentTrackID_Invalid
     let track: CMPersistentTrackID
     let clip: Clip
+    let neighbours: [Clip]
     let frame: CGSize
     let timelineStart: Double  // timeline time at the start of this instruction
     let speed: Double
     let box: RendererBox
 
-    init(range: CMTimeRange, track: CMPersistentTrackID, clip: Clip, frame: CGSize, timelineStart: Double, speed: Double, box: RendererBox) {
+    init(range: CMTimeRange, track: CMPersistentTrackID, clip: Clip, neighbours: [Clip], frame: CGSize, timelineStart: Double, speed: Double, box: RendererBox) {
         timeRange = range
         self.track = track
         requiredSourceTrackIDs = [NSNumber(value: track)]
         self.clip = clip
+        self.neighbours = neighbours
         self.frame = frame
         self.timelineStart = timelineStart
         self.speed = speed
@@ -230,6 +302,14 @@ final class SequenceInstruction: NSObject, AVVideoCompositionInstructionProtocol
     }
 
     func timelineTime(_ t: CMTime) -> Double { timelineStart + CMTimeSubtract(t, timeRange.start).seconds * speed }
+
+    // The clip a decoded frame belongs to: this one, unless its stored size says it's from the clip next door.
+    func clip(for frame: CVPixelBuffer) -> Clip {
+        let w = CVPixelBufferGetWidth(frame), h = CVPixelBufferGetHeight(frame)
+        func fits(_ c: Clip) -> Bool { c.rotation % 180 == 0 ? (c.w == w && c.h == h) : (c.w == h && c.h == w) }
+        if fits(clip) { return clip }
+        return neighbours.first(where: fits) ?? clip
+    }
 }
 
 final class SequenceCompositor: NSObject, AVVideoCompositing {
@@ -248,7 +328,7 @@ final class SequenceCompositor: NSObject, AVVideoCompositing {
             return req.finish(with: NSError(domain: "Ather", code: 1, userInfo: [NSLocalizedDescriptionKey: "No frame to render."]))
         }
         let size = req.renderContext.size
-        let src = req.sourceFrame(byTrackID: ins.track).map { VideoSequence.place(CIImage(cvPixelBuffer: $0), clip: ins.clip, frame: ins.frame) }
+        let src = req.sourceFrame(byTrackID: ins.track).map { VideoSequence.place(CIImage(cvPixelBuffer: $0), clip: ins.clip(for: $0), frame: ins.frame) }
             ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: ins.frame))
         let img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
         SequenceCompositor.context.render(img, to: out, bounds: CGRect(origin: .zero, size: size), colorSpace: space)

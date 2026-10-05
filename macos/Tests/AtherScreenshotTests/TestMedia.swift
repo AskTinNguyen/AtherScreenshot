@@ -23,7 +23,10 @@ enum TestMedia {
         }
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
+        // Video and sound go in interleaved: the writer stops taking one while the other lags too far behind.
         let n = Int(seconds * Double(fps))
+        let rate = 48000.0, total = Int(seconds * rate)
+        var at = 0
         for i in 0..<n {
             while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
             var pb: CVPixelBuffer?
@@ -36,21 +39,20 @@ enum TestMedia {
             paint(i, ctx)
             CVPixelBufferUnlockBaseAddress(pb!, [])
             ad.append(pb!, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+            if let a = audio {
+                let upTo = i == n - 1 ? total : min(total, Int((Double(i + 1) / Double(fps) + 1) * rate))  // sound a second ahead
+                while at < upTo {
+                    while !a.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
+                    let k = min(4800, upTo - at)
+                    var samples = [Int16](repeating: 0, count: k)
+                    for j in 0..<k { samples[j] = Int16(sin(2 * .pi * 440 * Double(at + j) / rate) * 12000) }
+                    a.append(pcm(samples, at: at, rate: rate))
+                    at += k
+                }
+                if at >= total { a.markAsFinished(); audio = nil }  // the writer holds video back while sound may still come
+            }
         }
         input.markAsFinished()
-        if let a = audio {
-            let rate = 48000.0, total = Int(seconds * rate), chunk = 4800
-            var at = 0
-            while at < total {
-                while !a.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
-                let k = min(chunk, total - at)
-                var samples = [Int16](repeating: 0, count: k)
-                for j in 0..<k { samples[j] = Int16(sin(2 * .pi * 440 * Double(at + j) / rate) * 12000) }
-                a.append(pcm(samples, at: at, rate: rate))
-                at += k
-            }
-            a.markAsFinished()
-        }
         await writer.finishWriting()
         if writer.status != .completed { throw writer.error ?? VideoSource.Failure.noVideo }
         return url
