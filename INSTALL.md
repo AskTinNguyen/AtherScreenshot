@@ -24,13 +24,17 @@ The installer:
 
 Every feature is in the command palette. Change shortcuts and options in **Settings** (palette → "Settings").
 
-Click the notification after a recording (or open an MP4 from the gallery) to trim it, crop it, change its speed, and add captions and callouts. **Auto captions** use Windows speech recognition on your PC. If it isn't installed for your language, add a speech pack in Windows Settings › Time & language › Speech.
+Click the notification after a recording (or open a video from the gallery) to trim it, crop it, change its speed, add captions and callouts, and join more videos to it (Add › Video clip…, or drop them on the editor).
+
+Pictures and videos from anywhere open too: right-click one in Explorer › **Edit with Ather Screenshot** (or **Open with**). Edits are saved as new files in your captures; the original is never changed. **Auto captions** use Windows speech recognition on your PC. If it isn't installed for your language, add a speech pack in Windows Settings › Time & language › Speech.
 
 **If PrintScreen doesn't work:** go to Windows Settings › Accessibility › Keyboard and turn off *"Use the Print screen key to open screen capture"*. Also close ShareX, Lightshot or any other tool that uses that key.
 
 ## Update
 
-Run the newer `AtherScreenshot-Setup-<version>.exe` and click **UPDATE**. Your settings and captures are kept.
+From 0.0.2 the app updates itself. It checks once a day, tells you when there's a new version, and installs it when you click the notification, or **Update to version …** in the tray menu. "Check for updates…" checks right away; Settings › Updates turns the daily check off.
+
+Running a newer `AtherScreenshot-Setup-<version>.exe` and clicking **UPDATE** works too. Either way your settings, captures and gallery are kept.
 
 ## Uninstall
 

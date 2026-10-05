@@ -6,6 +6,7 @@ rem                             new build of the same version) and writes downlo
 rem                             that file too: copies before 0.0.2.1 look for updates there.
 rem Running copies find the update within a day (or at once with "Check for updates...").
 rem Set UPDATE_NOTES to one line about what's new; the app shows it when it offers the update.
+rem RELEASE_NOTES.md is the release page text: update it for every release (and re-run publish to refresh it).
 rem A re-release of the same version: raise ATHER_VERSION_BUILD and ATHER_BUILD_STR in src\version.h.
 rem Optional code signing (removes the SmartScreen "unknown publisher" warning):
 rem   set SIGN_PFX=path\to\cert.pfx & set SIGN_PASSWORD=...   before running.
@@ -63,9 +64,10 @@ git branch -r --contains %COMMIT% | findstr /c:"origin/" >nul || (echo Push %COM
 set ASSETS="%DIST%\AtherScreenshot-Setup-%VER%.exe" "%DIST%\AtherScreenshot-%VER%-portable.zip" "%DIST%\SHA256SUMS.txt" "%DIST%\latest.json"
 gh release view v%VER% --repo %REPO% >nul 2>nul
 if errorlevel 1 (
-  gh release create v%VER% %ASSETS% --repo %REPO% --target %COMMIT% --title "Ather Screenshot %VER%" --notes-file INSTALL.md --latest || exit /b 1
+  gh release create v%VER% %ASSETS% --repo %REPO% --target %COMMIT% --title "Ather Screenshot %VER%" --notes-file RELEASE_NOTES.md --latest || exit /b 1
 ) else (
   gh release upload v%VER% %ASSETS% --repo %REPO% --clobber || exit /b 1
+  gh release edit v%VER% --repo %REPO% --notes-file RELEASE_NOTES.md || exit /b 1
 )
 if not exist downloads mkdir downloads
 copy /y "%DIST%\latest.json" downloads\latest.json >nul || exit /b 1

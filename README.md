@@ -23,13 +23,13 @@
 
 ## Download
 
-Windows **0.0.2** · macOS **0.0.1** (the Mac gets the 0.0.2 features next)
+Windows **0.0.2** · macOS **0.0.1** (the Mac gets the 0.0.2 features next) · [What's new in 0.0.2](RELEASE_NOTES.md): updates from inside the app, your game controller in recordings, editing any picture or video, and joining videos into one.
 
 | Platform | Download | Size | Requirements |
 |---|---|---|---|
 | **macOS** | [**AtherScreenshot-0.0.1-macOS.dmg**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-macOS.dmg) | 3.7 MB | macOS 14+, Apple silicon and Intel |
-| **Windows** | [**AtherScreenshot-Setup-0.0.2.exe**](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe) | 2.7 MB | Windows 10/11, x64 |
-| Windows (portable) | [AtherScreenshot-0.0.2-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
+| **Windows** | [**AtherScreenshot-Setup-0.0.2.exe**](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe) | 2.8 MB | Windows 10/11, x64 |
+| Windows (portable) | [AtherScreenshot-0.0.2-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-portable.zip) | 1.3 MB | Windows 10/11, x64, no install |
 
 Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/SHA256SUMS.txt) · Windows files are on the [v0.0.2 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.2); earlier ones on [v0.0.1](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
 
