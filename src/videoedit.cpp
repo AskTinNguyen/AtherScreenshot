@@ -258,12 +258,13 @@ void ApplyClips(VideoEdit& e, std::vector<Clip> clips) {
         if (!spot) return l;
         const Clip& oc = before[spot->first];
         const double src = spot->second;
-        // The footage may now be in another clip of the same file (a split): any clip that shows this moment
-        // will do, the same clip first. Otherwise the same clip, where the moment was cut off.
+        // The footage may now be in another piece of the same video (a split): any piece that shows this moment
+        // will do, the same clip first. Not another copy of the file added separately. Otherwise the same clip,
+        // where the moment was cut off.
         std::optional<size_t> found;
         for (size_t i = 0; i < clips.size(); ++i) {
             const Clip& nc = clips[i];
-            if (_wcsicmp(nc.path.c_str(), oc.path.c_str()) != 0 || src < nc.in - 1e-6 || src > nc.out + 1e-6) continue;
+            if (nc.source != oc.source || _wcsicmp(nc.path.c_str(), oc.path.c_str()) != 0 || src < nc.in - 1e-6 || src > nc.out + 1e-6) continue;
             if (!found || nc.id == oc.id) found = i;
         }
         for (size_t i = 0; i < clips.size() && !found; ++i)
@@ -1281,6 +1282,19 @@ ATHER_TEST(video_clip_changes_move_items_with_their_footage) {
     ApplyClips(split, {right, b});
     CHECK_EQ(split.marks.size(), 1u);
     CHECK_NEAR(split.marks[0].start, 3, 1e-9);
+
+    VideoEdit twice;  // the same file added twice: removing one copy drops its items, they don't jump to the other
+    Clip x1 = TestClip(L"x", 0, 10), x2 = TestClip(L"x", 0, 10);
+    x1.source = 1;
+    x2.source = 2;
+    twice.clips = {x1, x2};
+    twice.trimEnd = 18;
+    Caption late;
+    late.start = 15, late.end = 17;
+    twice.captions = {late};
+    ApplyClips(twice, {x1});
+    CHECK(twice.captions.empty());
+    CHECK_NEAR(twice.trimEnd, 10, 1e-9);
 
     VideoEdit kept = e;  // the trim follows its footage
     kept.trimStart = 1;  // 1 s into a

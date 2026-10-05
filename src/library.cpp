@@ -92,7 +92,7 @@ static std::wstring ExtOf(const std::wstring& path) {
 MediaType MediaTypeOf(const std::wstring& path) {
     const std::wstring e = ExtOf(path);
     if (e == L"gif") return MediaType::Gif;
-    if (e == L"mp4" || e == L"mov" || e == L"m4v") return MediaType::Video;
+    if (e == L"mp4" || e == L"mov" || e == L"m4v" || e == L"wmv" || e == L"avi" || e == L"mkv") return MediaType::Video;
     return MediaType::Image;
 }
 
@@ -103,7 +103,8 @@ const wchar_t* MediaTypeWords(MediaType t) {
 }
 
 bool IsMediaFile(const std::wstring& path) {
-    static const wchar_t* const kExts[] = {L"png", L"jpg", L"jpeg", L"gif", L"mp4", L"mov", L"m4v", L"heic", L"tif", L"tiff", L"webp", L"bmp"};
+    static const wchar_t* const kExts[] = {L"png", L"jpg", L"jpeg", L"gif", L"mp4", L"mov", L"m4v", L"wmv", L"avi", L"mkv",
+                                           L"heic", L"tif", L"tiff", L"webp", L"bmp"};
     const std::wstring e = ExtOf(path);
     for (const wchar_t* k : kExts)
         if (e == k) return true;
@@ -1211,7 +1212,9 @@ void Library::IndexInBackground() {
     std::vector<Todo> todo;
     for (const auto& p : paths_) {
         auto it = meta_.find(p);
-        if (it == meta_.end() || it->second.indexed >= kIndexVersion) continue;
+        // Pictures indexed by version 1 are still right; only videos changed in version 2.
+        const int needed = MediaTypeOf(p) == MediaType::Video ? kIndexVersion : 1;
+        if (it == meta_.end() || it->second.indexed >= needed) continue;
         // Text survives only for legacy-imported OCR of an unchanged file.
         todo.push_back({p, it->second.mtime, !it->second.text.has_value()});
     }

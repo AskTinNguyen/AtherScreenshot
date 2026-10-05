@@ -21,7 +21,8 @@ struct UpdateInfo {
 int CompareVersions(const std::wstring& a, const std::wstring& b);
 // The Windows entry of a manifest, if it's well-formed and points at this repository over HTTPS.
 std::optional<UpdateInfo> ParseUpdateManifest(const std::string& json, bool allowLocalhost = false);
-// True when the file is exactly the update the manifest describes. Otherwise *error says why.
+// True when the file is exactly the update the manifest describes (its version compared as numbers, so "0.0.3"
+// matches "0.0.3.0"). Otherwise *error says why.
 bool VerifyUpdateFile(const std::wstring& path, const UpdateInfo& info, std::wstring* error);
 // Puts `staged` in place of `target`, keeping the old one as target.old (rolled back on failure).
 bool SwapExe(const std::wstring& target, const std::wstring& staged, std::wstring* error);
@@ -37,7 +38,10 @@ void DownloadUpdateAsync(const UpdateInfo& info, std::function<void(double)> pro
 bool InstallStagedUpdate(const std::wstring& staged, std::wstring* error);
 
 // At startup, before the single-instance check. `--after-update <pid>`: waits for the old copy to exit and
-// returns true (show "Updated"). Always removes leftovers of an earlier update.
+// returns true (show "Updated").
 bool FinishUpdate(const std::wstring& cmdline);
+// Removes leftovers of an earlier update (<exe>.old, <exe>.update). Only the running instance may call it: another
+// one may be downloading into <exe>.update right now.
+void CleanUpUpdateFiles();
 
 }  // namespace ather

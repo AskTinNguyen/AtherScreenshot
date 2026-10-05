@@ -97,6 +97,7 @@ struct Caption {
 // each is fitted into the sequence frame (black bars when the shape differs).
 struct Clip {
     uint64_t id = NewItemId();
+    uint64_t source = 0;  // shared by the pieces split from one added video (not by a second copy of the file)
     std::wstring path;
     double in = 0, out = 0;
     double length = 0;  // the whole file

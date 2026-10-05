@@ -234,7 +234,7 @@ bool VerifyUpdateFile(const std::wstring& path, const UpdateInfo& info, std::wst
         *error = L"The download doesn't match its checksum, so it wasn't installed.";
         return false;
     }
-    if (ExeVersion(path) != info.version) {
+    if (CompareVersions(ExeVersion(path), info.version) != 0 || ExeVersion(path).empty()) {
         *error = L"The download isn't Ather Screenshot " + info.version + L", so it wasn't installed.";
         return false;
     }
@@ -335,12 +335,16 @@ bool FinishUpdate(const std::wstring& cmdline) {
             CloseHandle(p);
         }
     }
+    return after;
+}
+
+void CleanUpUpdateFiles() {
     const std::wstring self = SelfExe();
     for (const wchar_t* ext : {L".old", L".update"}) {
         const std::wstring f = self + ext;
+        // The old exe can still be mapped for a moment after its process exits.
         for (int i = 0; i < 10 && GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(f.c_str()); ++i) Sleep(200);
     }
-    return after;
 }
 
 // ---- tests ----
@@ -385,6 +389,9 @@ ATHER_TEST(updater_verifies_and_swaps_the_exe) {
     std::wstring err;
     CHECK(info.sha256.size() == 64);
     CHECK(VerifyUpdateFile(staged, info, &err));
+    UpdateInfo padded = info;
+    padded.version += L".0";  // "0.0.2.0" is the same version as the "0.0.2" inside the exe
+    CHECK(VerifyUpdateFile(staged, padded, &err));
     UpdateInfo wrong = info;
     wrong.sha256[0] = wrong.sha256[0] == L'0' ? L'1' : L'0';
     CHECK(!VerifyUpdateFile(staged, wrong, &err) && err.find(L"checksum") != std::wstring::npos);

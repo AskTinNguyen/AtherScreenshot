@@ -476,6 +476,7 @@ std::wstring InstalledExePath() { return InstallDir() + L"\\AtherScreenshot.exe"
 void RefreshInstallRecord() {
     const std::wstring target = InstalledExePath();
     if (_wcsicmp(SelfPath().c_str(), target.c_str()) != 0) return;  // portable: nothing registered
+    if (InstalledVersion() == ATHER_VERSION_WSTR) return;           // up to date
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
         WIN32_FILE_ATTRIBUTE_DATA fa{};

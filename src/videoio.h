@@ -33,8 +33,11 @@ struct Sequence {
     std::vector<Clip> clips;
     SIZE size{};
     double Duration() const { return ClipsDuration(clips); }
+    double Fps() const;     // the highest of the clips (≤ 60), 30 when unknown
+    bool HasAudio() const;  // any clip with sound
 };
-// The whole file as a clip; nothing when it can't be read as a video.
+// The whole file as a clip; nothing when it can't be decoded here (a frame is read to make sure: a container can
+// open fine while its codec isn't installed). Its sound counts only if it can be decoded too.
 std::optional<Clip> ClipOf(const std::wstring& path);
 // The edit's clips in its frame, or the whole `source` file when the edit has no clips.
 Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
@@ -83,8 +86,8 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps = 12,
                ExportProgress progress = {});
 
-// `count` frames spread over the sequence, each at most `maxSide` pixels.
-std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide);
+// `count` frames spread over the sequence, each at most `maxSide` pixels. `cancelled` is asked between frames.
+std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide, const std::function<bool()>& cancelled = {});
 
 // Speech in [from, to) of the video as caption-sized chunks with word times, on this PC. Blocking: call from
 // a worker thread with COM initialized.
@@ -103,7 +106,10 @@ public:
     double Now() const;
     void SetRate(double r);
     void SetMuted(bool m);
-    BitmapPtr NewFrame(double* t);  // the newest decoded frame, or null when there is no new one
+    // The newest decoded frame, or null when there is no new one. With `frame`, it comes `frame`-sized, with the
+    // picture (`content`: its stored size, or the engine's own) fitted in on black — scaled by the engine.
+    BitmapPtr NewFrame(double* t, SIZE frame = {}, SIZE content = {});
+    bool Failed() const;  // the engine hit an error: it won't play
 
 private:
     VideoPlayer();
@@ -130,6 +136,7 @@ private:
     SequencePlayer() = default;
     VideoPlayer* Cur() const;
     void Start(VideoPlayer* p);
+    void Advance();  // on to the next clip that can play (past ones whose engine failed), or the end
     Sequence seq_;
     std::vector<double> starts_;
     std::vector<std::pair<std::wstring, std::unique_ptr<VideoPlayer>>> players_;  // by file

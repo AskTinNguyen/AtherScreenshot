@@ -9,6 +9,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <map>
@@ -240,7 +241,7 @@ private:
             BitmapPtr f;
             double ft = 0;
             const double frameDur = r.Fps() > 1 ? 1 / r.Fps() : 1 / 30.0;
-            while (!(last && lastT >= t - frameDur * 0.5) && r.Read(&f, &ft)) {
+            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.Read(&f, &ft)) {
                 last = f;
                 lastT = ft;
             }
@@ -256,7 +257,7 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     double want_ = -1;
-    bool quit_ = false;
+    std::atomic<bool> quit_{false};  // also checked mid-decode, so replacing the fetcher never waits long
     std::thread worker_;
 };
 
@@ -298,6 +299,8 @@ public:
     std::vector<Clip> builtClips;  // what the player, fetcher and thumbnails were made for
     std::optional<uint64_t> selClip;
     uint64_t thumbGen = 0;
+    std::shared_ptr<std::atomic<uint64_t>> thumbLatest = std::make_shared<std::atomic<uint64_t>>(0);  // shared with the jobs
+    std::vector<Clip> transcribedClips;  // what the running auto-captions job is transcribing
     std::wstring app, window;
 
     VideoEdit edit;
@@ -466,8 +469,7 @@ public:
         double t = 0;
         if (playing) {
             if (auto f = player->NewFrame(&t)) {
-                if (f->Width() != videoSize.cx || f->Height() != videoSize.cy) f = Resample(*f, videoSize.cx, videoSize.cy);
-                if (f) raw = f;
+                raw = f;  // already fitted into the sequence frame
                 rawT = t;
                 Rerender();
                 Invalidate();  // only when there's a new frame (the playhead moves with it)
@@ -501,6 +503,7 @@ public:
     // The player, the paused-frame decoder and the thumbnails follow the clips (after edits and undo).
     void RebuildSequence() {
         builtClips = edit.clips;
+        if (playing && player) paused = player->Now();  // the playhead stays where playback was
         playing = false;
         duration = ClipsDuration(edit.clips);
         paused = std::clamp(paused, 0.0, std::max(0.0, duration - 0.01));
@@ -521,9 +524,11 @@ public:
         HWND self = hwnd;
         const Sequence sq = Seq();
         const WPARAM gen = (WPARAM)++thumbGen;
-        std::thread([sq, self, gen] {
+        thumbLatest->store(gen);
+        std::thread([sq, self, gen, latest = thumbLatest] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            auto* t = new std::vector<BitmapPtr>(VideoThumbnails(sq, 16, 240));
+            // A newer job (or closing the editor) makes this one stop between frames.
+            auto* t = new std::vector<BitmapPtr>(VideoThumbnails(sq, 16, 240, [&] { return latest->load() != gen; }));
             CoUninitialize();
             if (!PostMessageW(self, WM_THUMBS, gen, (LPARAM)t)) delete t;
         }).detach();
@@ -619,8 +624,9 @@ public:
         if (i >= edit.clips.size()) return;
         std::vector<Clip> clips = edit.clips;
         Clip& c = clips[i];
-        if (in) c.in = std::clamp(*in, 0.0, c.out - 0.2);
-        if (out) c.out = std::clamp(*out, c.in + 0.2, c.length);
+        const double shortest = std::min(0.2, c.Duration());
+        if (in) c.in = std::clamp(*in, 0.0, c.out - shortest);
+        if (out) c.out = std::clamp(*out, c.in + shortest, std::max(c.length, c.in + shortest));
         SetClips(clips);
     }
 
@@ -1598,9 +1604,8 @@ public:
                 g.FillRectangle(&cut, (float)TX(t0) - s, (float)strip.top, 2 * s, (float)RectH(strip));
             }
         }
-        if (drag.kind == DragKind::ClipMove && drag.target >= 0) {  // where the clip would go
+        if (drag.kind == DragKind::ClipMove && drag.target >= 0 && drag.clip < edit.clips.size()) {  // where the clip would go
             std::vector<Clip> order = edit.clips;
-            const Clip c = order[drag.clip];
             order.erase(order.begin() + drag.clip);
             const float x = (float)TX(ClipStart(order, (size_t)drag.target));
             gp::SolidBrush mark(A(theme::kAccent));
@@ -1734,23 +1739,29 @@ public:
         const int top = tr.top + LaneH();
         const int capY = top + S(62), markY = top + S(90), rowH = S(18);
         SetCapture(hwnd);
-        if (LaneH() && p.y < top) {  // the clip lane: grab an edge to trim, or the clip to select and move it
-            for (size_t i = 0; i < edit.clips.size(); ++i) {
-                const double t0 = ClipStart(edit.clips, i), t1 = t0 + edit.clips[i].Duration();
-                if (p.x < TX(t0) - S(5) || p.x > TX(t1) + S(5)) continue;
-                const bool near0 = std::abs(p.x - TX(t0)) < S(6), near1 = std::abs(p.x - TX(t1)) < S(6);
+        // The playhead knob sits over the clip lane: it scrubs, whatever is under it.
+        const bool onKnob = std::abs(p.x - TX(Now())) <= S(7) && p.y < tr.top + S(8);
+        if (LaneH() && p.y < top && !onKnob) {  // the clip lane: grab the selected clip's edge to trim, or a clip to move
+            auto begin = [&](size_t i, DragKind kind) {
                 drag = {};
+                drag.kind = kind;
                 drag.clip = i;
                 drag.downX = p.x;
                 drag.grab = TT(p.x);
-                if (selClip == edit.clips[i].id && (near0 || near1)) {
-                    drag.kind = near0 ? DragKind::ClipIn : DragKind::ClipOut;
-                    drag.value = near0 ? edit.clips[i].in : edit.clips[i].out;
+                drag.value = kind == DragKind::ClipIn ? edit.clips[i].in : edit.clips[i].out;
+            };
+            if (const auto k = SelClipIndex()) {  // its edges win over the neighbour's body
+                const double t0 = ClipStart(edit.clips, *k), t1 = t0 + edit.clips[*k].Duration();
+                const double d0 = std::abs(p.x - TX(t0)), d1 = std::abs(p.x - TX(t1));
+                if (std::min(d0, d1) < S(6)) {
+                    begin(*k, d0 <= d1 ? DragKind::ClipIn : DragKind::ClipOut);
                     Pause();
-                } else {
-                    drag.kind = DragKind::ClipMove;
-                    SelectClip(edit.clips[i].id);
+                    return;
                 }
+            }
+            if (const auto spot = LocateClip(edit.clips, TT(p.x))) {
+                begin(spot->first, DragKind::ClipMove);
+                SelectClip(edit.clips[spot->first].id);
                 return;
             }
             ReleaseCapture();
@@ -1847,16 +1858,19 @@ public:
             case DragKind::Playhead: Seek(now); break;
             case DragKind::ClipIn:
             case DragKind::ClipOut: {
+                if (drag.clip >= edit.clips.size()) break;
                 const Clip& c = edit.clips[drag.clip];
                 const double v = (drag.kind == DragKind::ClipIn ? c.in : c.out) + (now - drag.grab);
-                drag.value = drag.kind == DragKind::ClipIn ? std::clamp(v, 0.0, c.out - 0.2) : std::clamp(v, c.in + 0.2, c.length);
+                const double shortest = std::min(0.2, c.Duration());
+                drag.value = drag.kind == DragKind::ClipIn ? std::clamp(v, 0.0, c.out - shortest)
+                                                           : std::clamp(v, c.in + shortest, std::max(c.length, c.in + shortest));
                 const double t0 = ClipStart(edit.clips, drag.clip);
                 if (drag.value >= c.in && drag.value <= c.out) Seek(t0 + drag.value - c.in);  // shows the frame at the cut
                 Invalidate();
                 break;
             }
             case DragKind::ClipMove: {
-                if (drag.target < 0 && std::abs(p.x - drag.downX) < S(5)) break;
+                if (drag.clip >= edit.clips.size() || (drag.target < 0 && std::abs(p.x - drag.downX) < S(5))) break;
                 int target = 0;  // how many of the other clips end up before it
                 for (size_t i = 0; i < edit.clips.size(); ++i)
                     if (i != drag.clip && TX(ClipStart(edit.clips, i) + edit.clips[i].Duration() / 2) < p.x) ++target;
@@ -1958,7 +1972,20 @@ public:
 
     // ---- keys ----
 
+    // Ends a drag without applying it (Esc, or the mouse capture taken away). Live item drags keep what they did so
+    // far (it's one undo step); clip drags only apply on release, so nothing changes.
+    void CancelDrag() {
+        if (drag.kind == DragKind::None) return;
+        drag = {};
+        if (GetCapture() == hwnd) ReleaseCapture();
+        Invalidate();
+    }
+
     bool OnKey(WPARAM vk) {
+        if (drag.kind != DragKind::None) {
+            if (vk == VK_ESCAPE) CancelDrag();
+            return true;
+        }
         const bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, shift = GetKeyState(VK_SHIFT) < 0;
         if (ctrl) {
             switch (vk) {
@@ -2009,6 +2036,7 @@ public:
         Invalidate();
         ShowToast(L"Transcribing…", L"Turning speech into captions on this PC", nullptr, nullptr, 120000);
         const Sequence sq = Seq();
+        transcribedClips = edit.clips;
         const double a = edit.trimStart, b = edit.trimEnd;
         HWND h = hwnd;
         std::thread([sq, a, b, h] {
@@ -2028,6 +2056,14 @@ public:
         } else if (caps.empty()) {
             ShowToast(L"No speech found", L"Add captions by hand with T.", nullptr, nullptr, 3000);
         } else {
+            if (edit.clips != transcribedClips) {  // the clips changed while it ran: move the captions with their footage
+                VideoEdit then;
+                then.clips = transcribedClips;
+                then.trimEnd = ClipsDuration(transcribedClips);
+                then.captions = std::move(caps);
+                ApplyClips(then, edit.clips);
+                caps = std::move(then.captions);
+            }
             PushUndo();
             std::erase_if(edit.captions, [](const Caption& c) { return c.text.empty(); });
             edit.captions.insert(edit.captions.end(), caps.begin(), caps.end());
@@ -2192,6 +2228,9 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONDBLCLK: OnMouseDown({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, m == WM_LBUTTONDBLCLK); return 0;
         case WM_MOUSEMOVE: OnMouseMove({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, w); return 0;
         case WM_LBUTTONUP: OnMouseUp(); return 0;
+        case WM_CAPTURECHANGED:
+            if ((HWND)l != hwnd) CancelDrag();  // Alt+Tab, a menu, another window took the mouse mid-drag
+            return 0;
         case WM_MOUSELEAVE: hoverRect = {}; tipShown = false; Invalidate(); return 0;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
@@ -2259,6 +2298,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kTimerFrame);
+            thumbLatest->store(~0ull);  // stops a thumbnail job still running
             player.reset();
             fetcher.reset();
             return 0;
@@ -2348,12 +2388,7 @@ void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon) {
     g_icon = icon;
 }
 
-bool IsVideoFile(const std::wstring& path) {
-    const size_t dot = path.find_last_of(L'.');
-    if (dot == std::wstring::npos) return false;
-    const std::wstring ext = Lower(path.substr(dot + 1));
-    return ext == L"mp4" || ext == L"mov" || ext == L"m4v" || ext == L"wmv" || ext == L"avi" || ext == L"mkv";
-}
+bool IsVideoFile(const std::wstring& path) { return MediaTypeOf(path) == MediaType::Video; }  // one list, in library.cpp
 
 int VideoEditorCount() { return (int)g_editors.size(); }
 
@@ -2386,6 +2421,13 @@ bool OpenVideoEditor(const std::wstring& path) {
 // ---------- snapshots and tests ----------
 
 namespace {
+
+// Saves go to a test folder for the scope; restored even when a test returns early.
+struct CapturesFolderForTest {
+    std::wstring old = g_folder;
+    explicit CapturesFolderForTest(const std::wstring& f) { g_folder = f; }
+    ~CapturesFolderForTest() { g_folder = old; }
+};
 
 void Pump(int ms) {
     const ULONGLONG end = GetTickCount64() + ms;
@@ -2598,8 +2640,7 @@ ATHER_TEST(video_editor_saves_new_files) {
     CHECK(WriteTestClip(clip, 640, 360, 30, 3, true));
     WIN32_FILE_ATTRIBUTE_DATA before{};
     GetFileAttributesExW(clip.c_str(), GetFileExInfoStandard, &before);
-    const std::wstring oldFolder = g_folder;
-    g_folder = caps;
+    const CapturesFolderForTest folder(caps);
     VideoEditor* e = OpenHidden(clip, 1180, 760);
     CHECK(e != nullptr);
     if (!e) return;
@@ -2630,7 +2671,6 @@ ATHER_TEST(video_editor_saves_new_files) {
     WIN32_FILE_ATTRIBUTE_DATA after{};
     GetFileAttributesExW(clip.c_str(), GetFileExInfoStandard, &after);
     CHECK(CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0);  // the original is untouched
-    g_folder = oldFolder;
     DestroyWindow(e->hwnd);
 }
 
@@ -2672,8 +2712,7 @@ ATHER_TEST(video_editor_joins_splits_and_reorders_clips) {
     const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4", caps = dir + L"/caps";
     CHECK(WriteTestClip(a, 640, 360, 30, 3, true));
     CHECK(WriteTestClip(b, 360, 360, 30, 2, false));
-    const std::wstring oldFolder = g_folder;
-    g_folder = caps;
+    const CapturesFolderForTest folder(caps);
     VideoEditor* e = OpenHidden(a, 1180, 760);
     CHECK(e != nullptr);
     if (!e) return;
@@ -2729,7 +2768,6 @@ ATHER_TEST(video_editor_joins_splits_and_reorders_clips) {
     CHECK_EQ(files.size(), 1u);
     VideoInfo vi;
     CHECK(!files.empty() && ProbeVideo(files[0], &vi) && std::fabs(vi.duration - 5) < 0.2 && vi.w == 640 && vi.hasAudio);
-    g_folder = oldFolder;
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
@@ -2774,6 +2812,63 @@ ATHER_TEST(video_editor_clip_lane_mouse) {
     e->OnKey(VK_DELETE);
     CHECK_EQ(e->edit.clips.size(), 1u);
     CHECK_EQ(e->LaneH(), 0);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The lane's fiddly parts: a selected clip's left edge trims (not its neighbour), the playhead knob scrubs over the
+// lane, keys can't change the clips mid-drag, and a click on a very short clip's edge leaves it alone.
+ATHER_TEST(video_editor_clip_lane_edges_knob_and_keys) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, false));
+    CHECK(WriteTestClip(b, 640, 360, 30, 2, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->AddClips({b});  // [a, b], b selected, playhead at the cut
+    CHECK(e->edit.clips.size() == 2 && e->selClip == e->edit.clips[1].id);
+    const RECT tr = e->TimelineRect();
+    const int laneY = tr.top + e->LaneH() / 2;
+    const uint64_t bId = e->edit.clips[1].id;
+    // b's left edge sits right at the end of a: grabbing it trims b.
+    const int edge = (int)e->TX(ClipStart(e->edit.clips, 1));
+    e->OnMouseDown({edge, laneY}, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::ClipIn);
+    e->OnMouseMove({(int)e->TX(ClipStart(e->edit.clips, 1) + 0.5), laneY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(e->edit.clips[0].path == a && e->edit.clips[1].id == bId);  // not reordered
+    CHECK_NEAR(e->edit.clips[1].in, 0.5, 0.06);
+    // The knob scrubs, even over the lane.
+    e->Seek(1.0);
+    e->OnMouseDown({(int)e->TX(1.0), tr.top}, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::Playhead);
+    e->OnMouseMove({(int)e->TX(2.0), tr.top}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK_NEAR(e->Now(), 2.0, 0.05);
+    CHECK(e->edit.clips[1].id == bId);
+    // Mid-drag, Delete and Ctrl+Z do nothing (Esc cancels the drag).
+    e->OnMouseDown({(int)e->TX(0.5), laneY}, false);
+    e->OnMouseMove({(int)e->TX(0.5) + 40, laneY}, MK_LBUTTON);
+    e->OnKey(VK_DELETE);
+    CHECK_EQ(e->edit.clips.size(), 2u);
+    e->OnKey(VK_ESCAPE);
+    CHECK(e->drag.kind == VideoEditor::DragKind::None);
+    e->OnMouseUp();
+    CHECK_EQ(e->edit.clips.size(), 2u);
+    // A 0.15 s piece at the end of b: clicking its right edge without moving changes nothing.
+    const double end = e->duration;
+    e->Seek(end - 0.15);
+    e->SplitAtPlayhead();
+    CHECK_EQ(e->edit.clips.size(), 3u);
+    const Clip tail = e->edit.clips[2];
+    const size_t undoBefore = e->undoStack.size();
+    const int right = (int)e->TX(e->duration) - 1;
+    e->OnMouseDown({right, laneY}, false);
+    e->OnMouseUp();
+    CHECK(e->edit.clips[2] == tail);
+    CHECK(e->edit.clips[2].out <= e->edit.clips[2].length + 1e-9);
+    CHECK_EQ(e->undoStack.size(), undoBefore);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

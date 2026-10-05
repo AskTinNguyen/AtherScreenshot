@@ -128,7 +128,8 @@ float FeatureDistance(const std::vector<float>& a, const std::vector<float>& b);
 
 class Library {
 public:
-    static constexpr int kIndexVersion = 1;
+    // 2: videos are measured upright (phone videos stored sideways with a rotation), so they are indexed again.
+    static constexpr int kIndexVersion = 2;
     static Library& Shared();
 
     // `persists: false` gives tests an in-memory store that never touches disk.

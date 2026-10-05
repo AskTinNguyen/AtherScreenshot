@@ -149,7 +149,7 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
         }
         if (twoD) b2->Unlock2D();
         else buf->Unlock();
-        if (p_->rotation) out = RotateBitmap(*out, (int)p_->rotation);
+        if (p_->rotation && !(out = RotateBitmap(*out, (int)p_->rotation))) return false;
         *frame = out;
         *t = ts / kTicks;
         return true;
@@ -158,16 +158,25 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
 
 // ---------- sequences ----------
 
+bool AudioDecodes(const std::wstring& path);
+
 std::optional<Clip> ClipOf(const std::wstring& path) {
     VideoInfo vi;
     if (!ProbeVideo(path, &vi) || vi.w <= 0 || vi.h <= 0 || vi.duration <= 0) return std::nullopt;
+    {
+        VideoReader r;
+        BitmapPtr f;
+        double t = 0;
+        if (!r.Open(path) || !r.Read(&f, &t)) return std::nullopt;
+    }
     Clip c;
+    c.source = c.id;  // pieces split from it share this
     c.path = path;
     c.out = c.length = vi.duration;
     c.w = vi.w;
     c.h = vi.h;
     c.fps = vi.fps;
-    c.hasAudio = vi.hasAudio;
+    c.hasAudio = vi.hasAudio && AudioDecodes(path);
     return c;
 }
 
@@ -207,17 +216,20 @@ SequenceReader::~SequenceReader() = default;
 SIZE SequenceReader::Size() const { return p_->seq.size; }
 double SequenceReader::Duration() const { return p_->seq.Duration(); }
 
-double SequenceReader::Fps() const {
+double Sequence::Fps() const {
     double f = 0;
-    for (const auto& c : p_->seq.clips) f = std::max(f, c.fps);
+    for (const auto& c : clips) f = std::max(f, c.fps);
     return f > 1 ? std::min(f, 60.0) : 30;
 }
 
-bool SequenceReader::HasAudio() const {
-    for (const auto& c : p_->seq.clips)
+bool Sequence::HasAudio() const {
+    for (const auto& c : clips)
         if (c.hasAudio) return true;
     return false;
 }
+
+double SequenceReader::Fps() const { return p_->seq.Fps(); }
+bool SequenceReader::HasAudio() const { return p_->seq.HasAudio(); }
 
 bool SequenceReader::Open(const Sequence& s) {
     if (s.clips.empty() || s.size.cx <= 0 || s.size.cy <= 0) return false;
@@ -394,7 +406,10 @@ public:
                 const Clip& c = seq_.clips[sg.clip];
                 if (c.hasAudio) {
                     reader_ = std::make_unique<AudioReader>();
-                    if (reader_->Open(c.path) && reader_->Seek(sg.from)) rs_ = std::make_unique<Resampler>(reader_->Rate(), reader_->Channels(), rate_, ch_);
+                    if (reader_->Open(c.path)) {
+                        reader_->Seek(sg.from);  // when it can't seek, it reads from the start and skips to `from`
+                        rs_ = std::make_unique<Resampler>(reader_->Rate(), reader_->Channels(), rate_, ch_);
+                    }
                     else reader_.reset();
                 }
             }
@@ -496,6 +511,11 @@ private:
 };
 
 }  // namespace
+
+bool AudioDecodes(const std::wstring& path) {
+    AudioReader r;
+    return r.Open(path);
+}
 
 // ---------- TimeStretch ----------
 
@@ -637,17 +657,12 @@ private:
 
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
     const Sequence seq = SequenceOf(source, e);
-    SequenceReader probe;
-    if (!probe.Open(seq)) {
-        if (error) *error = L"Can't read this video.";
-        return false;
-    }
-    const int fps = std::clamp((int)std::lround(probe.Fps()), 1, 60);
+    const int fps = (int)std::lround(seq.Fps());
     EditFrames frames;
-    if (!frames.Open(seq, e, fps, error)) return false;
+    if (!frames.Open(seq, e, fps, error)) return false;  // "Can't read this video."
     const SIZE sz = frames.Out();
     std::unique_ptr<AudioPipe> audio;
-    if (!e.muted && probe.HasAudio()) {
+    if (!e.muted && seq.HasAudio()) {
         audio = std::make_unique<AudioPipe>();
         if (!audio->Open(seq, e.trimStart, e.trimEnd, e.speed)) audio.reset();
     }
@@ -708,11 +723,12 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
     return SUCCEEDED(hr);
 }
 
-std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide) {
+std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide, const std::function<bool()>& cancelled) {
     std::vector<BitmapPtr> out;
     SequenceReader r;
     if (!r.Open(s) || r.Duration() <= 0) return out;
     for (int i = 0; i < count; ++i) {
+        if (cancelled && cancelled()) return {};
         const double t = r.Duration() * (i + 0.5) / count;
         r.Seek(t);
         BitmapPtr f, last;
@@ -959,23 +975,38 @@ void VideoPlayer::SetRate(double r) {
     p_->engine->SetPlaybackRate(r);
 }
 
-BitmapPtr VideoPlayer::NewFrame(double* t) {
+bool VideoPlayer::Failed() const { return *p_->failed; }
+
+BitmapPtr VideoPlayer::NewFrame(double* t, SIZE frame, SIZE content) {
     LONGLONG pts = 0;
     if (p_->engine->OnVideoStreamTick(&pts) != S_OK) return nullptr;
-    DWORD w = 0, h = 0;
-    if (FAILED(p_->engine->GetNativeVideoSize(&w, &h)) || !w || !h) return nullptr;
+    DWORD nw = 0, nh = 0;
+    if (FAILED(p_->engine->GetNativeVideoSize(&nw, &nh)) || !nw || !nh) return nullptr;
+    // The engine's native size is corrected for non-square pixels, while decoded frames (paused, export) keep the
+    // stored pixels; fitting the stored size keeps the playing picture where the paused one is.
+    const DWORD w = frame.cx > 0 ? (DWORD)frame.cx : nw, h = frame.cy > 0 ? (DWORD)frame.cy : nh;
+    RECT dst{0, 0, (LONG)w, (LONG)h};
+    if (frame.cx > 0) {
+        const double cw = content.cx > 0 ? content.cx : nw, ch = content.cy > 0 ? content.cy : nh;
+        const double k = std::min(w / cw, h / ch);
+        const LONG fw = std::clamp((LONG)std::lround(cw * k), 1L, (LONG)w), fh = std::clamp((LONG)std::lround(ch * k), 1L, (LONG)h);
+        dst = {((LONG)w - fw) / 2, ((LONG)h - fh) / 2, ((LONG)w - fw) / 2 + fw, ((LONG)h - fh) / 2 + fh};
+    }
     if (!p_->target || w != p_->w || h != p_->h) {
         p_->target.Reset();
         if (FAILED(p_->wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppBGRA, WICBitmapCacheOnDemand, &p_->target))) return nullptr;
         p_->w = w;
         p_->h = h;
     }
-    RECT dst{0, 0, (LONG)w, (LONG)h};
     MFARGB border{0, 0, 0, 255};
     if (FAILED(p_->engine->TransferVideoFrame(p_->target.Get(), nullptr, &dst, &border))) return nullptr;
     auto out = Bitmap::Create((int)w, (int)h);
     if (!out || FAILED(p_->target->CopyPixels(nullptr, w * 4, w * h * 4, reinterpret_cast<BYTE*>(out->Bits())))) return nullptr;
-    for (size_t i = 0, n = (size_t)w * h; i < n; ++i) out->Bits()[i] |= 0xFF000000u;
+    for (LONG y = 0; y < (LONG)h; ++y) {  // opaque, and black around the picture
+        uint32_t* row = out->Bits() + (size_t)y * w;
+        const bool bar = y < dst.top || y >= dst.bottom;
+        for (LONG x = 0; x < (LONG)w; ++x) row[x] = bar || x < dst.left || x >= dst.right ? 0xFF000000u : row[x] | 0xFF000000u;
+    }
     *t = pts / kTicks;
     return out;
 }
@@ -1037,7 +1068,21 @@ void SequencePlayer::Start(VideoPlayer* p) {
 void SequencePlayer::Play() {
     playing_ = true;
     ended_ = false;
+    if (VideoPlayer* p = Cur(); !p || p->Failed()) return Advance();
     Start(Cur());
+}
+
+void SequencePlayer::Advance() {
+    if (VideoPlayer* p = Cur()) p->Pause();
+    for (size_t i = cur_ + 1; i < seq_.clips.size(); ++i) {
+        cur_ = i;
+        VideoPlayer* p = Cur();
+        if (!p || p->Failed()) continue;  // can't play: on to the next one
+        p->Seek(seq_.clips[i].in);
+        Start(p);
+        return;
+    }
+    ended_ = true;
 }
 
 void SequencePlayer::Pause() {
@@ -1089,26 +1134,17 @@ BitmapPtr SequencePlayer::NewFrame(double* t) {
     if (playing_ && !ended_) {
         const Clip& c = seq_.clips[cur_];
         if (p->Now() >= c.out - 0.02 || !p->Playing()) {  // this clip is over: hand over to the next one
-            if (cur_ + 1 < seq_.clips.size()) {
-                p->Pause();
-                ++cur_;
-                p = Cur();
-                if (!p) return nullptr;
-                p->Seek(seq_.clips[cur_].in);
-                Start(p);
-            } else {
-                ended_ = true;
-                p->Pause();
-            }
+            Advance();
+            p = Cur();
+            if (!p || ended_) return nullptr;
         }
     }
     const Clip& c = seq_.clips[cur_];
     double ts = 0;
-    BitmapPtr f = p->NewFrame(&ts);
+    BitmapPtr f = p->NewFrame(&ts, seq_.size, {c.w, c.h});  // fitted into the sequence frame by the engine
     // Frames from outside the clip are the engine catching up after a hand-over or a seek, or a part that was cut.
     if (!f || ts < c.in - 0.25 || ts > c.out + 0.001) return nullptr;
     *t = starts_[cur_] + std::clamp(ts - c.in, 0.0, c.Duration());
-    if (f->Width() != seq_.size.cx || f->Height() != seq_.size.cy) f = FitInto(*f, seq_.size.cx, seq_.size.cy);
     return f;
 }
 

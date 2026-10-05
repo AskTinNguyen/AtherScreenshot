@@ -15,14 +15,15 @@ The Windows build gained these features after 0.0.1. This brings them to the Mac
 - **Input:** the GameController framework (`GCController`, `extendedGamepad`). It covers Xbox, PlayStation and MFi pads natively, so the Mac does better than the Windows XInput version here. Use the first connected controller. Draw nothing while none is connected.
 - **Sampling:** poll at about 250 Hz, or use the `valueChangedHandler` callbacks, and **latch presses between frames**. Every button seen down since the last frame shows as down in the next frame, and the triggers show their highest value since then. A tap shorter than a frame must still appear (`PadLatch` in `gamepad.cpp`; its test is `gamepad_latch_keeps_a_tap_between_frames`).
 - **Drawing:** burned into the recorded frames only, not shown on screen. Draw it where the click and key overlays are drawn.
-  - The design box is 240 × 150 units. It is 220 pt wide at most, never more than a third of the frame's width or half its height, with a 16 pt margin (`GamepadLayout`).
-  - The look follows a white modern controller (`PaintPad` in `gamepad.cpp`):
-    - A white shell with a soft shadow and a fine dark edge, so it reads on both light and dark video.
-    - Black sticks inside glowing orange rings (`#FF9E2C`). They move up to 7 units and glow brighter when clicked.
-    - A black D-pad with arrows on a light round plate.
-    - Glossy black A, B, X and Y with letters in their usual colors (`#40BE5C`, `#EC3E42`, `#308CEC`, `#FACC24`). When pressed, they fill with that color and glow.
-    - Bumpers, triggers (filling from the top), View and Menu light up orange.
-  - **Opacity:** draw onto a separate layer, then composite it at the chosen opacity, so overlapping parts fade together.
+  - The design box is 240 × 172 units: the outline reaches y = 170 at the grips. It is 220 pt wide at most, never more than a third of the frame's width or half its height, with a 16 pt margin (`GamepadLayout`).
+  - The look matches the white modern controller in the reference photo. Every position and size is in `PaintPad` in `gamepad.cpp`, measured from the photo at about 0.495 units per photo pixel; copy them from there:
+    - **Shell:** white, with soft shading just inside the edge, a light shadow and a fine dark rim, so it reads on light and dark video.
+    - **Sticks:** the left stick is high on the left, the right stick low right of center. Each has an orange LED ring (`#FFA02E`) fixed in the shell with a soft glow, a dark gap, and a black domed cap that tilts up to 4.5 units with the stick. Clicking the stick turns the ring nearly white and makes the glow stronger.
+    - **D-pad:** low on the left, on a light round plate. It's glossy black with arrow notches and a raised middle; the pressed arm lights orange.
+    - **A, B, X and Y:** high on the right, glossy black, with letters in their colors (A `#2EB84A`, B `#E82C38`, X `#2A84F2`, Y `#F4CC14`). When pressed, a button fills with its color and glows.
+    - **Middle:** View and Menu are small white buttons on either side of a home button. Below them are two more small buttons with a dot between them, a pill and three status lights. View and Menu light orange when pressed.
+    - **Bumpers and triggers:** the bumpers are thin white bands along the shoulders and light orange when pressed. Triggers aren't visible at rest; pulling one makes an orange tab rise behind its shoulder, as far as it's pulled.
+  - **Opacity:** draw onto a separate layer, then composite it at the chosen opacity, so overlapping parts fade together. Keep the drawn layer and reuse it while the pad state doesn't change, because drawing it costs milliseconds per frame.
   - For PlayStation pads you may relabel the face buttons as ✕○□△, keeping the same positions.
 
 ## 2. Edit pictures and videos from anywhere

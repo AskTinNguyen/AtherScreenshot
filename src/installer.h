@@ -10,7 +10,8 @@ std::wstring InstalledExePath();
 // the install location (e.g. Downloads), shows the branded install/update window.
 // Returns true if the process should exit with *exitCode; false to continue starting the app.
 bool RunInstallFlow(const std::wstring& cmdline, HICON icon, int* exitCode);
-// After an in-app update of the installed copy: the version in Apps & features and the Explorer menus.
+// At startup of the installed copy: when an in-app update changed the version, the version in Apps & features
+// and the Explorer menus follow.
 void RefreshInstallRecord();
 
 }  // namespace ather

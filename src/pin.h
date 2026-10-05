@@ -7,5 +7,6 @@ namespace ather {
 // Drag to move, wheel to zoom, Ctrl+wheel for opacity, double-click / Esc / middle-click to close.
 void PinImage(BitmapPtr img, const RECT* at);
 void CloseAllPins();
+int PinCount();
 
 }  // namespace ather

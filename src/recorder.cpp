@@ -232,6 +232,7 @@ void Run(Session* s) {
                     stopReason = L"The window was closed.";
                     break;
                 }
+                if (pad && s->clock.Paused()) pad->Take();  // presses during a pause don't pile up into the next frame
                 if (!s->clock.Paused()) {
                     if (wgc) {
                         wgc->Grab(raw->Bits());  // no new frame = screen unchanged, reuse the previous one

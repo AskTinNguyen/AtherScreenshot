@@ -80,7 +80,6 @@ PadCorner ParsePadCorner(const std::wstring& s) {
 
 void PadLatch::Feed(const PadState& s) {
     cur_ = s;
-    held_.connected = held_.connected || s.connected;
     held_.buttons |= s.buttons;
     held_.lt = std::max(held_.lt, s.lt);
     held_.rt = std::max(held_.rt, s.rt);
@@ -279,11 +278,12 @@ void PaintPad(gp::Graphics& g, const PadState& s) {
     WhiteButton(g, 84.6f, 26.8f, 6.4f, on(XINPUT_GAMEPAD_BACK));
     WhiteButton(g, 154.4f, 26.8f, 6.4f, on(XINPUT_GAMEPAD_START));
     {
-        gp::Pen icon(Rgba(120, 121, 128), 0.9f);
-        icon.SetStartCap(gp::LineCapRound);
-        icon.SetEndCap(gp::LineCapRound);
         const bool v = on(XINPUT_GAMEPAD_BACK), m = on(XINPUT_GAMEPAD_START);
         gp::Pen iconV(v ? Rgba(255, 255, 255) : Rgba(120, 121, 128), 0.9f), iconM(m ? Rgba(255, 255, 255) : Rgba(120, 121, 128), 0.9f);
+        for (gp::Pen* pen : {&iconV, &iconM}) {
+            pen->SetStartCap(gp::LineCapRound);
+            pen->SetEndCap(gp::LineCapRound);
+        }
         g.DrawLine(&iconV, 82.4f, 26.8f, 86.8f, 26.8f);  // ‹ with a stem
         g.DrawLine(&iconV, 82.4f, 26.8f, 84.2f, 25.f);
         g.DrawLine(&iconV, 82.4f, 26.8f, 84.2f, 28.6f);
@@ -433,20 +433,37 @@ void DrawGamepad(Bitmap& frame, const PadState& s, PadCorner corner, float dpi, 
     // overlapping parts fade together instead of showing through each other.
     const float pad = 10 * L.u;
     const int ox = (int)std::floor(L.x - pad), oy = (int)std::floor(L.y - pad);
-    const int w = (int)std::ceil(240 * L.u + 2 * pad) + 1, h = (int)std::ceil(kBoxH * L.u + 2 * pad) + 1;
-    auto layer = Bitmap::Create(w, h);
-    if (!layer) return;
-    std::fill(layer->Bits(), layer->Bits() + (size_t)w * h, 0u);
-    {
-        gp::Bitmap gb(w, h, w * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(layer->Bits()));
-        gp::Graphics g(&gb);
-        g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
-        g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
-        g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
-        g.TranslateTransform(L.x - ox, L.y - oy);
-        g.ScaleTransform(L.u, L.u);
-        PaintPad(g, s);
+    const int w = (int)std::ceil(kBoxW * L.u + 2 * pad) + 1, h = (int)std::ceil(kBoxH * L.u + 2 * pad) + 1;
+    const float fx = L.x - ox, fy = L.y - oy;
+    // Drawing the controller takes a few milliseconds and the pad mostly sits still between frames, so the last
+    // drawing is kept (per recording thread) and reused while nothing about it changed.
+    struct Cached {
+        PadState s;
+        int w = 0, h = 0;
+        float u = 0, fx = 0, fy = 0;
+        BitmapPtr layer;
+    };
+    thread_local Cached cache;
+    const auto same = [](const PadState& a, const PadState& b) {
+        return a.buttons == b.buttons && a.lx == b.lx && a.ly == b.ly && a.rx == b.rx && a.ry == b.ry && a.lt == b.lt && a.rt == b.rt;
+    };
+    if (!cache.layer || cache.w != w || cache.h != h || cache.u != L.u || cache.fx != fx || cache.fy != fy || !same(cache.s, s)) {
+        auto layer = Bitmap::Create(w, h);
+        if (!layer) return;
+        std::fill(layer->Bits(), layer->Bits() + (size_t)w * h, 0u);
+        {
+            gp::Bitmap gb(w, h, w * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(layer->Bits()));
+            gp::Graphics g(&gb);
+            g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+            g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+            g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
+            g.TranslateTransform(fx, fy);
+            g.ScaleTransform(L.u, L.u);
+            PaintPad(g, s);
+        }
+        cache = {s, w, h, L.u, fx, fy, layer};
     }
+    Bitmap* layer = cache.layer.get();
     const int k = (int)std::lround(opacity * 256);
     for (int y = std::max(0, -oy); y < h && oy + y < frame.Height(); ++y) {
         const uint32_t* src = layer->Bits() + (size_t)y * w;

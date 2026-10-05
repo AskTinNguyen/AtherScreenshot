@@ -52,7 +52,7 @@ struct PadLayout {
     POINT At(float dx, float dy) const { return {(LONG)(x + dx * u), (LONG)(y + dy * u)}; }
 };
 PadLayout GamepadLayout(int frameW, int frameH, PadCorner corner, float dpi);
-// Design-box positions of a few controls (for tests).
+// Design-box positions of a few controls (used by the drawing and the tests).
 constexpr float kPadA[2] = {196.7f, 67.1f}, kPadLeftStick[2] = {43, 49}, kPadLT[2] = {46, -2};
 
 // Draws the controller onto opaque BGRA frame pixels at `opacity` (0…1). Does nothing for a disconnected pad.

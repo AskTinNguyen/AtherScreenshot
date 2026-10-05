@@ -192,4 +192,6 @@ void CloseAllPins() {
     for (HWND h : pins) DestroyWindow(h);
 }
 
+int PinCount() { return (int)g_pins.size(); }
+
 }  // namespace ather

@@ -715,6 +715,8 @@ After TakeCliAfter() {
 std::optional<UpdateInfo> g_update;  // a newer version found by the last check
 std::wstring g_updateAnnounced;      // the version the automatic check already announced
 bool g_updating = false;
+bool g_quitting = false;  // the app is shutting down: a finished download must not restart it
+constexpr wchar_t kDownloadPage[] = L"https://github.com/AskTinNguyen/AtherScreenshot#download";
 
 void CheckForUpdates(bool manual) {
     CheckForUpdateAsync([manual](std::optional<UpdateInfo> info, std::wstring err) {
@@ -729,33 +731,39 @@ void CheckForUpdates(bool manual) {
         }
         if (!manual && g_updateAnnounced == info->version) return;  // once per version, unless asked
         g_updateAnnounced = info->version;
-        wchar_t size[32];
-        swprintf_s(size, L"%.1f MB", info->size / 1048576.0);
         ShowToast(L"Ather Screenshot " + info->version + L" is available", (info->notes.empty() ? L"" : info->notes + L"\n") +
-                      L"Click to update (" + size + L"). Settings and captures stay.",
+                      L"Click to update (" + FormatBytes(info->size) + L"). Settings, saved captures and the gallery stay.",
                   nullptr, [] { InstallUpdate(); }, 15000);
     });
 }
 
-// The update restarts the app, so it waits until nothing is in progress.
+// The update restarts the app, so it waits until nothing is in progress, and asks before closing pins
+// (they live only on screen).
 bool UpdateBlocked() {
     if (RecorderBusy()) return Notify(L"Finish the recording first", L"Then update from the tray menu."), true;
+    if (OverlayActive() || ScrollingCaptureActive()) return Notify(L"Finish the capture first", L"Then update from the tray menu."), true;
     if (EditorCount() > 0 || VideoEditorCount() > 0)
         return Notify(L"Close the editors first", L"Updating restarts Ather Screenshot. Save and close the editors, then update from the tray menu."), true;
+    if (const int pins = PinCount()) {
+        const std::wstring q = L"Updating restarts Ather Screenshot, which closes " + std::to_wstring(pins) +
+                               (pins == 1 ? L" pinned screenshot." : L" pinned screenshots.") + L"\n\nUpdate now?";
+        SetForegroundWindow(g_hwnd);
+        if (MessageBoxW(nullptr, q.c_str(), kProductName, MB_OKCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) != IDOK) return true;
+    }
     return false;
 }
 
 void InstallUpdate() {
-    if (!g_update || g_updating || UpdateBlocked()) return;
+    if (!g_update || g_updating || g_quitting || UpdateBlocked()) return;
     g_updating = true;
     const UpdateInfo info = *g_update;
     const uint64_t toast = ShowToast(L"Downloading Ather Screenshot " + info.version + L"…", L"0%", nullptr, nullptr, 600000);
     DownloadUpdateAsync(info, [toast](double p) { UpdateToastBody(toast, std::to_wstring((int)std::lround(p * 100)) + L"%"); },
-                        [toast, info](std::wstring staged, std::wstring err) {
+                        [toast](std::wstring staged, std::wstring e) {
                             g_updating = false;
-                            std::wstring e = err;
-                            if (e.empty() && UpdateBlocked()) {  // something started while it downloaded
+                            if (e.empty() && (g_quitting || UpdateBlocked())) {  // quitting, or something started while it downloaded
                                 DeleteFileW(staged.c_str());
+                                if (!g_quitting) HideToast();
                                 return;
                             }
                             if (e.empty() && InstallStagedUpdate(staged, &e)) {
@@ -765,7 +773,7 @@ void InstallUpdate() {
                             }
                             HideToast();
                             ShowToast(L"The update didn't install", e + L"\nClick to download it from GitHub instead.", nullptr,
-                                      [] { ShellExecuteW(nullptr, L"open", L"https://github.com/AskTinNguyen/AtherScreenshot#download", nullptr, nullptr, SW_SHOWNORMAL); },
+                                      [] { OpenPath(kDownloadPage); },
                                       12000);
                         });
 }
@@ -919,7 +927,6 @@ void Execute(int id, bool deferCapture, bool untrusted) {
             break;
         }
         case CmdCheckUpdates: CheckForUpdates(true); break;
-        case CmdInstallUpdate: InstallUpdate(); break;
         case CmdExit: DestroyWindow(g_hwnd); break;
     }
 }
@@ -1248,7 +1255,8 @@ void ShowTrayMenu() {
     int id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, g_hwnd, nullptr);
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
-    if (id) Execute(id, true);
+    if (id == CmdInstallUpdate) InstallUpdate();  // not a palette command, so not in kCmds
+    else if (id) Execute(id, true);
 }
 
 // ---- main window ----
@@ -1306,6 +1314,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_DESTROY:
+            g_quitting = true;
             RemoveTrayIcon();
             for (const auto& c : kCmds) UnregisterHotKey(h, c.id);
             PostQuitMessage(0);
@@ -1375,6 +1384,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LocalFree(CommandLineToArgvW(GetCommandLineW(), &argc));
     if (alreadyRunning && justUpdated) return 0;  // the old version never quit: leave it running, don't hand it our flag
+    if (!alreadyRunning) CleanUpUpdateFiles();  // only the running instance owns these (another may be downloading)
     if (alreadyRunning) {
         // Already running: forward the command line, or with no arguments open the palette.
         if (HWND other = FindWindowW(kMainClass, nullptr)) {
@@ -1427,8 +1437,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                g_settings.Hotkey(L"CaptureRegion") + L" to capture  ·  " + g_settings.Hotkey(L"CommandPalette") +
                    L" for commands");
     }
+    RefreshInstallRecord();  // after an update (or if a launch raced the updated copy): the version in Apps & features
     if (justUpdated) {
-        RefreshInstallRecord();
         Notify(L"Updated to Ather Screenshot " ATHER_VERSION_WSTR, L"Your settings, captures and gallery are just as you left them.");
     } else if (argc > 1) {  // first launch with a command: run it too
         bool fromLink = false;
