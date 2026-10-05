@@ -2072,7 +2072,7 @@ bool IsVideoFile(const std::wstring& path) {
     const size_t dot = path.find_last_of(L'.');
     if (dot == std::wstring::npos) return false;
     const std::wstring ext = Lower(path.substr(dot + 1));
-    return ext == L"mp4" || ext == L"mov" || ext == L"m4v";
+    return ext == L"mp4" || ext == L"mov" || ext == L"m4v" || ext == L"wmv" || ext == L"avi" || ext == L"mkv";
 }
 
 int VideoEditorCount() { return (int)g_editors.size(); }

@@ -157,6 +157,22 @@ BitmapPtr Resample(const Bitmap& src, int w, int h) {
     return out;
 }
 
+BitmapPtr RotateBitmap(const Bitmap& src, int degrees) {
+    const int w = src.Width(), h = src.Height();
+    auto out = degrees == 180 ? Bitmap::Create(w, h) : Bitmap::Create(h, w);
+    if (!out) return nullptr;
+    const uint32_t* s = src.Bits();
+    uint32_t* d = out->Bits();
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const uint32_t c = s[(size_t)y * w + x];
+            if (degrees == 90) d[(size_t)x * h + (h - 1 - y)] = c;
+            else if (degrees == 180) d[(size_t)(h - 1 - y) * w + (w - 1 - x)] = c;
+            else d[(size_t)(w - 1 - x) * h + y] = c;
+        }
+    return out;
+}
+
 bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at, int maxSide, BitmapPtr* frame) {
     EnsureMediaFoundation();
     ComPtr<IMFAttributes> attr;
@@ -182,8 +198,11 @@ bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at, int maxSid
         h = (UINT32)area.Area.cy;
     }
     if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && den) vi.fps = (double)num / den;
-    vi.w = (int)w;
-    vi.h = (int)h;
+    // Phone videos are stored sideways with a rotation for players to apply; show them upright.
+    UINT32 rotation = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, 0) % 360;
+    if (rotation % 90) rotation = 0;
+    vi.w = (int)(rotation % 180 ? h : w);
+    vi.h = (int)(rotation % 180 ? w : h);
     if (info) *info = vi;
     if (!frame) return true;
 
@@ -238,6 +257,9 @@ bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at, int maxSid
     }
     if (twoD) b2->Unlock2D();
     else buf->Unlock();
+    if (rotation && !(full = RotateBitmap(*full, (int)rotation))) return false;
+    w = (UINT32)full->Width();
+    h = (UINT32)full->Height();
     if (maxSide > 0 && (int)std::max(w, h) > maxSide) {
         const double k = (double)maxSide / std::max(w, h);
         *frame = Resample(*full, std::max(1, (int)std::lround(w * k)), std::max(1, (int)std::lround(h * k)));
@@ -261,7 +283,7 @@ Mp4Writer::Mp4Writer() : p_(std::make_unique<Impl>()) {}
 Mp4Writer::~Mp4Writer() = default;
 int64_t Mp4Writer::Frames() const { return p_->frames; }
 
-HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels) {
+HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels, int rotation) {
     EnsureMediaFoundation();
     p_->w = w;
     p_->h = h;
@@ -283,6 +305,7 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(out.Get(), MF_MT_FRAME_SIZE, w, h);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(out.Get(), MF_MT_FRAME_RATE, fps, 1);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(out.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    if (SUCCEEDED(hr) && rotation) hr = out->SetUINT32(MF_MT_VIDEO_ROTATION, (UINT32)rotation);
     if (SUCCEEDED(hr)) hr = p_->writer->AddStream(out.Get(), &p_->video);
     if (SUCCEEDED(hr)) hr = MFCreateMediaType(&in);
     if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);

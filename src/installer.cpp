@@ -91,6 +91,48 @@ void SetDword(HKEY k, const wchar_t* name, DWORD v) {
     RegSetValueExW(k, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
 }
 
+// Explorer integration for pictures and videos made anywhere: Ather Screenshot in "Open with", and "Edit with
+// Ather Screenshot" on the right-click menu. Both launch the exe with just the path, which RunCli treats as
+// "open this file in the editor" (never anything else). Per user, removed again on uninstall.
+constexpr wchar_t kFileProgId[] = L"Software\\Classes\\AtherScreenshot.File";
+constexpr wchar_t kAppKey[] = L"Software\\Classes\\Applications\\AtherScreenshot.exe";
+constexpr wchar_t kEditVerb[] = L"AtherScreenshot.Edit";
+const wchar_t* const kEditableTypes[] = {L".png", L".jpg", L".jpeg", L".bmp", L".gif", L".webp", L".tif", L".tiff", L".heic",
+                                         L".mp4", L".mov", L".m4v", L".wmv", L".avi", L".mkv"};
+
+void SetKeyString(const std::wstring& path, const wchar_t* name, const std::wstring& v) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    SetString(k, name, v);
+    RegCloseKey(k);
+}
+
+void RegisterFileTypes(const std::wstring& exe) {
+    const std::wstring open = L"\"" + exe + L"\" \"%1\"", icon = L"\"" + exe + L"\",0";
+    SetKeyString(kFileProgId, nullptr, L"Picture or video");
+    SetKeyString(std::wstring(kFileProgId) + L"\\DefaultIcon", nullptr, icon);
+    SetKeyString(std::wstring(kFileProgId) + L"\\shell\\open\\command", nullptr, open);
+    SetKeyString(kAppKey, L"FriendlyAppName", kProductName);
+    SetKeyString(std::wstring(kAppKey) + L"\\shell\\open\\command", nullptr, open);
+    for (const wchar_t* ext : kEditableTypes) {
+        SetKeyString(std::wstring(kAppKey) + L"\\SupportedTypes", ext, L"");
+        SetKeyString(std::wstring(L"Software\\Classes\\") + ext + L"\\OpenWithProgids", L"AtherScreenshot.File", L"");
+        const std::wstring verb = std::wstring(L"Software\\Classes\\SystemFileAssociations\\") + ext + L"\\shell\\" + kEditVerb;
+        SetKeyString(verb, L"MUIVerb", L"Edit with Ather Screenshot");
+        SetKeyString(verb, L"Icon", icon);
+        SetKeyString(verb + L"\\command", nullptr, open);
+    }
+}
+
+void UnregisterFileTypes() {
+    RegDeleteTreeW(HKEY_CURRENT_USER, kFileProgId);
+    RegDeleteTreeW(HKEY_CURRENT_USER, kAppKey);
+    for (const wchar_t* ext : kEditableTypes) {
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\") + ext + L"\\OpenWithProgids").c_str(), L"AtherScreenshot.File");
+        RegDeleteTreeW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\SystemFileAssociations\\") + ext + L"\\shell\\" + kEditVerb).c_str());
+    }
+}
+
 bool CreateShortcut(const std::wstring& target, const std::wstring& lnk) {
     ComPtr<IShellLinkW> link;
     ComPtr<IPersistFile> file;
@@ -159,7 +201,8 @@ std::wstring Install(bool startWithWindows) {
         }
         RegCloseKey(k);
     }
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);  // refresh Start menu
+    RegisterFileTypes(target);
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);  // refresh Start menu and file menus
     return L"";
 }
 
@@ -177,6 +220,8 @@ void Uninstall() {
     }
     RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
     RegDeleteTreeW(HKEY_CURRENT_USER, kProtocolKey);
+    UnregisterFileTypes();
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     DeleteFileW(ShortcutPath().c_str());
     // This exe may be the one being deleted: remove the folder from a helper once we've exited.
     // (`timeout` refuses to run without a console, so wait with ping; retry in case the exe is still closing.)

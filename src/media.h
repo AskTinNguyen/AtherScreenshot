@@ -23,6 +23,8 @@ struct VideoInfo {
 // Reads the video's size and length, and optionally the frame at `at` seconds scaled to `maxSide`.
 bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at = -1, int maxSide = 0, BitmapPtr* frame = nullptr);
 
+// The image turned clockwise by 90, 180 or 270 degrees.
+BitmapPtr RotateBitmap(const Bitmap& src, int degrees);
 // Area-averaging resample (box filter when shrinking, bilinear when growing).
 BitmapPtr Resample(const Bitmap& src, int w, int h);
 // Starts Media Foundation once per process.
@@ -33,7 +35,8 @@ class Mp4Writer {
 public:
     Mp4Writer();
     ~Mp4Writer();
-    HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2);
+    // `rotation` (0, 90, 180, 270) is stored for players to apply, as phones do; the frames stay as given.
+    HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0);
     HRESULT WriteFrame(const uint32_t* px, int64_t t, int64_t duration);
     // Interleaved 16-bit PCM at the rate and channel count given to Begin.
     HRESULT WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t);

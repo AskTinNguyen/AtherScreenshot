@@ -140,7 +140,7 @@ const CmdDef kCmds[] = {
     {CmdHistory, L"History", L"Capture gallery", L"history browse recent search thumbnails library tags collections organize", 0xE81C, L"Ctrl+Alt+H", false},
     {CmdScrolling, L"CaptureScrolling", L"Scrolling capture (long page)", L"scroll stitch full page chat long", 0xE8CB, L"Ctrl+Alt+S", true},
     {CmdEditLast, L"EditLastCapture", L"Annotate last capture", L"edit editor draw markup", 0xE70F, L"", false},
-    {CmdOpenImage, L"OpenImageInEditor", L"Open image in editor…", L"edit file annotate load", 0xE8E5, L"", false},
+    {CmdOpenImage, L"OpenImageInEditor", L"Open a picture or video to edit…", L"edit file annotate load image video mp4 import", 0xE8E5, L"", false},
     {CmdFullscreen, L"CaptureFullscreen", L"Capture full screen", L"all monitors desktop entire everything", 0xE7F4, L"Ctrl+PrintScreen", true},
     {CmdMonitor, L"CaptureMonitor", L"Capture current monitor", L"display screen", 0xE7F4, L"Ctrl+Shift+PrintScreen", true},
     {CmdWindow, L"CaptureWindow", L"Capture active window", L"app foreground focused", 0xE8A7, L"Alt+PrintScreen", true},
@@ -620,19 +620,27 @@ void StartRuler() {
     ShowOverlay(OverlayMode::Ruler, CaptureScreen(virt, false), virt, MakeOverlayOptions(), [](const OverlayResult&) {});
 }
 
+// Any picture or video, wherever it came from: pictures open in the editor, videos in the video editor.
+void OpenFileToEdit(const std::wstring& file) {
+    if (IsVideoFile(file)) OpenVideoEditor(file);
+    else OpenEditorFile(file);
+}
+
 void OpenImageInEditor() {
     wchar_t file[MAX_PATH] = L"";
     std::wstring dir = g_settings.CapturesFolder();
     OPENFILENAMEW ofn{sizeof(ofn)};
     ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff\0All files\0*.*\0";
+    ofn.lpstrFilter = L"Pictures and videos\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.heic;*.mp4;*.mov;*.m4v;*.wmv;*.avi;*.mkv\0"
+                      L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.heic\0Videos\0*.mp4;*.mov;*.m4v;*.wmv;*.avi;*.mkv\0"
+                      L"All files\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrInitialDir = dir.c_str();
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     SetForegroundWindow(g_hwnd);
     if (!GetOpenFileNameW(&ofn)) return;
-    OpenEditorFile(file);
+    OpenFileToEdit(file);
 }
 
 void CaptureActiveWindow(After after) {
@@ -1066,6 +1074,8 @@ void RunCli(const CliRequest& req, bool trusted) {
         if (GetFileAttributesW(req.file.c_str()) == INVALID_FILE_ATTRIBUTES)
             return Notify(L"File not found", req.file);
         if (req.cmd == CmdUploadLast) return UploadAndCopyLink(req.file);
+        if (req.cmd == CmdEditLast && IsVideoFile(req.file)) return (void)OpenVideoEditor(req.file);
+        if (req.cmd == CmdPinLast && IsVideoFile(req.file)) return Notify(L"Videos can't be pinned", FileNameOf(req.file));
         if (req.cmd == CmdEditLast || req.cmd == CmdPinLast) {
             BitmapPtr img = LoadImageFile(req.file);
             if (!img) return Notify(L"Could not open image", FileNameOf(req.file));

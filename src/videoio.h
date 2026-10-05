@@ -82,7 +82,8 @@ private:
     std::unique_ptr<Impl> p_;
 };
 
-// Test helper: a clip whose color changes every second (red, green, blue…), optionally with a 440 Hz tone.
-bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone);
+// Test helper: a clip whose color changes every second (red, green, blue…), optionally with a 440 Hz tone, and
+// optionally marked as rotated (as phones do).
+bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone, int rotation = 0);
 
 }  // namespace ather

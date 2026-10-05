@@ -55,14 +55,17 @@ std::wstring HrText(const wchar_t* what, HRESULT hr) {
 
 struct VideoReader::Impl {
     ComPtr<IMFSourceReader> reader;
-    UINT32 w = 0, h = 0, cw = 0, ch = 0;
+    UINT32 w = 0, h = 0, cw = 0, ch = 0;  // shown size (before rotation), decoded size
+    UINT32 rotation = 0;                  // clockwise degrees to show it upright (phone videos)
     double duration = 0, fps = 0;
     bool audio = false;
 };
 
 VideoReader::VideoReader() : p_(std::make_unique<Impl>()) {}
 VideoReader::~VideoReader() = default;
-SIZE VideoReader::Size() const { return {(LONG)p_->w, (LONG)p_->h}; }
+SIZE VideoReader::Size() const {
+    return p_->rotation % 180 ? SIZE{(LONG)p_->h, (LONG)p_->w} : SIZE{(LONG)p_->w, (LONG)p_->h};
+}
 double VideoReader::Duration() const { return p_->duration; }
 double VideoReader::Fps() const { return p_->fps; }
 bool VideoReader::HasAudio() const { return p_->audio; }
@@ -90,6 +93,9 @@ bool VideoReader::Open(const std::wstring& path) {
         p_->h = (UINT32)area.Area.cy;
     }
     if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && den) p_->fps = (double)num / den;
+    // Turned like the preview player turns it (IMFMediaEngine applies this itself).
+    p_->rotation = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, 0) % 360;
+    if (p_->rotation % 90) p_->rotation = 0;
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
     hr = MFCreateMediaType(&rgb);
@@ -142,6 +148,7 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
         }
         if (twoD) b2->Unlock2D();
         else buf->Unlock();
+        if (p_->rotation) out = RotateBitmap(*out, (int)p_->rotation);
         *frame = out;
         *t = ts / kTicks;
         return true;
@@ -795,9 +802,9 @@ BitmapPtr VideoPlayer::NewFrame(double* t) {
 
 // ---------- test clip ----------
 
-bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone) {
+bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone, int rotation) {
     Mp4Writer mw;
-    if (FAILED(mw.Begin(path, w, h, fps, tone ? kRate : 0, 2))) return false;
+    if (FAILED(mw.Begin(path, w, h, fps, tone ? kRate : 0, 2, rotation))) return false;
     const uint32_t colors[] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu};
     std::vector<uint32_t> px((size_t)w * h);
     const int n = (int)std::lround(seconds * fps);
@@ -821,6 +828,30 @@ bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double secon
 }
 
 // ---------- tests (VideoTests.swift) ----------
+
+ATHER_TEST(video_rotated_phone_clip_reads_upright_like_the_preview) {
+    for (int rot : {90, 270}) {
+        const std::wstring path = test::TempDir() + L"/rot" + std::to_wstring(rot) + L".mp4";
+        CHECK(WriteTestClip(path, 320, 160, 10, 1, false, rot));
+        VideoReader vr;
+        CHECK(vr.Open(path));
+        CHECK(vr.Size().cx == 160 && vr.Size().cy == 320);
+        BitmapPtr f;
+        double t = 0;
+        CHECK(vr.Read(&f, &t) && f && f->Width() == 160 && f->Height() == 320);
+        VideoInfo vi;
+        BitmapPtr thumb;
+        CHECK(ProbeVideo(path, &vi, 0.2, 0, &thumb) && vi.w == 160 && vi.h == 320 && thumb && thumb->Width() == 160);
+    }
+    // Which way it turns: a mark in the top-left corner of the stored picture ends up top-right after 90°.
+    auto src = Bitmap::Create(4, 2);
+    std::fill(src->Bits(), src->Bits() + 8, 0xFF000000u);
+    src->Bits()[0] = 0xFFFFFFFFu;
+    auto r90 = RotateBitmap(*src, 90), r270 = RotateBitmap(*src, 270), r180 = RotateBitmap(*src, 180);
+    CHECK(r90->Width() == 2 && r90->Height() == 4 && r90->Bits()[1] == 0xFFFFFFFFu);
+    CHECK(r270->Bits()[3 * 2] == 0xFFFFFFFFu);  // bottom-left
+    CHECK(r180->Bits()[7] == 0xFFFFFFFFu);
+}
 
 ATHER_TEST(video_time_stretch_keeps_pitch) {
     const int rate = 48000;
