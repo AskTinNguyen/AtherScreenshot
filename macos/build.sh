@@ -2,7 +2,11 @@
 # Builds build/Ather Screenshot.app.
 #   ./build.sh            release build for this Mac's architecture
 #   ./build.sh debug      debug build
-#   ./build.sh package    universal (arm64 + x86_64) release + dist/*.zip, *.dmg, SHA256SUMS.txt
+#   ./build.sh package    universal (arm64 + x86_64) release + dist/*.zip (the update), *.dmg, SHA256SUMS.txt
+#   ./build.sh publish    package, then add the Mac side to the GitHub Release v<version> (made by the Windows
+#                         package.bat publish): uploads the DMG and the zip, sets the "macos" entry of the
+#                         release's latest.json (keeping "windows"), and writes the same to ../downloads/latest.json.
+#                         Needs gh. Only when the owner says so.
 # Signing: ad-hoc by default. Set SIGN_IDENTITY="Developer ID Application: …" to sign for distribution,
 # and NOTARY_PROFILE=<notarytool keychain profile> with `package` to notarize the DMG.
 set -euo pipefail
@@ -12,7 +16,7 @@ MODE="${1:-release}"
 CONFIG=release
 [ "$MODE" = "debug" ] && CONFIG=debug
 ARCHS=()
-[ "$MODE" = "package" ] && ARCHS=(--arch arm64 --arch x86_64)
+[ "$MODE" = "package" ] || [ "$MODE" = "publish" ] && ARCHS=(--arch arm64 --arch x86_64)
 
 # The version lives in ../src/version.h, shared with the Windows build.
 VERSION=$(sed -n 's/.*ATHER_VERSION_STR "\(.*\)".*/\1/p' ../src/version.h)
@@ -45,7 +49,7 @@ else
 fi
 echo "Built $APP ($VERSION)"
 
-if [ "$MODE" = "package" ]; then
+if [ "$MODE" = "package" ] || [ "$MODE" = "publish" ]; then
   mkdir -p dist
   ZIP="dist/AtherScreenshot-$VERSION-macOS.zip"
   DMG="dist/AtherScreenshot-$VERSION-macOS.dmg"
@@ -64,4 +68,33 @@ if [ "$MODE" = "package" ]; then
   fi
   (cd dist && shasum -a 256 "$(basename "$ZIP")" "$(basename "$DMG")" > SHA256SUMS.txt)
   echo "Packaged: $ZIP, $DMG"
+fi
+
+if [ "$MODE" = "publish" ]; then
+  REPO=AskTinNguyen/AtherScreenshot
+  TAG="v$VERSION"
+  gh release view "$TAG" --repo "$REPO" >/dev/null || { echo "No release $TAG yet: publish Windows first (package.bat publish)."; exit 1; }
+  gh release upload "$TAG" "$DMG" "$ZIP" --repo "$REPO" --clobber
+  WORK=$(mktemp -d)
+  gh release download "$TAG" --repo "$REPO" --pattern latest.json --dir "$WORK" 2>/dev/null || echo '{}' > "$WORK/latest.json"
+  # Only the macos entry changes; windows (and anything else) stays as it is.
+  /usr/bin/python3 - "$WORK/latest.json" "$ZIP" "$BUILD_NUM" "https://github.com/$REPO/releases/download/$TAG/$(basename "$ZIP")" "${UPDATE_NOTES:-}" <<'PY'
+import hashlib, json, os, sys
+path, zip_, build, url, notes = sys.argv[1:6]
+raw = open(path, 'rb').read().decode('utf-8-sig').strip() or '{}'
+m = json.loads(raw)
+m['macos'] = {'version': build, 'url': url, 'sha256': hashlib.sha256(open(zip_, 'rb').read()).hexdigest(),
+              'size': os.path.getsize(zip_), 'notes': notes}
+open(path, 'w').write(json.dumps(m, indent=4) + '\n')
+PY
+  gh release upload "$TAG" "$WORK/latest.json" --repo "$REPO" --clobber
+  /usr/bin/python3 - "$WORK/latest.json" ../downloads/latest.json <<'PY'
+import json, sys
+new = json.load(open(sys.argv[1]))
+try: m = json.loads(open(sys.argv[2], 'rb').read().decode('utf-8-sig'))
+except Exception: m = {}
+m['macos'] = new['macos']
+open(sys.argv[2], 'w').write(json.dumps(m, indent=4) + '\n')
+PY
+  echo "Published the Mac side of $TAG (build $BUILD_NUM). Commit and push downloads/latest.json."
 fi

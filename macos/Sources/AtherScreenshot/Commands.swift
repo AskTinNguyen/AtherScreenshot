@@ -44,6 +44,7 @@ enum Cmd: String, CaseIterable {
     case toggleCursor = "ToggleCaptureCursor"
     case toggleLogin = "ToggleLaunchAtLogin"
     case settings = "EditSettings"
+    case checkUpdates = "CheckForUpdates"
     case about = "About"
     case quit = "Quit"
 }
@@ -102,6 +103,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .toggleCursor, title: "Include mouse cursor", keywords: "toggle setting pointer", icon: "cursorarrow", hotkey: "", capture: false),
     CmdDef(cmd: .toggleLogin, title: "Launch at login", keywords: "toggle startup boot autostart", icon: "power", hotkey: "", capture: false),
     CmdDef(cmd: .settings, title: "Settings", keywords: "preferences options config hotkeys shortcuts keyboard", icon: "gearshape", hotkey: "", capture: false),
+    CmdDef(cmd: .checkUpdates, title: "Check for updates…", keywords: "update upgrade new version download latest", icon: "arrow.down.circle", hotkey: "", capture: false),
     CmdDef(cmd: .about, title: "About Ather Screenshot", keywords: "version info help", icon: "info.circle", hotkey: "", capture: false),
     CmdDef(cmd: .quit, title: "Quit Ather Screenshot", keywords: "exit close", icon: "power.circle", hotkey: "", capture: false),
 ]

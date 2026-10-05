@@ -10,7 +10,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static var shared: AppDelegate!
 
     static func main() {
-        let args = Array(CommandLine.arguments.dropFirst())
+        var args = Array(CommandLine.arguments.dropFirst())
+        // Relaunched by the update helper (the old copy has quit by then).
+        let afterUpdate = args.first == "--after-update", updateFailed = args.first == "--update-failed"
+        if afterUpdate || updateFailed { args.removeFirst() }
         if args.first == "--write-iconset", args.count >= 2 {
             exit(Logo.writeIconset(URL(fileURLWithPath: args[1])) ? 0 : 1)
         }
@@ -49,6 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let d = AppDelegate()
         shared = d
         d.launchArgs = args
+        d.afterUpdate = afterUpdate
+        d.updateFailed = updateFailed
         app.delegate = d
         app.setActivationPolicy(.accessory)
         app.run()
@@ -72,6 +77,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let s = Settings.shared
     private var statusItem: NSStatusItem!
     private var launchArgs: [String] = []
+    private var afterUpdate = false
+    private var updateFailed = false
     private var trackedWindows: [NSWindow] = []
     private var hotkeysSuspended = false
 
@@ -107,8 +114,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.runCli((parts.last ?? "").components(separatedBy: "\u{1f}"), trusted: trusted)
         }
         try? FileManager.default.createDirectory(at: s.capturesFolder, withIntermediateDirectories: true)
+        Updater.cleanUp()  // only this, the running instance, clears an earlier update's leftovers
+        UpdateController.shared.start()
 
-        if !launchArgs.isEmpty {
+        if afterUpdate {
+            Toast.shared.show("Updated to Ather Screenshot \(AppDelegate.version)", "Your settings, captures and gallery are just as you left them.", ms: 6000)
+        } else if updateFailed {
+            UpdateController.shared.failed("The new version couldn't be put in place, so this one kept running.")
+        } else if !launchArgs.isEmpty {
             runCli(launchArgs, trusted: AppDelegate.interactiveLaunch)
         } else if !UserDefaults.standard.bool(forKey: "Welcomed") {
             UserDefaults.standard.set(true, forKey: "Welcomed")
@@ -141,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Finish an active recording and pending writes before quitting, so nothing is lost.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        UpdateController.shared.quitting = true  // a download finishing now must not install or relaunch
         let finishWrites = {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
@@ -277,6 +291,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(.openFolder)
         add(.settings, "Settings…")
         menu.addItem(.separator())
+        if let u = UpdateController.shared.available {
+            // Not a palette command: it starts the update itself.
+            let item = NSMenuItem(title: "Update to version \(u.version)…", action: #selector(menuInstallUpdate), keyEquivalent: "")
+            item.target = self
+            item.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+            menu.addItem(item)
+        } else {
+            add(.checkUpdates)
+        }
         add(.about)
         add(.quit)
     }
@@ -287,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.execute(c) }
     }
     @objc private func menuAbout() { execute(.about) }
+    @objc func menuInstallUpdate() { UpdateController.shared.install() }
     @objc private func menuSettings() { execute(.settings) }
 
     func toggleState(_ c: Cmd) -> Bool? {
@@ -357,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .stopRecording:
             if Recorder.isActive { Recorder.current?.stop() } else if ScrollCapture.active != nil { ScrollCapture.cancel() } else { Toast.shared.show("Not recording") }
         case .pauseRecording: Recorder.current?.togglePause()
+        case .checkUpdates: UpdateController.shared.check(manual: true)
         case .history: GalleryWindow.show()
         case .editLast:
             if let img = lastImage { Editor.open(img, scale: lastScale) } else if let u = lastImageURL { Editor.open(url: u) } else { Toast.shared.show("Nothing captured yet") }

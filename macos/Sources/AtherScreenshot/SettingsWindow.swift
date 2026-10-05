@@ -27,6 +27,7 @@ private let rows: [Row] = {
     var r: [Row] = [
         Row(key: "CopyToClipboard", title: "Copy to clipboard after capture", section: "General", kind: .toggle),
         Row(key: "SaveToFile", title: "Save to file after capture", section: "General", kind: .toggle),
+        Row(key: "CheckAutomatically", title: "Check for updates automatically (daily, from GitHub)", section: "Updates", keywords: "update upgrade version", kind: .toggle),
         Row(key: "AutoTag", title: "Tag captures automatically (otherwise tags are suggested)", section: "Gallery", keywords: "auto tags suggestions categorize", kind: .toggle),
         Row(key: "SaveFolder", title: "Captures folder", section: "General", keywords: "directory path pictures", kind: .folder),
         Row(key: "AfterCapture", title: "After capture", section: "General", keywords: "action pin open edit upload",
@@ -75,7 +76,7 @@ private let rows: [Row] = {
     return r
 }()
 
-private let sections = ["General", "Capture", "Recording", "Editor", "Gallery", "Upload", "Shortcuts"]
+private let sections = ["General", "Capture", "Recording", "Editor", "Gallery", "Upload", "Updates", "Shortcuts"]
 
 struct SettingsView: View {
     @ObservedObject var s = Settings.shared
