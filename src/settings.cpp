@@ -184,6 +184,10 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"ShowClicks=1\r\n"
         L"; Shows typed keys in the video. Off by default: it would also show passwords you type.\r\n"
         L"ShowKeys=0\r\n"
+        L"; Draws a connected game controller (Xbox-style, XInput) in a corner of the video\r\n"
+        L"ShowGamepad=0\r\n"
+        L"; topleft | topright | bottomleft | bottomright\r\n"
+        L"GamepadCorner=bottomright\r\n"
         L"; Windows.Graphics.Capture (GPU). 0 = classic GDI capture\r\n"
         L"GpuCapture=1\r\n"
         L"\r\n[Scrolling]\r\n"
@@ -248,6 +252,8 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Recording", L"CountdownSeconds", L"3"},
         {L"Recording", L"ShowClicks", L"1"},
         {L"Recording", L"ShowKeys", L"0"},
+        {L"Recording", L"ShowGamepad", L"0"},
+        {L"Recording", L"GamepadCorner", L"bottomright"},
         {L"Recording", L"GpuCapture", L"1"},
         {L"Scrolling", L"DelayMs", L"400"},
         {L"Scrolling", L"MaxFrames", L"60"},
@@ -285,6 +291,8 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     countdownSeconds = std::clamp(_wtoi(Get(L"Recording", L"CountdownSeconds", L"3").c_str()), 0, 10);
     showClicks = GetBool(L"Recording", L"ShowClicks", true);
     showKeys = GetBool(L"Recording", L"ShowKeys", false);
+    showGamepad = GetBool(L"Recording", L"ShowGamepad", false);
+    gamepadCorner = Lower(Get(L"Recording", L"GamepadCorner", L"bottomright"));
     gpuCapture = GetBool(L"Recording", L"GpuCapture", true);
     fileNameTemplate = Get(L"Capture", L"FileNameTemplate", L"Ather_{yyyy}{MM}{dd}_{HH}{mm}{ss}_{ms}");
     askForName = GetBool(L"Capture", L"AskForName", false);

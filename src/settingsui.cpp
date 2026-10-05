@@ -174,6 +174,11 @@ void Window::Build() {
     add(Kind::Toggle, L"Recording", L"RecordCursor", L"Record mouse cursor", L"", L"1");
     add(Kind::Toggle, L"Recording", L"ShowClicks", L"Show clicks", L"Ripples where you click", L"1");
     add(Kind::Toggle, L"Recording", L"ShowKeys", L"Show keystrokes", L"Careful: also shows passwords you type", L"0");
+    add(Kind::Toggle, L"Recording", L"ShowGamepad", L"Show game controller", L"Buttons and sticks in a corner, while a controller is connected", L"0");
+    {
+        Row* r = add(Kind::Choice, L"Recording", L"GamepadCorner", L"Controller corner", L"Where the controller goes in the video", L"bottomright");
+        r->choices = {{L"bottomright", L"Bottom right"}, {L"bottomleft", L"Bottom left"}, {L"topright", L"Top right"}, {L"topleft", L"Top left"}};
+    }
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
     header(L"Scrolling capture & editor");

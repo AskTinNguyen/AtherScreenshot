@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "gamepad.h"
 
 namespace ather {
 
@@ -16,6 +17,8 @@ struct RecordOptions {
     bool gpuCapture = true;    // Windows.Graphics.Capture when possible, GDI otherwise
     bool showClicks = false;
     bool showKeys = false;
+    bool showGamepad = false;  // a game controller in a corner while one is connected
+    PadCorner gamepadCorner = PadCorner::BottomRight;
     int countdownSeconds = 0;
     std::wstring path;
 };

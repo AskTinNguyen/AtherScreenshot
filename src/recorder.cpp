@@ -210,7 +210,9 @@ void Run(Session* s) {
         auto raw = Bitmap::Create(s->outW, s->outH);
         auto frame = Bitmap::Create(s->outW, s->outH);  // raw + click/key overlays
         const size_t bytes = (size_t)s->outW * s->outH * 4;
-        const bool viz = s->opt.showClicks || s->opt.showKeys;
+        const bool viz = s->opt.showClicks || s->opt.showKeys || s->opt.showGamepad;
+        std::unique_ptr<GamepadPoller> pad;
+        if (s->opt.showGamepad) pad = std::make_unique<GamepadPoller>();
         HDC screen = GetDC(nullptr);
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
@@ -248,7 +250,9 @@ void Run(Session* s) {
                         POINT origin{r.left, r.top};
                         RECT wr;
                         if (s->opt.window && GetWindowFrame(s->opt.window, &wr)) origin = {wr.left, wr.top};
-                        DrawInputViz(*frame, origin, s->scaled ? (float)s->outW / RectW(r) : 1.f);
+                        const float scale = s->scaled ? (float)s->outW / RectW(r) : 1.f;
+                        DrawInputViz(*frame, origin, scale);
+                        if (pad) DrawGamepad(*frame, pad->Take(), s->opt.gamepadCorner, DpiScaleAt({origin.x + 1, origin.y + 1}) * scale);
                         px = frame->Bits();
                     }
                     lastT = s->clock.ActiveTicks100ns(RecClock::Now());

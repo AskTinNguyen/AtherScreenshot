@@ -70,6 +70,7 @@ enum Cmd : int {
     CmdToggleMic,
     CmdToggleClicks,
     CmdToggleKeys,
+    CmdToggleGamepad,
     CmdRegionRedact,
     CmdRenameLast,
     CmdToggleAutoRedact,
@@ -129,6 +130,7 @@ const CmdDef kCmds[] = {
     {CmdToggleMic, L"ToggleMicrophone", L"Record microphone", L"toggle mic voice", 0xE720, L"", false},
     {CmdToggleClicks, L"ToggleShowClicks", L"Show clicks in recordings", L"toggle mouse ripple", 0xE962, L"", false},
     {CmdToggleKeys, L"ToggleShowKeys", L"Show keystrokes in recordings", L"toggle keyboard keys", 0xE765, L"", false},
+    {CmdToggleGamepad, L"ToggleShowGamepad", L"Show game controller in recordings", L"toggle gamepad controller xbox joystick input overlay", 0xE7FC, L"", false},
     {CmdRegionRedact, L"CaptureRegionRedact", L"Capture region with auto-redact", L"privacy hide email key token password ocr pixelate", 0xE72E, L"", true},
     {CmdRenameLast, L"RenameLastCapture", L"Rename last capture…", L"name file title", 0xE8AC, L"", false},
     {CmdToggleAutoRedact, L"ToggleAutoRedact", L"Auto-redact every capture", L"toggle privacy ocr pixelate", 0xE72E, L"", false},
@@ -297,6 +299,7 @@ bool ToggleState(int id, bool* on) {
         case CmdToggleMic: *on = g_settings.microphone; return true;
         case CmdToggleClicks: *on = g_settings.showClicks; return true;
         case CmdToggleKeys: *on = g_settings.showKeys; return true;
+        case CmdToggleGamepad: *on = g_settings.showGamepad; return true;
         case CmdToggleAutoRedact: *on = g_settings.autoRedact; return true;
     }
     return false;
@@ -524,6 +527,8 @@ void BeginRecording(RecordFormat fmt, const RECT& rect, HWND window, const std::
     o.gpuCapture = g_settings.gpuCapture;
     o.showClicks = g_settings.showClicks;
     o.showKeys = g_settings.showKeys;
+    o.showGamepad = g_settings.showGamepad;
+    o.gamepadCorner = ParsePadCorner(g_settings.gamepadCorner);
     o.countdownSeconds = g_settings.countdownSeconds;
     o.path = MakeCapturePath(g_settings.CapturesFolder(), fmt == RecordFormat::Gif ? L"gif" : L"mp4",
                              {title, WindowAppName(window), RectW(rect), RectH(rect)});
@@ -763,6 +768,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdToggleMic: Toggle(g_settings.microphone, L"Recording", L"RecordMicrophone", L"Microphone"); break;
         case CmdToggleClicks: Toggle(g_settings.showClicks, L"Recording", L"ShowClicks", L"Show clicks"); break;
         case CmdToggleKeys: Toggle(g_settings.showKeys, L"Recording", L"ShowKeys", L"Show keystrokes"); break;
+        case CmdToggleGamepad: Toggle(g_settings.showGamepad, L"Recording", L"ShowGamepad", L"Show game controller"); break;
         case CmdEditLast:
             if (g_last) OpenEditor(g_last);
             else if (auto recent = RecentCaptures(g_settings.CapturesFolder(), 1); !recent.empty())

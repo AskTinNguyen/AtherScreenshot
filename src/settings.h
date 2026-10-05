@@ -40,6 +40,8 @@ public:
     int countdownSeconds = 3;
     bool showClicks = true;
     bool showKeys = false;
+    bool showGamepad = false;
+    std::wstring gamepadCorner = L"bottomright";  // topleft | topright | bottomleft | bottomright
     bool gpuCapture = true;
     // scrolling capture
     int scrollDelayMs = 400;
