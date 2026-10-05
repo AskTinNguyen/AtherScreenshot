@@ -42,7 +42,7 @@ rem 3) Checksums so people can verify what they downloaded.
 powershell -NoProfile -Command "Get-ChildItem '%DIST%\*' -Include *.exe,*.zip | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $_.Name } | Set-Content -Encoding ascii '%DIST%\SHA256SUMS.txt'" || exit /b 1
 
 rem 4) What running copies read to find this version (src\updater.cpp). It points at the setup exe in downloads\.
-powershell -NoProfile -Command "$f = Get-Item '%DIST%\AtherScreenshot-Setup-%VER%.exe'; $w = [ordered]@{ version = '%VER%'; url = 'https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/' + $f.Name; sha256 = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(); size = $f.Length; notes = [string]$env:UPDATE_NOTES }; [IO.File]::WriteAllText((Join-Path (Resolve-Path '%DIST%') 'latest.json'), (ConvertTo-Json @{ windows = $w } -Depth 3))" || exit /b 1
+powershell -NoProfile -Command "$f = Get-Item '%DIST%\AtherScreenshot-Setup-%VER%.exe'; $w = [ordered]@{ version = '%VER%'; url = 'https://raw.githubusercontent.com/AskTinNguyen/AtherScreenshot/main/downloads/' + $f.Name; sha256 = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(); size = $f.Length; notes = [string]$env:UPDATE_NOTES }; [IO.File]::WriteAllText((Join-Path (Resolve-Path '%DIST%') 'latest.json'), (ConvertTo-Json @{ windows = $w } -Depth 3))" || exit /b 1
 
 echo.
 echo Packaged Ather Screenshot %VER%:

@@ -1,7 +1,7 @@
 {
     "windows":  {
                     "version":  "0.0.2",
-                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-Setup-0.0.2.exe",
+                    "url":  "https://raw.githubusercontent.com/AskTinNguyen/AtherScreenshot/main/downloads/AtherScreenshot-Setup-0.0.2.exe",
                     "sha256":  "328636e2f1192817550b9301aa48c08ae6539532f38a12c42d09956408c976eb",
                     "size":  2913280,
                     "notes":  "Game controller overlay, edit any picture or video, join videos into one, and updates from inside the app."
