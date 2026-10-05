@@ -1,8 +1,10 @@
 #include "videoeditor.h"
 
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <mfmediaengine.h>
 #include <objidl.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
 
@@ -192,7 +194,7 @@ void RunMenu(HWND owner, const std::vector<MenuItem>& items, POINT at) {
 // Decodes the frame at a time on a worker thread (keeps one reader open, so stepping forward is cheap).
 class FrameFetcher {
 public:
-    FrameFetcher(std::wstring path, HWND hwnd) : path_(std::move(path)), hwnd_(hwnd), worker_([this] { Work(); }) {}
+    FrameFetcher(Sequence seq, HWND hwnd) : seq_(std::move(seq)), hwnd_(hwnd), worker_([this] { Work(); }) {}
     ~FrameFetcher() {
         {
             std::lock_guard l(mu_);
@@ -216,8 +218,8 @@ public:
 private:
     void Work() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        VideoReader r;
-        const bool ok = r.Open(path_);
+        SequenceReader r;
+        const bool ok = r.Open(seq_);
         BitmapPtr last;
         double lastT = -1;
         for (;;) {
@@ -249,7 +251,7 @@ private:
         CoUninitialize();
     }
 
-    std::wstring path_;
+    Sequence seq_;
     HWND hwnd_;
     std::mutex mu_;
     std::condition_variable cv_;
@@ -289,10 +291,13 @@ public:
     float s = 1;
     bool snapshotMode = false;
 
-    std::unique_ptr<VideoPlayer> player;
+    std::unique_ptr<SequencePlayer> player;
     std::unique_ptr<FrameFetcher> fetcher;
-    SIZE videoSize{16, 9};
-    double duration = 0;
+    SIZE videoSize{16, 9};  // the sequence frame: the first video's size
+    double duration = 0;    // of all clips
+    std::vector<Clip> builtClips;  // what the player, fetcher and thumbnails were made for
+    std::optional<uint64_t> selClip;
+    uint64_t thumbGen = 0;
     std::wstring app, window;
 
     VideoEdit edit;
@@ -322,7 +327,7 @@ public:
     std::vector<Hot> hots;
     RECT hoverRect{};
 
-    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item };
+    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut };
     struct Drag {
         DragKind kind = DragKind::None;
         VPoint from;
@@ -333,6 +338,10 @@ public:
         bool isCaption = false;
         int edge = 0;
         double grab = 0, s0 = 0, e0 = 0;
+        size_t clip = 0;      // clip drags: which clip
+        double value = 0;     // the new in or out point
+        int target = -1;      // where a moved clip goes (-1 = it hasn't moved)
+        int downX = 0;
     } drag;
 
     int S(int v) const { return Px(s, v); }
@@ -377,6 +386,7 @@ public:
 
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
+        if (edit.clips != builtClips) RebuildSequence();
         if (player) player->SetMuted(edit.muted);
         Rerender();
         SyncFields();
@@ -384,6 +394,7 @@ public:
     }
 
     void Select(std::optional<uint64_t> id) {
+        if (id) selClip.reset();
         if (id == selected) return;
         selected = id;
         Rerender();
@@ -468,6 +479,149 @@ public:
         } else {
             player->NewFrame(&t);  // drains the engine; paused frames come from the fetcher
         }
+    }
+
+    // ---- clips ----
+
+    Sequence Seq() const { return Sequence{edit.clips, videoSize}; }
+    std::optional<size_t> SelClipIndex() const {
+        for (size_t i = 0; selClip && i < edit.clips.size(); ++i)
+            if (edit.clips[i].id == *selClip) return i;
+        return std::nullopt;
+    }
+
+    void SelectClip(std::optional<uint64_t> id) {
+        if (id) selected.reset();
+        selClip = id;
+        SyncFields();
+        Rerender();
+        Invalidate();
+    }
+
+    // The player, the paused-frame decoder and the thumbnails follow the clips (after edits and undo).
+    void RebuildSequence() {
+        builtClips = edit.clips;
+        playing = false;
+        duration = ClipsDuration(edit.clips);
+        paused = std::clamp(paused, 0.0, std::max(0.0, duration - 0.01));
+        if (player) {
+            player->SetSequence(Seq());
+            player->Seek(paused);
+        }
+        if (hwnd) {
+            fetcher = std::make_unique<FrameFetcher>(Seq(), hwnd);
+            fetcher->Request(paused);
+            thumbs.clear();  // the old ones would be stretched over the wrong clips
+            LoadThumbs();
+        }
+        if (selClip && !SelClipIndex()) selClip.reset();
+    }
+
+    void LoadThumbs() {
+        HWND self = hwnd;
+        const Sequence sq = Seq();
+        const WPARAM gen = (WPARAM)++thumbGen;
+        std::thread([sq, self, gen] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            auto* t = new std::vector<BitmapPtr>(VideoThumbnails(sq, 16, 240));
+            CoUninitialize();
+            if (!PostMessageW(self, WM_THUMBS, gen, (LPARAM)t)) delete t;
+        }).detach();
+    }
+
+    // One undo step: the new clip list, with markup and captions moved along with their footage.
+    void SetClips(std::vector<Clip> clips) {
+        if (clips.empty() || clips == edit.clips) return;
+        Pause();
+        PushUndo();
+        ApplyClips(edit, std::move(clips));
+        Changed();
+    }
+
+    // Joins videos after the selected clip (or at the end). Any shape works: each is fitted into the frame.
+    void AddClips(const std::vector<std::wstring>& paths) {
+        std::vector<Clip> add;
+        std::wstring bad;
+        for (const auto& p : paths) {
+            if (auto c = IsVideoFile(p) ? ClipOf(p) : std::nullopt) add.push_back(*c);
+            else bad += (bad.empty() ? L"" : L", ") + FileNameOf(p);
+        }
+        if (!bad.empty()) ShowToast(L"Can't add that as a video", bad, nullptr, nullptr, 4000);
+        if (add.empty()) return;
+        std::vector<Clip> clips = edit.clips;
+        const size_t at = SelClipIndex() ? *SelClipIndex() + 1 : clips.size();
+        clips.insert(clips.begin() + at, add.begin(), add.end());
+        SetClips(clips);
+        SelectClip(add.front().id);
+        Seek(ClipStart(edit.clips, at));
+    }
+
+    void AddClipDialog() {
+        std::vector<wchar_t> buf(32768, L'\0');
+        OPENFILENAMEW ofn{sizeof(ofn)};
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = L"Videos\0*.mp4;*.mov;*.m4v;*.wmv;*.avi;*.mkv\0All files\0*.*\0";
+        ofn.lpstrFile = buf.data();
+        ofn.nMaxFile = (DWORD)buf.size();
+        ofn.lpstrTitle = L"Add videos after this one";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+        if (!GetOpenFileNameW(&ofn)) return;
+        std::vector<std::wstring> parts;
+        for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) parts.push_back(p);
+        std::vector<std::wstring> files;
+        if (parts.size() == 1) files = parts;
+        else
+            for (size_t i = 1; i < parts.size(); ++i) files.push_back(parts[0] + L"\\" + parts[i]);
+        AddClips(files);
+    }
+
+    // Cuts the clip under the playhead in two (then a middle part can be removed, or the halves reordered).
+    void SplitAtPlayhead() {
+        const double t = Now();
+        const auto spot = LocateClip(edit.clips, t);
+        if (!spot) return;
+        const Clip& c = edit.clips[spot->first];
+        if (spot->second - c.in < 0.1 || c.out - spot->second < 0.1) {
+            ShowToast(L"Move the playhead into a clip to split it", L"", nullptr, nullptr, 2000);
+            return;
+        }
+        std::vector<Clip> clips = edit.clips;
+        Clip second = c;
+        second.id = NewItemId();
+        second.in = spot->second;
+        clips[spot->first].out = spot->second;
+        clips.insert(clips.begin() + spot->first + 1, second);
+        SetClips(clips);
+        SelectClip(second.id);
+        Seek(t);
+    }
+
+    void MoveClip(size_t from, size_t to) {
+        if (from >= edit.clips.size() || to >= edit.clips.size() || from == to) return;
+        std::vector<Clip> clips = edit.clips;
+        const Clip c = clips[from];
+        clips.erase(clips.begin() + from);
+        clips.insert(clips.begin() + to, c);
+        SetClips(clips);
+        Seek(ClipStart(edit.clips, to));
+    }
+
+    void RemoveClip(size_t i) {
+        if (i >= edit.clips.size() || edit.clips.size() < 2) return;
+        std::vector<Clip> clips = edit.clips;
+        clips.erase(clips.begin() + i);
+        SetClips(clips);
+        SelectClip(std::nullopt);
+        Seek(ClipStart(edit.clips, std::min(i, edit.clips.size() - 1)));
+    }
+
+    void TrimClip(size_t i, std::optional<double> in, std::optional<double> out) {
+        if (i >= edit.clips.size()) return;
+        std::vector<Clip> clips = edit.clips;
+        Clip& c = clips[i];
+        if (in) c.in = std::clamp(*in, 0.0, c.out - 0.2);
+        if (out) c.out = std::clamp(*out, c.in + 0.2, c.length);
+        SetClips(clips);
     }
 
     // ---- editing ----
@@ -762,6 +916,11 @@ public:
 
     std::vector<MenuItem> AddMenu() {
         std::vector<MenuItem> v;
+        MenuItem clip;
+        clip.label = L"Video clip…\tCtrl+O";
+        clip.run = [this] { AddClipDialog(); };
+        v.push_back(clip);
+        v.push_back(MenuItem::Sep());
         MenuItem cap;
         cap.label = L"Caption\tT";
         cap.run = [this] { AddCaption(); };
@@ -895,9 +1054,11 @@ public:
         }
         return out;
     }
+    // The clip lane shows once there's more than one clip.
+    int LaneH() const { return edit.clips.size() > 1 ? S(24) : 0; }
     RECT TimelineRect() const {
         const RECT c = Client();
-        const int h = S(90) + RowCount() * S(18);
+        const int h = S(90) + RowCount() * S(18) + LaneH();
         return {S(100), c.bottom - S(14) - h, c.right - S(14), c.bottom - S(14)};
     }
     RECT InspectorRect() const {
@@ -1053,7 +1214,7 @@ public:
         }, L"Remove the sound");
         x = r.right + S(4);
         Separator(dc, x, y, h);
-        r = Button(dc, g, x, y, h, 0xE710, L"Add", true, false, [] {}, L"Add text, emoji, callouts, blur, zoom or a title card at the playhead");
+        r = Button(dc, g, x, y, h, 0xE710, L"Add", true, false, [] {}, L"Add another video, text, emoji, callouts, blur, zoom or a title card");
         {
             const RECT ar = r;
             hots.back().click = [this, ar] { Popup(ar, AddMenu()); };
@@ -1280,9 +1441,18 @@ public:
             }
         }
         if (ci || mi) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
+        if (const auto k = SelClipIndex(); k && !ci && !mi) {
+            const size_t i = *k;
+            const Clip& c = edit.clips[i];
+            label(L"Clip " + std::to_wstring(i + 1) + L" of " + std::to_wstring(edit.clips.size()) + L":  " + FileNameOf(c.path) + L"  ·  " + Clock(c.Duration()));
+            button(0xE8C6, L"Split at playhead", false, [this](RECT) { SplitAtPlayhead(); }, L"Cut this clip in two at the playhead (S)");
+            if (i > 0) button(0xE760, L"Earlier", false, [this, i](RECT) { MoveClip(i, i - 1); }, L"Play this clip before the one on its left");
+            if (i + 1 < edit.clips.size()) button(0xE761, L"Later", false, [this, i](RECT) { MoveClip(i, i + 1); }, L"Play this clip after the one on its right");
+            if (edit.clips.size() > 1) button(0xE74D, L"Remove", false, [this, i](RECT) { RemoveClip(i); }, L"Take this clip out (Del)");
+        }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · Ctrl+Z undo",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join them",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -1320,8 +1490,9 @@ public:
 
     void PaintTimeline(HDC dc, gp::Graphics& g) {
         const RECT tr = TimelineRect();
-        const int stripH = S(52), capY = tr.top + S(62), capH = S(22), markY = tr.top + S(90), rowH = S(18);
-        const RECT strip{tr.left, tr.top, tr.right, tr.top + stripH};
+        const int top = tr.top + LaneH();
+        const int stripH = S(52), capY = top + S(62), capH = S(22), markY = top + S(90), rowH = S(18);
+        const RECT strip{tr.left, top, tr.right, top + stripH};
         FillRR(g, strip, (float)S(6), A(theme::kSurface));
         if (!thumbs.empty()) {
             const double w = RectW(strip) / (double)thumbs.size();
@@ -1343,6 +1514,7 @@ public:
             SelectClipRgn(dc, nullptr);
             DeleteObject(clip);
         }
+        if (edit.clips.size() > 1) PaintClips(dc, g, tr, strip);
         const int xs = (int)TX(edit.trimStart), xe = (int)TX(edit.trimEnd);
         gp::SolidBrush dim(gp::Color(166, 0, 0, 0));
         g.FillRectangle(&dim, (float)strip.left, (float)strip.top, (float)(xs - strip.left), (float)stripH);
@@ -1398,6 +1570,42 @@ public:
         Hotspot(play, [this] { TogglePlay(); }, L"Play / pause (Space)");
         Text(dc, fMono, Clock(Now()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)}, theme::kTextDim);
         Text(dc, fMono, Clock(edit.OutputDuration()) + L" out", {S(12), play.bottom + S(24), tr.left - S(4), play.bottom + S(40)}, theme::kMuted);
+    }
+
+    // Clip lane: one bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
+    void PaintClips(HDC dc, gp::Graphics& g, const RECT& tr, const RECT& strip) {
+        const int y = tr.top, h = LaneH() - S(4);
+        for (size_t i = 0; i < edit.clips.size(); ++i) {
+            const Clip& c = edit.clips[i];
+            const double t0 = ClipStart(edit.clips, i), t1 = t0 + c.Duration();
+            RECT r{(LONG)TX(t0) + S(1), y, (LONG)TX(t1) - S(1), y + h};
+            if (drag.clip == i && (drag.kind == DragKind::ClipIn || drag.kind == DragKind::ClipOut)) {  // the proposed cut
+                if (drag.kind == DragKind::ClipIn) r.left = (LONG)TX(t0 + drag.value - c.in);
+                else r.right = (LONG)TX(t0 + drag.value - c.in);
+            }
+            const bool sel = selClip == c.id;
+            const bool lifted = drag.kind == DragKind::ClipMove && drag.target >= 0 && drag.clip == i;
+            FillRR(g, r, (float)S(4), sel ? A(theme::kAccent, lifted ? 120 : 255) : gp::Color(lifted ? 20 : 46, 255, 255, 255));
+            HRGN clip = CreateRectRgn(r.left + S(3), r.top, r.right - S(3), r.bottom);
+            SelectClipRgn(dc, clip);
+            Text(dc, fSmall, FileNameOf(c.path) + L"  " + Clock(c.Duration()), {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
+            if (sel)  // trim grips
+                for (LONG hx : {r.left, r.right}) FillRR(g, {hx - S(2), r.top + S(4), hx + S(2), r.bottom - S(4)}, (float)S(2), A(theme::kOnAccent));
+            if (i > 0) {
+                gp::SolidBrush cut(gp::Color(230, 0, 0, 0));
+                g.FillRectangle(&cut, (float)TX(t0) - s, (float)strip.top, 2 * s, (float)RectH(strip));
+            }
+        }
+        if (drag.kind == DragKind::ClipMove && drag.target >= 0) {  // where the clip would go
+            std::vector<Clip> order = edit.clips;
+            const Clip c = order[drag.clip];
+            order.erase(order.begin() + drag.clip);
+            const float x = (float)TX(ClipStart(order, (size_t)drag.target));
+            gp::SolidBrush mark(A(theme::kAccent));
+            g.FillRectangle(&mark, x - 1.5f * s, (float)y - S(2), 3 * s, (float)(strip.bottom - y + S(2)));
+        }
     }
 
     void PaintTooltip(HDC dc, gp::Graphics& g) {
@@ -1523,8 +1731,32 @@ public:
 
     void TimelineDown(POINT p, bool dbl) {
         const RECT tr = TimelineRect();
-        const int capY = tr.top + S(62), markY = tr.top + S(90), rowH = S(18);
+        const int top = tr.top + LaneH();
+        const int capY = top + S(62), markY = top + S(90), rowH = S(18);
         SetCapture(hwnd);
+        if (LaneH() && p.y < top) {  // the clip lane: grab an edge to trim, or the clip to select and move it
+            for (size_t i = 0; i < edit.clips.size(); ++i) {
+                const double t0 = ClipStart(edit.clips, i), t1 = t0 + edit.clips[i].Duration();
+                if (p.x < TX(t0) - S(5) || p.x > TX(t1) + S(5)) continue;
+                const bool near0 = std::abs(p.x - TX(t0)) < S(6), near1 = std::abs(p.x - TX(t1)) < S(6);
+                drag = {};
+                drag.clip = i;
+                drag.downX = p.x;
+                drag.grab = TT(p.x);
+                if (selClip == edit.clips[i].id && (near0 || near1)) {
+                    drag.kind = near0 ? DragKind::ClipIn : DragKind::ClipOut;
+                    drag.value = near0 ? edit.clips[i].in : edit.clips[i].out;
+                    Pause();
+                } else {
+                    drag.kind = DragKind::ClipMove;
+                    SelectClip(edit.clips[i].id);
+                }
+                return;
+            }
+            ReleaseCapture();
+            SelectClip(std::nullopt);
+            return;
+        }
         auto grab = [&](uint64_t id, bool isCaption, double s0, double e0) {
             drag = {};
             drag.kind = DragKind::Item;
@@ -1613,6 +1845,25 @@ public:
                 Seek(edit.trimEnd);
                 break;
             case DragKind::Playhead: Seek(now); break;
+            case DragKind::ClipIn:
+            case DragKind::ClipOut: {
+                const Clip& c = edit.clips[drag.clip];
+                const double v = (drag.kind == DragKind::ClipIn ? c.in : c.out) + (now - drag.grab);
+                drag.value = drag.kind == DragKind::ClipIn ? std::clamp(v, 0.0, c.out - 0.2) : std::clamp(v, c.in + 0.2, c.length);
+                const double t0 = ClipStart(edit.clips, drag.clip);
+                if (drag.value >= c.in && drag.value <= c.out) Seek(t0 + drag.value - c.in);  // shows the frame at the cut
+                Invalidate();
+                break;
+            }
+            case DragKind::ClipMove: {
+                if (drag.target < 0 && std::abs(p.x - drag.downX) < S(5)) break;
+                int target = 0;  // how many of the other clips end up before it
+                for (size_t i = 0; i < edit.clips.size(); ++i)
+                    if (i != drag.clip && TX(ClipStart(edit.clips, i) + edit.clips[i].Duration() / 2) < p.x) ++target;
+                drag.target = target;
+                Invalidate();
+                break;
+            }
             case DragKind::Item: {
                 double st = drag.s0, en = drag.e0;
                 if (drag.edge == -1) st = std::min(now, drag.e0 - 0.2);
@@ -1688,6 +1939,16 @@ public:
     }
 
     void OnMouseUp() {
+        const Drag d = drag;
+        if (d.kind == DragKind::ClipIn || d.kind == DragKind::ClipOut || d.kind == DragKind::ClipMove) {
+            drag = {};
+            ReleaseCapture();
+            if (d.kind == DragKind::ClipIn) TrimClip(d.clip, d.value, std::nullopt);
+            else if (d.kind == DragKind::ClipOut) TrimClip(d.clip, std::nullopt, d.value);
+            else if (d.target >= 0) MoveClip(d.clip, (size_t)d.target);
+            Invalidate();
+            return;
+        }
         if (drag.kind == DragKind::Item)
             std::stable_sort(edit.captions.begin(), edit.captions.end(), [](const Caption& a, const Caption& b) { return a.start < b.start; });
         drag = {};
@@ -1702,6 +1963,7 @@ public:
         if (ctrl) {
             switch (vk) {
                 case 'S': Save(shift); return true;
+                case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
                 case 'W': PostMessageW(hwnd, WM_CLOSE, 0, 0); return true;
                 default: return false;
@@ -1711,6 +1973,7 @@ public:
             case VK_SPACE: TogglePlay(); break;
             case VK_LEFT: Step(shift ? -30 : -1); break;
             case VK_RIGHT: Step(shift ? 30 : 1); break;
+            case 'S': SplitAtPlayhead(); break;
             case 'I': PushUndo(); SetTrim(Now(), std::nullopt); break;
             case 'O': PushUndo(); SetTrim(std::nullopt, Now()); break;
             case 'T': AddCaption(); break;
@@ -1722,10 +1985,14 @@ public:
             case 'Z': AddMark(MarkKind::Zoom); break;
             case 'C': cropping = !cropping; Invalidate(); break;
             case VK_DELETE:
-            case VK_BACK: DeleteSelected(); break;
+            case VK_BACK:
+                if (SelClipIndex() && !selected) RemoveClip(*SelClipIndex());
+                else DeleteSelected();
+                break;
             case VK_ESCAPE:
                 if (cropping) cropping = false;
                 else if (selected) Select(std::nullopt);
+                else if (selClip) SelectClip(std::nullopt);
                 else PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 Invalidate();
                 break;
@@ -1741,13 +2008,13 @@ public:
         busy = true;
         Invalidate();
         ShowToast(L"Transcribing…", L"Turning speech into captions on this PC", nullptr, nullptr, 120000);
-        const std::wstring p = path;
+        const Sequence sq = Seq();
         const double a = edit.trimStart, b = edit.trimEnd;
         HWND h = hwnd;
-        std::thread([p, a, b, h] {
+        std::thread([sq, a, b, h] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             auto* r = new TranscribeResult{};
-            r->ok = Transcribe(p, a, b, &r->caps, &r->err);
+            r->ok = Transcribe(sq, a, b, &r->caps, &r->err);
             CoUninitialize();
             if (!PostMessageW(h, WM_TRANSCRIBED, 0, (LPARAM)r)) delete r;
         }).detach();
@@ -1956,8 +2223,22 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         }
         case WM_THUMBS: {
             std::unique_ptr<std::vector<BitmapPtr>> t(reinterpret_cast<std::vector<BitmapPtr>*>(l));
+            if (w != (WPARAM)thumbGen) return 0;  // for clips that have changed since
             thumbs = std::move(*t);
             Invalidate();
+            return 0;
+        }
+        case WM_DROPFILES: {  // videos dropped on the editor join the sequence
+            HDROP drop = (HDROP)w;
+            std::vector<std::wstring> files;
+            const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; ++i) {
+                wchar_t f[MAX_PATH * 2];
+                if (DragQueryFileW(drop, i, f, (UINT)std::size(f))) files.push_back(f);
+            }
+            DragFinish(drop);
+            ForceForeground(hwnd);
+            AddClips(files);
             return 0;
         }
         case WM_TRANSCRIBED: {
@@ -2008,10 +2289,15 @@ bool VideoEditor::Create() {
     }
     VideoInfo vi;
     BitmapPtr first;
-    if (!ProbeVideo(path, &vi, 0, 0, &first) || vi.w <= 0) return false;
+    const auto clip = ClipOf(path);
+    if (!clip || !ProbeVideo(path, &vi, 0, 0, &first) || vi.w <= 0) return false;
     videoSize = {vi.w, vi.h};
-    duration = vi.duration;
     raw = first;
+    edit.clips = {*clip};
+    edit.frameW = vi.w;
+    edit.frameH = vi.h;
+    builtClips = edit.clips;
+    duration = ClipsDuration(edit.clips);
     edit.trimEnd = duration;
     const ItemMeta& meta = Library::Shared().Meta(path);
     app = meta.app;
@@ -2040,18 +2326,12 @@ bool VideoEditor::Create() {
         (id == kField1 ? field1 : field2) = f;
     }
     std::wstring err;
-    player = VideoPlayer::Open(path, hwnd, WM_ENGINE, &err);
-    fetcher = std::make_unique<FrameFetcher>(path, hwnd);
+    player = SequencePlayer::Open(Seq(), hwnd, WM_ENGINE, &err);
+    fetcher = std::make_unique<FrameFetcher>(Seq(), hwnd);
     Rerender();
     SetTimer(hwnd, kTimerFrame, 15, nullptr);
-    HWND self = hwnd;
-    const std::wstring p = path;
-    std::thread([p, self] {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        auto* t = new std::vector<BitmapPtr>(VideoThumbnails(p, 16, 240));
-        CoUninitialize();
-        if (!PostMessageW(self, WM_THUMBS, 0, (LPARAM)t)) delete t;
-    }).detach();
+    LoadThumbs();
+    DragAcceptFiles(hwnd, TRUE);
     if (snapshotMode) return true;
     ShowWindow(hwnd, SW_SHOW);
     ForceForeground(hwnd);
@@ -2226,6 +2506,19 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
     e->Select(std::nullopt);
     Pump(100);
     SavePng(*Snapshot(e), outDir + L"\\video-editor-crop.png");
+    e->cropping = false;
+    // Joined clips: a square second video (fitted with black bars), then the first one split in two.
+    const std::wstring square = outDir + L"\\snapshot-square.mp4";
+    if (WriteTestClip(square, 720, 720, 30, 2, false)) {
+        e->AddClips({square});
+        e->Seek(2.0);
+        e->SplitAtPlayhead();
+        e->SelectClip(e->edit.clips[1].id);
+        e->Seek(3.6);
+        for (int i = 0; i < 50 && e->thumbs.empty(); ++i) Pump(100);
+        Pump(300);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-clips.png");
+    }
     e->dirty = false;
     DestroyWindow(e->hwnd);
     return 0;
@@ -2369,6 +2662,118 @@ ATHER_TEST(video_editor_trim_keys_and_add_defaults) {
     CHECK(e->edit.captions.empty());
     e->Undo();
     CHECK_EQ(e->edit.captions.size(), 1u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Several videos as one: add (any shape), split, reorder, remove, undo; playback crosses the cuts; save joins them.
+ATHER_TEST(video_editor_joins_splits_and_reorders_clips) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4", caps = dir + L"/caps";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, true));
+    CHECK(WriteTestClip(b, 360, 360, 30, 2, false));
+    const std::wstring oldFolder = g_folder;
+    g_folder = caps;
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK_EQ(e->edit.clips.size(), 1u);
+    CHECK_EQ(e->LaneH(), 0);  // one video: no clip lane
+    e->AddClips({b, dir + L"/missing.mp4"});
+    CHECK_EQ(e->edit.clips.size(), 2u);
+    CHECK_NEAR(e->duration, 5, 0.1);
+    CHECK_NEAR(e->edit.trimEnd, e->duration, 1e-9);  // an untrimmed end grows with the sequence
+    CHECK(e->LaneH() > 0);
+    // A caption in b's footage, then split a: everything stays put.
+    e->Seek(4.0);
+    e->AddCaption();
+    const double capAt = e->edit.captions.back().start;
+    e->Seek(1.5);
+    e->SplitAtPlayhead();
+    CHECK_EQ(e->edit.clips.size(), 3u);
+    CHECK_NEAR(e->edit.captions.back().start, capAt, 1e-6);
+    // b to the front: its caption comes along.
+    const double aLen = e->edit.clips[0].Duration() + e->edit.clips[1].Duration();
+    e->MoveClip(2, 0);
+    CHECK(e->edit.clips[0].path == b);
+    CHECK_NEAR(e->edit.captions.back().start, capAt - aLen, 1e-6);
+    // Remove the middle clip, undo it.
+    e->RemoveClip(1);
+    CHECK_EQ(e->edit.clips.size(), 2u);
+    CHECK_NEAR(e->duration, 3.5, 0.1);
+    e->Undo();
+    CHECK_EQ(e->edit.clips.size(), 3u);
+    CHECK_NEAR(e->duration, 5, 0.1);
+    // Playback runs on over a cut instead of stopping at it.
+    e->Seek(1.4);
+    e->Play();
+    Pump(1500);
+    test::Note("now " + std::to_string(e->Now()) + ", rawT " + std::to_string(e->rawT));
+    CHECK(e->Now() > 2.3);
+    CHECK(e->rawT > 2.1);
+    e->Pause();
+    // Paused frames come from the right clip: 0.5 s into b is red, in a square frame with black bars.
+    e->Seek(0.5);
+    Pump(800);
+    CHECK(e->raw && e->raw->Width() == 640);
+    if (e->raw) {
+        const uint32_t mid = e->raw->Bits()[(size_t)180 * 640 + 320] & 0xFFFFFF, side = e->raw->Bits()[(size_t)180 * 640 + 20] & 0xFFFFFF;
+        CHECK(((mid >> 16) & 255) > 200 && ((mid >> 8) & 255) < 60);
+        CHECK((side & 0xF0F0F0) == 0);
+    }
+    e->Save(false);
+    for (int i = 0; i < 150 && e->busy; ++i) Pump(100);
+    test::Note("save error: " + ToUtf8(e->lastSaveError));
+    CHECK(!e->busy && e->lastSaveError.empty());
+    const auto files = RecentCaptures(caps, 10, true);
+    CHECK_EQ(files.size(), 1u);
+    VideoInfo vi;
+    CHECK(!files.empty() && ProbeVideo(files[0], &vi) && std::fabs(vi.duration - 5) < 0.2 && vi.w == 640 && vi.hasAudio);
+    g_folder = oldFolder;
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The clip lane by mouse: click selects, dragging a clip reorders, dragging a selected clip's edge trims it.
+ATHER_TEST(video_editor_clip_lane_mouse) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, false));
+    CHECK(WriteTestClip(b, 640, 360, 30, 2, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->AddClips({b});
+    e->SelectClip(std::nullopt);
+    CHECK_EQ(e->edit.clips.size(), 2u);
+    const RECT tr = e->TimelineRect();
+    const int laneY = tr.top + e->LaneH() / 2;
+    auto mid = [&](size_t i) { return (int)e->TX(ClipStart(e->edit.clips, i) + e->edit.clips[i].Duration() / 2); };
+    // Drag b onto the left half of a: it goes first.
+    const uint64_t bId = e->edit.clips[1].id;
+    e->OnMouseDown({mid(1), laneY}, false);
+    CHECK(e->selClip == bId);
+    e->OnMouseMove({mid(1) - 40, laneY}, MK_LBUTTON);
+    e->OnMouseMove({(int)e->TX(0.2), laneY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(e->edit.clips[0].id == bId);
+    // Trim b's end by dragging its right edge left by half a second.
+    const double before = e->edit.clips[0].out;
+    const int edge = (int)e->TX(e->edit.clips[0].Duration());
+    e->OnMouseDown({edge, laneY}, false);
+    e->OnMouseMove({(int)e->TX(e->edit.clips[0].Duration() - 0.5), laneY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK_NEAR(e->edit.clips[0].out, before - 0.5, 0.05);
+    CHECK_NEAR(e->duration, ClipsDuration(e->edit.clips), 1e-9);
+    e->Undo();
+    CHECK_NEAR(e->edit.clips[0].out, before, 1e-9);
+    // Delete removes the selected clip; the last one can't go.
+    e->OnKey(VK_DELETE);
+    CHECK_EQ(e->edit.clips.size(), 1u);
+    e->SelectClip(e->edit.clips[0].id);
+    e->OnKey(VK_DELETE);
+    CHECK_EQ(e->edit.clips.size(), 1u);
+    CHECK_EQ(e->LaneH(), 0);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

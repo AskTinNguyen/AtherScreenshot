@@ -93,7 +93,28 @@ struct Caption {
     bool operator==(const Caption&) const = default;
 };
 
+// One video of the sequence: the stretch [in, out) of a file, in that file's seconds. Clips play back to back;
+// each is fitted into the sequence frame (black bars when the shape differs).
+struct Clip {
+    uint64_t id = NewItemId();
+    std::wstring path;
+    double in = 0, out = 0;
+    double length = 0;  // the whole file
+    int w = 0, h = 0;   // upright size
+    double fps = 0;
+    bool hasAudio = false;
+    double Duration() const { return std::max(0.0, out - in); }
+    bool operator==(const Clip&) const = default;
+};
+
+double ClipsDuration(const std::vector<Clip>& clips);
+double ClipStart(const std::vector<Clip>& clips, size_t i);  // where clip i begins on the timeline
+// The clip playing at timeline time `t` and the source time in it (the last clip's end past the end).
+std::optional<std::pair<size_t, double>> LocateClip(const std::vector<Clip>& clips, double t);
+
 struct VideoEdit {
+    std::vector<Clip> clips;  // empty = the whole source file
+    int frameW = 0, frameH = 0;  // the sequence frame; 0 = the first clip's size
     double trimStart = 0, trimEnd = 0;
     std::optional<VRect> crop;
     double speed = 1;
@@ -128,6 +149,10 @@ struct Motion {
     // Entrance and exit of one item at time `t`. Each style has one tuned duration.
     static Motion Between(AnimStyle in, AnimStyle out, double start, double end, double t, int chars, double height);
 };
+
+// Replaces the clips and moves everything on the timeline with the clip it sits in: marks and captions keep
+// their place in the footage, items in a removed clip (or a cut-off part of one) go, and the trim follows.
+void ApplyClips(VideoEdit& e, std::vector<Clip> clips);
 
 // Groups transcribed words into short captions: a new one after a pause > 0.7 s, ~42 characters or 3.5 s;
 // each holds until the next (at most 0.8 s more). Keeps each word's times.

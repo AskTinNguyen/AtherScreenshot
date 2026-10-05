@@ -219,6 +219,92 @@ Motion Motion::Between(AnimStyle inS, AnimStyle outS, double start, double end, 
 
 // ---------- captions from words ----------
 
+double ClipsDuration(const std::vector<Clip>& clips) {
+    double d = 0;
+    for (const auto& c : clips) d += c.Duration();
+    return d;
+}
+
+double ClipStart(const std::vector<Clip>& clips, size_t i) {
+    double d = 0;
+    for (size_t k = 0; k < i && k < clips.size(); ++k) d += clips[k].Duration();
+    return d;
+}
+
+std::optional<std::pair<size_t, double>> LocateClip(const std::vector<Clip>& clips, double t) {
+    if (clips.empty()) return std::nullopt;
+    double at = 0;
+    for (size_t i = 0; i < clips.size(); ++i) {
+        const double d = clips[i].Duration();
+        if (t < at + d || i + 1 == clips.size()) return std::make_pair(i, clips[i].in + std::clamp(t - at, 0.0, d));
+        at += d;
+    }
+    return std::nullopt;
+}
+
+void ApplyClips(VideoEdit& e, std::vector<Clip> clips) {
+    const std::vector<Clip> before = e.clips;
+    const double oldTotal = ClipsDuration(before), newTotal = ClipsDuration(clips);
+    // Where an old timeline time lands now: the same moment of the same footage, if that clip and moment are kept.
+    // `side` says which way it fell off when that moment was cut: -1 before the kept part, 1 after it.
+    struct Landing {
+        std::optional<double> t;
+        int side = 0;
+        uint64_t clip = 0;
+    };
+    auto land = [&](double t) {
+        Landing l;
+        const auto spot = LocateClip(before, t);
+        if (!spot) return l;
+        const Clip& oc = before[spot->first];
+        const double src = spot->second;
+        // The footage may now be in another clip of the same file (a split): any clip that shows this moment
+        // will do, the same clip first. Otherwise the same clip, where the moment was cut off.
+        std::optional<size_t> found;
+        for (size_t i = 0; i < clips.size(); ++i) {
+            const Clip& nc = clips[i];
+            if (_wcsicmp(nc.path.c_str(), oc.path.c_str()) != 0 || src < nc.in - 1e-6 || src > nc.out + 1e-6) continue;
+            if (!found || nc.id == oc.id) found = i;
+        }
+        for (size_t i = 0; i < clips.size() && !found; ++i)
+            if (clips[i].id == oc.id) found = i;
+        if (!found) return l;
+        const Clip& nc = clips[*found];
+        l.clip = nc.id;
+        l.side = src < nc.in - 1e-6 ? -1 : src > nc.out + 1e-6 ? 1 : 0;
+        l.t = ClipStart(clips, *found) + std::clamp(src - nc.in, 0.0, nc.Duration());
+        return l;
+    };
+    // An item keeps its length; it goes when its clip is gone or both its ends were cut off on the same side.
+    auto move = [&](double& start, double& end) {
+        const Landing a = land(start), b = land(std::max(start, end - 1e-6));
+        if (!a.t) return false;
+        if (a.side != 0 && b.clip == a.clip && b.side == a.side) return false;
+        const double len = end - start;
+        start = std::min(*a.t, std::max(0.0, newTotal - 0.1));
+        end = std::min(newTotal, start + len);
+        return end > start;
+    };
+    for (auto it = e.marks.begin(); it != e.marks.end();) it = move(it->start, it->end) ? it + 1 : e.marks.erase(it);
+    for (auto it = e.captions.begin(); it != e.captions.end();) {
+        const double s0 = it->start;
+        if (!move(it->start, it->end)) {
+            it = e.captions.erase(it);
+            continue;
+        }
+        for (auto& w : it->words) w.start += it->start - s0, w.end += it->start - s0;
+        ++it;
+    }
+    std::stable_sort(e.captions.begin(), e.captions.end(), [](const Caption& a, const Caption& b) { return a.start < b.start; });
+    // The trim: an untouched end stays at the end; otherwise both ends follow their footage.
+    const bool wholeStart = e.trimStart <= 1e-6, wholeEnd = e.trimEnd >= oldTotal - 1e-6;
+    const auto ts = land(e.trimStart), te = land(std::max(0.0, e.trimEnd - 1e-6));
+    e.trimStart = wholeStart || !ts.t ? 0 : *ts.t;
+    e.trimEnd = wholeEnd || !te.t ? newTotal : std::min(newTotal, *te.t + (te.side ? 0 : 1e-6));  // looked up just before itself
+    if (e.trimEnd - e.trimStart < 0.1) e.trimStart = 0, e.trimEnd = newTotal;
+    e.clips = std::move(clips);
+}
+
 std::vector<Caption> ChunkCaptions(const std::vector<CaptionWord>& words) {
     std::vector<Caption> out;
     std::optional<Caption> cur;
@@ -1121,6 +1207,93 @@ ATHER_TEST(video_caption_chunking) {
     CHECK(caps[0].end <= caps[1].start);
     CHECK_EQ(caps[0].words.size(), 3u);
     CHECK_EQ(caps[0].words.back().end, caps[0].end);  // the last word stays lit
+}
+
+static Clip TestClip(const wchar_t* path, double in, double out) {
+    Clip c;
+    c.path = path;
+    c.in = in;
+    c.out = out;
+    c.length = 10;
+    c.w = 640;
+    c.h = 360;
+    return c;
+}
+
+ATHER_TEST(video_clips_locate_and_total) {
+    const std::vector<Clip> v = {TestClip(L"a", 1, 3), TestClip(L"b", 0, 4)};
+    CHECK_NEAR(ClipsDuration(v), 6, 1e-9);
+    CHECK_NEAR(ClipStart(v, 1), 2, 1e-9);
+    auto s = LocateClip(v, 2.5);
+    CHECK(s && s->first == 1 && std::fabs(s->second - 0.5) < 1e-9);
+    s = LocateClip(v, 0.5);
+    CHECK(s && s->first == 0 && std::fabs(s->second - 1.5) < 1e-9);
+    s = LocateClip(v, 99);  // past the end: the end of the last clip
+    CHECK(s && s->first == 1 && std::fabs(s->second - 4) < 1e-9);
+}
+
+// Reordering, removing and trimming clips moves markup and captions with their footage.
+ATHER_TEST(video_clip_changes_move_items_with_their_footage) {
+    VideoEdit e;
+    const Clip a = TestClip(L"a", 0, 4), b = TestClip(L"b", 0, 2);
+    e.clips = {a, b};
+    e.trimEnd = 6;
+    Mark inA, inB;
+    inA.start = 1, inA.end = 2;
+    inB.start = 4.5, inB.end = 5.5;
+    e.marks = {inA, inB};
+    Caption cap;
+    cap.start = 4.2, cap.end = 4.8;
+    cap.words = {{4.2, 4.5, L"hi"}};
+    e.captions = {cap};
+
+    VideoEdit swapped = e;
+    ApplyClips(swapped, {b, a});  // b first now
+    CHECK_NEAR(swapped.marks[0].start, 3, 1e-9);    // a's mark moved 2 s later
+    CHECK_NEAR(swapped.marks[1].start, 0.5, 1e-9);  // b's mark moved to the front
+    CHECK_NEAR(swapped.captions[0].start, 0.2, 1e-9);
+    CHECK_NEAR(swapped.captions[0].words[0].start, 0.2, 1e-9);  // word times follow
+    CHECK_NEAR(swapped.trimEnd, 6, 1e-9);
+
+    VideoEdit removed = e;
+    ApplyClips(removed, {a});
+    CHECK_EQ(removed.marks.size(), 1u);  // b's mark went with b
+    CHECK(removed.captions.empty());
+    CHECK_NEAR(removed.trimEnd, 4, 1e-9);
+
+    VideoEdit trimmed = e;
+    Clip a2 = a;
+    a2.in = 2.5;  // cut a's first 2.5 s: the mark at 1–2 s is gone, b moves 2.5 s earlier
+    ApplyClips(trimmed, {a2, b});
+    CHECK_EQ(trimmed.marks.size(), 1u);
+    CHECK_NEAR(trimmed.marks[0].start, 2, 1e-9);
+    CHECK_NEAR(trimmed.trimEnd, 3.5, 1e-9);
+
+    VideoEdit split = e;  // splitting a clip keeps everything where it was; dropping one half drops its items
+    Clip left = a, right = a;
+    left.out = 1.5;
+    right.id = NewItemId();
+    right.in = 1.5;
+    ApplyClips(split, {left, right, b});
+    CHECK_EQ(split.marks.size(), 2u);
+    CHECK_NEAR(split.marks[0].start, 1, 1e-9);
+    CHECK_NEAR(split.marks[1].start, 4.5, 1e-9);
+    ApplyClips(split, {right, b});
+    CHECK_EQ(split.marks.size(), 1u);
+    CHECK_NEAR(split.marks[0].start, 3, 1e-9);
+
+    VideoEdit kept = e;  // the trim follows its footage
+    kept.trimStart = 1;  // 1 s into a
+    kept.trimEnd = 5;    // 1 s into b
+    VideoEdit cut = kept;
+    Clip b2 = b;
+    b2.out = 1.5;
+    ApplyClips(cut, {a, b2});
+    CHECK_NEAR(cut.trimStart, 1, 1e-9);
+    CHECK_NEAR(cut.trimEnd, 5, 1e-9);
+    ApplyClips(kept, {b, a});  // the ends would cross: back to the whole sequence
+    CHECK_NEAR(kept.trimStart, 0, 1e-9);
+    CHECK_NEAR(kept.trimEnd, 6, 1e-9);
 }
 
 }  // namespace ather

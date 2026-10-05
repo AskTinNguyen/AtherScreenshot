@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <mutex>
 
 #include "json.h"
@@ -155,6 +156,122 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
     }
 }
 
+// ---------- sequences ----------
+
+std::optional<Clip> ClipOf(const std::wstring& path) {
+    VideoInfo vi;
+    if (!ProbeVideo(path, &vi) || vi.w <= 0 || vi.h <= 0 || vi.duration <= 0) return std::nullopt;
+    Clip c;
+    c.path = path;
+    c.out = c.length = vi.duration;
+    c.w = vi.w;
+    c.h = vi.h;
+    c.fps = vi.fps;
+    c.hasAudio = vi.hasAudio;
+    return c;
+}
+
+Sequence SequenceOf(const std::wstring& source, const VideoEdit& e) {
+    Sequence s;
+    s.clips = e.clips;
+    if (s.clips.empty())
+        if (auto c = ClipOf(source)) s.clips.push_back(*c);
+    if (e.frameW > 0 && e.frameH > 0) s.size = {e.frameW, e.frameH};
+    else if (!s.clips.empty()) s.size = {s.clips[0].w, s.clips[0].h};
+    return s;
+}
+
+struct SequenceReader::Impl {
+    Sequence seq;
+    std::vector<double> starts;
+    size_t cur = 0;
+    std::unique_ptr<VideoReader> reader;
+    BitmapPtr pre;  // the last frame before the clip's in point: shown until the first frame inside it
+    std::deque<std::pair<BitmapPtr, double>> queue;
+
+    void Enter(size_t i, double src) {
+        cur = i;
+        pre = nullptr;
+        reader = std::make_unique<VideoReader>();
+        if (!reader->Open(seq.clips[i].path)) reader.reset();  // unreadable: the clip is skipped
+        else reader->Seek(src);
+    }
+    BitmapPtr Fit(const BitmapPtr& f) const {
+        if (!f || (f->Width() == seq.size.cx && f->Height() == seq.size.cy)) return f;
+        return FitInto(*f, seq.size.cx, seq.size.cy);
+    }
+};
+
+SequenceReader::SequenceReader() : p_(std::make_unique<Impl>()) {}
+SequenceReader::~SequenceReader() = default;
+SIZE SequenceReader::Size() const { return p_->seq.size; }
+double SequenceReader::Duration() const { return p_->seq.Duration(); }
+
+double SequenceReader::Fps() const {
+    double f = 0;
+    for (const auto& c : p_->seq.clips) f = std::max(f, c.fps);
+    return f > 1 ? std::min(f, 60.0) : 30;
+}
+
+bool SequenceReader::HasAudio() const {
+    for (const auto& c : p_->seq.clips)
+        if (c.hasAudio) return true;
+    return false;
+}
+
+bool SequenceReader::Open(const Sequence& s) {
+    if (s.clips.empty() || s.size.cx <= 0 || s.size.cy <= 0) return false;
+    p_->seq = s;
+    p_->starts.clear();
+    for (size_t i = 0; i < s.clips.size(); ++i) p_->starts.push_back(ClipStart(s.clips, i));
+    p_->queue.clear();
+    p_->Enter(0, s.clips[0].in);
+    return p_->reader != nullptr;
+}
+
+bool SequenceReader::Seek(double t) {
+    const auto spot = LocateClip(p_->seq.clips, t);
+    if (!spot) return false;
+    p_->queue.clear();
+    if (p_->reader && spot->first == p_->cur) {  // same file still open: just seek it
+        p_->pre = nullptr;
+        return p_->reader->Seek(spot->second);
+    }
+    p_->Enter(spot->first, spot->second);
+    return p_->reader != nullptr;
+}
+
+bool SequenceReader::Read(BitmapPtr* frame, double* t) {
+    Impl& p = *p_;
+    const size_t n = p.seq.clips.size();
+    for (;;) {
+        if (!p.queue.empty()) {
+            *frame = p.queue.front().first;
+            *t = p.queue.front().second;
+            p.queue.pop_front();
+            return *frame != nullptr;
+        }
+        if (p.cur >= n) return false;
+        const Clip& c = p.seq.clips[p.cur];
+        BitmapPtr f;
+        double ts = 0;
+        if (!p.reader || !p.reader->Read(&f, &ts) || ts >= c.out - 1e-4) {  // this clip is done
+            if (p.pre) p.queue.push_back({p.Fit(p.pre), p.starts[p.cur]});
+            p.pre = nullptr;
+            if (p.cur + 1 < n) p.Enter(p.cur + 1, p.seq.clips[p.cur + 1].in);
+            else p.cur = n, p.reader.reset();
+            continue;
+        }
+        if (ts < c.in - 1e-4) {
+            p.pre = f;
+            continue;
+        }
+        if (p.pre && ts > c.in + 1e-3) p.queue.push_back({p.Fit(p.pre), p.starts[p.cur]});
+        p.pre = nullptr;
+        p.queue.push_back({p.Fit(f), p.starts[p.cur] + (ts - c.in)});
+    }
+}
+
 // ---------- audio in ----------
 
 namespace {
@@ -245,14 +362,95 @@ private:
     std::vector<float> buf_;
 };
 
+// A timeline range of a sequence's sound at one rate and channel count: each clip's audio in turn, and silence
+// for clips without sound (or where a file's audio runs short), so it stays in step with the pictures.
+class SequenceAudio {
+public:
+    SequenceAudio(const Sequence& s, double from, double to, int rate, int channels) : seq_(s), rate_(rate), ch_(channels) {
+        double at = 0;
+        for (size_t i = 0; i < s.clips.size(); ++i) {
+            const Clip& c = s.clips[i];
+            const double a = std::max(from, at), b = std::min(to, at + c.Duration());
+            if (b > a) {
+                const int64_t f0 = std::llround((a - from) * rate), f1 = std::llround((b - from) * rate);
+                segs_.push_back({i, c.in + (a - at), c.in + (b - at), f1 - f0});
+            }
+            at += c.Duration();
+        }
+    }
+    bool AnyAudio() const {
+        for (const auto& c : seq_.clips)
+            if (c.hasAudio) return true;
+        return false;
+    }
+    // Appends the next piece; false once everything is out.
+    bool Read(std::vector<float>& out) {
+        while (seg_ < segs_.size()) {
+            const Seg& sg = segs_[seg_];
+            if (!started_) {
+                started_ = true;
+                made_ = 0;
+                reader_.reset();
+                const Clip& c = seq_.clips[sg.clip];
+                if (c.hasAudio) {
+                    reader_ = std::make_unique<AudioReader>();
+                    if (reader_->Open(c.path) && reader_->Seek(sg.from)) rs_ = std::make_unique<Resampler>(reader_->Rate(), reader_->Channels(), rate_, ch_);
+                    else reader_.reset();
+                }
+            }
+            const int64_t left = sg.frames - made_;
+            if (left <= 0) {
+                ++seg_;
+                started_ = false;
+                continue;
+            }
+            if (reader_) {
+                std::vector<float> in, conv;
+                double t = 0;
+                if (reader_->Read(in, &t) && t < sg.to) {
+                    const int ch = reader_->Channels(), rate = reader_->Rate();
+                    const int64_t frames = (int64_t)in.size() / ch;
+                    const int64_t skip = std::clamp<int64_t>(std::llround((sg.from - t) * rate), 0, frames);
+                    const int64_t end = std::clamp<int64_t>(std::llround((sg.to - t) * rate), 0, frames);
+                    if (end > skip) rs_->Process(in.data() + skip * ch, (size_t)(end - skip), conv);
+                    const int64_t take = std::min<int64_t>((int64_t)conv.size() / ch_, left);
+                    out.insert(out.end(), conv.begin(), conv.begin() + take * ch_);
+                    made_ += take;
+                    if (take > 0) return true;
+                    continue;
+                }
+                reader_.reset();  // the file's sound ended early: silence for the rest of the clip
+            }
+            const int64_t n = std::min<int64_t>(left, 4096);
+            out.insert(out.end(), (size_t)(n * ch_), 0.f);
+            made_ += n;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    struct Seg {
+        size_t clip;
+        double from, to;  // source seconds
+        int64_t frames;   // exactly this many frames come out for it
+    };
+    Sequence seq_;
+    int rate_, ch_;
+    std::vector<Seg> segs_;
+    size_t seg_ = 0;
+    bool started_ = false;
+    int64_t made_ = 0;
+    std::unique_ptr<AudioReader> reader_;
+    std::unique_ptr<Resampler> rs_;
+};
+
 // The edit's audio: the trimmed range, as 48 kHz stereo, at the edit's speed.
 class AudioPipe {
 public:
-    bool Open(const std::wstring& path, double from, double to, double speed) {
-        if (!reader_.Open(path) || !reader_.Seek(from)) return false;
-        from_ = from;
-        to_ = to;
-        rs_ = std::make_unique<Resampler>(reader_.Rate(), reader_.Channels(), kRate, 2);
+    bool Open(const Sequence& s, double from, double to, double speed) {
+        audio_ = std::make_unique<SequenceAudio>(s, from, to, kRate, 2);
+        if (!audio_->AnyAudio()) return false;
         if (std::fabs(speed - 1) > 1e-6) ts_ = std::make_unique<TimeStretch>(2, kRate, speed);
         return true;
     }
@@ -276,32 +474,23 @@ public:
 
 private:
     void Fill() {
-        std::vector<float> in, conv;
-        double t = 0;
-        if (!reader_.Read(in, &t) || t >= to_) {
+        std::vector<float> chunk;
+        if (!audio_->Read(chunk)) {
             eof_ = true;
             if (ts_) ts_->Finish(ready_);
             return;
         }
-        const int ch = reader_.Channels(), rate = reader_.Rate();
-        const int64_t frames = (int64_t)in.size() / ch;
-        const int64_t skip = std::clamp<int64_t>(std::llround((from_ - t) * rate), 0, frames);
-        const int64_t end = std::clamp<int64_t>(std::llround((to_ - t) * rate), 0, frames);
-        if (end <= skip) return;
-        rs_->Process(in.data() + skip * ch, (size_t)(end - skip), conv);
         if (ts_) {
-            ts_->Push(conv.data(), conv.size() / 2);
+            ts_->Push(chunk.data(), chunk.size() / 2);
             ts_->Pull(ready_);
         } else {
-            ready_.insert(ready_.end(), conv.begin(), conv.end());
+            ready_.insert(ready_.end(), chunk.begin(), chunk.end());
         }
     }
 
-    AudioReader reader_;
-    std::unique_ptr<Resampler> rs_;
+    std::unique_ptr<SequenceAudio> audio_;
     std::unique_ptr<TimeStretch> ts_;
     std::vector<float> ready_;
-    double from_ = 0, to_ = 0;
     int64_t written_ = 0;
     bool eof_ = false;
 };
@@ -392,8 +581,8 @@ namespace {
 // trimStart + i/fps × speed, run through the frame renderer.
 class EditFrames {
 public:
-    bool Open(const std::wstring& path, const VideoEdit& e, double fps, std::wstring* error) {
-        if (!reader_.Open(path)) {
+    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error) {
+        if (!reader_.Open(seq)) {
             if (error) *error = L"Can't read this video.";
             return false;
         }
@@ -436,7 +625,7 @@ private:
         }
     }
 
-    VideoReader reader_;
+    SequenceReader reader_;
     VideoEdit e_;
     double fps_ = 30;
     std::unique_ptr<FrameRenderer> renderer_;
@@ -447,20 +636,20 @@ private:
 }  // namespace
 
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
-    VideoReader probe;
-    if (!probe.Open(source)) {
+    const Sequence seq = SequenceOf(source, e);
+    SequenceReader probe;
+    if (!probe.Open(seq)) {
         if (error) *error = L"Can't read this video.";
         return false;
     }
-    const double srcFps = probe.Fps();
-    const int fps = srcFps > 1 ? std::clamp((int)std::lround(srcFps), 1, 60) : 30;
+    const int fps = std::clamp((int)std::lround(probe.Fps()), 1, 60);
     EditFrames frames;
-    if (!frames.Open(source, e, fps, error)) return false;
+    if (!frames.Open(seq, e, fps, error)) return false;
     const SIZE sz = frames.Out();
     std::unique_ptr<AudioPipe> audio;
     if (!e.muted && probe.HasAudio()) {
         audio = std::make_unique<AudioPipe>();
-        if (!audio->Open(source, e.trimStart, e.trimEnd, e.speed)) audio.reset();
+        if (!audio->Open(seq, e.trimStart, e.trimEnd, e.speed)) audio.reset();
     }
     Mp4Writer w;
     HRESULT hr = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2);
@@ -494,7 +683,7 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
 
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps, ExportProgress progress) {
     EditFrames frames;
-    if (!frames.Open(source, e, fps, error)) return false;
+    if (!frames.Open(SequenceOf(source, e), e, fps, error)) return false;
     const SIZE sz = frames.Out();
     const double k = std::min({1.0, 960.0 / sz.cx, 960.0 / sz.cy});
     const int gw = std::max(1, (int)std::lround(sz.cx * k)), gh = std::max(1, (int)std::lround(sz.cy * k));
@@ -519,10 +708,10 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
     return SUCCEEDED(hr);
 }
 
-std::vector<BitmapPtr> VideoThumbnails(const std::wstring& path, int count, int maxSide) {
+std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide) {
     std::vector<BitmapPtr> out;
-    VideoReader r;
-    if (!r.Open(path) || r.Duration() <= 0) return out;
+    SequenceReader r;
+    if (!r.Open(s) || r.Duration() <= 0) return out;
     for (int i = 0; i < count; ++i) {
         const double t = r.Duration() * (i + 0.5) / count;
         r.Seek(t);
@@ -654,23 +843,14 @@ bool TranscribeWav(const std::wstring& wav, double offset, std::vector<CaptionWo
 
 }  // namespace
 
-bool Transcribe(const std::wstring& path, double from, double to, std::vector<Caption>* out, std::wstring* error) {
-    AudioReader ar;
-    if (!ar.Open(path)) {
-        if (error) *error = L"This recording has no audio. Turn on system audio or the microphone in Settings › Recording.";
+bool Transcribe(const Sequence& s, double from, double to, std::vector<Caption>* out, std::wstring* error) {
+    SequenceAudio audio(s, from, to, 16000, 1);
+    if (!audio.AnyAudio()) {
+        if (error) *error = L"This video has no sound. For recordings, turn on system audio or the microphone in Settings › Recording.";
         return false;
     }
-    ar.Seek(from);
-    Resampler rs(ar.Rate(), ar.Channels(), 16000, 1);
-    std::vector<float> in, mono;
-    double t = 0;
-    while (ar.Read(in, &t) && t < to) {
-        const int ch = ar.Channels();
-        const int64_t frames = (int64_t)in.size() / ch;
-        const int64_t skip = std::clamp<int64_t>(std::llround((from - t) * ar.Rate()), 0, frames);
-        const int64_t end = std::clamp<int64_t>(std::llround((to - t) * ar.Rate()), 0, frames);
-        if (end > skip) rs.Process(in.data() + skip * ch, (size_t)(end - skip), mono);
-    }
+    std::vector<float> mono;
+    while (audio.Read(mono)) {}
     std::vector<int16_t> pcm(mono.size());
     for (size_t i = 0; i < mono.size(); ++i) pcm[i] = (int16_t)std::lround(std::clamp(mono[i], -1.f, 1.f) * 32767);
     wchar_t tmp[MAX_PATH];
@@ -800,6 +980,138 @@ BitmapPtr VideoPlayer::NewFrame(double* t) {
     return out;
 }
 
+// ---------- sequence playback ----------
+
+std::unique_ptr<SequencePlayer> SequencePlayer::Open(const Sequence& s, HWND notify, UINT msg, std::wstring* error) {
+    std::unique_ptr<SequencePlayer> sp(new SequencePlayer());
+    sp->notify_ = notify;
+    sp->msg_ = msg;
+    sp->SetSequence(s);
+    if (!sp->Cur()) {
+        if (error && error->empty()) *error = L"Can't play this video";
+        return nullptr;
+    }
+    return sp;
+}
+
+VideoPlayer* SequencePlayer::Cur() const {
+    if (cur_ >= seq_.clips.size()) return nullptr;
+    for (const auto& [path, p] : players_)
+        if (_wcsicmp(path.c_str(), seq_.clips[cur_].path.c_str()) == 0) return p.get();
+    return nullptr;
+}
+
+void SequencePlayer::SetSequence(const Sequence& s) {
+    for (auto& [path, p] : players_)
+        if (p) p->Pause();
+    std::vector<std::pair<std::wstring, std::unique_ptr<VideoPlayer>>> keep;
+    for (const auto& c : s.clips) {
+        bool have = false;
+        for (const auto& k : keep) have = have || _wcsicmp(k.first.c_str(), c.path.c_str()) == 0;
+        if (have) continue;
+        std::unique_ptr<VideoPlayer> p;
+        for (auto& [path, old] : players_)
+            if (old && _wcsicmp(path.c_str(), c.path.c_str()) == 0) p = std::move(old);
+        if (!p) p = VideoPlayer::Open(c.path, notify_, msg_, nullptr);
+        if (p) {
+            p->SetRate(rate_);
+            p->SetMuted(muted_);
+        }
+        keep.emplace_back(c.path, std::move(p));
+    }
+    players_ = std::move(keep);
+    seq_ = s;
+    starts_.clear();
+    for (size_t i = 0; i < s.clips.size(); ++i) starts_.push_back(ClipStart(s.clips, i));
+    cur_ = 0;
+    playing_ = ended_ = false;
+}
+
+void SequencePlayer::Start(VideoPlayer* p) {
+    if (!p) return;
+    p->SetRate(rate_);
+    p->SetMuted(muted_);
+    p->Play();
+}
+
+void SequencePlayer::Play() {
+    playing_ = true;
+    ended_ = false;
+    Start(Cur());
+}
+
+void SequencePlayer::Pause() {
+    playing_ = false;
+    if (auto* p = Cur()) p->Pause();
+}
+
+bool SequencePlayer::Playing() const {
+    const VideoPlayer* p = Cur();
+    return playing_ && !ended_ && p && p->Playing();
+}
+
+void SequencePlayer::Seek(double t) {
+    const auto spot = LocateClip(seq_.clips, t);
+    if (!spot) return;
+    if (spot->first != cur_) {
+        if (auto* p = Cur()) p->Pause();
+        cur_ = spot->first;
+    }
+    ended_ = false;
+    if (auto* p = Cur()) {
+        p->Seek(spot->second);
+        if (playing_) Start(p);
+    }
+}
+
+double SequencePlayer::Now() const {
+    if (cur_ >= seq_.clips.size()) return seq_.Duration();
+    const Clip& c = seq_.clips[cur_];
+    const VideoPlayer* p = Cur();
+    return starts_[cur_] + (p ? std::clamp(p->Now() - c.in, 0.0, c.Duration()) : 0);
+}
+
+void SequencePlayer::SetRate(double r) {
+    rate_ = r;
+    for (auto& [path, p] : players_)
+        if (p) p->SetRate(r);
+}
+
+void SequencePlayer::SetMuted(bool m) {
+    muted_ = m;
+    for (auto& [path, p] : players_)
+        if (p) p->SetMuted(m);
+}
+
+BitmapPtr SequencePlayer::NewFrame(double* t) {
+    VideoPlayer* p = Cur();
+    if (!p) return nullptr;
+    if (playing_ && !ended_) {
+        const Clip& c = seq_.clips[cur_];
+        if (p->Now() >= c.out - 0.02 || !p->Playing()) {  // this clip is over: hand over to the next one
+            if (cur_ + 1 < seq_.clips.size()) {
+                p->Pause();
+                ++cur_;
+                p = Cur();
+                if (!p) return nullptr;
+                p->Seek(seq_.clips[cur_].in);
+                Start(p);
+            } else {
+                ended_ = true;
+                p->Pause();
+            }
+        }
+    }
+    const Clip& c = seq_.clips[cur_];
+    double ts = 0;
+    BitmapPtr f = p->NewFrame(&ts);
+    // Frames from outside the clip are the engine catching up after a hand-over or a seek, or a part that was cut.
+    if (!f || ts < c.in - 0.25 || ts > c.out + 0.001) return nullptr;
+    *t = starts_[cur_] + std::clamp(ts - c.in, 0.0, c.Duration());
+    if (f->Width() != seq_.size.cx || f->Height() != seq_.size.cy) f = FitInto(*f, seq_.size.cx, seq_.size.cy);
+    return f;
+}
+
 // ---------- test clip ----------
 
 bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone, int rotation) {
@@ -828,6 +1140,65 @@ bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double secon
 }
 
 // ---------- tests (VideoTests.swift) ----------
+
+// Clips of different files and shapes play back to back: cut points, black bars, sound only where there is some.
+ATHER_TEST(video_sequence_joins_clips_into_one_video) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4", out = dir + L"/joined.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, true));   // red, green, blue seconds, with a tone
+    CHECK(WriteTestClip(b, 320, 320, 30, 2, false));  // square and silent
+    auto ca = ClipOf(a), cb = ClipOf(b);
+    CHECK(ca && cb);
+    if (!ca || !cb) return;
+    CHECK(ca->hasAudio && !cb->hasAudio);
+    Clip a1 = *ca, b1 = *cb, a2 = *ca;
+    a1.in = 1, a1.out = 2;  // green
+    b1.in = 0, b1.out = 1;  // red, square
+    a2.id = NewItemId();
+    a2.in = 2, a2.out = 3;  // blue
+    VideoEdit e;
+    e.clips = {a1, b1, a2};
+    e.frameW = 640;
+    e.frameH = 360;
+    e.trimEnd = ClipsDuration(e.clips);
+    CHECK_NEAR(e.trimEnd, 3, 1e-9);
+    std::wstring err;
+    CHECK(ExportMp4(L"", e, out, &err));
+    VideoInfo vi;
+    CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 3) < 0.15 && vi.w == 640 && vi.h == 360 && vi.hasAudio);
+    VideoReader r;
+    CHECK(r.Open(out));
+    auto at = [&](double t, int x, int y) {
+        r.Seek(t);
+        BitmapPtr f, last;
+        double ft = 0;
+        while (r.Read(&f, &ft)) {
+            last = f;
+            if (ft >= t - 0.02) break;
+        }
+        return last ? last->Bits()[(size_t)y * last->Width() + x] & 0xFFFFFF : 0x123456u;
+    };
+    auto is = [](uint32_t c, int ch) { return ((c >> (16 - 8 * ch)) & 255) > 180 && ((c >> (16 - 8 * ((ch + 1) % 3))) & 255) < 80; };
+    CHECK(is(at(0.5, 320, 180), 1));  // green from a
+    CHECK(is(at(1.5, 320, 180), 0));  // red from b, in the middle
+    CHECK((at(1.5, 20, 180) & 0xF0F0F0) == 0);  // with black bars at the sides
+    CHECK(is(at(2.5, 320, 180), 2));  // blue from a again
+    // The sequence reader reports timeline times in order.
+    SequenceReader sr;
+    CHECK(sr.Open(SequenceOf(L"", e)));
+    BitmapPtr f;
+    double t = -1, prev = -1;
+    int n = 0;
+    bool ordered = true;
+    while (sr.Read(&f, &t)) {
+        ordered = ordered && t >= prev - 1e-9 && f->Width() == 640;
+        prev = t;
+        ++n;
+    }
+    CHECK(ordered);
+    CHECK(n >= 85 && n <= 95);
+    CHECK(prev > 2.9 && prev < 3.0);
+}
 
 ATHER_TEST(video_rotated_phone_clip_reads_upright_like_the_preview) {
     for (int rot : {90, 270}) {
@@ -970,7 +1341,7 @@ ATHER_TEST(video_transcribe_speech_with_word_times) {
 ATHER_TEST(video_thumbnails_spread_over_the_clip) {
     const std::wstring clip = test::TempDir() + L"\\clip.mp4";
     CHECK(WriteTestClip(clip, 320, 180, 30, 3, false));
-    const auto th = VideoThumbnails(clip, 6, 64);
+    const auto th = VideoThumbnails(SequenceOf(clip, {}), 6, 64);
     CHECK_EQ(th.size(), 6u);
     if (th.size() == 6) {
         CHECK(th[0]->Width() <= 64);

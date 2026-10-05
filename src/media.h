@@ -25,6 +25,8 @@ bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at = -1, int m
 
 // The image turned clockwise by 90, 180 or 270 degrees.
 BitmapPtr RotateBitmap(const Bitmap& src, int degrees);
+// `src` scaled to fit a w × h frame, centered on black (black bars where the shapes differ).
+BitmapPtr FitInto(const Bitmap& src, int w, int h);
 // Area-averaging resample (box filter when shrinking, bilinear when growing).
 BitmapPtr Resample(const Bitmap& src, int w, int h);
 // Starts Media Foundation once per process.

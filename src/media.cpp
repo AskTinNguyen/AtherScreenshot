@@ -173,6 +173,19 @@ BitmapPtr RotateBitmap(const Bitmap& src, int degrees) {
     return out;
 }
 
+BitmapPtr FitInto(const Bitmap& src, int w, int h) {
+    auto out = Bitmap::Create(w, h);
+    if (!out) return nullptr;
+    std::fill(out->Bits(), out->Bits() + (size_t)w * h, 0xFF000000u);
+    const double k = std::min((double)w / std::max(1, src.Width()), (double)h / std::max(1, src.Height()));
+    const int fw = std::clamp((int)std::lround(src.Width() * k), 1, w), fh = std::clamp((int)std::lround(src.Height() * k), 1, h);
+    BitmapPtr fit = fw == src.Width() && fh == src.Height() ? nullptr : Resample(src, fw, fh);
+    const Bitmap& from = fit ? *fit : src;
+    const int ox = (w - fw) / 2, oy = (h - fh) / 2;
+    for (int y = 0; y < fh; ++y) memcpy(out->Bits() + (size_t)(y + oy) * w + ox, from.Bits() + (size_t)y * fw, (size_t)fw * 4);
+    return out;
+}
+
 bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at, int maxSide, BitmapPtr* frame) {
     EnsureMediaFoundation();
     ComPtr<IMFAttributes> attr;

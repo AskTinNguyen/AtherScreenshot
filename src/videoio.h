@@ -28,6 +28,35 @@ private:
     std::unique_ptr<Impl> p_;
 };
 
+// The clips to play as one video, each fitted into `size`.
+struct Sequence {
+    std::vector<Clip> clips;
+    SIZE size{};
+    double Duration() const { return ClipsDuration(clips); }
+};
+// The whole file as a clip; nothing when it can't be read as a video.
+std::optional<Clip> ClipOf(const std::wstring& path);
+// The edit's clips in its frame, or the whole `source` file when the edit has no clips.
+Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
+
+// Reads a sequence like one video: frames in order with timeline times, fitted into the sequence frame.
+class SequenceReader {
+public:
+    SequenceReader();
+    ~SequenceReader();
+    bool Open(const Sequence& s);
+    SIZE Size() const;
+    double Duration() const;
+    double Fps() const;  // the highest of the clips (≤ 60)
+    bool HasAudio() const;
+    bool Seek(double t);
+    bool Read(BitmapPtr* frame, double* t);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> p_;
+};
+
 // Changes the speed of audio without changing its pitch (WSOLA: overlapping windows, each placed where it
 // lines up best with the previous one). Interleaved float samples; feed and drain as you go.
 class TimeStretch {
@@ -54,12 +83,12 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps = 12,
                ExportProgress progress = {});
 
-// `count` frames spread over the video, each at most `maxSide` pixels.
-std::vector<BitmapPtr> VideoThumbnails(const std::wstring& path, int count, int maxSide);
+// `count` frames spread over the sequence, each at most `maxSide` pixels.
+std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide);
 
 // Speech in [from, to) of the video as caption-sized chunks with word times, on this PC. Blocking: call from
 // a worker thread with COM initialized.
-bool Transcribe(const std::wstring& path, double from, double to, std::vector<Caption>* out, std::wstring* error);
+bool Transcribe(const Sequence& s, double from, double to, std::vector<Caption>* out, std::wstring* error);
 
 // Playback for the editor preview. Frames come out through NewFrame, so the window can run them through the
 // frame renderer before showing them. Events are posted to `notify` as `msg` (wParam = MF_MEDIA_ENGINE_EVENT).
@@ -80,6 +109,35 @@ private:
     VideoPlayer();
     struct Impl;
     std::unique_ptr<Impl> p_;
+};
+
+// Preview playback of a sequence: one player per file, handing over at each clip's end. Times are timeline
+// times; frames come out fitted into the sequence frame.
+class SequencePlayer {
+public:
+    static std::unique_ptr<SequencePlayer> Open(const Sequence& s, HWND notify, UINT msg, std::wstring* error);
+    void SetSequence(const Sequence& s);  // pauses; keeps the players of files still in it
+    void Play();
+    void Pause();
+    bool Playing() const;
+    void Seek(double t);
+    double Now() const;
+    void SetRate(double r);
+    void SetMuted(bool m);
+    BitmapPtr NewFrame(double* t);
+
+private:
+    SequencePlayer() = default;
+    VideoPlayer* Cur() const;
+    void Start(VideoPlayer* p);
+    Sequence seq_;
+    std::vector<double> starts_;
+    std::vector<std::pair<std::wstring, std::unique_ptr<VideoPlayer>>> players_;  // by file
+    size_t cur_ = 0;
+    bool playing_ = false, ended_ = false, muted_ = false;
+    double rate_ = 1;
+    HWND notify_ = nullptr;
+    UINT msg_ = 0;
 };
 
 // Test helper: a clip whose color changes every second (red, green, blue…), optionally with a 440 Hz tone, and
