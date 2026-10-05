@@ -152,116 +152,205 @@ PadLayout GamepadLayout(int frameW, int frameH, PadCorner corner, float dpi) {
     return l;
 }
 
+namespace {
+
+// The controller's outline in the 240 × 150 design box: shoulders, grips and the dip between them.
+void BodyPath(gp::GraphicsPath& p) {
+    // Left half from the top middle round to the bottom middle, then the same mirrored.
+    const gp::PointF left[] = {
+        {120, 35}, {100, 35}, {80, 29}, {62, 29},     // top edge to the left shoulder
+        {44, 29}, {28, 40}, {22, 60},                 // shoulder
+        {16, 82}, {16, 116}, {28, 134},               // outer side down the grip
+        {36, 146}, {54, 148}, {64, 138},              // round grip bottom
+        {74, 128}, {80, 113}, {96, 110},              // up the inside of the grip
+        {106, 108}, {114, 108}, {120, 108},           // bottom middle
+    };
+    std::vector<gp::PointF> pts(std::begin(left), std::end(left));
+    for (int i = (int)std::size(left) - 2; i >= 0; --i) pts.push_back({240 - left[i].X, left[i].Y});
+    p.AddBeziers(pts.data(), (INT)pts.size());
+    p.CloseFigure();
+}
+
+void Glow(gp::Graphics& g, float cx, float cy, float r, gp::Color c) {
+    for (int i = 3; i >= 1; --i) {
+        gp::SolidBrush b(gp::Color((BYTE)(c.GetA() * 0.16f), c.GetR(), c.GetG(), c.GetB()));
+        const float rr = r + i * 2.2f;
+        g.FillEllipse(&b, cx - rr, cy - rr, 2 * rr, 2 * rr);
+    }
+}
+
+// A domed disc: lighter toward the top-left, like it catches the light.
+void Dome(gp::Graphics& g, float cx, float cy, float r, gp::Color mid, gp::Color edge) {
+    gp::GraphicsPath p;
+    p.AddEllipse(cx - r, cy - r, 2 * r, 2 * r);
+    gp::PathGradientBrush b(&p);
+    b.SetCenterPoint(gp::PointF(cx - r * 0.3f, cy - r * 0.35f));
+    b.SetCenterColor(mid);
+    INT n = 1;
+    b.SetSurroundColors(&edge, &n);
+    g.FillPath(&b, &p);
+}
+
+}  // namespace
+
 void DrawGamepad(Bitmap& frame, const PadState& s, PadCorner corner, float dpi) {
     if (!s.connected || frame.Width() < 32 || frame.Height() < 32) return;
     const PadLayout L = GamepadLayout(frame.Width(), frame.Height(), corner, dpi);
     gp::Bitmap gb(frame.Width(), frame.Height(), frame.Width() * 4, PixelFormat32bppRGB, reinterpret_cast<BYTE*>(frame.Bits()));
     gp::Graphics g(&gb);
     g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(gp::TextRenderingHintAntiAliasGridFit);
+    g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
     g.TranslateTransform(L.x, L.y);
     g.ScaleTransform(L.u, L.u);
 
     const auto on = [&](WORD b) { return (s.buttons & b) != 0; };
-    const gp::Color lit = Rgba(255, 255, 255, 235), idle = Rgba(0, 0, 0, 120), edge = Rgba(255, 255, 255, 80);
-    gp::Pen edgePen(edge, 1.5f);
-    gp::SolidBrush idleBrush(idle), litBrush(lit);
+    const gp::Color lit = Rgba(255, 255, 255, 240), part = Rgba(34, 35, 40, 245), partEdge = Rgba(255, 255, 255, 34);
+    gp::Pen partPen(partEdge, 1);
 
-    // Triggers: filled as far as they are pulled.
+    // Triggers behind the shoulders: they fill from the bottom as they're pulled.
     for (int side = 0; side < 2; ++side) {
-        const float v = side ? s.rt : s.lt, x = side ? 160.f : 40.f;
+        const float v = side ? s.rt : s.lt, x = side ? 160.f : 50.f;
         gp::GraphicsPath p;
-        RoundRect(p, x, 4, 40, 14, 6);
-        g.FillPath(&idleBrush, &p);
+        RoundRect(p, x, 3, 30, 26, 10);
+        gp::SolidBrush base(part);
+        g.FillPath(&base, &p);
         if (v > 0) {
             g.SetClip(&p);
-            g.FillRectangle(&litBrush, x, 4.f, 40 * v, 14.f);
+            gp::SolidBrush fill(lit);
+            g.FillRectangle(&fill, x, 3 + 26 * (1 - v), 30.f, 26 * v);
             g.ResetClip();
         }
-        g.DrawPath(&edgePen, &p);
+        g.DrawPath(&partPen, &p);
     }
-    // Bumpers.
+    // Bumpers: bands that follow the curve of each shoulder.
     for (int side = 0; side < 2; ++side) {
-        gp::GraphicsPath p;
-        RoundRect(p, side ? 154.f : 34.f, 22, 52, 11, 5.5f);
-        g.FillPath(on(side ? XINPUT_GAMEPAD_RIGHT_SHOULDER : XINPUT_GAMEPAD_LEFT_SHOULDER) ? &litBrush : &idleBrush, &p);
-        g.DrawPath(&edgePen, &p);
+        auto X = [side](float x) { return side ? 240 - x : x; };
+        gp::GraphicsPath band;
+        const gp::PointF pts[] = {{X(38), 38}, {X(44), 29}, {X(54), 25}, {X(66), 25}, {X(76), 25}, {X(86), 26}, {X(94), 28}};
+        band.AddBeziers(pts, 7);
+        const bool down = on(side ? XINPUT_GAMEPAD_RIGHT_SHOULDER : XINPUT_GAMEPAD_LEFT_SHOULDER);
+        gp::Pen rim(partEdge, 11);
+        rim.SetStartCap(gp::LineCapRound);
+        rim.SetEndCap(gp::LineCapRound);
+        g.DrawPath(&rim, &band);
+        gp::Pen fill(down ? lit : part, 9);
+        fill.SetStartCap(gp::LineCapRound);
+        fill.SetEndCap(gp::LineCapRound);
+        g.DrawPath(&fill, &band);
     }
-    // Body: one shape (winding fill) so the overlapping grips don't darken where they meet.
+    // Body: a soft shadow, a top-lit fill and a thin rim.
     {
-        gp::GraphicsPath body(gp::FillModeWinding);
-        RoundRect(body, 22, 36, 196, 74, 34);
-        body.AddEllipse(24.f, 72.f, 64.f, 76.f);
-        body.AddEllipse(152.f, 72.f, 64.f, 76.f);
-        gp::SolidBrush fill(Rgba(30, 30, 36, 205));
+        gp::GraphicsPath body;
+        BodyPath(body);
+        for (int i = 3; i >= 1; --i) {
+            gp::Matrix m;
+            m.Translate(0, 1.5f * i);
+            std::unique_ptr<gp::GraphicsPath> sh(body.Clone());
+            sh->Transform(&m);
+            gp::Pen spread(Rgba(0, 0, 0, 22), 2.5f * i);
+            gp::SolidBrush dark(Rgba(0, 0, 0, 30));
+            g.FillPath(&dark, sh.get());
+            g.DrawPath(&spread, sh.get());
+        }
+        gp::LinearGradientBrush fill(gp::PointF(0, 28), gp::PointF(0, 148), Rgba(74, 76, 86, 240), Rgba(36, 37, 43, 240));
         g.FillPath(&fill, &body);
-        std::unique_ptr<gp::GraphicsPath> rim(body.Clone());
-        rim->Outline(nullptr, 0.1f);  // just the outside edge, not where the grips overlap
-        g.DrawPath(&edgePen, rim.get());
+        gp::Pen rim(Rgba(255, 255, 255, 46), 1.2f);
+        g.DrawPath(&rim, &body);
     }
-    // Sticks: the cap moves with the stick and lights when clicked.
+    // Center: a dim home button and the View / Menu buttons.
+    {
+        gp::SolidBrush home(Rgba(255, 255, 255, 26));
+        g.FillEllipse(&home, 112.f, 44.f, 16.f, 16.f);
+        gp::Pen ring(Rgba(255, 255, 255, 60), 1.2f);
+        g.DrawEllipse(&ring, 112.f, 44.f, 16.f, 16.f);
+        for (int side = 0; side < 2; ++side) {
+            const float cx = side ? 136.f : 104.f, cy = 72;
+            const bool down = on(side ? XINPUT_GAMEPAD_START : XINPUT_GAMEPAD_BACK);
+            if (down) Glow(g, cx, cy, 5, lit);
+            gp::SolidBrush b(down ? lit : part);
+            g.FillEllipse(&b, cx - 5, cy - 5, 10.f, 10.f);
+            g.DrawEllipse(&partPen, cx - 5, cy - 5, 10.f, 10.f);
+            gp::Pen glyph(down ? Rgba(30, 30, 34) : Rgba(255, 255, 255, 140), 1);
+            if (side) {  // ≡
+                for (int k = -1; k <= 1; ++k) g.DrawLine(&glyph, cx - 2.5f, cy + k * 2.f, cx + 2.5f, cy + k * 2.f);
+            } else {  // ⧉
+                g.DrawRectangle(&glyph, cx - 2.8f, cy - 1.2f, 3.6f, 3.6f);
+                g.DrawLine(&glyph, cx - 1.2f, cy - 2.8f, cx + 2.8f, cy - 2.8f);
+                g.DrawLine(&glyph, cx + 2.8f, cy - 2.8f, cx + 2.8f, cy + 1.2f);
+            }
+        }
+    }
+    // Sticks: a recessed well and a domed cap that moves with the stick and lights when clicked.
     for (int side = 0; side < 2; ++side) {
-        const float cx = side ? 148.f : kPadLeftStick[0], cy = side ? 104.f : kPadLeftStick[1];
-        const float dx = (side ? s.rx : s.lx) * 9, dy = -(side ? s.ry : s.ly) * 9;
-        gp::SolidBrush base(Rgba(0, 0, 0, 150));
-        g.FillEllipse(&base, cx - 19, cy - 19, 38.f, 38.f);
-        g.DrawEllipse(&edgePen, cx - 19, cy - 19, 38.f, 38.f);
+        const float cx = side ? 146.f : kPadLeftStick[0], cy = side ? 98.f : kPadLeftStick[1];
+        const float dx = (side ? s.rx : s.lx) * 8, dy = -(side ? s.ry : s.ly) * 8;
+        Dome(g, cx, cy, 18, Rgba(14, 14, 17, 250), Rgba(28, 29, 34, 250));
+        gp::Pen well(Rgba(255, 255, 255, 30), 1);
+        g.DrawEllipse(&well, cx - 18, cy - 18, 36.f, 36.f);
         const bool click = on(side ? XINPUT_GAMEPAD_RIGHT_THUMB : XINPUT_GAMEPAD_LEFT_THUMB);
         const bool moved = dx * dx + dy * dy > 1;
-        gp::SolidBrush cap(click ? lit : moved ? Rgba(150, 150, 165, 240) : Rgba(85, 85, 96, 240));
-        g.FillEllipse(&cap, cx + dx - 12, cy + dy - 12, 24.f, 24.f);
+        if (click) Glow(g, cx + dx, cy + dy, 12, lit);
+        Dome(g, cx + dx, cy + dy, 12.5f, click ? Rgba(255, 255, 255) : moved ? Rgba(132, 134, 146) : Rgba(96, 98, 108),
+             click ? Rgba(205, 208, 216) : Rgba(44, 45, 52));
+        gp::Pen grip(click ? Rgba(0, 0, 0, 50) : Rgba(0, 0, 0, 90), 1.2f);
+        g.DrawEllipse(&grip, cx + dx - 8, cy + dy - 8, 16.f, 16.f);
     }
-    // D-pad.
+    // D-pad: one cross; the pressed arm lights.
     {
-        const float cx = 92, cy = 104, a = 5, len = 13;
+        const float cx = 94, cy = 98, a = 6, len = 16;
+        gp::GraphicsPath cross(gp::FillModeWinding);
+        RoundRect(cross, cx - a, cy - len, 2 * a, 2 * len, 2.5f);
+        RoundRect(cross, cx - len, cy - a, 2 * len, 2 * a, 2.5f);
+        gp::SolidBrush base(part);
+        g.FillPath(&base, &cross);
+        std::unique_ptr<gp::GraphicsPath> rim(cross.Clone());
+        rim->Outline(nullptr, 0.1f);
+        g.DrawPath(&partPen, rim.get());
         const struct {
             WORD b;
             float x, y, w, h;
-        } arms[] = {{XINPUT_GAMEPAD_DPAD_UP, cx - a, cy - a - len, 2 * a, len},
-                    {XINPUT_GAMEPAD_DPAD_DOWN, cx - a, cy + a, 2 * a, len},
-                    {XINPUT_GAMEPAD_DPAD_LEFT, cx - a - len, cy - a, len, 2 * a},
-                    {XINPUT_GAMEPAD_DPAD_RIGHT, cx + a, cy - a, len, 2 * a}};
-        gp::SolidBrush mid(Rgba(0, 0, 0, 120));
-        g.FillRectangle(&mid, cx - a, cy - a, 2 * a, 2 * a);
-        for (const auto& arm : arms) {
-            gp::GraphicsPath p;
-            RoundRect(p, arm.x, arm.y, arm.w, arm.h, 2.5f);
-            g.FillPath(on(arm.b) ? &litBrush : &idleBrush, &p);
-            g.DrawPath(&edgePen, &p);
-        }
+        } arms[] = {{XINPUT_GAMEPAD_DPAD_UP, cx - a, cy - len, 2 * a, len - a},
+                    {XINPUT_GAMEPAD_DPAD_DOWN, cx - a, cy + a, 2 * a, len - a},
+                    {XINPUT_GAMEPAD_DPAD_LEFT, cx - len, cy - a, len - a, 2 * a},
+                    {XINPUT_GAMEPAD_DPAD_RIGHT, cx + a, cy - a, len - a, 2 * a}};
+        gp::SolidBrush litB(lit);
+        for (const auto& arm : arms)
+            if (on(arm.b)) {
+                gp::GraphicsPath p;
+                RoundRect(p, arm.x + 0.8f, arm.y + 0.8f, arm.w - 1.6f, arm.h - 1.6f, 2);
+                g.FillPath(&litB, &p);
+            }
+        gp::SolidBrush dimple(Rgba(0, 0, 0, 70));
+        g.FillEllipse(&dimple, cx - 3, cy - 3, 6.f, 6.f);
     }
-    // View and Menu.
-    for (int side = 0; side < 2; ++side) {
-        gp::GraphicsPath p;
-        RoundRect(p, side ? 128.f : 100.f, 59, 12, 7, 3.5f);
-        g.FillPath(on(side ? XINPUT_GAMEPAD_START : XINPUT_GAMEPAD_BACK) ? &litBrush : &idleBrush, &p);
-        g.DrawPath(&edgePen, &p);
-    }
-    // A, B, X and Y in their usual colors.
+    // A, B, X and Y: dark and lettered in their color, or lit in their color with a glow.
     {
         gp::FontFamily family(L"Segoe UI");
-        gp::Font font(&family, 10, gp::FontStyleBold, gp::UnitPixel);
+        gp::Font font(&family, 10.5f, gp::FontStyleBold, gp::UnitPixel);
         gp::StringFormat center;
         center.SetAlignment(gp::StringAlignmentCenter);
         center.SetLineAlignment(gp::StringAlignmentCenter);
-        const float cx = kPadA[0], cy = kPadA[1] - 15, d = 15, r = 8.5f;
+        const float cx = kPadA[0], cy = kPadA[1] - 15, d = 15, r = 9;
         const struct {
             WORD b;
             float x, y;
             const wchar_t* t;
             gp::Color c;
         } face[] = {{XINPUT_GAMEPAD_A, cx, cy + d, L"A", Rgba(108, 194, 74)},
-                    {XINPUT_GAMEPAD_B, cx + d, cy, L"B", Rgba(226, 70, 63)},
-                    {XINPUT_GAMEPAD_X, cx - d, cy, L"X", Rgba(61, 143, 224)},
-                    {XINPUT_GAMEPAD_Y, cx, cy - d, L"Y", Rgba(242, 193, 46)}};
+                    {XINPUT_GAMEPAD_B, cx + d, cy, L"B", Rgba(232, 72, 64)},
+                    {XINPUT_GAMEPAD_X, cx - d, cy, L"X", Rgba(64, 146, 228)},
+                    {XINPUT_GAMEPAD_Y, cx, cy - d, L"Y", Rgba(244, 196, 48)}};
         for (const auto& f : face) {
             const bool down = on(f.b);
-            gp::SolidBrush fill(down ? f.c : idle);
-            g.FillEllipse(&fill, f.x - r, f.y - r, 2 * r, 2 * r);
-            gp::Pen ring(down ? lit : gp::Color(150, f.c.GetR(), f.c.GetG(), f.c.GetB()), 1.5f);
+            if (down) Glow(g, f.x, f.y, r, f.c);
+            const gp::Color hi = down ? Rgba((BYTE)std::min(255, f.c.GetR() + 60), (BYTE)std::min(255, f.c.GetG() + 60), (BYTE)std::min(255, f.c.GetB() + 60))
+                                      : Rgba(52, 54, 62);
+            Dome(g, f.x, f.y, r, hi, down ? f.c : Rgba(20, 21, 25));
+            gp::Pen ring(down ? Rgba(255, 255, 255, 120) : gp::Color(110, f.c.GetR(), f.c.GetG(), f.c.GetB()), 1);
             g.DrawEllipse(&ring, f.x - r, f.y - r, 2 * r, 2 * r);
             gp::SolidBrush text(down ? Rgba(255, 255, 255) : f.c);
-            g.DrawString(f.t, 1, &font, gp::RectF(f.x - r, f.y - r + 0.5f, 2 * r, 2 * r), &center, &text);
+            g.DrawString(f.t, 1, &font, gp::RectF(f.x - r, f.y - r + 0.6f, 2 * r, 2 * r), &center, &text);
         }
     }
 }
@@ -320,12 +409,21 @@ ATHER_TEST(gamepad_draws_pressed_buttons_lit) {
     s.connected = true;
     auto idle = frame();
     DrawGamepad(*idle, s, PadCorner::BottomRight, 1);
-    s.buttons = XINPUT_GAMEPAD_A;
+    s.buttons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_RIGHT_SHOULDER;
     s.lt = 1;
+    s.rt = 0.4f;
+    s.lx = 0.7f;
+    s.ly = 0.5f;
     auto pressed = frame();
     DrawGamepad(*pressed, s, PadCorner::BottomRight, 1);
     wchar_t dir[MAX_PATH];  // for eyeballing: run the tests with ATHER_SNAPSHOTS set to a folder
-    if (GetEnvironmentVariableW(L"ATHER_SNAPSHOTS", dir, MAX_PATH)) SavePng(*pressed, std::wstring(dir) + L"/gamepad.png");
+    if (GetEnvironmentVariableW(L"ATHER_SNAPSHOTS", dir, MAX_PATH)) {
+        SavePng(*pressed, std::wstring(dir) + L"/gamepad.png");
+        auto big = Bitmap::Create(1280, 720);
+        std::fill(big->Bits(), big->Bits() + 1280 * 720, 0xFF3A5A78u);
+        DrawGamepad(*big, s, PadCorner::TopLeft, 3);
+        SavePng(*big, std::wstring(dir) + L"/gamepad-large.png");
+    }
     const PadLayout L = GamepadLayout(640, 360, PadCorner::BottomRight, 1);
     const auto a0 = px(*idle, L.At(kPadA[0] - 5.5f, kPadA[1])), a1 = px(*pressed, L.At(kPadA[0] - 5.5f, kPadA[1]));
     CHECK(a1[1] > a1[0] + 60 && a1[1] > a1[2] + 60);  // green when pressed

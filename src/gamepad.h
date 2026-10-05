@@ -53,7 +53,7 @@ struct PadLayout {
 };
 PadLayout GamepadLayout(int frameW, int frameH, PadCorner corner, float dpi);
 // Design-box positions of a few controls (for tests).
-constexpr float kPadA[2] = {178, 85}, kPadLeftStick[2] = {62, 70}, kPadLT[2] = {60, 11};
+constexpr float kPadA[2] = {176, 81}, kPadLeftStick[2] = {66, 66}, kPadLT[2] = {64, 12};
 
 // Draws the controller onto opaque BGRA frame pixels. Does nothing for a disconnected pad.
 void DrawGamepad(Bitmap& frame, const PadState& s, PadCorner corner, float dpi);
