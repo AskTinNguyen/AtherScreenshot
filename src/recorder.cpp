@@ -252,7 +252,7 @@ void Run(Session* s) {
                         if (s->opt.window && GetWindowFrame(s->opt.window, &wr)) origin = {wr.left, wr.top};
                         const float scale = s->scaled ? (float)s->outW / RectW(r) : 1.f;
                         DrawInputViz(*frame, origin, scale);
-                        if (pad) DrawGamepad(*frame, pad->Take(), s->opt.gamepadCorner, DpiScaleAt({origin.x + 1, origin.y + 1}) * scale);
+                        if (pad) DrawGamepad(*frame, pad->Take(), s->opt.gamepadCorner, DpiScaleAt({origin.x + 1, origin.y + 1}) * scale, s->opt.gamepadOpacity);
                         px = frame->Bits();
                     }
                     lastT = s->clock.ActiveTicks100ns(RecClock::Now());

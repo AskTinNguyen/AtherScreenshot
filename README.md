@@ -107,7 +107,7 @@ Select a region, or use "Record a window", which follows one window wherever it 
 - **MP4:** H.264 with the hardware encoder when available, plus AAC audio of the system sound (`RecordSystemAudio`) and/or the microphone (`RecordMicrophone`), mixed and kept in sync. Pauses are cut out.
 - **GIF:** per-frame palettes; identical frames are merged.
 - **Click and keystroke overlay:** click ripples (`ShowClicks`) and a keystroke pill (`ShowKeys`, off by default because it would show anything you type, including passwords).
-- **Game controller overlay:** with "Show game controller" on (`ShowGamepad`), a connected Xbox-style (XInput) controller is drawn in a corner of the video, like OBS's Input Overlay: sticks, triggers, bumpers, D-pad, A/B/X/Y and View/Menu light up as you use them. Pick the corner with `GamepadCorner`. Nothing is drawn while no controller is connected. PlayStation controllers show up when Steam Input or DS4Windows presents them as XInput.
+- **Game controller overlay:** with "Show game controller" on (`ShowGamepad`), a connected Xbox-style (XInput) controller is drawn in a corner of the video, like OBS's Input Overlay: a white controller whose sticks move, triggers fill and buttons light up as you use them. Pick the corner with `GamepadCorner` and how visible it is with "Controller opacity" (`GamepadOpacity`, 10–100%). Nothing is drawn while no controller is connected. PlayStation controllers show up when Steam Input or DS4Windows presents them as XInput.
 - When a recording finishes, the file is copied to the clipboard so you can paste it into chats.
 
 ## Video editor

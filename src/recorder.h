@@ -19,6 +19,7 @@ struct RecordOptions {
     bool showKeys = false;
     bool showGamepad = false;  // a game controller in a corner while one is connected
     PadCorner gamepadCorner = PadCorner::BottomRight;
+    float gamepadOpacity = 1;  // 0…1
     int countdownSeconds = 0;
     std::wstring path;
 };

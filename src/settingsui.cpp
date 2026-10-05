@@ -179,6 +179,7 @@ void Window::Build() {
         Row* r = add(Kind::Choice, L"Recording", L"GamepadCorner", L"Controller corner", L"Where the controller goes in the video", L"bottomright");
         r->choices = {{L"bottomright", L"Bottom right"}, {L"bottomleft", L"Bottom left"}, {L"topright", L"Top right"}, {L"topleft", L"Top left"}};
     }
+    add(Kind::Number, L"Recording", L"GamepadOpacity", L"Controller opacity", L"Percent: lower lets the video show through", L"100", 10, 100);
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
     header(L"Scrolling capture & editor");

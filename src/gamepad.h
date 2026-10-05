@@ -53,9 +53,9 @@ struct PadLayout {
 };
 PadLayout GamepadLayout(int frameW, int frameH, PadCorner corner, float dpi);
 // Design-box positions of a few controls (for tests).
-constexpr float kPadA[2] = {176, 81}, kPadLeftStick[2] = {66, 66}, kPadLT[2] = {64, 12};
+constexpr float kPadA[2] = {180, 75}, kPadLeftStick[2] = {60, 64}, kPadLT[2] = {63, 12};
 
-// Draws the controller onto opaque BGRA frame pixels. Does nothing for a disconnected pad.
-void DrawGamepad(Bitmap& frame, const PadState& s, PadCorner corner, float dpi);
+// Draws the controller onto opaque BGRA frame pixels at `opacity` (0…1). Does nothing for a disconnected pad.
+void DrawGamepad(Bitmap& frame, const PadState& s, PadCorner corner, float dpi, float opacity = 1);
 
 }  // namespace ather

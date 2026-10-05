@@ -10,16 +10,18 @@ The Windows build gained three features after 0.0.1. This brings them to the Mac
 
 ## 1. Game controller overlay
 
-- **Settings:** `[Recording] ShowGamepad=0` (off by default) and `GamepadCorner=bottomright` (`topleft | topright | bottomleft | bottomright`). There's a toggle and a corner picker in Settings › Recording, and a palette command "Show game controller in recordings" (`ToggleShowGamepad`).
+- **Settings:** `[Recording] ShowGamepad=0` (off by default), `GamepadCorner=bottomright` (`topleft | topright | bottomleft | bottomright`) and `GamepadOpacity=100` (percent, 10–100). Settings › Recording has a toggle, a corner picker and an opacity field, and there's a palette command "Show game controller in recordings" (`ToggleShowGamepad`).
 - **Input:** the GameController framework (`GCController`, `extendedGamepad`). It covers Xbox, PlayStation and MFi pads natively, so the Mac does better than the Windows XInput version here. Use the first connected controller. Draw nothing while none is connected.
 - **Sampling:** poll at about 250 Hz, or use the `valueChangedHandler` callbacks, and **latch presses between frames**. Every button seen down since the last frame shows as down in the next frame, and the triggers show their highest value since then. A tap shorter than a frame must still appear (`PadLatch` in `gamepad.cpp`; its test is `gamepad_latch_keeps_a_tap_between_frames`).
 - **Drawing:** burned into the recorded frames only, not shown on screen. Draw it where the click and key overlays are drawn.
   - The design box is 240 × 150 units. It is 220 pt wide at most, never more than a third of the frame's width or half its height, with a 16 pt margin (`GamepadLayout`).
-  - The shapes and colors are in `DrawGamepad`:
-    - The body is one union shape with a light rim.
-    - Triggers fill white as they are pulled; bumpers, the D-pad and View/Menu light white when pressed.
-    - Stick caps move up to 9 units and light white when the stick is clicked.
-    - A, B, X and Y use their usual colors (`#6CC24A`, `#E2463F`, `#3D8FE0`, `#F2C12E`), filled when pressed and outlined when not.
+  - The look follows a white modern controller (`PaintPad` in `gamepad.cpp`):
+    - A white shell with a soft shadow and a fine dark edge, so it reads on both light and dark video.
+    - Black sticks inside glowing orange rings (`#FF9E2C`). They move up to 7 units and glow brighter when clicked.
+    - A black D-pad with arrows on a light round plate.
+    - Glossy black A, B, X and Y with letters in their usual colors (`#40BE5C`, `#EC3E42`, `#308CEC`, `#FACC24`). When pressed, they fill with that color and glow.
+    - Bumpers, triggers (filling from the top), View and Menu light up orange.
+  - **Opacity:** draw onto a separate layer, then composite it at the chosen opacity, so overlapping parts fade together.
   - For PlayStation pads you may relabel the face buttons as ✕○□△, keeping the same positions.
 
 ## 2. Edit pictures and videos from anywhere

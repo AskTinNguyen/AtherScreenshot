@@ -529,6 +529,7 @@ void BeginRecording(RecordFormat fmt, const RECT& rect, HWND window, const std::
     o.showKeys = g_settings.showKeys;
     o.showGamepad = g_settings.showGamepad;
     o.gamepadCorner = ParsePadCorner(g_settings.gamepadCorner);
+    o.gamepadOpacity = g_settings.gamepadOpacity / 100.f;
     o.countdownSeconds = g_settings.countdownSeconds;
     o.path = MakeCapturePath(g_settings.CapturesFolder(), fmt == RecordFormat::Gif ? L"gif" : L"mp4",
                              {title, WindowAppName(window), RectW(rect), RectH(rect)});

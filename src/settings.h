@@ -42,6 +42,7 @@ public:
     bool showKeys = false;
     bool showGamepad = false;
     std::wstring gamepadCorner = L"bottomright";  // topleft | topright | bottomleft | bottomright
+    int gamepadOpacity = 100;                      // percent
     bool gpuCapture = true;
     // scrolling capture
     int scrollDelayMs = 400;
