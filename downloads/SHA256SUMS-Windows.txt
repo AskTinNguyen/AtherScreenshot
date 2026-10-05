@@ -1,2 +1,2 @@
-8501ab1d653a92e85417c216c4ea72cc8c6b2a9c9ab4b523a61087a764389aff  AtherScreenshot-0.0.2-portable.zip
-0f41c14455ee18977b3fcb99d602b5d4ac0b0fc082afe3e70c9484e1bbd141db  AtherScreenshot-Setup-0.0.2.exe
+dcf833a6f1bb89f226d6ce427bc6f212b0f71c87b7eb5eceee537cc36b386921  AtherScreenshot-0.0.2-portable.zip
+328636e2f1192817550b9301aa48c08ae6539532f38a12c42d09956408c976eb  AtherScreenshot-Setup-0.0.2.exe
