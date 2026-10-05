@@ -1,9 +1,16 @@
 {
-    "windows":  {
-                    "version":  "0.0.2.1",
-                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "b71bbf92dd5a7e712d0cc208f4f5ae72f70d8d89da95d73ff377377b88378522",
-                    "size":  2934272,
-                    "notes":  "Game controller overlay, edit any picture or video, join videos into one, updates from inside the app, and many fixes."
-                }
+    "windows": {
+        "version": "0.0.2.1",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+        "sha256": "b71bbf92dd5a7e712d0cc208f4f5ae72f70d8d89da95d73ff377377b88378522",
+        "size": 2934272,
+        "notes": "Game controller overlay, edit any picture or video, join videos into one, updates from inside the app, and many fixes."
+    },
+    "macos": {
+        "version": "0.0.2.1",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+        "sha256": "f227f41701c1c8ad985a1d0f6a9b13e4891fd11e714eca2f806149200fe3c2e0",
+        "size": 3431024,
+        "notes": "Game controller overlay, edit any picture or video, join videos into one, updates from inside the app, and many fixes."
+    }
 }
