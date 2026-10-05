@@ -23,15 +23,15 @@
 
 ## Download
 
-Version **0.0.1**
+Windows **0.0.2** · macOS **0.0.1** (the Mac gets the 0.0.2 features next)
 
 | Platform | Download | Size | Requirements |
 |---|---|---|---|
 | **macOS** | [**AtherScreenshot-0.0.1-macOS.dmg**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-macOS.dmg) | 3.7 MB | macOS 14+, Apple silicon and Intel |
-| **Windows** | [**AtherScreenshot-Setup-0.0.1.exe**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-Setup-0.0.1.exe) | 2.7 MB | Windows 10/11, x64 |
-| Windows (portable) | [AtherScreenshot-0.0.1-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.1-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
+| **Windows** | [**AtherScreenshot-Setup-0.0.2.exe**](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-Setup-0.0.2.exe) | 2.7 MB | Windows 10/11, x64 |
+| Windows (portable) | [AtherScreenshot-0.0.2-portable.zip](https://github.com/AskTinNguyen/AtherScreenshot/raw/main/downloads/AtherScreenshot-0.0.2-portable.zip) | 1.2 MB | Windows 10/11, x64, no install |
 
-Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256SUMS-Windows.txt) · All files are also on the [v0.0.1 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
+Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256SUMS-Windows.txt) · Earlier files are on the [v0.0.1 release page](https://github.com/AskTinNguyen/AtherScreenshot/releases/tag/v0.0.1).
 
 **First launch.** The builds aren't signed yet, so your OS asks once:
 
@@ -47,8 +47,8 @@ Checksums: [macOS](downloads/SHA256SUMS-macOS.txt) · [Windows](downloads/SHA256
 | 📸 **Capture** | Region, window, full screen, scrolling pages, delay timer, screen ruler, color picker, OCR text, and auto-redaction of emails, keys and card numbers |
 | ✏️ **Annotate** | Arrows, shapes, text, steps, highlighter, blur and pixelate, spotlight, magnifier, crop and styled export |
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
-| 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks and keystrokes |
-| 🎬 **Edit video** | Trim, crop, speed, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter) |
+| 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller (Windows) |
+| 🎬 **Edit video** | Trim, crop, speed, join several videos (Windows), auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3) |
