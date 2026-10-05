@@ -5,49 +5,23 @@ import XCTest
 
 final class VideoTests: XCTestCase {
     // A 3-second, 30 fps test clip whose color changes every second.
-    private func makeClip() async throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ather-clip-\(UUID().uuidString).mp4")
-        let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 640, AVVideoHeightKey: 360])
-        let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                                                                                                               kCVPixelBufferWidthKey as String: 640, kCVPixelBufferHeightKey as String: 360])
-        w.add(input)
-        w.startWriting()
-        w.startSession(atSourceTime: .zero)
-        let colors: [NSColor] = [.red, .green, .blue]
-        for i in 0..<90 {
-            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
-            var pb: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(nil, ad.pixelBufferPool!, &pb)
-            CVPixelBufferLockBaseAddress(pb!, [])
-            let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb!), width: 640, height: 360, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb!),
-                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
-            ctx.setFillColor(colors[i / 30].cgColor)
-            ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
-            CVPixelBufferUnlockBaseAddress(pb!, [])
-            ad.append(pb!, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: 30))
-        }
-        input.markAsFinished()
-        await w.finishWriting()
-        return url
-    }
+    private func makeClip() async throws -> URL { try await TestMedia.colors() }
 
     func testExportTrimSpeedCropCaptions() async throws {
         let clip = try await makeClip()
-        let asset = AVURLAsset(url: clip)
-        var e = VideoEdit(trimEnd: 3)
+        var e = TestMedia.edit([try await VideoSource.probe(clip)])
         e.trimStart = 1
         e.trimEnd = 3
         e.speed = 2
         e.crop = CGRect(x: 100, y: 50, width: 321, height: 201)
         e.captions = [Caption(start: 1.2, end: 2.5, text: "Click Deploy")]
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("ather-out-\(UUID().uuidString).mp4")
-        try await VideoExport.mp4(asset, e, to: out)
+        try await VideoExport.mp4(e, to: out)
         let res = AVURLAsset(url: out)
         let dur = try await res.load(.duration).seconds
         XCTAssertEqual(dur, 1, accuracy: 0.1)                       // 2 s trimmed, played at 2×
-        let size = try await VideoExport.displaySize(res)
-        XCTAssertEqual(size, CGSize(width: 320, height: 200))       // crop, rounded down to even
+        let probed = try await VideoSource.probe(out)
+        XCTAssertEqual(CGSize(width: probed.w, height: probed.h), CGSize(width: 320, height: 200))       // crop, rounded down to even
         // The first frame comes from second 1 of the source (green), not 0 (red).
         let gen = AVAssetImageGenerator(asset: res)
         gen.requestedTimeToleranceBefore = .zero
@@ -70,7 +44,7 @@ final class VideoTests: XCTestCase {
         XCTAssertEqual(darkPixels(after), 0, "caption gone")
 
         let gif = FileManager.default.temporaryDirectory.appendingPathComponent("ather-out-\(UUID().uuidString).gif")
-        try await VideoExport.gif(asset, e, to: gif, fps: 10)
+        try await VideoExport.gif(e, to: gif, fps: 10)
         let src = CGImageSourceCreateWithURL(gif as CFURL, nil)!
         XCTAssertEqual(CGImageSourceGetCount(src), 10)
     }

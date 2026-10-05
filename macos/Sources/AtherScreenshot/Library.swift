@@ -12,11 +12,8 @@ enum MediaType: String, Codable, CaseIterable, Identifiable {
     case image, gif, video
     var id: String { rawValue }
     static func of(_ u: URL) -> MediaType {
-        switch u.pathExtension.lowercased() {
-        case "gif": return .gif
-        case "mp4", "mov", "m4v": return .video
-        default: return .image
-        }
+        if u.pathExtension.lowercased() == "gif" { return .gif }
+        return MediaFiles.isVideo(u) ? .video : .image
     }
     var label: String { self == .image ? "Screenshots" : self == .gif ? "GIFs" : "Videos" }
     var symbol: String { self == .image ? "photo" : self == .gif ? "photo.stack" : "film" }
@@ -233,7 +230,10 @@ struct Filter: Codable, Equatable, Hashable {
 
 final class Library: ObservableObject {
     static let shared = Library()
-    static let indexVersion = 1
+    // Videos indexed before 0.0.2 by the Windows app kept a phone video's sideways size; version 2 re-indexes
+    // only videos (kIndexVersion on Windows). Pictures stay at 1.
+    static let indexVersion = 2
+    static func indexVersion(for u: URL) -> Int { MediaType.of(u) == .video ? indexVersion : 1 }
 
     @Published private(set) var urls: [URL] = []
     @Published private(set) var meta: [String: ItemMeta] = [:]
@@ -489,7 +489,7 @@ final class Library: ObservableObject {
     private func indexInBackground() {
         guard !indexing else { return }
         let todo = urls.compactMap { u -> (URL, Double, Bool)? in
-            guard let e = meta[u.path], e.indexed < Library.indexVersion else { return nil }
+            guard let e = meta[u.path], e.indexed < Library.indexVersion(for: u) else { return nil }
             return (u, e.mtime, e.text == nil)  // text survives only for legacy-imported OCR of an unchanged file
         }
         guard !todo.isEmpty else { return }
@@ -649,7 +649,7 @@ final class Library: ObservableObject {
         let dir = folder.appendingPathComponent("Imported", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var out: [URL] = []
-        for f in files where Output.mediaExtensions.contains(f.pathExtension.lowercased()) {
+        for f in files where MediaFiles.isMedia(f) {
             if isInLibrary(f) { out.append(f); continue }  // already in the library
             let dst = Output.uniqueURL(dir, f.deletingPathExtension().lastPathComponent, f.pathExtension)
             if (try? FileManager.default.copyItem(at: f, to: dst)) != nil { out.append(dst) }

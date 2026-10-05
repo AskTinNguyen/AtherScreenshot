@@ -44,6 +44,8 @@ struct VideoEdit: Equatable {
     var captionLook = CaptionLook.pill
     var captionStyle = AnimStyle.auto
     var highlightWords = true  // auto captions: the spoken word lights up
+    var clips: [Clip] = []     // played back to back; every time above is timeline time
+    var frame = CGSize.zero    // the sequence frame: the first video's upright size, kept when clips change
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
     static let captionScale: [CGFloat] = [0.03, 0.037, 0.045, 0.055, 0.068]
@@ -71,41 +73,12 @@ enum VideoExport {
         let size: CGSize
     }
 
-    static func displaySize(_ asset: AVAsset) async throws -> CGSize {
-        guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.noVideo }
-        let (n, t) = try await vt.load(.naturalSize, .preferredTransform)
-        let r = CGRect(origin: .zero, size: n).applying(t)
-        return CGSize(width: abs(r.width), height: abs(r.height))
-    }
-
-    static func prepare(_ asset: AVAsset, _ e: VideoEdit) async throws -> Prepared {
-        guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.noVideo }
-        let comp = AVMutableComposition()
-        let range = CMTimeRange(start: CMTime(seconds: e.trimStart, preferredTimescale: 600), end: CMTime(seconds: e.trimEnd, preferredTimescale: 600))
-        guard let cv = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw Failure.noVideo }
-        try cv.insertTimeRange(range, of: vt, at: .zero)
-        if !e.muted {
-            for at in try await asset.loadTracks(withMediaType: .audio) {
-                let ca = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-                try ca?.insertTimeRange(range, of: at, at: .zero)
-            }
-        }
-        if e.speed != 1 {
-            comp.scaleTimeRange(CMTimeRange(start: .zero, duration: range.duration), toDuration: CMTimeMultiplyByFloat64(range.duration, multiplier: 1 / e.speed))
-        }
-        let (natural, t, fps) = try await vt.load(.naturalSize, .preferredTransform, .nominalFrameRate)
-        let shown = CGRect(origin: .zero, size: natural).applying(t)
-        let full = CGRect(x: 0, y: 0, width: abs(shown.width), height: abs(shown.height))
-
+    static func prepare(_ e: VideoEdit) async throws -> Prepared {
         // Every frame goes through the same renderer the preview uses.
-        let renderer = FrameRenderer(edit: e, full: full.size, preview: false)
-        let (start, speed) = (e.trimStart, e.speed)
-        let vc = AVMutableVideoComposition(asset: comp) { req in
-            req.finish(with: renderer.render(req.sourceImage, at: start + req.compositionTime.seconds * speed), context: nil)
-        }
-        vc.renderSize = renderer.out
-        vc.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps > 1 ? min(60, fps.rounded()) : 30))
-        return Prepared(composition: comp, video: vc, size: renderer.out)
+        let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
+        let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), speed: e.speed, muted: e.muted,
+                                              box: RendererBox(renderer))
+        return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
 
     static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill,
@@ -131,8 +104,8 @@ enum VideoExport {
         if s.status != .completed { throw Failure.failed(s.error?.localizedDescription ?? "Export failed.") }
     }
 
-    static func mp4(_ asset: AVAsset, _ e: VideoEdit, to url: URL) async throws {
-        let p = try await prepare(asset, e)
+    static func mp4(_ e: VideoEdit, to url: URL) async throws {
+        let p = try await prepare(e)
         guard let s = AVAssetExportSession(asset: p.composition, presetName: AVAssetExportPresetHighestQuality) else { throw Failure.failed("Can't export this video.") }
         s.videoComposition = p.video
         s.audioTimePitchAlgorithm = .spectral   // sped-up audio keeps its pitch
@@ -143,10 +116,10 @@ enum VideoExport {
     }
 
     // Renders the edit to MP4 first, then samples it into a GIF (≤ 960 px wide).
-    static func gif(_ asset: AVAsset, _ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
+    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try await mp4(asset, e, to: tmp)
+        try await mp4(e, to: tmp)
         let src = AVURLAsset(url: tmp)
         let duration = try await src.load(.duration).seconds
         let gen = AVAssetImageGenerator(asset: src)
@@ -166,7 +139,7 @@ enum VideoExport {
     }
 
     // Speech in the trimmed range, as caption-sized chunks. On device when the Mac supports it.
-    static func transcribe(_ asset: AVAsset, from start: Double, to end: Double) async throws -> [Caption] {
+    static func transcribe(_ clips: [Clip], frame: CGSize, from start: Double, to end: Double) async throws -> [Caption] {
         let status = await withCheckedContinuation { k in SFSpeechRecognizer.requestAuthorization { k.resume(returning: $0) } }
         guard status == .authorized else {
             throw Failure.failed("Allow Ather Screenshot in System Settings › Privacy & Security › Speech Recognition.")
@@ -174,12 +147,12 @@ enum VideoExport {
         guard let rec = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US")), rec.isAvailable else {
             throw Failure.failed("Speech recognition isn't available for your language.")
         }
-        let tracks = try await asset.loadTracks(withMediaType: .audio)
-        guard !tracks.isEmpty else { throw Failure.failed("This recording has no audio. Turn on system audio or the microphone in Settings › Recording.") }
-        // Mix the audio tracks of the trimmed range into one file.
-        let comp = AVMutableComposition()
-        let range = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600), end: CMTime(seconds: end, preferredTimescale: 600))
-        for t in tracks { try comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)?.insertTimeRange(range, of: t, at: .zero) }
+        // The sequence's sound in the trimmed range, mixed into one file.
+        let seq = try await VideoSequence.build(clips, frame: frame, range: start...max(start, end), box: RendererBox(FrameRenderer(edit: VideoEdit(trimEnd: 0), full: frame, preview: true)))
+        let comp = seq.composition
+        guard !comp.tracks(withMediaType: .audio).isEmpty else {
+            throw Failure.failed("This video has no sound. For recordings, turn on system audio or the microphone in Settings › Recording.")
+        }
         let audio = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).m4a")
         defer { try? FileManager.default.removeItem(at: audio) }
         guard let s = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetAppleM4A) else { throw Failure.failed("Can't read the audio.") }
@@ -235,8 +208,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     static let quickEmoji = ["✅", "❌", "⚠️", "👉", "👀", "💡", "🎉", "🔥", "⭐️", "❤️", "👍", "🤔"]
 
     let url: URL
-    let asset: AVURLAsset
-    let player: AVPlayer
+    let player = AVPlayer()
     let window: NSWindow
     var duration: Double = 0
     var videoSize = CGSize(width: 16, height: 9)
@@ -274,8 +246,6 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     private init(_ url: URL) {
         self.url = url
-        asset = AVURLAsset(url: url)
-        player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
         let vis = Geo.mouseScreen.visibleFrame
         let size = NSSize(width: min(1240, vis.width * 0.92), height: min(880, vis.height * 0.92))
         window = NSWindow(contentRect: NSRect(x: vis.midX - size.width / 2, y: vis.midY - size.height / 2, width: size.width, height: size.height),
@@ -300,28 +270,39 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     @MainActor private func load() async {   // touches the window after each await
+        let clip: Clip
         do {
-            duration = try await asset.load(.duration).seconds
-            videoSize = try await VideoExport.displaySize(asset)
+            clip = try await VideoSource.probe(url)
         } catch {
             Toast.shared.show("Can't open this video", error.localizedDescription)
             return window.close()
         }
-        edit = VideoEdit(trimEnd: duration)
+        edit = VideoEdit(trimEnd: clip.duration, clips: [clip], frame: CGSize(width: clip.w, height: clip.h))
         undoStack = []
         dirty = false
-        // The preview runs every frame through the export renderer.
+        await rebuildPlayer()
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] t in self?.tick(t.seconds) }
+        changed()
+    }
+
+    // The preview plays the sequence through the export renderer. Rebuilt when the clips change.
+    @MainActor func rebuildPlayer() async {
+        duration = VideoSequence.total(edit.clips)
+        videoSize = edit.frame
         let box = RendererBox(FrameRenderer(edit: edit, full: videoSize, preview: true))
         previewBox = box
-        if let vc = try? await AVMutableVideoComposition.videoComposition(with: asset, applyingCIFiltersWithHandler: { req in
-            req.finish(with: box.renderer.render(req.sourceImage, at: req.compositionTime.seconds), context: nil)
-        }) {
-            previewComposition = vc
-            player.currentItem?.videoComposition = vc
+        do {
+            let b = try await VideoSequence.build(edit.clips, frame: edit.frame, box: box)
+            let at = player.currentTime()
+            let item = AVPlayerItem(asset: b.composition)
+            item.videoComposition = b.video
+            previewComposition = b.video
+            player.replaceCurrentItem(with: item)
+            if at.isValid, at.seconds > 0 { await player.seek(to: CMTime(seconds: min(at.seconds, duration), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
+        } catch {
+            Toast.shared.show("Can't play this video", error.localizedDescription)
         }
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] t in self?.tick(t.seconds) }
         timeline.loadThumbnails()
-        changed()
     }
 
     // Hands the latest edit to the preview; while paused, re-renders the current frame.
@@ -935,11 +916,11 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         guard !busy else { return }
         busy = true
         Toast.shared.show("Transcribing…", "Turning speech into captions on this Mac", ms: 120_000)
-        let (a, s, e) = (asset, edit.trimStart, edit.trimEnd)
+        let (clips, frame, s, e) = (edit.clips, edit.frame, edit.trimStart, edit.trimEnd)
         Task { @MainActor in
             defer { self.busy = false }
             do {
-                let caps = try await VideoExport.transcribe(a, from: s, to: e)
+                let caps = try await VideoExport.transcribe(clips, frame: frame, from: s, to: e)
                 Toast.shared.hide()
                 guard !caps.isEmpty else { return Toast.shared.show("No speech found", "Add captions by hand with T.") }
                 self.pushUndo()
@@ -961,11 +942,11 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         let info = NameInfo(app: src.app, window: src.window)
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).\(gif ? "gif" : "mp4")")
         Toast.shared.show(gif ? "Saving GIF…" : "Saving video…", "\(clock(edit.outputDuration)) long", ms: 600_000)
-        let (a, e) = (asset, edit)
+        let e = edit
         Task { @MainActor in
             defer { self.busy = false }
             do {
-                if gif { try await VideoExport.gif(a, e, to: tmp) } else { try await VideoExport.mp4(a, e, to: tmp) }
+                if gif { try await VideoExport.gif(e, to: tmp) } else { try await VideoExport.mp4(e, to: tmp) }
                 let out = Output.newCaptureURL(ext: gif ? "gif" : "mp4", info: info)
                 Library.shared.noteEdit(out, from: self.url, info: info, edited: true)
                 try FileManager.default.moveItem(at: tmp, to: out)
@@ -1339,16 +1320,31 @@ final class Timeline: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with e: NSEvent) { if editor?.key(e) != true { super.keyDown(with: e) } }
 
+    // Frames straight from each clip's file, upright, without the sequence's black bars. A newer edit cancels
+    // the job in flight, so stale frames are never decoded or shown.
+    private var thumbJob: Task<Void, Never>?
     func loadThumbnails() {
+        thumbJob?.cancel()
         guard let e = editor, e.duration > 0 else { return }
-        let gen = AVAssetImageGenerator(asset: e.asset)
-        gen.appliesPreferredTrackTransform = true
-        gen.maximumSize = CGSize(width: 240, height: 240)
+        let clips = e.edit.clips, total = e.duration
         let count = 16
-        let times = (0..<count).map { CMTime(seconds: e.duration * (Double($0) + 0.5) / Double(count), preferredTimescale: 600) }
-        Task { @MainActor in
+        thumbJob = Task { @MainActor in
+            var gens: [String: AVAssetImageGenerator] = [:]
             var out: [CGImage] = []
-            for t in times { if let img = try? await gen.image(at: t).image { out.append(img) } }
+            for i in 0..<count {
+                guard !Task.isCancelled else { return }
+                guard let (k, ft) = VideoSequence.locate(clips, total * (Double(i) + 0.5) / Double(count)) else { continue }
+                let path = clips[k].path
+                let gen = gens[path] ?? {
+                    let g = AVAssetImageGenerator(asset: AVURLAsset(url: clips[k].url))
+                    g.appliesPreferredTrackTransform = true
+                    g.maximumSize = CGSize(width: 240, height: 240)
+                    gens[path] = g
+                    return g
+                }()
+                if let img = try? await gen.image(at: CMTime(seconds: ft, preferredTimescale: 600)).image { out.append(img) }
+            }
+            guard !Task.isCancelled else { return }
             self.thumbs = out
             self.needsDisplay = true
         }

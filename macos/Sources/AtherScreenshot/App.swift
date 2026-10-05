@@ -125,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for u in urls {
-            if u.isFileURL { Editor.open(url: u) }
+            if u.isFileURL { openToEdit(u) }
             else if u.scheme == "atherscreenshot" {  // atherscreenshot://region?pin
                 var args = [u.host ?? ""]
                 for q in URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems ?? [] {
@@ -314,8 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for u in Output.listCaptures().prefix(5) {
             items.append(PaletteItem(id: "recent", title: "Open recent: \(u.lastPathComponent)", keywords: "recent last history file", icon: "clock",
                                      hint: Library.dateFormat.string(from: (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date())) {
-                if ["mp4", "mov"].contains(u.pathExtension.lowercased()) { VideoEditor.open(u) }
-                else if u.pathExtension.lowercased() == "gif" { Output.open(u) } else { Editor.open(url: u) }
+                if u.pathExtension.lowercased() == "gif" { Output.open(u) } else { self.openToEdit(u) }
             })
         }
         return items
@@ -680,9 +679,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func openImage() {
         activateApp()
         let p = NSOpenPanel()
-        p.allowedContentTypes = [.image]
+        p.allowedContentTypes = MediaFiles.contentTypes(pictures: true, videos: true)
         p.directoryURL = s.capturesFolder
-        if p.runModal() == .OK, let u = p.url { Editor.open(url: u) }
+        if p.runModal() == .OK, let u = p.url { openToEdit(u) }
+    }
+
+    // Any file opened from outside: videos go to the video editor, everything else to the image editor.
+    // Edits are saved as new captures; the original is never changed.
+    func openToEdit(_ u: URL) {
+        if MediaFiles.isVideo(u) { VideoEditor.open(u) } else { Editor.open(url: u) }
     }
 
     func promptRename(_ url: URL) {
@@ -750,14 +755,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             i += 1
         }
         switch first.lowercased() {
-        case "edit": files.forEach { Editor.open(url: URL(fileURLWithPath: $0)) }; return
-        case "pin": files.compactMap { CGImage.load(URL(fileURLWithPath: $0)) }.forEach { Pin.show($0) }; return
+        case "edit": files.forEach { openToEdit(URL(fileURLWithPath: $0)) }; return
+        case "pin":
+            for f in files.map({ URL(fileURLWithPath: $0) }) {
+                if MediaFiles.isVideo(f) { Toast.shared.show("Videos can't be pinned", f.lastPathComponent) }
+                else if let img = CGImage.load(f) { Pin.show(img) }
+            }
+            return
         case "upload": files.forEach { upload(URL(fileURLWithPath: $0)) }; return
         default: break
         }
         let cmd = kCliNames[first.lowercased()] ?? Cmd.allCases.first { $0.rawValue.lowercased() == first.lowercased() }
         guard let cmd else {
-            if trusted, FileManager.default.fileExists(atPath: first) { Editor.open(url: URL(fileURLWithPath: first)) }
+            if trusted, FileManager.default.fileExists(atPath: first) { openToEdit(URL(fileURLWithPath: first)) }
             else { Toast.shared.show("Unknown command", first) }
             return
         }
