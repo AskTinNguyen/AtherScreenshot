@@ -16,7 +16,8 @@ ARCHS=()
 
 # The version lives in ../src/version.h, shared with the Windows build.
 VERSION=$(sed -n 's/.*ATHER_VERSION_STR "\(.*\)".*/\1/p' ../src/version.h)
-BUILD_NUM=$(git rev-list --count HEAD 2>/dev/null || echo 1)
+# The build (CFBundleVersion) is what the updater compares; re-releases of a version raise only the build.
+BUILD_NUM=$(sed -n 's/.*ATHER_BUILD_STR "\(.*\)".*/\1/p' ../src/version.h)
 
 # `swift` on PATH can be something else entirely (python-swiftclient); use the Xcode toolchain.
 SWIFT="xcrun swift"
