@@ -60,7 +60,7 @@ Values are stored in `%APPDATA%\AtherScreenshot\settings.ini`.
 
 ## Annotation editor
 
-Open it with `Ctrl+Alt+E`, by clicking the capture toast, from the gallery, from a pin's menu, with "Open image in editor…", or with `AtherScreenshot.exe edit <file>`.
+Open it with `Ctrl+Alt+E`, by clicking the capture toast, from the gallery, from a pin's menu, with "Open a picture or video to edit…", or with `AtherScreenshot.exe edit <file>`. Pictures and videos from anywhere work too: the installer adds Ather Screenshot to Explorer's "Open with" and an "Edit with Ather Screenshot" item to the right-click menu (videos open in the video editor). Edits are saved as new files in your captures; the original is never changed.
 
 | Key | Tool |
 |---|---|
@@ -107,13 +107,18 @@ Select a region, or use "Record a window", which follows one window wherever it 
 - **MP4:** H.264 with the hardware encoder when available, plus AAC audio of the system sound (`RecordSystemAudio`) and/or the microphone (`RecordMicrophone`), mixed and kept in sync. Pauses are cut out.
 - **GIF:** per-frame palettes; identical frames are merged.
 - **Click and keystroke overlay:** click ripples (`ShowClicks`) and a keystroke pill (`ShowKeys`, off by default because it would show anything you type, including passwords).
+- **Game controller overlay:** with "Show game controller" on (`ShowGamepad`), a connected Xbox-style (XInput) controller is drawn in a corner of the video, like OBS's Input Overlay: sticks, triggers, bumpers, D-pad, A/B/X/Y and View/Menu light up as you use them. Pick the corner with `GamepadCorner`. Nothing is drawn while no controller is connected. PlayStation controllers show up when Steam Input or DS4Windows presents them as XInput.
 - When a recording finishes, the file is copied to the clipboard so you can paste it into chats.
 
 ## Video editor
 
-Opening an MP4 (from the gallery, the "Recording saved" notification, or Open recent in the palette) opens a small editor instead of a player:
+Opening a video (from the gallery, the "Recording saved" notification, Open recent in the palette, "Open a picture or video to edit…", or Explorer) opens a small editor instead of a player. MP4, MOV, M4V, WMV, AVI and MKV work; phone videos recorded sideways show upright.
 
 - **Trim:** drag the yellow handles on the timeline, or press I and O at the playhead.
+- **Join videos:** Add ▾ › Video clip… (Ctrl+O), or drop video files on the editor, to add them after the selected clip. Clips play back to back; videos of another shape get black bars.
+  - Once there's more than one clip, a clip lane shows above the timeline: click a clip to select it, drag it to reorder, and drag a selected clip's edges to trim it.
+  - S splits the clip at the playhead (then remove a middle part, or reorder the halves). The selected clip's row has Split, Earlier, Later and Remove (Del).
+  - Markup and captions move with the footage they're on; undo covers clip changes too.
 - **Crop:** press C and drag on the video; pick Free, 16:9, 4:3, 1:1 or 9:16 to keep a shape.
 - **Speed** 0.5–4× (audio keeps its pitch) and **Mute**.
 - **Captions:**
