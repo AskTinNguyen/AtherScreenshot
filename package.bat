@@ -56,10 +56,14 @@ dir /b %DIST%
 
 if /i not "%1"=="publish" exit /b 0
 where gh >nul 2>nul || (echo gh CLI not found & exit /b 1)
+rem The release is tagged at the commit that was built, so it has to be on GitHub already.
+for /f %%c in ('git rev-parse HEAD') do set COMMIT=%%c
+git fetch -q origin
+git branch -r --contains %COMMIT% | findstr /c:"origin/" >nul || (echo Push %COMMIT% first: the release is tagged there. & exit /b 1)
 set ASSETS="%DIST%\AtherScreenshot-Setup-%VER%.exe" "%DIST%\AtherScreenshot-%VER%-portable.zip" "%DIST%\SHA256SUMS.txt" "%DIST%\latest.json"
 gh release view v%VER% --repo %REPO% >nul 2>nul
 if errorlevel 1 (
-  gh release create v%VER% %ASSETS% --repo %REPO% --title "Ather Screenshot %VER%" --notes-file INSTALL.md --latest || exit /b 1
+  gh release create v%VER% %ASSETS% --repo %REPO% --target %COMMIT% --title "Ather Screenshot %VER%" --notes-file INSTALL.md --latest || exit /b 1
 ) else (
   gh release upload v%VER% %ASSETS% --repo %REPO% --clobber || exit /b 1
 )
