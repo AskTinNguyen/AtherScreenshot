@@ -171,7 +171,8 @@ public:
     // `src`: the source frame (full size, opaque). `t`: source time in seconds. Returns a frame of `Out()` size.
     BitmapPtr Render(const Bitmap& src, double t) const;
     // The same, but when nothing changes the frame (an export without edits at `t`) it can be `src` itself.
-    BitmapPtr Render(const BitmapPtr& src, double t) const;
+    // `owned`: nothing else will look at `src` again, so it can be drawn on instead of a copy of it.
+    BitmapPtr Render(const BitmapPtr& src, double t, bool owned = false) const;
 
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
@@ -190,7 +191,7 @@ public:
     uint64_t settled = 0;        // preview while paused: the selected item shows fully, not mid-animation
 
 private:
-    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t) const;
+    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;
     std::optional<Placed> RingImage(VRect r) const;
 

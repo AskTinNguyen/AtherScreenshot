@@ -397,8 +397,9 @@ BitmapPtr Blank(int w, int h) {
 
 // Gaussian-like blur (three box passes) of `inner`, sampling up to 3 radii around it so the edges blend with
 // the surroundings (like Core Image's clamped blur). Returns the blurred pixels of `inner`.
-// The four channels go through the passes side by side (one SSE lane each, each lane doing exactly the float
-// arithmetic of a channel on its own), and the column passes sweep whole rows at a time.
+// Each pass is a box along the rows, then one down the columns. The four channels go side by side (an SSE lane
+// each, each lane doing exactly the float arithmetic of that channel alone). Rows stream through the six passes,
+// each column pass keeping just the rows its window spans, so the work stays in the cache.
 std::vector<uint32_t> BlurArea(const Bitmap& img, const RECT& inner, double sigma) {
     const int r = std::max(1, (int)std::lround(sigma));
     const int W = img.Width(), H = img.Height();
@@ -406,57 +407,91 @@ std::vector<uint32_t> BlurArea(const Bitmap& img, const RECT& inner, double sigm
                  std::min((LONG)H, inner.bottom + 3 * r)};
     const int pw = RectW(P), ph = RectH(P), iw = RectW(inner), ih = RectH(inner);
     std::vector<uint32_t> out((size_t)iw * ih, 0);
-    // Kept per thread between calls (fresh memory costs a page fault per 4 KB), unless they grew big.
-    thread_local std::vector<__m128> plane, tmp;
-    plane.resize((size_t)pw * ph);
-    tmp.resize((size_t)pw * ph);
     const __m128i zero = _mm_setzero_si128();
-    for (int y = 0; y < ph; ++y) {
-        const uint32_t* row = img.Bits() + (size_t)(P.top + y) * W + P.left;
-        __m128* dst = plane.data() + (size_t)y * pw;
-        for (int x = 0; x < pw; ++x) dst[x] = _mm_cvtepi32_ps(_mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)row[x]), zero), zero));
+    const bool pass = pw > 1 && ph > 1;
+    const int rh = std::min(r, pw - 1), rv = std::min(r, ph - 1), R = 2 * rv + 2;  // R: rows a column window spans
+    // Kept per thread between calls (fresh memory costs a page fault per 4 KB), unless it grew big.
+    thread_local std::vector<__m128> mem;
+    mem.resize((size_t)pw * (3 * (R + 2) + 1));
+    __m128* scratch = mem.data();
+    struct Stage {
+        __m128 *ring, *sum, *out;
+        int fetched = -1;
+    } stages[3];
+    for (int s = 0; s < 3; ++s) {
+        __m128* base = mem.data() + (size_t)pw * (1 + s * (R + 2));
+        stages[s] = {base, base + (size_t)pw * R, base + (size_t)pw * (R + 1)};
     }
-    if (pw > 1 && ph > 1)
-        for (int k = 0; k < 3; ++k) {
-            {  // along each row
-                const int rr = std::min(r, pw - 1);
-                const __m128 inv = _mm_set1_ps(1.f / (2 * rr + 1)), first = _mm_set1_ps((float)(rr + 1));
-                for (int y = 0; y < ph; ++y) {
-                    __m128* d = plane.data() + (size_t)y * pw;
-                    __m128* o = tmp.data() + (size_t)y * pw;
-                    __m128 sum = _mm_mul_ps(d[0], first);
-                    for (int i = 1; i <= rr; ++i) sum = _mm_add_ps(sum, d[i]);
-                    for (int i = 0; i < pw; ++i) {
-                        o[i] = _mm_mul_ps(sum, inv);
-                        sum = _mm_add_ps(sum, _mm_sub_ps(d[std::min(i + rr + 1, pw - 1)], d[std::max(i - rr, 0)]));
-                    }
+    auto load = [&](int y, __m128* d) {  // row y of the area, as floats
+        const uint32_t* row = img.Bits() + (size_t)(P.top + y) * W + P.left;
+        for (int x = 0; x < pw; ++x) d[x] = _mm_cvtepi32_ps(_mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)row[x]), zero), zero));
+    };
+    const __m128 invH = _mm_set1_ps(1.f / (2 * rh + 1)), firstH = _mm_set1_ps((float)(rh + 1));
+    const __m128 invV = _mm_set1_ps(1.f / (2 * rv + 1)), firstV = _mm_set1_ps((float)(rv + 1));
+    auto along = [&](const __m128* d, __m128* o) {  // a box along one row (the clamps only near its ends)
+        __m128 sum = _mm_mul_ps(d[0], firstH);
+        for (int i = 1; i <= rh; ++i) sum = _mm_add_ps(sum, d[i]);
+        const int mid0 = std::min(rh, pw), mid1 = std::max(mid0, pw - rh - 1);  // i − rh ≥ 0 and i + rh + 1 ≤ pw − 1 in between
+        int i = 0;
+        for (; i < mid0; ++i) {
+            o[i] = _mm_mul_ps(sum, invH);
+            sum = _mm_add_ps(sum, _mm_sub_ps(d[std::min(i + rh + 1, pw - 1)], d[std::max(i - rh, 0)]));
+        }
+        for (; i < mid1; ++i) {
+            o[i] = _mm_mul_ps(sum, invH);
+            sum = _mm_add_ps(sum, _mm_sub_ps(d[i + rh + 1], d[i - rh]));
+        }
+        for (; i < pw; ++i) {
+            o[i] = _mm_mul_ps(sum, invH);
+            sum = _mm_add_ps(sum, _mm_sub_ps(d[std::min(i + rh + 1, pw - 1)], d[std::max(i - rh, 0)]));
+        }
+    };
+    // Row i (asked for in order from 0) after pass s: the box down the columns over rows that had the box along
+    // them, fed by pass s − 1 (or the image).
+    auto passRow = [&](auto& self, int s, int i) -> const __m128* {
+        Stage& st = stages[s];
+        auto in = [&](int j) { return st.ring + (size_t)(j % R) * pw; };
+        auto fetch = [&](int j) {
+            while (st.fetched < j) {
+                const int y = ++st.fetched;
+                if (s == 0) {
+                    load(y, scratch);
+                    along(scratch, in(y));
+                } else {
+                    along(self(self, s - 1, y), in(y));
                 }
-                plane.swap(tmp);
             }
-            {  // down each column, all columns at once
-                const int rr = std::min(r, ph - 1);
-                const __m128 inv = _mm_set1_ps(1.f / (2 * rr + 1)), first = _mm_set1_ps((float)(rr + 1));
-                std::vector<__m128> sum((size_t)pw);
-                auto row = [&](int y) { return plane.data() + (size_t)y * pw; };
-                for (int x = 0; x < pw; ++x) sum[x] = _mm_mul_ps(row(0)[x], first);
-                for (int i = 1; i <= rr; ++i)
-                    for (int x = 0; x < pw; ++x) sum[x] = _mm_add_ps(sum[x], row(i)[x]);
-                for (int i = 0; i < ph; ++i) {
-                    __m128* o = tmp.data() + (size_t)i * pw;
-                    const __m128 *add = row(std::min(i + rr + 1, ph - 1)), *sub = row(std::max(i - rr, 0));
-                    for (int x = 0; x < pw; ++x) {
-                        o[x] = _mm_mul_ps(sum[x], inv);
-                        sum[x] = _mm_add_ps(sum[x], _mm_sub_ps(add[x], sub[x]));
-                    }
-                }
-                plane.swap(tmp);
+        };
+        if (i == 0) {
+            fetch(rv);
+            const __m128* r0 = in(0);
+            for (int x = 0; x < pw; ++x) st.sum[x] = _mm_mul_ps(r0[x], firstV);
+            for (int k = 1; k <= rv; ++k) {
+                const __m128* rk = in(k);
+                for (int x = 0; x < pw; ++x) st.sum[x] = _mm_add_ps(st.sum[x], rk[x]);
             }
         }
+        for (int x = 0; x < pw; ++x) st.out[x] = _mm_mul_ps(st.sum[x], invV);
+        const int a = std::min(i + rv + 1, ph - 1), b = std::max(i - rv, 0);
+        fetch(a);
+        const __m128 *add = in(a), *sub = in(b);
+        for (int x = 0; x < pw; ++x) st.sum[x] = _mm_add_ps(st.sum[x], _mm_sub_ps(add[x], sub[x]));
+        return st.out;
+    };
     // Rounded like lround (halves up; anything below zero is 0 after the clamp), clamped to 0…255.
     const __m128 half = _mm_set1_ps(0.5f), one = _mm_set1_ps(1.f), fzero = _mm_setzero_ps();
-    for (int y = 0; y < ih; ++y) {
-        const __m128* src = plane.data() + (size_t)(inner.top - P.top + y) * pw + (inner.left - P.left);
-        uint32_t* dst = out.data() + (size_t)y * iw;
+    const int top = inner.top - P.top, left = inner.left - P.left;
+    for (int y = 0; y < top + ih; ++y) {
+        const __m128* row;
+        if (pass) {
+            row = passRow(passRow, 2, y);
+        } else {
+            load(y, scratch);
+            row = scratch;
+        }
+        if (y < top) continue;
+        const __m128* src = row + left;
+        uint32_t* dst = out.data() + (size_t)(y - top) * iw;
         for (int x = 0; x < iw; ++x) {
             const __m128 v = _mm_max_ps(src[x], fzero);
             const __m128 tr = _mm_cvtepi32_ps(_mm_cvttps_epi32(v));
@@ -465,10 +500,7 @@ std::vector<uint32_t> BlurArea(const Bitmap& img, const RECT& inner, double sigm
             dst[x] = (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(_mm_packs_epi32(q, zero), zero));
         }
     }
-    if (plane.capacity() > (1u << 19)) {  // 8 MB
-        std::vector<__m128>().swap(plane);
-        std::vector<__m128>().swap(tmp);
-    }
+    if (mem.capacity() > (1u << 19)) std::vector<__m128>().swap(mem);  // 8 MB
     return out;
 }
 // Bilinear sample of a premultiplied image; transparent outside it.
@@ -534,15 +566,19 @@ BitmapPtr SampleRect(const Bitmap& src, VRect r, int w, int h) {
         const uint32_t* r0 = src.Bits() + (size_t)y0 * W;
         const uint32_t* r1 = r0 + W;
         uint32_t* d = out->Bits() + (size_t)y * w;
+        __m128d bg0{}, ra0{}, bg1{}, ra1{}, bg2{}, ra2{}, bg3{}, ra3{};
+        int have = -1;  // the source column whose pixels are in those (zoomed in, neighbors share them)
         for (int x = 0; x < w; ++x) {
             const int x0 = xs[x];
             const double fx = fxs[x], gx = gxs[x];
             const __m128d w0 = _mm_set1_pd(gx * gy), w1 = _mm_set1_pd(fx * gy), w2 = _mm_set1_pd(gx * fy), w3 = _mm_set1_pd(fx * fy);
-            __m128d bg0, ra0, bg1, ra1, bg2, ra2, bg3, ra3;
-            lanes(r0[x0], &bg0, &ra0);
-            lanes(r0[x0 + 1], &bg1, &ra1);
-            lanes(r1[x0], &bg2, &ra2);
-            lanes(r1[x0 + 1], &bg3, &ra3);
+            if (x0 != have) {
+                have = x0;
+                lanes(r0[x0], &bg0, &ra0);
+                lanes(r0[x0 + 1], &bg1, &ra1);
+                lanes(r1[x0], &bg2, &ra2);
+                lanes(r1[x0 + 1], &bg3, &ra3);
+            }
             __m128d bg = _mm_mul_pd(bg0, w0), ra = _mm_mul_pd(ra0, w0);
             bg = _mm_add_pd(bg, _mm_mul_pd(bg1, w1)), ra = _mm_add_pd(ra, _mm_mul_pd(ra1, w1));
             bg = _mm_add_pd(bg, _mm_mul_pd(bg2, w2)), ra = _mm_add_pd(ra, _mm_mul_pd(ra2, w2));
@@ -673,16 +709,17 @@ FrameRenderer::FrameRenderer(const VideoEdit& edit, SIZE full, bool preview) : e
     unit_ = std::max(1.0, full.cy / 720.0);
 }
 
-BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw(src, nullptr, t); }
+BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw(src, nullptr, t, false); }
 
-BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t) const { return src ? Draw(*src, &src, t) : nullptr; }
+BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t, bool owned) const { return src ? Draw(*src, &src, t, owned) : nullptr; }
 
-BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t) const {
-    // Steps 1–2 change the video itself, on a copy of it. An export frame without them reads the source as is.
+BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
+    // Steps 1–2 change the video itself, on a copy of it (or on it, when it's `owned`). An export frame without
+    // them reads the source as is.
     bool onVideo = false;
     for (const auto& m : edit_.marks) onVideo = onVideo || (m.kind != MarkKind::Title && m.kind != MarkKind::Zoom && m.Active(t));
     BitmapPtr img;
-    { ProfE pe(14); img = preview_ || onVideo ? Copy(src) : nullptr; }  // PROF-TEMP
+    { ProfE pe(14); img = preview_ || onVideo ? (owned && shared && !preview_ ? *shared : Copy(src)) : nullptr; }  // PROF-TEMP
     if ((preview_ || onVideo) && !img) return nullptr;
     const VRect extent{0, 0, (double)src.Width(), (double)src.Height()};
     // 1. Blur and pixelate, in the order they were added.
@@ -744,7 +781,7 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     BitmapPtr framed;
     if (preview_ && r == view_) framed = nullptr;  // drawn in place
     else if (!preview_ && r == extent && tsize.cx == src.Width() && tsize.cy == src.Height())  // the whole frame, unscaled
-        framed = img ? img : shared && !overlays ? *shared : Copy(src);
+        framed = img ? img : shared && (!overlays || owned) ? *shared : Copy(src);
     else { ProfE pe(11); framed = SampleRect(video, r, tsize.cx, tsize.cy); }  // PROF-TEMP
     if (!framed && !(preview_ && r == view_)) return nullptr;
     // 4. Captions and title cards stay put on screen.

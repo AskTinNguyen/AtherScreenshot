@@ -1090,19 +1090,23 @@ public:
     }
 
     // The source frame of output frame `i` (asked in order) and its source time.
-    bool Next(int i, VideoFrame* src, double* st) {
+    // `alone`: no other output frame shows that source frame, so its rendering can draw on it.
+    bool Next(int i, VideoFrame* src, double* st, bool* alone) {
         *st = e_.trimStart + i / fps_ * e_.speed;
         while (next_ && nextT_ <= *st + 1e-3) {
             cur_ = next_;
             Advance(*st + 1e-3);  // frames that a later one up to here replaces needn't be copied off the GPU
         }
         *src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
+        // Not the previous output frame's, and the next output frame shows a later one.
+        *alone = *src != shown_ && next_ && *src != next_ && nextT_ <= e_.trimStart + (i + 1) / fps_ * e_.speed + 1e-3;
+        shown_ = *src;
         return (bool)*src;
     }
-    BitmapPtr Render(const VideoFrame& src, double st) const {
+    BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
         ProfT pt(2);  // PROF-TEMP
         const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
-        return renderer_->Render(f, st);
+        return renderer_->Render(f, st, alone);
     }
 
 private:
@@ -1117,7 +1121,7 @@ private:
     VideoEdit e_;
     double fps_ = 30;
     std::unique_ptr<FrameRenderer> renderer_;
-    VideoFrame cur_, next_;
+    VideoFrame cur_, next_, shown_;
     double nextT_ = 0;
 };
 
@@ -1251,12 +1255,13 @@ std::pair<int, size_t> ExportWorkers(SIZE px) {
     return {workers, depth};
 }
 
-// Makes output frames first…end−1 on worker threads (`make` turns a source frame and its time into one) and hands
+// Makes output frames first…end−1 on worker threads (`make` turns a source frame, its time and whether it's shown
+// alone into one) and hands
 // them to `use` in order, on this thread, while another thread decodes ahead. Stops when `use` returns false or
 // a frame can't be made. With `shared`, on that pool, alongside `share` − 1 others (they split the frames in flight).
 // Decoding and handing over are one thread each, so they go before the renderers: above normal priority.
 template <class T>
-void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(const VideoFrame&, double)>& make,
+void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(const VideoFrame&, double, bool)>& make,
                   const std::function<bool(int, T&)>& use, WorkerPool* shared = nullptr, int share = 1) {
     const SIZE full = frames.Full(), out = frames.Out();
     const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
@@ -1270,7 +1275,8 @@ void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(
         for (int i = first; i < end; ++i) {
             VideoFrame src;
             double st = 0;
-            if (!frames.Next(i, &src, &st) || !work.Push([&make, src, st] { return make(src, st); })) break;
+            bool alone = false;
+            if (!frames.Next(i, &src, &st, &alone) || !work.Push([&make, src, st, alone] { return make(src, st, alone); })) break;
         }
         work.Close();
         CoUninitialize();
@@ -1299,9 +1305,9 @@ namespace {
 
 // Makes the MP4's frames: the rendered frame as NV12 for the encoder.
 auto Mp4Frames(EditFrames& frames, SIZE sz) {
-    return [&frames, sz](const VideoFrame& src, double st) {
+    return [&frames, sz](const VideoFrame& src, double st, bool alone) {
         EncoderFrame ef;
-        const BitmapPtr f = frames.Render(src, st);
+        const BitmapPtr f = frames.Render(src, st, alone);
         if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
         ef.nv12 = RecycledBytes((size_t)sz.cx * sz.cy * 3 / 2);
         { ProfT pt(1); BgraToNv12(f->Bits(), sz.cx, sz.cy, ef.nv12->data()); }  // PROF-TEMP
@@ -1353,10 +1359,11 @@ enum class Outcome { Done, Failed, Retry };  // Retry: this way doesn't work her
 
 std::atomic<int> g_joined{0};  // encoders the last export's video was joined from (0: one encoder), for the tests
 
-// Encoders for an export of `n` frames at `fps`: one per few seconds of video, up to three.
+// Encoders for an export of `n` frames at `fps`: two from four seconds on. (A third gains little more on plain
+// exports and costs on ones with edits, measured on an RTX 5090 with --bench-export.)
 int EncodersFor(int n, int fps) {
     if (wchar_t v[8]; GetEnvironmentVariableW(L"ATHER_ENCODERS", v, 8)) return std::max(1, _wtoi(v));  // developer switch (--bench-export)
-    return std::clamp(n / std::max(1, 2 * fps), 1, 3);
+    return n >= 4 * fps ? 2 : 1;
 }
 
 // Encoding is what holds a plain export back: a hardware encoder does ~300–450 frames a second, and a GPU often
@@ -1526,9 +1533,9 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
         BitmapPtr bgra;  // for --bench-export's tap
         explicit operator bool() const { return q != nullptr; }
     };
-    auto make = [&](const VideoFrame& src, double st) {
+    auto make = [&](const VideoFrame& src, double st, bool alone) {
         GifFrame gf;
-        BitmapPtr f = frames.Render(src, st);
+        BitmapPtr f = frames.Render(src, st, alone);
         if (f && (f->Width() != gw || f->Height() != gh)) f = Resample(*f, gw, gh);
         if (!f) return gf;
         gf.q = GifWriter::Quantize(f->Bits(), gw, gh);  // the slow part of a GIF frame, on the workers
