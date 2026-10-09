@@ -2459,13 +2459,14 @@ ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
 
 // A frame whose edits change only parts of it gets just those converted and drawn on: there it is byte for byte the
 // whole frame rendered and converted, and elsewhere the frame (its crop) as decoded. Every kind of markup, with
-// their animations, and captions; in SD and HD, cropped and not.
+// their animations, and captions; in SD and HD, cropped (on odd pixels too) and not.
 ATHER_TEST(video_edits_drawn_on_their_part_match_the_whole_frame) {
     struct Case {
         SIZE sz;
         std::optional<VRect> crop;
     };
-    for (const Case& k : {Case{{640, 360}, std::nullopt}, Case{{1280, 720}, VRect{64, 32, 1100, 600}}, Case{{1280, 720}, std::nullopt}}) {
+    for (const Case& k : {Case{{640, 360}, std::nullopt}, Case{{1280, 720}, VRect{64, 32, 1100, 600}},
+                         Case{{1280, 720}, VRect{75, 41, 1013, 611}}, Case{{1280, 720}, std::nullopt}}) {
         const SIZE sz = k.sz;
         const std::wstring clip = test::TempDir() + L"\\noise.mp4";
         Mp4Writer mw;

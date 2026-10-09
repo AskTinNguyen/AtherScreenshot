@@ -741,8 +741,11 @@ FrameRenderer::FrameRenderer(const VideoEdit& edit, SIZE full, bool preview) : e
     if (edit.crop)
         if (auto i = Intersect(*edit.crop, f)) v = i->Integral();
     if (v.w < 16 || v.h < 16) v = f;
+    // An export shows whole 2 × 2 pixel blocks (H.264 wants even sizes), so the crop's color samples go out as decoded
+    // (moving its corner up to a pixel up and left).
+    if (!preview) v = {std::floor(v.x / 2) * 2, std::floor(v.y / 2) * 2, std::floor(v.w / 2) * 2, std::floor(v.h / 2) * 2};
     view_ = v;
-    out_ = preview ? full : SIZE{(LONG)(std::floor(v.w / 2) * 2), (LONG)(std::floor(v.h / 2) * 2)};  // H.264 wants even sizes
+    out_ = preview ? full : SIZE{(LONG)v.w, (LONG)v.h};
     unit_ = std::max(1.0, full.cy / 720.0);
 }
 
