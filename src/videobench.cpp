@@ -117,6 +117,20 @@ std::vector<Scenario> Scenarios(const Clip& c) {
         s.edit.speed = 2;
         out.push_back(s);
     }
+    {  // captions all along, nothing else
+        Scenario s{L"captions", false, {}};
+        s.edit.trimEnd = std::min(D, 20.0);
+        const wchar_t* lines[] = {L"Open the project settings", L"Pick the build target", L"Then click deploy",
+                                  L"Wait for the green check", L"That's it, it's live", L"Thanks for watching"};
+        for (int i = 0; i < 6; ++i) {
+            Caption cap;
+            cap.start = s.edit.trimEnd * i / 6;
+            cap.end = s.edit.trimEnd * (i + 0.95) / 6;
+            cap.text = lines[i];
+            s.edit.captions.push_back(cap);
+        }
+        out.push_back(s);
+    }
     if (D >= 40) {  // a whole long recording, as it is
         Scenario s{L"long", false, {}};
         s.edit.trimEnd = D;

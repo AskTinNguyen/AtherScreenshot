@@ -160,8 +160,8 @@ BitmapPtr Resample(const Bitmap& src, int w, int h) {
     return out;
 }
 
-void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
-    const bool hd = h > 576;
+void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out, int frameHeight) {
+    const bool hd = (frameHeight > 0 ? frameHeight : h) > 576;
     const int yr = hd ? 47 : 66, yg = hd ? 157 : 129, yb = hd ? 16 : 25;
     const int ur = hd ? -26 : -38, ug = hd ? -87 : -74, ub = 112;
     const int vr = 112, vg = hd ? -102 : -94, vb = hd ? -10 : -18;

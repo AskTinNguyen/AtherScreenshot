@@ -176,6 +176,11 @@ public:
 
     // An export frame at `t` is the source frame as it is: no edit shows, and nothing is cropped or zoomed.
     bool Untouched(double t) const;
+    // An export frame at `t` whose only edits are captions (nothing cropped or zoomed): the part of the frame they
+    // cover, on even pixels (empty when none shows), else nothing. DrawCaptions draws them on that part (`area`, whose
+    // top-left is `at`) exactly as Render draws them on the frame.
+    std::optional<RECT> CaptionArea(double t) const;
+    void DrawCaptions(Bitmap& area, POINT at, double t) const;
 
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
@@ -210,7 +215,8 @@ private:
 
 // Draws `img` stretched into `r` (destination pixels, fractional) on premultiplied `dst` with motion applied:
 // scale about the center, offset, wipe, blur and alpha.
-void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo);
+// `at`: where `dst`'s top-left is, when it holds just a part of the frame (`r` stays in frame pixels).
+void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo, POINT at = {});
 // Frees the rendered marks, captions and title cards kept between frames.
 void ClearRenderCache();
 

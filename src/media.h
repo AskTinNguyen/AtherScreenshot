@@ -31,8 +31,9 @@ BitmapPtr FitInto(const Bitmap& src, int w, int h);
 BitmapPtr Resample(const Bitmap& src, int w, int h);
 // BGRA → NV12 (w × h luma, then h/2 rows of interleaved chroma; w and h even), exactly as Media Foundation's
 // video processor makes it for the encoder: BT.709 above 576 rows and BT.601 up to that, studio range, 8-bit fixed
-// point, each chroma sample the rounded mean of its 2 × 2 pixels'.
-void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out);
+// point, each chroma sample the rounded mean of its 2 × 2 pixels'. `frameHeight`: the whole frame's, when converting a
+// part of it (it picks the matrix).
+void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out, int frameHeight = 0);
 // Starts Media Foundation once per process.
 void EnsureMediaFoundation();
 

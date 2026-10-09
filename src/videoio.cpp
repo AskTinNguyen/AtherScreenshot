@@ -223,7 +223,8 @@ void ReleaseRecycledBytes() {
 struct VideoFrame::State {
     std::once_flag once;
     BitmapPtr bgra;  // the picture, once converted (or as decoded, when the decoder made BGRA)
-    Bytes yuv;       // NV12 until converted: w × h luma, then the chroma rows, `pitch` bytes each
+    Bytes yuv;       // NV12 as decoded: w × h luma, then the chroma rows, `pitch` bytes each (kept once converted:
+                     // other output frames may pass it on to the encoder meanwhile, so it never changes)
     int pitch = 0, w = 0, h = 0;
     YuvMatrix matrix;
     int rotation = 0;  // applied on conversion
@@ -242,7 +243,6 @@ BitmapPtr VideoFrame::Bgra() const {
         if (out && s.rotation) out = RotateBitmap(*out, s.rotation);
         if (out && s.fit.cx > 0 && (out->Width() != s.fit.cx || out->Height() != s.fit.cy)) out = FitInto(*out, s.fit.cx, s.fit.cy);
         s.bgra = out;
-        s.yuv = nullptr;
     });
     return s.bgra;
 }
@@ -1084,6 +1084,7 @@ public:
     }
     SIZE Out() const { return renderer_->Out(); }
     SIZE Full() const { return renderer_->Full(); }
+    const FrameRenderer& Renderer() const { return *renderer_; }
     int Count(bool roundUp) const {
         const double n = e_.OutputDuration() * fps_;
         return std::max(1, roundUp ? (int)std::ceil(n - 1e-6) : (int)std::floor(n + 1e-6));
@@ -1111,15 +1112,37 @@ public:
         shown_ = *src;
         return (bool)*src;
     }
-    // The source frame as the encoder's NV12 when the export shows it as it is (no edit at `st`, the same size,
-    // and colors the encoder side reads the same way: the matrix BgraToNv12 would use, studio range), else null.
-    // Then nothing is converted, and the frame keeps its colors exactly instead of going through RGB and back.
+    // The source frame as the encoder's NV12 when the export shows it as it is (no edit at `st`), else null. Then
+    // nothing is converted, and the frame keeps its colors exactly instead of going through RGB and back.
     Bytes Passthrough(const VideoFrame& src, double st) const {
+        return Nv12Ready(src.state()) && renderer_->Untouched(st) ? src.state()->yuv : nullptr;
+    }
+    // The encoder's NV12 for a frame whose only edits at `st` are captions, else null: the frame as decoded, with
+    // just the part the captions cover converted, drawn on and converted back (each pixel there as Render and
+    // BgraToNv12 make it).
+    Bytes WithCaptions(const VideoFrame& src, double st) const {
         const VideoFrame::State* s = src.state();
-        if (!s || !s->yuv || s->rotation || s->w != s->fit.cx || s->h != s->fit.cy || (s->w & 1) || (s->h & 1) || s->pitch != s->w) return nullptr;
-        static const YuvMatrix hd = StudioMatrix(true), sd = StudioMatrix(false);
-        if (!(s->matrix == (s->h > 576 ? hd : sd)) || !renderer_->Untouched(st)) return nullptr;
-        return s->yuv;
+        const auto area = Nv12Ready(s) ? renderer_->CaptionArea(st) : std::nullopt;
+        if (!area) return nullptr;
+        const int w = s->w, h = s->h, aw = area->right - area->left, ah = area->bottom - area->top;
+        const size_t luma = (size_t)w * h;
+        Bytes out = RecycledBytes(luma * 3 / 2);
+        memcpy(out->data(), s->yuv->data(), out->size());
+        if (aw <= 0 || ah <= 0) return out;
+        const BitmapPtr part = Bitmap::CreateRecycled(aw, ah);
+        if (!part) return nullptr;
+        const uint8_t* y = s->yuv->data() + (size_t)area->top * w + area->left;
+        const uint8_t* uv = s->yuv->data() + luma + (size_t)(area->top / 2) * w + area->left;
+        Nv12ToBgra(y, uv, w, aw, ah, part->Bits(), s->matrix);
+        renderer_->DrawCaptions(*part, {area->left, area->top}, st);
+        thread_local std::vector<uint8_t> nv;
+        nv.resize((size_t)aw * ah * 3 / 2);
+        BgraToNv12(part->Bits(), aw, ah, nv.data(), h);
+        uint8_t* oy = out->data() + (size_t)area->top * w + area->left;
+        uint8_t* ouv = out->data() + luma + (size_t)(area->top / 2) * w + area->left;
+        for (int r = 0; r < ah; ++r) memcpy(oy + (size_t)r * w, nv.data() + (size_t)r * aw, (size_t)aw);
+        for (int r = 0; r < ah / 2; ++r) memcpy(ouv + (size_t)r * w, nv.data() + (size_t)aw * ah + (size_t)r * aw, (size_t)aw);
+        return out;
     }
     BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
         const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
@@ -1127,6 +1150,14 @@ public:
     }
 
 private:
+    // The decoded NV12 can be the encoder's: upright and sequence-sized, and with colors the encoder side reads the
+    // same way (studio range and the matrix BgraToNv12 picks for that height).
+    static bool Nv12Ready(const VideoFrame::State* s) {
+        if (!s || !s->yuv || s->rotation || s->w != s->fit.cx || s->h != s->fit.cy || (s->w & 1) || (s->h & 1) || s->pitch != s->w) return false;
+        static const YuvMatrix hd = StudioMatrix(true), sd = StudioMatrix(false);
+        return s->matrix == (s->h > 576 ? hd : sd);
+    }
+
     void Advance(double skipTo = -1e300) {
         double t = 0;
         if (!reader_.ReadFrame(&next_, &t, skipTo)) next_ = {};
@@ -1327,6 +1358,10 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
         EncoderFrame ef;
         if ((ef.nv12 = frames.Passthrough(src, st))) {  // shown as decoded: straight to the encoder
             if (g_exportTap) ef.bgra = src.Bgra();
+            return ef;
+        }
+        if ((ef.nv12 = frames.WithCaptions(src, st))) {  // only captions on it: just their part converted
+            if (g_exportTap) ef.bgra = frames.Render(src, st, false);
             return ef;
         }
         const BitmapPtr f = frames.Render(src, st, alone);
@@ -2361,6 +2396,92 @@ ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
         }
     }
     SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
+}
+
+// A frame with only captions gets just their part converted and drawn: there it is byte for byte the whole frame
+// rendered and converted, and elsewhere the frame as decoded. In SD and HD, with captions popping in (scaled) and
+// one dragged off center.
+ATHER_TEST(video_captions_drawn_on_their_part_match_the_whole_frame) {
+    for (SIZE sz : {SIZE{640, 360}, SIZE{1280, 720}}) {
+        const std::wstring clip = test::TempDir() + L"\\noise.mp4";
+        Mp4Writer mw;
+        CHECK(SUCCEEDED(mw.Begin(clip, sz.cx, sz.cy, 10)));
+        std::vector<uint32_t> px((size_t)sz.cx * sz.cy);
+        uint32_t seed = 3;
+        for (int i = 0; i < 20; ++i) {
+            for (size_t k = 0; k < px.size(); ++k) px[k] = 0xFF000000u | ((seed = seed * 1664525u + 1013904223u) >> 8);
+            mw.WriteFrame(px.data(), i * 1'000'000, 1'000'000);
+        }
+        CHECK(SUCCEEDED(mw.Finalize()));
+        VideoEdit e;
+        e.trimEnd = 2;
+        e.captionStyle = AnimStyle::Pop;
+        e.captionLook = sz.cx > 640 ? CaptionLook::Outline : CaptionLook::Pill;
+        Caption a, b;
+        a.start = 0, a.end = 2, a.text = L"Popping in at the bottom";
+        b.start = 0.5, b.end = 1.6, b.text = L"Dragged", b.center = VPoint{0.31, 0.27};
+        e.captions = {a, b};
+        EditFrames frames;
+        CHECK(frames.Open(SequenceOf(clip, e), e, 10, nullptr));
+        int checked = 0, insideWrong = 0, outsideWrong = 0;
+        for (int i = 0; i < 20; ++i) {
+            VideoFrame src;
+            double st = 0;
+            bool alone = false;
+            if (!frames.Next(i, &src, &st, &alone)) break;
+            const auto area = frames.Renderer().CaptionArea(st);
+            const Bytes got = frames.WithCaptions(src, st);
+            CHECK(area && got);
+            if (!area || !got) continue;
+            const std::vector<uint8_t> decoded = *src.state()->yuv;
+            const BitmapPtr whole = frames.Render(src, st, false);
+            std::vector<uint8_t> ref((size_t)sz.cx * sz.cy * 3 / 2);
+            BgraToNv12(whole->Bits(), sz.cx, sz.cy, ref.data());
+            for (int y = 0; y < sz.cy; ++y)
+                for (int x = 0; x < sz.cx; ++x) {
+                    const bool in = x >= area->left && x < area->right && y >= area->top && y < area->bottom;
+                    const size_t lk = (size_t)y * sz.cx + x, ck = (size_t)sz.cx * sz.cy + (size_t)(y / 2) * sz.cx + x;
+                    if (in) insideWrong += (*got)[lk] != ref[lk] || (*got)[ck] != ref[ck];
+                    else outsideWrong += (*got)[lk] != decoded[lk] || (*got)[ck] != decoded[ck];
+                }
+            checked += area->right > area->left;
+        }
+        test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + ": " + std::to_string(checked) + " frames with captions");
+        CHECK(checked >= 15);
+        CHECK_EQ(insideWrong, 0);
+        CHECK_EQ(outsideWrong, 0);
+    }
+}
+
+// In slow motion every source frame is shown twice; here once with a mark on it (converted and drawn on) and once
+// with just a caption (its NV12 copied, only the caption's part converted), by different workers at the same time.
+ATHER_TEST(video_export_frame_shown_twice_both_ways) {
+    const std::wstring clip = test::TempDir() + L"\\clip.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 3, false));
+    VideoEdit e;
+    e.trimEnd = 3;
+    e.speed = 0.5;
+    for (int k = 0; k < 90; ++k) {  // the mark on each source frame's first showing, the caption on its second
+        Mark m;
+        m.kind = MarkKind::Box;
+        m.a = {100, 100}, m.b = {300, 200};
+        m.style = AnimStyle::None;
+        m.start = k / 30.0;
+        m.end = k / 30.0 + 1 / 120.0;
+        e.marks.push_back(m);
+        Caption c;
+        c.start = k / 30.0 + 1 / 60.0;
+        c.end = c.start + 1 / 120.0;
+        c.text = L"Second showing";
+        e.captions.push_back(c);
+    }
+    for (int round = 0; round < 5; ++round) {
+        const std::wstring out = test::TempDir() + L"\\slow.mp4";
+        std::wstring err;
+        CHECK(ExportMp4(clip, e, out, &err));
+        VideoInfo vi;
+        CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 6) < 0.1);
+    }
 }
 
 // Cancelling halfway stops the export (one encoder or several) and leaves no pieces behind.

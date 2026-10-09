@@ -639,7 +639,20 @@ void ClearRenderCache() {
     g_cacheBytes = 0;
 }
 
-void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
+// Where PlaceImage puts `img` before clipping it to the destination: `r` widened for a blur-in, scaled, moved.
+static std::optional<VRect> PlacedRect(const Bitmap& img, VRect r, const Motion& mo) {
+    if (r.w <= 0 || r.h <= 0 || mo.alpha <= 0.001) return std::nullopt;
+    if (mo.blur > 0.3) {
+        const double k = img.Width() / r.w;
+        const int pad = (int)std::ceil(mo.blur * 3 * k);
+        r = r.Inset(-pad / k, -pad / k);
+    }
+    const VRect c{r.MidX() - r.w * mo.scale / 2 + mo.dx, r.MidY() - r.h * mo.scale / 2 + mo.dy, r.w * mo.scale, r.h * mo.scale};
+    if (c.w < 0.5 || c.h < 0.5) return std::nullopt;
+    return c;
+}
+
+void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo, POINT at) {
     if (r.w <= 0 || r.h <= 0 || mo.alpha <= 0.001) return;
     const Bitmap* src = &img;
     BitmapPtr blurred;
@@ -663,19 +676,21 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
     VRect c{r.MidX() - r.w * mo.scale / 2 + mo.dx, r.MidY() - r.h * mo.scale / 2 + mo.dy, r.w * mo.scale, r.h * mo.scale};
     if (c.w < 0.5 || c.h < 0.5) return;
     const uint32_t a = (uint32_t)std::clamp(std::lround(mo.alpha * 255), 0L, 255L);
+    // `dst` covers [at.x, at.x + W) × [at.y, at.y + H) of the frame; everything is worked out in frame pixels.
     const int W = dst.Width(), H = dst.Height();
-    const int x0 = std::max(0, (int)std::floor(c.x)), y0 = std::max(0, (int)std::floor(c.y));
-    const int x1 = std::min(W, (int)std::ceil(c.MaxX())), y1 = std::min(H, (int)std::ceil(c.MaxY()));
+    const int x0 = std::max((int)at.x, (int)std::floor(c.x)), y0 = std::max((int)at.y, (int)std::floor(c.y));
+    const int x1 = std::min((int)at.x + W, (int)std::ceil(c.MaxX())), y1 = std::min((int)at.y + H, (int)std::ceil(c.MaxY()));
     const int sw = src->Width(), sh = src->Height();
     const bool exact = c.x == std::floor(c.x) && c.y == std::floor(c.y) && std::fabs(c.w - sw) < 1e-6 && std::fabs(c.h - sh) < 1e-6;
     for (int y = y0; y < y1; ++y) {
-        uint32_t* row = dst.Bits() + (size_t)y * W;
+        uint32_t* const line = dst.Bits() + (size_t)(y - at.y) * W;
+        auto row = [&](int x) -> uint32_t& { return line[x - at.x]; };
         int xs = x0;
         if (exact && y - (int)c.y < sh) {  // four at a time while the source row lasts, then one by one
             const int cx = (int)c.x;
             const int end = (int)std::min({(double)x1, (double)cx + sw, cx + std::ceil(clipX)});
             const uint32_t* s = src->Bits() + (size_t)(y - (int)c.y) * sw;
-            for (; xs + 4 <= end; xs += 4) OverFour(row + xs, s + (xs - cx), a);
+            for (; xs + 4 <= end; xs += 4) OverFour(&row(xs), s + (xs - cx), a);
         }
         for (int x = xs; x < x1; ++x) {
             uint32_t p;
@@ -689,7 +704,7 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
                 p = Sample(*src, sx, sy);
             }
             if (a < 255) p = Scale(p, a);
-            Over(row[x], p);
+            Over(row(x), p);
         }
     }
 }
@@ -807,6 +822,38 @@ bool FrameRenderer::Untouched(double t) const {
     for (const auto& c : edit_.captions)
         if (c.Active(t) && !Trimmed(c.text).empty()) return false;
     return ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy};
+}
+
+std::optional<RECT> FrameRenderer::CaptionArea(double t) const {
+    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy || (full_.cx & 1) || (full_.cy & 1)) return std::nullopt;
+    for (const auto& m : edit_.marks)
+        if (m.Active(t) && m.kind != MarkKind::Zoom) return std::nullopt;
+    if (!(ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy})) return std::nullopt;
+    RECT a{full_.cx, full_.cy, 0, 0};
+    for (const auto& c : edit_.captions) {
+        if (!c.Active(t) || Trimmed(c.text).empty()) continue;
+        const Motion mo = CaptionMotion(c, t);
+        if (mo.alpha <= 0.001) continue;
+        const auto pl = CaptionImage(c, out_, t, mo.reveal);
+        const auto r = pl ? PlacedRect(*pl->image, pl->rect, mo) : std::nullopt;
+        if (!r) continue;
+        a.left = std::min(a.left, (LONG)std::max(0.0, std::floor(r->x)));
+        a.top = std::min(a.top, (LONG)std::max(0.0, std::floor(r->y)));
+        a.right = std::max(a.right, (LONG)std::min((double)full_.cx, std::ceil(r->MaxX())));
+        a.bottom = std::max(a.bottom, (LONG)std::min((double)full_.cy, std::ceil(r->MaxY())));
+    }
+    if (a.left >= a.right || a.top >= a.bottom) return RECT{};
+    // Whole 2 × 2 blocks, as the chroma has them.
+    return RECT{a.left & ~1L, a.top & ~1L, std::min((LONG)full_.cx, (a.right + 1) & ~1L), std::min((LONG)full_.cy, (a.bottom + 1) & ~1L)};
+}
+
+void FrameRenderer::DrawCaptions(Bitmap& area, POINT at, double t) const {
+    for (const auto& c : edit_.captions) {
+        if (!c.Active(t) || Trimmed(c.text).empty()) continue;
+        const Motion mo = CaptionMotion(c, t);
+        if (mo.alpha <= 0.001) continue;
+        if (auto pl = CaptionImage(c, out_, t, mo.reveal)) PlaceImage(area, *pl->image, pl->rect, mo, at);
+    }
 }
 
 VRect FrameRenderer::ViewRect(double t) const {
