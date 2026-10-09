@@ -639,6 +639,14 @@ void ClearRenderCache() {
     g_cacheBytes = 0;
 }
 
+// A ping's ring at `phase` (0…1 of a beat): spreading and fading.
+static Motion RingMotion(double phase) {
+    Motion ring;
+    ring.alpha = (1 - phase) * 0.8;
+    ring.scale = 1 + phase * 0.5;
+    return ring;
+}
+
 // Where PlaceImage puts `img` before clipping it to the destination: `r` widened for a blur-in, scaled, moved.
 static std::optional<VRect> PlacedRect(const Bitmap& img, VRect r, const Motion& mo) {
     if (r.w <= 0 || r.h <= 0 || mo.alpha <= 0.001) return std::nullopt;
@@ -734,52 +742,9 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     const BitmapPtr img = preview_ || onVideo ? (owned && shared && !preview_ ? *shared : Copy(src)) : nullptr;
     if ((preview_ || onVideo) && !img) return nullptr;
     const VRect extent{0, 0, (double)src.Width(), (double)src.Height()};
-    // 1. Blur and pixelate, in the order they were added.
-    for (const auto& m : edit_.marks) {
-        if (!img || (m.kind != MarkKind::Blur && m.kind != MarkKind::Pixelate) || !m.Active(t)) continue;
-        auto ri = Intersect(m.Rect(), extent);
-        if (!ri) continue;
-        const VRect q = ri->Integral();
-        const RECT rc{(LONG)q.x, (LONG)q.y, (LONG)q.MaxX(), (LONG)q.MaxY()};
-        if (RectW(rc) < 1 || RectH(rc) < 1) continue;
-        const Motion mo = MotionOf(m, t);
-        const double k = mo.blur > 0 ? std::max(0.15, 1 - mo.blur / (12 * unit_)) : 1;  // blur in: the effect strengthens
-        const double side = std::min(ri->w, ri->h);
-        const int lv = std::clamp(m.level, 0, 4);
-        std::vector<uint32_t> fx;
-        if (m.kind == MarkKind::Blur) {
-            static const double pct[] = {0.03, 0.05, 0.08, 0.12, 0.18};
-            fx = BlurArea(*img, rc, k * std::max(4.0, side * pct[lv]));
-        } else {
-            static const double pct[] = {0.04, 0.07, 0.1, 0.14, 0.2};
-            const int block = (int)std::lround(std::max(6.0, k * side * pct[lv]));
-            auto copy = img->Crop(rc);
-            if (!copy) continue;
-            copy->Pixelate({0, 0, copy->Width(), copy->Height()}, block);
-            fx.assign(copy->Bits(), copy->Bits() + (size_t)copy->Width() * copy->Height());
-        }
-        const int w = RectW(rc);
-        for (int y = rc.top; y < rc.bottom; ++y) {
-            uint32_t* row = img->Bits() + (size_t)y * img->Width();
-            const uint32_t* f = fx.data() + (size_t)(y - rc.top) * w;
-            for (int x = rc.left; x < rc.right; ++x) row[x] = mo.alpha < 1 ? Mix(row[x], f[x - rc.left], std::max(0.0, mo.alpha)) : f[x - rc.left];
-        }
-    }
-    // 2. Markup that sits on the video (moves with zoom).
-    for (const auto& m : edit_.marks) {
-        if (!img || KindIsRegion(m.kind) || m.kind == MarkKind::Title || !m.Active(t)) continue;
-        const Motion mo = MotionOf(m, t);
-        if (mo.alpha <= 0.001) continue;
-        auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
-        if (!pl) continue;
-        if (mo.ring)
-            if (auto ring = RingImage(pl->rect)) {
-                Motion rm;
-                rm.alpha = (1 - *mo.ring) * 0.8;
-                rm.scale = 1 + *mo.ring * 0.5;
-                PlaceImage(*img, *ring->image, ring->rect, rm);
-            }
-        PlaceImage(*img, *pl->image, pl->rect, mo);
+    if (img) {
+        DrawRegions(*img, {}, t);  // 1. Blur and pixelate, in the order they were added.
+        DrawMarks(*img, {}, t);    // 2. Markup that sits on the video (moves with zoom).
     }
     // 3. The visible area: the crop, or a zoom into it.
     const VRect r = ViewRect(t);
@@ -796,23 +761,85 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     if (!framed && !(preview_ && r == view_)) return nullptr;
     // 4. Captions and title cards stay put on screen.
     Bitmap& target = framed ? *framed : *img;
-    const double ox = framed ? 0 : view_.x, oy = framed ? 0 : view_.y;
-    for (const auto& c : edit_.captions) {
-        if (!c.Active(t) || (!preview_ && Trimmed(c.text).empty())) continue;
-        const Motion mo = CaptionMotion(c, t);
-        if (mo.alpha <= 0.001) continue;
-        if (auto pl = CaptionImage(c, tsize, t, mo.reveal)) PlaceImage(target, *pl->image, pl->rect.Offset(ox, oy), mo);
-    }
-    for (const auto& m : edit_.marks) {
-        if (m.kind != MarkKind::Title || !m.Active(t)) continue;
-        const Motion mo = MotionOf(m, t);
-        if (auto card = TitleImage(m, tsize)) PlaceImage(target, *card, {ox, oy, (double)tsize.cx, (double)tsize.cy}, mo);
-    }
+    DrawOverlays(target, framed ? 0 : view_.x, framed ? 0 : view_.y, {}, tsize, t);
     if (!framed) return img;
     if (!preview_) return framed;
     for (int y = 0; y < tsize.cy; ++y)  // preview: the framed output sits in place inside the full frame
         memcpy(img->Bits() + (size_t)(y + (int)view_.y) * img->Width() + (int)view_.x, framed->Bits() + (size_t)y * tsize.cx, (size_t)tsize.cx * 4);
     return img;
+}
+
+std::optional<FrameRenderer::Effect> FrameRenderer::EffectOf(const Mark& m, double t) const {
+    auto ri = Intersect(m.Rect(), VRect{0, 0, (double)full_.cx, (double)full_.cy});
+    if (!ri) return std::nullopt;
+    const VRect q = ri->Integral();
+    Effect fx;
+    fx.rc = {(LONG)q.x, (LONG)q.y, (LONG)q.MaxX(), (LONG)q.MaxY()};
+    if (RectW(fx.rc) < 1 || RectH(fx.rc) < 1) return std::nullopt;
+    fx.mo = MotionOf(m, t);
+    const double k = fx.mo.blur > 0 ? std::max(0.15, 1 - fx.mo.blur / (12 * unit_)) : 1;  // blur in: the effect strengthens
+    const double side = std::min(ri->w, ri->h);
+    const int lv = std::clamp(m.level, 0, 4);
+    if (m.kind == MarkKind::Blur) {
+        static const double pct[] = {0.03, 0.05, 0.08, 0.12, 0.18};
+        fx.sigma = k * std::max(4.0, side * pct[lv]);
+    } else {
+        static const double pct[] = {0.04, 0.07, 0.1, 0.14, 0.2};
+        fx.block = (int)std::lround(std::max(6.0, k * side * pct[lv]));
+    }
+    return fx;
+}
+
+void FrameRenderer::DrawRegions(Bitmap& img, POINT at, double t) const {
+    for (const auto& m : edit_.marks) {
+        if ((m.kind != MarkKind::Blur && m.kind != MarkKind::Pixelate) || !m.Active(t)) continue;
+        const auto fx = EffectOf(m, t);
+        if (!fx) continue;
+        const RECT rc{fx->rc.left - at.x, fx->rc.top - at.y, fx->rc.right - at.x, fx->rc.bottom - at.y};
+        std::vector<uint32_t> px;
+        if (m.kind == MarkKind::Blur) {
+            px = BlurArea(img, rc, fx->sigma);
+        } else {
+            auto copy = img.Crop(rc);
+            if (!copy) continue;
+            copy->Pixelate({0, 0, copy->Width(), copy->Height()}, fx->block);
+            px.assign(copy->Bits(), copy->Bits() + (size_t)copy->Width() * copy->Height());
+        }
+        const int w = RectW(rc);
+        const Motion& mo = fx->mo;
+        for (int y = rc.top; y < rc.bottom; ++y) {
+            uint32_t* row = img.Bits() + (size_t)y * img.Width();
+            const uint32_t* f = px.data() + (size_t)(y - rc.top) * w;
+            for (int x = rc.left; x < rc.right; ++x) row[x] = mo.alpha < 1 ? Mix(row[x], f[x - rc.left], std::max(0.0, mo.alpha)) : f[x - rc.left];
+        }
+    }
+}
+
+void FrameRenderer::DrawMarks(Bitmap& img, POINT at, double t) const {
+    for (const auto& m : edit_.marks) {
+        if (KindIsRegion(m.kind) || m.kind == MarkKind::Title || !m.Active(t)) continue;
+        const Motion mo = MotionOf(m, t);
+        if (mo.alpha <= 0.001) continue;
+        auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
+        if (!pl) continue;
+        if (mo.ring)
+            if (auto ring = RingImage(pl->rect)) PlaceImage(img, *ring->image, ring->rect, RingMotion(*mo.ring), at);
+        PlaceImage(img, *pl->image, pl->rect, mo, at);
+    }
+}
+
+void FrameRenderer::DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const {
+    for (const auto& c : edit_.captions) {
+        if (!c.Active(t) || (!preview_ && Trimmed(c.text).empty())) continue;
+        const Motion mo = CaptionMotion(c, t);
+        if (mo.alpha <= 0.001) continue;
+        if (auto pl = CaptionImage(c, tsize, t, mo.reveal)) PlaceImage(target, *pl->image, pl->rect.Offset(ox, oy), mo, at);
+    }
+    for (const auto& m : edit_.marks) {
+        if (m.kind != MarkKind::Title || !m.Active(t)) continue;
+        const Motion mo = MotionOf(m, t);
+        if (auto card = TitleImage(m, tsize)) PlaceImage(target, *card, {ox, oy, (double)tsize.cx, (double)tsize.cy}, mo, at);
+    }
 }
 
 bool FrameRenderer::Untouched(double t) const {
@@ -824,36 +851,52 @@ bool FrameRenderer::Untouched(double t) const {
     return ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy};
 }
 
-std::optional<RECT> FrameRenderer::CaptionArea(double t) const {
-    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy || (full_.cx & 1) || (full_.cy & 1)) return std::nullopt;
-    for (const auto& m : edit_.marks)
-        if (m.Active(t) && m.kind != MarkKind::Zoom) return std::nullopt;
-    if (!(ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy})) return std::nullopt;
+std::optional<RECT> FrameRenderer::EditArea(double t) const {
+    const int vx = (int)view_.x, vy = (int)view_.y;
+    if (preview_ || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_)) return std::nullopt;
     RECT a{full_.cx, full_.cy, 0, 0};
-    for (const auto& c : edit_.captions) {
+    auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels, clipped to the frame
+        a.left = std::min(a.left, (LONG)std::max(0.0, std::floor(x0)));
+        a.top = std::min(a.top, (LONG)std::max(0.0, std::floor(y0)));
+        a.right = std::max(a.right, (LONG)std::min((double)full_.cx, std::ceil(x1)));
+        a.bottom = std::max(a.bottom, (LONG)std::min((double)full_.cy, std::ceil(y1)));
+    };
+    auto addPlaced = [&](const Bitmap& img, VRect r, const Motion& mo, double dx, double dy) {
+        if (auto c = PlacedRect(img, r, mo)) add(c->x + dx, c->y + dy, c->MaxX() + dx, c->MaxY() + dy);
+    };
+    for (const auto& m : edit_.marks) {
+        if (!m.Active(t) || m.kind == MarkKind::Zoom) continue;
+        if (m.kind == MarkKind::Title) return std::nullopt;  // the whole frame
+        if (KindIsRegion(m.kind)) {
+            const auto fx = EffectOf(m, t);
+            if (!fx) continue;
+            const double reach = m.kind == MarkKind::Blur ? 3.0 * std::max(1, (int)std::lround(fx->sigma)) : 0;  // what BlurArea reads
+            add(fx->rc.left - reach, fx->rc.top - reach, fx->rc.right + reach, fx->rc.bottom + reach);
+            continue;
+        }
+        const Motion mo = MotionOf(m, t);
+        if (mo.alpha <= 0.001) continue;
+        const auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
+        if (!pl) continue;
+        if (mo.ring)
+            if (auto ring = RingImage(pl->rect)) addPlaced(*ring->image, ring->rect, RingMotion(*mo.ring), 0, 0);
+        addPlaced(*pl->image, pl->rect, mo, 0, 0);
+    }
+    for (const auto& c : edit_.captions) {  // in output pixels: the crop starts at (vx, vy)
         if (!c.Active(t) || Trimmed(c.text).empty()) continue;
         const Motion mo = CaptionMotion(c, t);
         if (mo.alpha <= 0.001) continue;
-        const auto pl = CaptionImage(c, out_, t, mo.reveal);
-        const auto r = pl ? PlacedRect(*pl->image, pl->rect, mo) : std::nullopt;
-        if (!r) continue;
-        a.left = std::min(a.left, (LONG)std::max(0.0, std::floor(r->x)));
-        a.top = std::min(a.top, (LONG)std::max(0.0, std::floor(r->y)));
-        a.right = std::max(a.right, (LONG)std::min((double)full_.cx, std::ceil(r->MaxX())));
-        a.bottom = std::max(a.bottom, (LONG)std::min((double)full_.cy, std::ceil(r->MaxY())));
+        if (const auto pl = CaptionImage(c, out_, t, mo.reveal)) addPlaced(*pl->image, pl->rect, mo, vx, vy);
     }
     if (a.left >= a.right || a.top >= a.bottom) return RECT{};
     // Whole 2 × 2 blocks, as the chroma has them.
     return RECT{a.left & ~1L, a.top & ~1L, std::min((LONG)full_.cx, (a.right + 1) & ~1L), std::min((LONG)full_.cy, (a.bottom + 1) & ~1L)};
 }
 
-void FrameRenderer::DrawCaptions(Bitmap& area, POINT at, double t) const {
-    for (const auto& c : edit_.captions) {
-        if (!c.Active(t) || Trimmed(c.text).empty()) continue;
-        const Motion mo = CaptionMotion(c, t);
-        if (mo.alpha <= 0.001) continue;
-        if (auto pl = CaptionImage(c, out_, t, mo.reveal)) PlaceImage(area, *pl->image, pl->rect, mo, at);
-    }
+void FrameRenderer::DrawEdits(Bitmap& area, POINT at, double t) const {
+    DrawRegions(area, at, t);
+    DrawMarks(area, at, t);
+    DrawOverlays(area, 0, 0, {at.x - (LONG)view_.x, at.y - (LONG)view_.y}, out_, t);
 }
 
 VRect FrameRenderer::ViewRect(double t) const {

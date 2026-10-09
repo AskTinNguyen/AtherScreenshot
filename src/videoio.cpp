@@ -1115,34 +1115,42 @@ public:
     // The source frame as the encoder's NV12 when the export shows it as it is (no edit at `st`), else null. Then
     // nothing is converted, and the frame keeps its colors exactly instead of going through RGB and back.
     Bytes Passthrough(const VideoFrame& src, double st) const {
-        return Nv12Ready(src.state()) && renderer_->Untouched(st) ? src.state()->yuv : nullptr;
+        return Nv12Ready(src.state(), renderer_->Out().cy) && renderer_->Untouched(st) ? src.state()->yuv : nullptr;
     }
-    // The encoder's NV12 for a frame whose only edits at `st` are captions, else null: the frame as decoded, with
-    // just the part the captions cover converted, drawn on and converted back (each pixel there as Render and
+    // The encoder's NV12 for a frame whose edits at `st` change only part of it, else null: the frame (its crop) as
+    // decoded, with just that part converted, drawn on and converted back (each pixel there as Render and
     // BgraToNv12 make it).
-    Bytes WithCaptions(const VideoFrame& src, double st) const {
+    Bytes WithEdits(const VideoFrame& src, double st) const {
         const VideoFrame::State* s = src.state();
-        const auto area = Nv12Ready(s) ? renderer_->CaptionArea(st) : std::nullopt;
+        const SIZE out = renderer_->Out();
+        const auto area = Nv12Ready(s, out.cy) ? renderer_->EditArea(st) : std::nullopt;
         if (!area) return nullptr;
-        const int w = s->w, h = s->h, aw = area->right - area->left, ah = area->bottom - area->top;
-        const size_t luma = (size_t)w * h;
-        Bytes out = RecycledBytes(luma * 3 / 2);
-        memcpy(out->data(), s->yuv->data(), out->size());
-        if (aw <= 0 || ah <= 0) return out;
+        const VRect view = renderer_->View();
+        const int w = s->w, vx = (int)view.x, vy = (int)view.y, ow = out.cx, oh = out.cy;
+        const uint8_t* y = s->yuv->data();
+        const uint8_t* uv = y + (size_t)w * s->h;
+        Bytes o = RecycledBytes((size_t)ow * oh * 3 / 2);
+        uint8_t* oy = o->data();
+        uint8_t* ouv = oy + (size_t)ow * oh;
+        for (int r = 0; r < oh; ++r) memcpy(oy + (size_t)r * ow, y + (size_t)(vy + r) * w + vx, (size_t)ow);
+        for (int r = 0; r < oh / 2; ++r) memcpy(ouv + (size_t)r * ow, uv + (size_t)(vy / 2 + r) * w + vx, (size_t)ow);
+        // The part the edits change, where the crop shows it (all on even pixels).
+        const int x0 = std::max<int>(area->left, vx), x1 = std::min<int>(area->right, vx + ow);
+        const int y0 = std::max<int>(area->top, vy), y1 = std::min<int>(area->bottom, vy + oh);
+        if (x1 <= x0 || y1 <= y0) return o;
+        const int aw = area->right - area->left, ah = area->bottom - area->top;
         const BitmapPtr part = Bitmap::CreateRecycled(aw, ah);
         if (!part) return nullptr;
-        const uint8_t* y = s->yuv->data() + (size_t)area->top * w + area->left;
-        const uint8_t* uv = s->yuv->data() + luma + (size_t)(area->top / 2) * w + area->left;
-        Nv12ToBgra(y, uv, w, aw, ah, part->Bits(), s->matrix);
-        renderer_->DrawCaptions(*part, {area->left, area->top}, st);
+        Nv12ToBgra(y + (size_t)area->top * w + area->left, uv + (size_t)(area->top / 2) * w + area->left, w, aw, ah, part->Bits(), s->matrix);
+        renderer_->DrawEdits(*part, {area->left, area->top}, st);
         thread_local std::vector<uint8_t> nv;
         nv.resize((size_t)aw * ah * 3 / 2);
-        BgraToNv12(part->Bits(), aw, ah, nv.data(), h);
-        uint8_t* oy = out->data() + (size_t)area->top * w + area->left;
-        uint8_t* ouv = out->data() + luma + (size_t)(area->top / 2) * w + area->left;
-        for (int r = 0; r < ah; ++r) memcpy(oy + (size_t)r * w, nv.data() + (size_t)r * aw, (size_t)aw);
-        for (int r = 0; r < ah / 2; ++r) memcpy(ouv + (size_t)r * w, nv.data() + (size_t)aw * ah + (size_t)r * aw, (size_t)aw);
-        return out;
+        BgraToNv12(part->Bits(), aw, ah, nv.data(), oh);
+        const uint8_t* ny = nv.data() + (x0 - area->left);
+        const uint8_t* nuv = nv.data() + (size_t)aw * ah + (x0 - area->left);
+        for (int r = y0; r < y1; ++r) memcpy(oy + (size_t)(r - vy) * ow + (x0 - vx), ny + (size_t)(r - area->top) * aw, (size_t)(x1 - x0));
+        for (int r = y0 / 2; r < y1 / 2; ++r) memcpy(ouv + (size_t)(r - vy / 2) * ow + (x0 - vx), nuv + (size_t)(r - area->top / 2) * aw, (size_t)(x1 - x0));
+        return o;
     }
     BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
         const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
@@ -1151,11 +1159,11 @@ public:
 
 private:
     // The decoded NV12 can be the encoder's: upright and sequence-sized, and with colors the encoder side reads the
-    // same way (studio range and the matrix BgraToNv12 picks for that height).
-    static bool Nv12Ready(const VideoFrame::State* s) {
+    // same way (studio range and the matrix BgraToNv12 picks for an output that high).
+    static bool Nv12Ready(const VideoFrame::State* s, int outHeight) {
         if (!s || !s->yuv || s->rotation || s->w != s->fit.cx || s->h != s->fit.cy || (s->w & 1) || (s->h & 1) || s->pitch != s->w) return false;
         static const YuvMatrix hd = StudioMatrix(true), sd = StudioMatrix(false);
-        return s->matrix == (s->h > 576 ? hd : sd);
+        return s->matrix == (outHeight > 576 ? hd : sd);
     }
 
     void Advance(double skipTo = -1e300) {
@@ -1360,7 +1368,7 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
             if (g_exportTap) ef.bgra = src.Bgra();
             return ef;
         }
-        if ((ef.nv12 = frames.WithCaptions(src, st))) {  // only captions on it: just their part converted
+        if ((ef.nv12 = frames.WithEdits(src, st))) {  // edits on part of it: just that part converted
             if (g_exportTap) ef.bgra = frames.Render(src, st, false);
             return ef;
         }
@@ -2398,56 +2406,86 @@ ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
     SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
 }
 
-// A frame with only captions gets just their part converted and drawn: there it is byte for byte the whole frame
-// rendered and converted, and elsewhere the frame as decoded. In SD and HD, with captions popping in (scaled) and
-// one dragged off center.
-ATHER_TEST(video_captions_drawn_on_their_part_match_the_whole_frame) {
-    for (SIZE sz : {SIZE{640, 360}, SIZE{1280, 720}}) {
+// A frame whose edits change only part of it gets just that part converted and drawn on: there it is byte for byte
+// the whole frame rendered and converted, and elsewhere the frame (its crop) as decoded. Every kind of markup, with
+// their animations, and captions; in SD and HD, cropped and not.
+ATHER_TEST(video_edits_drawn_on_their_part_match_the_whole_frame) {
+    struct Case {
+        SIZE sz;
+        std::optional<VRect> crop;
+    };
+    for (const Case& k : {Case{{640, 360}, std::nullopt}, Case{{1280, 720}, VRect{64, 32, 1100, 600}}, Case{{1280, 720}, std::nullopt}}) {
+        const SIZE sz = k.sz;
         const std::wstring clip = test::TempDir() + L"\\noise.mp4";
         Mp4Writer mw;
         CHECK(SUCCEEDED(mw.Begin(clip, sz.cx, sz.cy, 10)));
         std::vector<uint32_t> px((size_t)sz.cx * sz.cy);
         uint32_t seed = 3;
-        for (int i = 0; i < 20; ++i) {
-            for (size_t k = 0; k < px.size(); ++k) px[k] = 0xFF000000u | ((seed = seed * 1664525u + 1013904223u) >> 8);
+        for (int i = 0; i < 30; ++i) {
+            for (size_t j = 0; j < px.size(); ++j) px[j] = 0xFF000000u | ((seed = seed * 1664525u + 1013904223u) >> 8);
             mw.WriteFrame(px.data(), i * 1'000'000, 1'000'000);
         }
         CHECK(SUCCEEDED(mw.Finalize()));
+        const double W = sz.cx, H = sz.cy;
         VideoEdit e;
-        e.trimEnd = 2;
+        e.trimEnd = 3;
+        e.crop = k.crop;
         e.captionStyle = AnimStyle::Pop;
         e.captionLook = sz.cx > 640 ? CaptionLook::Outline : CaptionLook::Pill;
+        auto mark = [&](MarkKind kind, double x0, double y0, double x1, double y1, double start, double end, AnimStyle st, std::wstring text = L"") {
+            Mark m;
+            m.kind = kind;
+            m.a = {W * x0, H * y0};
+            m.b = {W * x1, H * y1};
+            m.start = start;
+            m.end = end;
+            m.style = st;
+            m.text = std::move(text);
+            e.marks.push_back(m);
+            return &e.marks.back();
+        };
+        mark(MarkKind::Blur, 0.55, 0.55, 0.8, 0.75, 0, 3, AnimStyle::BlurIn);
+        mark(MarkKind::Pixelate, 0.05, 0.7, 0.3, 0.9, 0.5, 2.5, AnimStyle::Fade);
+        mark(MarkKind::Box, 0.1, 0.2, 0.4, 0.45, 0, 2, AnimStyle::DrawOn);
+        mark(MarkKind::Arrow, 0.7, 0.8, 0.45, 0.5, 0.3, 2.2, AnimStyle::DrawOn);
+        mark(MarkKind::Text, 0.5, 0.1, 0.9, 0.2, 0.2, 2.8, AnimStyle::Typewriter, L"Click Deploy");
+        mark(MarkKind::Emoji, 0.8, 0.3, 0.8 + 0.1 * H / W, 0.4, 0.4, 2.6, AnimStyle::Pop, L"✅")->emphasis = Emphasis::Ping;
+        mark(MarkKind::Bubble, 0.2, 0.55, 0.45, 0.65, 1, 2.9, AnimStyle::Pop, L"Saved!")->emphasis = Emphasis::Pulse;
         Caption a, b;
-        a.start = 0, a.end = 2, a.text = L"Popping in at the bottom";
+        a.start = 0, a.end = 3, a.text = L"Popping in at the bottom";
         b.start = 0.5, b.end = 1.6, b.text = L"Dragged", b.center = VPoint{0.31, 0.27};
         e.captions = {a, b};
         EditFrames frames;
         CHECK(frames.Open(SequenceOf(clip, e), e, 10, nullptr));
+        const SIZE out = frames.Out();
+        const int vx = e.crop ? (int)frames.Renderer().View().x : 0, vy = e.crop ? (int)frames.Renderer().View().y : 0;
         int checked = 0, insideWrong = 0, outsideWrong = 0;
-        for (int i = 0; i < 20; ++i) {
+        for (int i = 0; i < 30; ++i) {
             VideoFrame src;
             double st = 0;
             bool alone = false;
             if (!frames.Next(i, &src, &st, &alone)) break;
-            const auto area = frames.Renderer().CaptionArea(st);
-            const Bytes got = frames.WithCaptions(src, st);
+            const auto area = frames.Renderer().EditArea(st);
+            const Bytes got = frames.WithEdits(src, st);
             CHECK(area && got);
             if (!area || !got) continue;
             const std::vector<uint8_t> decoded = *src.state()->yuv;
             const BitmapPtr whole = frames.Render(src, st, false);
-            std::vector<uint8_t> ref((size_t)sz.cx * sz.cy * 3 / 2);
-            BgraToNv12(whole->Bits(), sz.cx, sz.cy, ref.data());
-            for (int y = 0; y < sz.cy; ++y)
-                for (int x = 0; x < sz.cx; ++x) {
-                    const bool in = x >= area->left && x < area->right && y >= area->top && y < area->bottom;
-                    const size_t lk = (size_t)y * sz.cx + x, ck = (size_t)sz.cx * sz.cy + (size_t)(y / 2) * sz.cx + x;
+            std::vector<uint8_t> ref((size_t)out.cx * out.cy * 3 / 2);
+            BgraToNv12(whole->Bits(), out.cx, out.cy, ref.data());
+            for (int y = 0; y < out.cy; ++y)
+                for (int x = 0; x < out.cx; ++x) {
+                    const int sx = x + vx, sy = y + vy;  // source pixels
+                    const bool in = sx >= area->left && sx < area->right && sy >= area->top && sy < area->bottom;
+                    const size_t lk = (size_t)y * out.cx + x, ck = (size_t)out.cx * out.cy + (size_t)(y / 2) * out.cx + x;
+                    const size_t sl = (size_t)sy * sz.cx + sx, sc = (size_t)sz.cx * sz.cy + (size_t)(sy / 2) * sz.cx + sx;
                     if (in) insideWrong += (*got)[lk] != ref[lk] || (*got)[ck] != ref[ck];
-                    else outsideWrong += (*got)[lk] != decoded[lk] || (*got)[ck] != decoded[ck];
+                    else outsideWrong += (*got)[lk] != decoded[sl] || (*got)[ck] != decoded[sc];
                 }
             checked += area->right > area->left;
         }
-        test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + ": " + std::to_string(checked) + " frames with captions");
-        CHECK(checked >= 15);
+        test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + (e.crop ? " cropped" : "") + ": " + std::to_string(checked) + " frames with edits");
+        CHECK(checked >= 25);
         CHECK_EQ(insideWrong, 0);
         CHECK_EQ(outsideWrong, 0);
     }

@@ -176,11 +176,12 @@ public:
 
     // An export frame at `t` is the source frame as it is: no edit shows, and nothing is cropped or zoomed.
     bool Untouched(double t) const;
-    // An export frame at `t` whose only edits are captions (nothing cropped or zoomed): the part of the frame they
-    // cover, on even pixels (empty when none shows), else nothing. DrawCaptions draws them on that part (`area`, whose
-    // top-left is `at`) exactly as Render draws them on the frame.
-    std::optional<RECT> CaptionArea(double t) const;
-    void DrawCaptions(Bitmap& area, POINT at, double t) const;
+    // An export frame at `t` whose edits change only part of the source frame (nothing zooming, no title card, and
+    // a crop that starts on even pixels): that part, in source pixels on even coordinates (empty when nothing shows),
+    // else nothing. DrawEdits draws them on that part (`area`, whose top-left is `at`) exactly as Render does on the
+    // whole frame.
+    std::optional<RECT> EditArea(double t) const;
+    void DrawEdits(Bitmap& area, POINT at, double t) const;
 
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
@@ -200,6 +201,17 @@ public:
 
 private:
     BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;
+    // Draw's steps, on `img` holding the part of the frame from `at` on (source pixels for 1–2, output for 4).
+    struct Effect {
+        RECT rc{};  // the pixels a blur or pixelate changes
+        Motion mo;
+        double sigma = 0;  // blur
+        int block = 0;     // pixelate
+    };
+    std::optional<Effect> EffectOf(const Mark& m, double t) const;
+    void DrawRegions(Bitmap& img, POINT at, double t) const;  // 1. blur and pixelate
+    void DrawMarks(Bitmap& img, POINT at, double t) const;    // 2. markup on the video
+    void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4. captions, title cards
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;
     std::optional<Placed> RingImage(VRect r) const;
 
