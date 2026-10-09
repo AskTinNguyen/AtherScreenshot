@@ -41,8 +41,10 @@ public:
     bool HasAudio() const;
     bool Seek(double t);  // lands on the key frame before `t`; Read on to reach it
     bool Read(BitmapPtr* frame, double* t);  // false at the end
-    // Like Read, without converting yet. With `fit`, Bgra() comes fitted into that size (black bars).
-    bool ReadFrame(VideoFrame* frame, double* t, SIZE fit = {});
+    // Like Read, without converting yet. With `fit`, Bgra() comes fitted into that size (black bars). With `skipTo`:
+    // a frame followed by one at or before that time (so not the newest up to it) comes without its picture (Bgra()
+    // is null), which saves copying it off the GPU — for callers after the newest frame up to a time.
+    bool ReadFrame(VideoFrame* frame, double* t, SIZE fit = {}, double skipTo = -1e300);
 
 private:
     struct Impl;
@@ -76,7 +78,7 @@ public:
     bool Seek(double t);
     // Sequence-sized frames. ReadFrame doesn't convert them yet (Bgra() does), so frames a caller skips cost
     // little; Read converts each.
-    bool ReadFrame(VideoFrame* frame, double* t);
+    bool ReadFrame(VideoFrame* frame, double* t, double skipTo = -1e300);  // `skipTo` in timeline time, as for VideoReader
     bool Read(BitmapPtr* frame, double* t);
     BitmapPtr Fit(const BitmapPtr& frame) const;  // any frame into the sequence frame
 
@@ -98,7 +100,7 @@ private:
     void Run(bool final, std::vector<float>& out);
     int ch_, n_, hop_, delta_;
     double speed_;
-    std::vector<float> in_, win_, tail_;
+    std::vector<float> in_, win_, tail_, mono_;
     int64_t base_ = 0;  // absolute frame index of in_[0]
     int64_t k_ = 0, prev_ = 0;
     bool started_ = false;

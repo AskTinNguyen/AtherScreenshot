@@ -241,7 +241,7 @@ private:
             VideoFrame f;
             double ft = 0;
             const double frameDur = r.Fps() > 1 ? 1 / r.Fps() : 1 / 30.0;
-            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.ReadFrame(&f, &ft)) {  // only the one shown is converted
+            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.ReadFrame(&f, &ft, t - frameDur * 0.5)) {  // only the one shown is converted
                 last = f;
                 lastT = ft;
             }

@@ -3,6 +3,7 @@
 #include <codecapi.h>
 #include <emmintrin.h>
 #include <mfapi.h>
+#include <mferror.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <propvarutil.h>
@@ -356,13 +357,37 @@ struct Mp4Writer::Impl {
     std::mutex mu;
     DWORD video = 0, audio = 0;
     int w = 0, h = 0, rate = 0, channels = 0;
-    bool nv12 = false;
+    bool nv12 = false, hardware = false;
     int64_t frames = 0;
 };
 
 Mp4Writer::Mp4Writer() : p_(std::make_unique<Impl>()) {}
 Mp4Writer::~Mp4Writer() = default;
 int64_t Mp4Writer::Frames() const { return p_->frames; }
+bool Mp4Writer::HardwareEncoder() const { return p_->hardware; }
+
+// The AAC stream of an MP4 (192 kbps), fed 16-bit PCM.
+static HRESULT AddAacStream(IMFSinkWriter* w, int rate, int channels, DWORD* index) {
+    ComPtr<IMFMediaType> aout, ain;
+    HRESULT hr = MFCreateMediaType(&aout);
+    if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+    if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
+    if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+    if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
+    if (SUCCEEDED(hr)) hr = w->AddStream(aout.Get(), index);
+    if (SUCCEEDED(hr)) hr = MFCreateMediaType(&ain);
+    if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
+    if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+    if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, channels * 2);
+    if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * channels * 2);
+    if (SUCCEEDED(hr)) hr = w->SetInputMediaType(*index, ain.Get(), nullptr);
+    return hr;
+}
 
 HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels, int rotation, bool nv12) {
     EnsureMediaFoundation();
@@ -378,6 +403,12 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, attr.Get(), &p_->writer);
     // Screen content: ~0.12 bits per pixel per frame keeps text crisp.
     const UINT32 bitrate = (UINT32)std::clamp<double>((double)w * h * fps * 0.12, 2e6, 50e6);
+    if (w <= 0) {  // sound only
+        if (SUCCEEDED(hr)) hr = audioRate > 0 ? AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio) : E_INVALIDARG;
+        if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
+        if (FAILED(hr)) p_->writer.Reset();
+        return hr;
+    }
     if (SUCCEEDED(hr)) hr = MFCreateMediaType(&out);
     if (SUCCEEDED(hr)) hr = out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     if (SUCCEEDED(hr)) hr = out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
@@ -398,42 +429,14 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), nullptr);
-    if (SUCCEEDED(hr) && audioRate > 0) {
-        ComPtr<IMFMediaType> aout, ain;
-        hr = MFCreateMediaType(&aout);
-        if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, audioRate);
-        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, audioChannels);
-        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
-        if (SUCCEEDED(hr)) hr = p_->writer->AddStream(aout.Get(), &p_->audio);
-        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&ain);
-        if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, audioRate);
-        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, audioChannels);
-        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, audioChannels * 2);
-        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audioRate * audioChannels * 2);
-        if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->audio, ain.Get(), nullptr);
-    }
-    if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
-    if (SUCCEEDED(hr) && GetEnvironmentVariableW(L"ATHER_ENC_NAME", nullptr, 0)) {  // EXP-TEMP
-        ComPtr<IMFTransform> enc;
+    if (SUCCEEDED(hr) && audioRate > 0) hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio);
+    ComPtr<IMFTransform> enc;
+    if (SUCCEEDED(hr) && SUCCEEDED(p_->writer->GetServiceForStream(p_->video, GUID_NULL, IID_PPV_ARGS(&enc)))) {
         ComPtr<IMFAttributes> ea;
-        WCHAR* name = nullptr;
-        UINT32 nl = 0;
-        std::wstring s = L"unknown";
-        if (SUCCEEDED(p_->writer->GetServiceForStream(p_->video, GUID_NULL, IID_PPV_ARGS(&enc))) && SUCCEEDED(enc->GetAttributes(&ea)) &&
-            SUCCEEDED(ea->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nl))) {
-            s = name;
-            s += MFGetAttributeUINT32(ea.Get(), MF_TRANSFORM_ASYNC, 0) ? L" (async)" : L" (sync)";
-            CoTaskMemFree(name);
-        }
-        SetEnvironmentVariableW(L"ATHER_ENC_NAME", s.c_str());
+        UINT32 n = 0;
+        p_->hardware = SUCCEEDED(enc->GetAttributes(&ea)) && SUCCEEDED(ea->GetStringLength(MFT_ENUM_HARDWARE_URL_Attribute, &n));
     }
-    if (FAILED(hr)) p_->writer.Reset();
+    if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();    if (FAILED(hr)) p_->writer.Reset();
     return hr;
 }
 
@@ -533,10 +536,154 @@ HRESULT Mp4Writer::WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t) {
     return WriteBytes(p_->writer.Get(), p_->audio, pcm, frames * p_->channels * 2, t, (int64_t)frames * 10'000'000 / p_->rate);
 }
 
-HRESULT Mp4Writer::Finalize() {
+// ---- Mp4Joiner ----
+
+struct Mp4Joiner::Impl {
+    ComPtr<IMFSinkWriter> writer;
+    std::vector<ComPtr<IMFSourceReader>> parts;
+    ComPtr<IMFSourceReader> sound;  // the sound, encoded already (CopyAudio)
+    ComPtr<IMFSample> soundNext;    // read and not written yet
+    bool soundEnd = false;
+    std::vector<bool> started;  // a frame of the part copied already
+    std::mutex mu;
+    DWORD video = 0, audio = 0;
+    int rate = 0, channels = 0;
+    int64_t frames = 0;
+};
+
+Mp4Joiner::Mp4Joiner() : p_(std::make_unique<Impl>()) {}
+Mp4Joiner::~Mp4Joiner() = default;
+
+HRESULT Mp4Joiner::Begin(const std::wstring& path, const std::vector<std::wstring>& parts, int audioRate, int audioChannels, const std::wstring& audioPart) {
+    EnsureMediaFoundation();
+    p_->rate = audioRate;
+    p_->channels = audioChannels;
+    ComPtr<IMFMediaType> type;  // the first part's, for the joined stream
+    std::vector<UINT8> sets;    // its parameter sets: every part must have the same
+    HRESULT hr = parts.empty() ? E_INVALIDARG : S_OK;
+    for (size_t i = 0; i < parts.size() && SUCCEEDED(hr); ++i) {
+        ComPtr<IMFSourceReader> r;
+        ComPtr<IMFMediaType> native;
+        hr = MFCreateSourceReaderFromURL(parts[i].c_str(), nullptr, &r);
+        if (SUCCEEDED(hr)) hr = r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        if (SUCCEEDED(hr)) hr = r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+        if (SUCCEEDED(hr)) hr = r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native);
+        GUID sub{};
+        if (SUCCEEDED(hr) && (FAILED(native->GetGUID(MF_MT_SUBTYPE, &sub)) || sub != MFVideoFormat_H264)) hr = MF_E_INVALIDMEDIATYPE;
+        if (SUCCEEDED(hr)) hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, native.Get());  // as stored
+        UINT32 n = 0;
+        std::vector<UINT8> s;
+        if (SUCCEEDED(hr) && SUCCEEDED(native->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &n)) && n) {
+            s.resize(n);
+            hr = native->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, s.data(), n, nullptr);
+        }
+        if (SUCCEEDED(hr) && i == 0) {
+            type = native;
+            sets = s;
+        } else if (SUCCEEDED(hr) && s != sets) {
+            hr = MF_E_INVALIDMEDIATYPE;
+        }
+        if (SUCCEEDED(hr)) p_->parts.push_back(r);
+    }
+    p_->started.assign(p_->parts.size(), false);
+    if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, nullptr, &p_->writer);
+    if (SUCCEEDED(hr)) hr = p_->writer->AddStream(type.Get(), &p_->video);
+    if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->video, type.Get(), nullptr);  // copied as is
+    if (SUCCEEDED(hr) && !audioPart.empty()) {
+        ComPtr<IMFMediaType> native;
+        hr = MFCreateSourceReaderFromURL(audioPart.c_str(), nullptr, &p_->sound);
+        if (SUCCEEDED(hr)) hr = p_->sound->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        if (SUCCEEDED(hr)) hr = p_->sound->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE);
+        if (SUCCEEDED(hr)) hr = p_->sound->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &native);
+        if (SUCCEEDED(hr)) hr = p_->sound->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, native.Get());  // as stored
+        if (SUCCEEDED(hr)) hr = p_->writer->AddStream(native.Get(), &p_->audio);
+        if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->audio, native.Get(), nullptr);
+    } else if (SUCCEEDED(hr) && audioRate > 0) {
+        hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio);
+    }
+    if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
+    if (FAILED(hr)) {
+        p_->writer.Reset();
+        p_->parts.clear();
+        p_->sound.Reset();
+    }
+    return hr;
+}
+
+HRESULT Mp4Joiner::CopyAudio(int64_t until) {
+    std::lock_guard lock(p_->mu);
+    if (!p_->writer || !p_->sound) return E_UNEXPECTED;
+    for (;;) {
+        if (!p_->soundNext && !p_->soundEnd) {
+            DWORD flags = 0;
+            LONGLONG ts = 0;
+            ComPtr<IMFSample> s;
+            if (FAILED(p_->sound->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, &ts, &s))) return E_FAIL;
+            if (s) p_->soundNext = s;
+            else if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) p_->soundEnd = true;
+            continue;
+        }
+        LONGLONG ts = 0;
+        if (!p_->soundNext || FAILED(p_->soundNext->GetSampleTime(&ts)) || ts >= until) return S_OK;
+        const HRESULT hr = p_->writer->WriteSample(p_->audio, p_->soundNext.Get());
+        p_->soundNext.Reset();
+        if (FAILED(hr)) return hr;
+    }
+}
+
+HRESULT Mp4Joiner::CopyFrames(size_t part, int64_t first, int count, int fps) {
+    std::lock_guard lock(p_->mu);
+    if (!p_->writer || part >= p_->parts.size() || fps <= 0) return E_UNEXPECTED;
+    IMFSourceReader* r = p_->parts[part].Get();
+    for (int j = 0; j < count; ++j) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        ComPtr<IMFSample> s;
+        do {
+            if (FAILED(r->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) return E_FAIL;
+            if (!s && (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR))) return MF_E_END_OF_STREAM;
+        } while (!s);
+        const bool key = MFGetAttributeUINT32(s.Get(), MFSampleExtension_CleanPoint, FALSE) != FALSE;
+        if (!p_->started[part] && !key) return MF_E_UNEXPECTED;  // a piece that doesn't start on a key frame can't be joined
+        p_->started[part] = true;
+        // A fresh sample around the same data, at the joined video's time for it.
+        ComPtr<IMFMediaBuffer> buf;
+        ComPtr<IMFSample> out;
+        HRESULT hr = s->ConvertToContiguousBuffer(&buf);
+        if (SUCCEEDED(hr)) hr = MFCreateSample(&out);
+        if (SUCCEEDED(hr)) hr = out->AddBuffer(buf.Get());
+        if (SUCCEEDED(hr) && key) hr = out->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+        const int64_t i = first + j;
+        if (SUCCEEDED(hr)) hr = out->SetSampleTime(std::llround(i * 1e7 / fps));
+        if (SUCCEEDED(hr)) hr = out->SetSampleDuration(std::llround(1e7 / fps));
+        if (SUCCEEDED(hr)) hr = p_->writer->WriteSample(p_->video, out.Get());
+        if (FAILED(hr)) return hr;
+        ++p_->frames;
+    }
+    return S_OK;
+}
+
+HRESULT Mp4Joiner::WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t) {
+    std::lock_guard lock(p_->mu);
+    if (!p_->writer || p_->rate <= 0 || !frames) return E_UNEXPECTED;
+    return WriteBytes(p_->writer.Get(), p_->audio, pcm, frames * p_->channels * 2, t, (int64_t)frames * 10'000'000 / p_->rate);
+}
+
+HRESULT Mp4Joiner::Finalize() {
     std::lock_guard lock(p_->mu);
     if (!p_->writer) return E_UNEXPECTED;
     const HRESULT hr = p_->frames ? p_->writer->Finalize() : E_FAIL;
+    p_->writer.Reset();
+    p_->parts.clear();
+    p_->sound.Reset();
+    p_->soundNext.Reset();
+    return hr;
+}
+
+HRESULT Mp4Writer::Finalize() {
+    std::lock_guard lock(p_->mu);
+    if (!p_->writer) return E_UNEXPECTED;
+    const HRESULT hr = p_->frames || p_->w <= 0 ? p_->writer->Finalize() : E_FAIL;
     p_->writer.Reset();
     return hr;
 }

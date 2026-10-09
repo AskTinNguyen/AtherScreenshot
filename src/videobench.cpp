@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <mutex>
 #include <thread>
 
 #include "media.h"
@@ -558,6 +559,8 @@ int EncodeExp(const std::wstring& outDir, int w, int h, int frames, int fps) {
     Mp4Writer mw;
     const std::wstring out = outDir + L"\\enc.mp4";
     CreateDirectoryW(outDir.c_str(), nullptr);
+    wchar_t gv[8] = L"0"; GetEnvironmentVariableW(L"ATHER_GOP", gv, 8);  // EXP-TEMP
+    (void)gv;
     if (FAILED(mw.Begin(out, w, h, fps, 48000, 2, 0, true))) return Say("begin failed\n"), 1;
     std::vector<int16_t> pcm(48000 / fps * 2 + 2, 0);
     const auto start = std::chrono::steady_clock::now();
@@ -636,10 +639,16 @@ int Bench(const std::vector<std::wstring>& args) {
             const std::wstring tag = BaseName(args[a]) + L"_" + s.name;
             const std::wstring out = dir + L"\\" + tag + (s.gif ? L".gif" : L".mp4");
             std::vector<uint64_t> hashes;
+            std::mutex hashMu;  // an export in pieces taps from several threads
             int frames = 0;
             if (tap)
                 g_exportTap = [&](int i, const Bitmap& b) {
-                    hashes.push_back(Hash(b));
+                    const uint64_t h = Hash(b);
+                    {
+                        std::lock_guard l(hashMu);
+                        if (hashes.size() <= (size_t)i) hashes.resize((size_t)i + 1);
+                        hashes[i] = h;
+                    }
                     if (i % 30 == 0) {
                         std::vector<uint8_t> raw(8 + (size_t)b.Width() * b.Height() * 4);
                         const int32_t wh[2] = {b.Width(), b.Height()};
@@ -666,7 +675,7 @@ int Bench(const std::vector<std::wstring>& args) {
             Say(line);
             sprintf_s(line, "          decode %.2f fit %.2f render %.2f write %.2f audio %.2f final %.2f gif %.2f wait %.2f\n", g_prof[0], g_prof[1], g_prof[2], g_prof[3], g_prof[4], g_prof[5], g_prof[6], g_prof[7]);  // PROF-TEMP
             Say(line);  // PROF-TEMP
-            sprintf_s(line, "          blur %.2f pixelate %.2f marks %.2f sample %.2f captions %.2f titles %.2f copy %.2f\n", g_prof[8], g_prof[9], g_prof[10], g_prof[11], g_prof[12], g_prof[13], g_prof[14]);  // PROF-TEMP
+            sprintf_s(line, "          blur %.2f pixelate %.2f marks %.2f sample %.2f captions %.2f titles %.2f copy %.2f map %.2f\n", g_prof[8], g_prof[9], g_prof[10], g_prof[11], g_prof[12], g_prof[13], g_prof[14], g_prof[15]);  // PROF-TEMP
             Say(line);  // PROF-TEMP2
             if (tap) {
                 std::string text;
