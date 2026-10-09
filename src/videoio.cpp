@@ -13,8 +13,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <thread>
 
 #include "json.h"
 #include "library.h"
@@ -52,6 +54,87 @@ std::wstring HrText(const wchar_t* what, HRESULT hr) {
 
 }  // namespace
 
+// ---------- frames ----------
+
+// YUV → RGB for 8-bit 4:2:0 video, bit for bit the way Media Foundation's own converter does it (which is ~15×
+// slower): 8-bit fixed point; the file's matrix, else BT.709 for HD and BT.601 below; studio range unless the file
+// says full; each chroma sample used as is for its 2 × 2 pixels.
+struct YuvMatrix {
+    int y = 0, rv = 0, gu = 0, gv = 0, bu = 0, yOff = 16;
+};
+
+namespace {
+
+YuvMatrix MatrixFor(IMFMediaType* native, UINT32 height) {
+    UINT32 m = MFGetAttributeUINT32(native, MF_MT_YUV_MATRIX, MFVideoTransferMatrix_Unknown);
+    if (m != MFVideoTransferMatrix_BT709 && m != MFVideoTransferMatrix_BT601 && m != MFVideoTransferMatrix_SMPTE240M &&
+        m != MFVideoTransferMatrix_BT2020_10 && m != MFVideoTransferMatrix_BT2020_12)
+        m = height >= 720 ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601;
+    double kr = 0.2126, kb = 0.0722;
+    if (m == MFVideoTransferMatrix_BT601) kr = 0.299, kb = 0.114;
+    else if (m == MFVideoTransferMatrix_SMPTE240M) kr = 0.212, kb = 0.087;
+    else if (m != MFVideoTransferMatrix_BT709) kr = 0.2627, kb = 0.0593;
+    const bool full = MFGetAttributeUINT32(native, MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_Unknown) == MFNominalRange_0_255;
+    const double ys = full ? 1 : 255.0 / 219, cs = full ? 1 : 255.0 / 224, kg = 1 - kr - kb;
+    auto fx = [](double v) { return (int)std::lround(v * 256); };
+    YuvMatrix x;
+    x.y = fx(ys);
+    x.rv = fx(2 * (1 - kr) * cs);
+    x.bu = fx(2 * (1 - kb) * cs);
+    x.gu = fx(2 * kb * (1 - kb) / kg * cs);
+    x.gv = fx(2 * kr * (1 - kr) / kg * cs);
+    x.yOff = full ? 0 : 16;
+    return x;
+}
+
+inline uint32_t Clamp8(int v) { return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+// NV12 (`w` × `h`, rows `pitch` bytes apart, chroma plane at `uv`) → opaque BGRA.
+void Nv12ToBgra(const uint8_t* yp, const uint8_t* uvp, int pitch, int w, int h, uint32_t* dst, const YuvMatrix& m) {
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* yr = yp + (size_t)pitch * y;
+        const uint8_t* cr = uvp + (size_t)pitch * (y / 2);
+        uint32_t* d = dst + (size_t)w * y;
+        for (int x = 0; x < w; x += 2) {
+            const int u = cr[x] - 128, v = cr[x + 1] - 128;
+            const int r = m.rv * v + 128, g = 128 - m.gu * u - m.gv * v, b = m.bu * u + 128;
+            for (int k = x; k < x + 2 && k < w; ++k) {
+                const int c = (yr[k] - m.yOff) * m.y;
+                d[k] = 0xFF000000u | Clamp8((c + r) >> 8) << 16 | Clamp8((c + g) >> 8) << 8 | Clamp8((c + b) >> 8);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+struct VideoFrame::State {
+    std::once_flag once;
+    BitmapPtr bgra;            // the picture, once converted (or as decoded, when the decoder made BGRA)
+    std::vector<uint8_t> yuv;  // NV12 until converted: w × h luma, then the chroma rows, `pitch` bytes each
+    int pitch = 0, w = 0, h = 0;
+    YuvMatrix matrix;
+    int rotation = 0;  // applied on conversion
+    SIZE fit{};        // fitted into this size on conversion, when set
+};
+
+VideoFrame::VideoFrame(BitmapPtr bgra) : s_(std::make_shared<State>()) { s_->bgra = std::move(bgra); }
+
+BitmapPtr VideoFrame::Bgra() const {
+    if (!s_) return nullptr;
+    State& s = *s_;
+    std::call_once(s.once, [&s] {
+        BitmapPtr out = s.bgra;
+        if (!out && !s.yuv.empty() && (out = Bitmap::Create(s.w, s.h)))
+            Nv12ToBgra(s.yuv.data(), s.yuv.data() + (size_t)s.pitch * s.h, s.pitch, s.w, s.h, out->Bits(), s.matrix);
+        if (out && s.rotation) out = RotateBitmap(*out, s.rotation);
+        if (out && s.fit.cx > 0 && (out->Width() != s.fit.cx || out->Height() != s.fit.cy)) out = FitInto(*out, s.fit.cx, s.fit.cy);
+        s.bgra = out;
+        std::vector<uint8_t>().swap(s.yuv);
+    });
+    return s.bgra;
+}
+
 // ---------- VideoReader ----------
 
 struct VideoReader::Impl {
@@ -60,6 +143,8 @@ struct VideoReader::Impl {
     UINT32 rotation = 0;                  // clockwise degrees to show it upright (phone videos)
     double duration = 0, fps = 0;
     bool audio = false;
+    bool nv12 = false;  // decoded to NV12 and converted here; else Media Foundation converts to RGB32
+    YuvMatrix matrix;
 };
 
 VideoReader::VideoReader() : p_(std::make_unique<Impl>()) {}
@@ -71,7 +156,7 @@ double VideoReader::Duration() const { return p_->duration; }
 double VideoReader::Fps() const { return p_->fps; }
 bool VideoReader::HasAudio() const { return p_->audio; }
 
-bool VideoReader::Open(const std::wstring& path) {
+bool VideoReader::Open(const std::wstring& path, bool convert) {
     EnsureMediaFoundation();
     ComPtr<IMFAttributes> attr;
     HRESULT hr = MFCreateAttributes(&attr, 1);
@@ -99,10 +184,22 @@ bool VideoReader::Open(const std::wstring& path) {
     if (p_->rotation % 90) p_->rotation = 0;
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-    hr = MFCreateMediaType(&rgb);
-    if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-    if (SUCCEEDED(hr)) hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, rgb.Get());
+    // NV12 straight from the decoder when it can (interlaced video keeps Media Foundation's deinterlacing).
+    const UINT32 interlace = MFGetAttributeUINT32(native.Get(), MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    if (convert && (interlace == MFVideoInterlace_Progressive || interlace == MFVideoInterlace_MixedInterlaceOrProgressive)) {
+        ComPtr<IMFMediaType> nv12;
+        p_->nv12 = SUCCEEDED(MFCreateMediaType(&nv12)) && SUCCEEDED(nv12->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
+                   SUCCEEDED(nv12->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) &&
+                   SUCCEEDED(r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nv12.Get()));
+        p_->matrix = MatrixFor(native.Get(), p_->h);
+    }
+    hr = S_OK;
+    if (!p_->nv12) {
+        hr = MFCreateMediaType(&rgb);
+        if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (SUCCEEDED(hr)) hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, rgb.Get());
+    }
     if (SUCCEEDED(hr)) hr = r->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur);
     if (SUCCEEDED(hr)) hr = MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &p_->cw, &p_->ch);
     return SUCCEEDED(hr) && p_->w > 0 && p_->h > 0;
@@ -111,6 +208,13 @@ bool VideoReader::Open(const std::wstring& path) {
 bool VideoReader::Seek(double t) { return p_->reader && SetPosition(p_->reader.Get(), t); }
 
 bool VideoReader::Read(BitmapPtr* frame, double* t) {
+    VideoFrame f;
+    if (!ReadFrame(&f, t)) return false;
+    *frame = f.Bgra();
+    return *frame != nullptr;
+}
+
+bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit) {
     if (!p_->reader) return false;
     for (;;) {
         DWORD flags = 0;
@@ -128,29 +232,51 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
         }
         ComPtr<IMFMediaBuffer> buf;
         if (FAILED(s->ConvertToContiguousBuffer(&buf))) return false;
-        auto out = Bitmap::Create((int)p_->w, (int)p_->h);
-        if (!out) return false;
         ComPtr<IMF2DBuffer> b2;
         BYTE* scan0 = nullptr;
         LONG pitch = 0;
-        BYTE* data = nullptr;
         DWORD len = 0;
         const bool twoD = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&scan0, &pitch));
         if (!twoD) {
-            if (FAILED(buf->Lock(&data, nullptr, &len))) return false;
-            scan0 = data;
-            pitch = (LONG)p_->cw * 4;
+            if (FAILED(buf->Lock(&scan0, nullptr, &len))) return false;
+            pitch = (LONG)p_->cw * (p_->nv12 ? 1 : 4);
+        } else {
+            buf->GetCurrentLength(&len);
         }
-        const UINT32 rows = std::min(p_->h, p_->ch), cols = std::min(p_->w, p_->cw);
-        for (UINT32 y = 0; y < rows; ++y) {
-            const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
-            uint32_t* dst = out->Bits() + (size_t)y * p_->w;
-            for (UINT32 x = 0; x < cols; ++x) dst[x] = row[x] | 0xFF000000u;
+        auto st = std::make_shared<VideoFrame::State>();
+        st->rotation = (int)p_->rotation;
+        st->fit = fit;
+        const int w = (int)p_->w, h = (int)p_->h;
+        bool ok = false;
+        if (p_->nv12) {
+            // Kept compact until converted. The chroma plane follows the decoded rows, which can be more than
+            // the shown ones (1088 for 1080).
+            const size_t rows = pitch > 0 ? (size_t)len / (size_t)pitch * 2 / 3 : 0;
+            ok = pitch >= ((w + 1) & ~1) && rows >= (size_t)h && (size_t)pitch * rows * 3 / 2 <= len;
+            if (ok) {
+                const int cp = (w + 1) & ~1;
+                st->w = w;
+                st->h = h;
+                st->pitch = cp;
+                st->matrix = p_->matrix;
+                st->yuv.resize((size_t)cp * (h + (h + 1) / 2));
+                for (int y = 0; y < h; ++y) memcpy(st->yuv.data() + (size_t)y * cp, scan0 + (size_t)pitch * y, (size_t)w);
+                const BYTE* uv = scan0 + (size_t)pitch * rows;
+                for (int y = 0; y < (h + 1) / 2; ++y) memcpy(st->yuv.data() + (size_t)(h + y) * cp, uv + (size_t)pitch * y, (size_t)cp);
+            }
+        } else if ((st->bgra = Bitmap::Create(w, h))) {
+            ok = true;
+            const UINT32 rows = std::min(p_->h, p_->ch), cols = std::min(p_->w, p_->cw);
+            for (UINT32 y = 0; y < rows; ++y) {
+                const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
+                uint32_t* dst = st->bgra->Bits() + (size_t)y * p_->w;
+                for (UINT32 x = 0; x < cols; ++x) dst[x] = row[x] | 0xFF000000u;
+            }
         }
         if (twoD) b2->Unlock2D();
         else buf->Unlock();
-        if (p_->rotation && !(out = RotateBitmap(*out, (int)p_->rotation))) return false;
-        *frame = out;
+        if (!ok) return false;
+        *frame = VideoFrame(std::move(st));
         *t = ts / kTicks;
         return true;
     }
@@ -165,9 +291,9 @@ std::optional<Clip> ClipOf(const std::wstring& path) {
     if (!ProbeVideo(path, &vi) || vi.w <= 0 || vi.h <= 0 || vi.duration <= 0) return std::nullopt;
     {
         VideoReader r;
-        BitmapPtr f;
+        VideoFrame f;
         double t = 0;
-        if (!r.Open(path) || !r.Read(&f, &t)) return std::nullopt;
+        if (!r.Open(path) || !r.ReadFrame(&f, &t)) return std::nullopt;
     }
     Clip c;
     c.source = c.id;  // pieces split from it share this
@@ -195,12 +321,12 @@ struct SequenceReader::Impl {
     std::vector<double> starts;
     size_t cur = 0;
     std::unique_ptr<VideoReader> reader;
-    BitmapPtr pre;  // the last frame before the clip's in point: shown until the first frame inside it
-    std::deque<std::pair<BitmapPtr, double>> queue;
+    VideoFrame pre;  // the last frame before the clip's in point: shown until the first frame inside it
+    std::deque<std::pair<VideoFrame, double>> queue;
 
     void Enter(size_t i, double src) {
         cur = i;
-        pre = nullptr;
+        pre = {};
         reader = std::make_unique<VideoReader>();
         if (!reader->Open(seq.clips[i].path)) reader.reset();  // unreadable: the clip is skipped
         else reader->Seek(src);
@@ -248,7 +374,7 @@ bool SequenceReader::Seek(double t) {
     if (!spot) return false;
     p_->queue.clear();
     if (p_->reader && spot->first == p_->cur) {  // same file still open: just seek it
-        p_->pre = nullptr;
+        p_->pre = {};
         return p_->reader->Seek(spot->second);
     }
     p_->Enter(spot->first, spot->second);
@@ -256,6 +382,13 @@ bool SequenceReader::Seek(double t) {
 }
 
 bool SequenceReader::Read(BitmapPtr* frame, double* t) {
+    VideoFrame f;
+    if (!ReadFrame(&f, t)) return false;
+    *frame = f.Bgra();
+    return *frame != nullptr;
+}
+
+bool SequenceReader::ReadFrame(VideoFrame* frame, double* t) {
     Impl& p = *p_;
     const size_t n = p.seq.clips.size();
     for (;;) {
@@ -263,15 +396,15 @@ bool SequenceReader::Read(BitmapPtr* frame, double* t) {
             *frame = p.queue.front().first;
             *t = p.queue.front().second;
             p.queue.pop_front();
-            return *frame != nullptr;
+            return true;
         }
         if (p.cur >= n) return false;
         const Clip& c = p.seq.clips[p.cur];
-        BitmapPtr f;
+        VideoFrame f;
         double ts = 0;
-        if (!p.reader || !p.reader->Read(&f, &ts) || ts >= c.out - 1e-4) {  // this clip is done
+        if (!p.reader || !p.reader->ReadFrame(&f, &ts, p.seq.size) || ts >= c.out - 1e-4) {  // this clip is done
             if (p.pre) p.queue.push_back({p.pre, p.starts[p.cur]});
-            p.pre = nullptr;
+            p.pre = {};
             if (p.cur + 1 < n) p.Enter(p.cur + 1, p.seq.clips[p.cur + 1].in);
             else p.cur = n, p.reader.reset();
             continue;
@@ -281,7 +414,7 @@ bool SequenceReader::Read(BitmapPtr* frame, double* t) {
             continue;
         }
         if (p.pre && ts > c.in + 1e-3) p.queue.push_back({p.pre, p.starts[p.cur]});
-        p.pre = nullptr;
+        p.pre = {};
         p.queue.push_back({f, p.starts[p.cur] + (ts - c.in)});
     }
 }
@@ -597,10 +730,13 @@ void TimeStretch::Run(bool final, std::vector<float>& out) {
 
 // ---------- export ----------
 
+extern double g_prof[8];  // PROF-TEMP
+struct ProfT { int i; LARGE_INTEGER a; ProfT(int k) : i(k) { QueryPerformanceCounter(&a); } ~ProfT() { LARGE_INTEGER b, f; QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f); g_prof[i] += double(b.QuadPart - a.QuadPart) / f.QuadPart; } };  // PROF-TEMP
 namespace {
 
 // The edited video's frames in output order: output time i/fps shows the source frame at
-// trimStart + i/fps × speed, run through the frame renderer.
+// trimStart + i/fps × speed, run through the frame renderer. Next picks each frame's source in order (decoding
+// as it goes, converting nothing); Render makes the frame, on any thread.
 class EditFrames {
 public:
     bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error) {
@@ -616,51 +752,148 @@ public:
         return true;
     }
     SIZE Out() const { return renderer_->Out(); }
-    double SourceFps() const { return reader_.Fps(); }
-    bool HasAudio() const { return reader_.HasAudio(); }
+    SIZE Full() const { return renderer_->Full(); }
     int Count(bool roundUp) const {
         const double n = e_.OutputDuration() * fps_;
         return std::max(1, roundUp ? (int)std::ceil(n - 1e-6) : (int)std::floor(n + 1e-6));
     }
 
-    BitmapPtr Frame(int i) {
-        const double st = e_.trimStart + i / fps_ * e_.speed;
-        while (next_ && nextT_ <= st + 1e-3) {
+    // The source frame of output frame `i` (asked in order) and its source time.
+    bool Next(int i, VideoFrame* src, double* st) {
+        *st = e_.trimStart + i / fps_ * e_.speed;
+        while (next_ && nextT_ <= *st + 1e-3) {
             cur_ = next_;
-            curT_ = nextT_;
             Advance();
         }
-        const BitmapPtr& src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
-        if (!src) return nullptr;
-        if (src != fitFor_) {  // fitted once per source frame, and only for frames that are used
-            fitFor_ = src;
-            fit_ = reader_.Fit(src);
-        }
-        return fit_ ? renderer_->Render(*fit_, st) : nullptr;
+        *src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
+        return (bool)*src;
+    }
+    BitmapPtr Render(const VideoFrame& src, double st) const {
+        ProfT pt(2);  // PROF-TEMP
+        const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
+        return f ? renderer_->Render(*f, st) : nullptr;
     }
 
 private:
     void Advance() {
-        BitmapPtr f;
+        ProfT pt(0);  // PROF-TEMP
         double t = 0;
-        if (reader_.Read(&f, &t)) {
-            next_ = f;
-            nextT_ = t;
-        } else {
-            next_ = nullptr;
-        }
+        if (!reader_.ReadFrame(&next_, &t)) next_ = {};
+        nextT_ = t;
     }
 
     SequenceReader reader_;
-    BitmapPtr fitFor_, fit_;
     VideoEdit e_;
     double fps_ = 30;
     std::unique_ptr<FrameRenderer> renderer_;
-    BitmapPtr cur_, next_;
-    double curT_ = 0, nextT_ = 0;
+    VideoFrame cur_, next_;
+    double nextT_ = 0;
 };
 
+// Runs jobs on worker threads (COM initialized) and hands the results back in the order they were pushed.
+class OrderedWork {
+public:
+    explicit OrderedWork(int workers) {
+        for (int i = 0; i < workers; ++i)
+            threads_.emplace_back([this] {
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                Work();
+                CoUninitialize();
+            });
+    }
+    ~OrderedWork() {  // drops what hasn't started, waits for what has
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : threads_) t.join();
+    }
+    size_t InFlight() const { return order_.size(); }
+    void Push(std::function<BitmapPtr()> job) {
+        auto s = std::make_shared<Slot>();
+        s->job = std::move(job);
+        std::lock_guard l(mu_);
+        order_.push_back(s);
+        todo_.push_back(s);
+        cv_.notify_one();
+    }
+    BitmapPtr Pop() {  // the oldest result, once it is ready
+        std::unique_lock l(mu_);
+        if (order_.empty()) return nullptr;
+        const auto s = order_.front();
+        order_.pop_front();
+        done_.wait(l, [&] { return s->done; });
+        return std::move(s->result);
+    }
+
+private:
+    struct Slot {
+        std::function<BitmapPtr()> job;
+        BitmapPtr result;
+        bool done = false;
+    };
+    void Work() {
+        std::unique_lock l(mu_);
+        for (;;) {
+            cv_.wait(l, [&] { return quit_ || !todo_.empty(); });
+            if (quit_) return;
+            const auto s = todo_.front();
+            todo_.pop_front();
+            l.unlock();
+            BitmapPtr r = s->job();
+            s->job = nullptr;
+            l.lock();
+            s->result = std::move(r);
+            s->done = true;
+            done_.notify_all();
+        }
+    }
+    std::mutex mu_;
+    std::condition_variable cv_, done_;
+    std::deque<std::shared_ptr<Slot>> order_, todo_;
+    std::vector<std::thread> threads_;
+    bool quit_ = false;
+};
+
+// Workers and frames in flight for an export of `px`-pixel frames: enough to keep every core busy, few enough
+// that the frames in flight stay within ~600 MB.
+std::pair<int, size_t> ExportWorkers(SIZE px) {
+    const int cores = (int)std::max(1u, std::thread::hardware_concurrency());
+    const int workers = std::clamp(cores - 1, 1, 24);
+    const double perFrame = std::max(1.0, (double)px.cx * px.cy * 14);  // NV12 source, its BGRA, the render and its copy
+    const size_t depth = (size_t)std::clamp((int)(600e6 / perFrame), 2, workers * 2);
+    return {workers, depth};
+}
+// Makes output frames 0…n−1 on worker threads (`make` turns a source frame and its time into one) and hands
+// them to `use` in order, on this thread. Stops when `use` returns false or a frame can't be made.
+void ExportFrames(EditFrames& frames, int n, const std::function<BitmapPtr(const VideoFrame&, double)>& make,
+                  const std::function<bool(int, const BitmapPtr&)>& use) {
+    const SIZE full = frames.Full(), out = frames.Out();
+    const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
+    OrderedWork work(workers);
+    int pushed = 0;
+    for (int i = 0; i < n; ++i) {
+        while (pushed < n && work.InFlight() < depth) {
+            VideoFrame src;
+            double st = 0;
+            if (!frames.Next(pushed, &src, &st)) {
+                n = pushed;
+                break;
+            }
+            work.Push([&make, src, st] { return make(src, st); });
+            ++pushed;
+        }
+        if (i >= pushed) break;
+        const BitmapPtr f = work.Pop();
+        if (!f || !use(i, f)) break;
+    }
+}
+
 }  // namespace
+
+std::function<void(int, const Bitmap&)> g_exportTap;
+double g_prof[8];  // PROF-TEMP
 
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
     const Sequence seq = SequenceOf(source, e);
@@ -681,24 +914,23 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     }
     const int n = frames.Count(true);
     const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
-    for (int i = 0; i < n; ++i) {
-        BitmapPtr f = frames.Frame(i);
-        if (!f) break;
-        hr = w.WriteFrame(f->Bits(), std::llround(i * kTicks / fps), std::llround(kTicks / fps));
+    bool cancelled = false;
+    ExportFrames(frames, n, [&](const VideoFrame& src, double st) { return frames.Render(src, st); }, [&](int i, const BitmapPtr& f) {
+        if (g_exportTap) g_exportTap(i, *f);
+        { ProfT pt(3); hr = w.WriteFrame(f->Bits(), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
+        ProfT pt4(4);  // PROF-TEMP
         if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
-        if (FAILED(hr)) {
-            if (error) *error = HrText(L"Encoding failed", hr);
-            w.Finalize();
-            return false;
-        }
-        if (progress && !progress((i + 1.0) / n)) {
-            w.Finalize();
-            if (error) *error = L"Cancelled.";
-            return false;
-        }
+        if (FAILED(hr)) return false;
+        cancelled = progress && !progress((i + 1.0) / n);
+        return !cancelled;
+    });
+    if (FAILED(hr) || cancelled) {
+        if (error) *error = cancelled ? L"Cancelled." : HrText(L"Encoding failed", hr);
+        w.Finalize();
+        return false;
     }
     if (audio) audio->WriteUntil(w, audioTotal);
-    hr = w.Finalize();
+    { ProfT pt(5); hr = w.Finalize(); }  // PROF-TEMP
     if (FAILED(hr) && error) *error = HrText(L"Couldn't finish the MP4", hr);
     return SUCCEEDED(hr);
 }
@@ -712,17 +944,23 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
     GifWriter g;
     HRESULT hr = g.Begin(out, gw, gh);
     const int n = frames.Count(false);
-    for (int i = 0; i < n && SUCCEEDED(hr); ++i) {
-        BitmapPtr f = frames.Frame(i);
-        if (!f) break;
-        if (f->Width() != gw || f->Height() != gh) f = Resample(*f, gw, gh);
-        const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
-        hr = f ? g.Add(f->Bits(), delay) : E_OUTOFMEMORY;
-        if (progress && !progress((i + 1.0) / n)) {
-            g.Finish();
-            if (error) *error = L"Cancelled.";
-            return false;
-        }
+    bool cancelled = false;
+    auto make = [&](const VideoFrame& src, double st) {
+        BitmapPtr f = frames.Render(src, st);
+        return f && (f->Width() != gw || f->Height() != gh) ? Resample(*f, gw, gh) : f;
+    };
+    if (SUCCEEDED(hr))
+        ExportFrames(frames, n, make, [&](int i, const BitmapPtr& f) {
+            if (g_exportTap) g_exportTap(i, *f);
+            const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
+            { ProfT pt(6); hr = g.Add(f->Bits(), delay); }  // PROF-TEMP
+            cancelled = SUCCEEDED(hr) && progress && !progress((i + 1.0) / n);
+            return SUCCEEDED(hr) && !cancelled;
+        });
+    if (cancelled) {
+        g.Finish();
+        if (error) *error = L"Cancelled.";
+        return false;
     }
     const HRESULT fin = g.Finish();
     if (SUCCEEDED(hr)) hr = fin;
@@ -738,13 +976,14 @@ std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide
         if (cancelled && cancelled()) return {};
         const double t = r.Duration() * (i + 0.5) / count;
         r.Seek(t);
-        BitmapPtr f, last;
+        VideoFrame f, kept;
         double ft = 0;
-        while (r.Read(&f, &ft)) {
-            last = f;
+        while (r.ReadFrame(&f, &ft)) {  // only the frame kept is converted
+            kept = f;
             if (ft >= t - 0.04) break;
         }
-        if (!last || !(last = r.Fit(last))) continue;
+        BitmapPtr last = kept.Bgra();
+        if (!last) continue;
         const double k = std::min(1.0, (double)maxSide / std::max(last->Width(), last->Height()));
         out.push_back(k < 1 ? Resample(*last, std::max(1, (int)std::lround(last->Width() * k)), std::max(1, (int)std::lround(last->Height() * k))) : last);
     }
@@ -1247,6 +1486,42 @@ ATHER_TEST(video_sequence_joins_clips_into_one_video) {
     CHECK(ordered);
     CHECK(n >= 85 && n <= 95);
     CHECK(prev > 2.9 && prev < 3.0);
+}
+
+// Frames converted here come out exactly as Media Foundation's own (much slower) converter makes them, for SD
+// (BT.601) and HD (BT.709) sizes alike.
+ATHER_TEST(video_decoding_matches_media_foundation_colors) {
+    for (SIZE sz : {SIZE{640, 360}, SIZE{1024, 576}, SIZE{960, 720}, SIZE{1280, 720}, SIZE{1920, 1080}}) {
+        const std::wstring path = test::TempDir() + L"/colors.mp4";
+        Mp4Writer mw;
+        CHECK(SUCCEEDED(mw.Begin(path, sz.cx, sz.cy, 10)));
+        std::vector<uint32_t> px((size_t)sz.cx * sz.cy);
+        for (int i = 0; i < 3; ++i) {
+            uint32_t seed = 7 + i;
+            for (int y = 0; y < sz.cy; ++y)
+                for (int x = 0; x < sz.cx; ++x) {
+                    seed = seed * 1664525u + 1013904223u;
+                    const uint32_t r = (uint32_t)(x * 255 / sz.cx), g = (uint32_t)(y * 255 / sz.cy), b = (seed >> 24) & 255;
+                    px[(size_t)y * sz.cx + x] = 0xFF000000u | r << 16 | g << 8 | ((x / 16 + y / 16 + i) % 2 ? b : 255 - r);
+                }
+            mw.WriteFrame(px.data(), i * 1'000'000, 1'000'000);
+        }
+        CHECK(SUCCEEDED(mw.Finalize()));
+        VideoReader ours, theirs;
+        CHECK(ours.Open(path) && theirs.Open(path, false));
+        BitmapPtr a, b;
+        double ta = 0, tb = 0;
+        int frames = 0, maxDiff = 0;
+        while (ours.Read(&a, &ta) && theirs.Read(&b, &tb)) {
+            ++frames;
+            CHECK(a->Width() == b->Width() && a->Height() == b->Height());
+            for (size_t k = 0, n = (size_t)a->Width() * a->Height(); k < n; ++k)
+                for (int s = 0; s < 24; s += 8) maxDiff = std::max(maxDiff, std::abs((int)((a->Bits()[k] >> s) & 255) - (int)((b->Bits()[k] >> s) & 255)));
+        }
+        test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + ": max diff " + std::to_string(maxDiff));
+        CHECK_EQ(frames, 3);
+        CHECK_EQ(maxDiff, 0);
+    }
 }
 
 ATHER_TEST(video_rotated_phone_clip_reads_upright_like_the_preview) {

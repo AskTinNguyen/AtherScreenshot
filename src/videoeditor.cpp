@@ -221,7 +221,7 @@ private:
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         SequenceReader r;
         const bool ok = r.Open(seq_);
-        BitmapPtr last;
+        VideoFrame last;
         double lastT = -1;
         for (;;) {
             double t;
@@ -235,18 +235,17 @@ private:
             if (!ok) continue;
             if (!(last && t >= lastT && t - lastT < 1.0)) {  // stepping forward reads on; anything else seeks
                 r.Seek(t);
-                last = nullptr;
+                last = {};
                 lastT = -1;
             }
-            BitmapPtr f;
+            VideoFrame f;
             double ft = 0;
             const double frameDur = r.Fps() > 1 ? 1 / r.Fps() : 1 / 30.0;
-            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.Read(&f, &ft)) {
+            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.ReadFrame(&f, &ft)) {  // only the one shown is converted
                 last = f;
                 lastT = ft;
             }
-            if (!last) continue;
-            BitmapPtr fitted = r.Fit(last);  // sequence-sized, like the playing frames
+            BitmapPtr fitted = last.Bgra();  // sequence-sized, like the playing frames
             if (!fitted) continue;
             auto* res = new Result{fitted, lastT};
             if (!PostMessageW(hwnd_, WM_FETCHED, 0, (LPARAM)res)) delete res;
