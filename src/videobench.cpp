@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <thread>
 
 #include "media.h"
@@ -161,6 +162,7 @@ std::vector<uint8_t> ReadAll(const std::wstring& path) {
     return v;
 }
 
+double CpuSeconds();  // EXP-TEMP
 // ---- experiment: decode options (EXP-TEMP) ----
 int DecodeExp(const std::wstring& path, int mode) {
     EnsureMediaFoundation();
@@ -192,9 +194,36 @@ int DecodeExp(const std::wstring& path, int mode) {
     mtp->SetGUID(MF_MT_SUBTYPE, (mode == 0 || mode == 2) ? MFVideoFormat_RGB32 : MFVideoFormat_NV12);
     hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, mtp.Get());
     if (FAILED(hr)) return Say("set type failed\n"), 1;
+    const double cpuStart = CpuSeconds();
     const auto start = std::chrono::steady_clock::now();
     int n = 0;
     uint64_t sum = 0;
+    // mode 4: GPU decode with a ring of staging textures, read back `lag` frames later
+    struct Pending {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+        bool busy = false;
+    };
+    std::vector<Pending> ring(6);
+    std::deque<int> order;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    if (dev) dev->GetImmediateContext(&ctx);
+    std::vector<uint8_t> copyTo;
+    auto drain = [&](size_t keep) {
+        while (order.size() > keep) {
+            Pending& pd = ring[order.front()];
+            order.pop_front();
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(ctx->Map(pd.staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                D3D11_TEXTURE2D_DESC d;
+                pd.staging->GetDesc(&d);
+                copyTo.resize((size_t)d.Width * d.Height * 3 / 2);
+                for (UINT y = 0; y < d.Height * 3 / 2; ++y) memcpy(copyTo.data() + (size_t)y * d.Width, (BYTE*)m.pData + (size_t)y * m.RowPitch, d.Width);
+                sum += copyTo[0];
+                ctx->Unmap(pd.staging.Get(), 0);
+            }
+            pd.busy = false;
+        }
+    };
     for (;;) {
         DWORD flags = 0;
         LONGLONG ts = 0;
@@ -204,6 +233,38 @@ int DecodeExp(const std::wstring& path, int mode) {
         if (!s) continue;
         Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
         s->GetBufferByIndex(0, &buf);
+        if (mode == 4) {
+            Microsoft::WRL::ComPtr<IMFDXGIBuffer> dx;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+            UINT sub = 0;
+            if (SUCCEEDED(buf.As(&dx)) && SUCCEEDED(dx->GetResource(IID_PPV_ARGS(&tex))) && SUCCEEDED(dx->GetSubresourceIndex(&sub))) {
+                int slot = -1;
+                for (int k = 0; k < (int)ring.size(); ++k)
+                    if (!ring[k].busy) { slot = k; break; }
+                if (slot < 0) { drain(order.size() - 1); for (int k = 0; k < (int)ring.size(); ++k) if (!ring[k].busy) { slot = k; break; } }
+                Pending& pd = ring[slot];
+                D3D11_TEXTURE2D_DESC d;
+                tex->GetDesc(&d);
+                if (!pd.staging) {
+                    D3D11_TEXTURE2D_DESC sd = d;
+                    sd.ArraySize = 1;
+                    sd.MipLevels = 1;
+                    sd.Usage = D3D11_USAGE_STAGING;
+                    sd.BindFlags = 0;
+                    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    sd.MiscFlags = 0;
+                    dev->CreateTexture2D(&sd, nullptr, &pd.staging);
+                }
+                ctx->CopySubresourceRegion(pd.staging.Get(), 0, 0, 0, 0, tex.Get(), sub, nullptr);
+                pd.busy = true;
+                order.push_back(slot);
+                drain(4);
+            } else if (n == 0) {
+                Say("mode 4: not a DXGI buffer\n");
+            }
+            ++n;
+            continue;
+        }
         Microsoft::WRL::ComPtr<IMF2DBuffer> b2;
         BYTE* p = nullptr;
         LONG pitch = 0;
@@ -213,9 +274,10 @@ int DecodeExp(const std::wstring& path, int mode) {
         }
         ++n;
     }
+    drain(0);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     char line[128];
-    sprintf_s(line, "mode %d: %d frames in %.2f s = %.1f fps (%llu)\n", mode, n, secs, n / secs, (unsigned long long)sum);
+    sprintf_s(line, "mode %d: %d frames in %.2f s = %.1f fps, cpu %.2f s (%llu)\n", mode, n, secs, n / secs, CpuSeconds() - cpuStart, (unsigned long long)sum);
     Say(line);
     return 0;
 }

@@ -1,5 +1,6 @@
 #include "videoio.h"
 
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
@@ -24,6 +25,7 @@
 #include "media.h"
 #include "selftest.h"
 
+#pragma comment(lib, "d3d11")
 #pragma comment(lib, "mfplat")
 #pragma comment(lib, "mfreadwrite")
 #pragma comment(lib, "mfuuid")
@@ -233,6 +235,39 @@ BitmapPtr VideoFrame::Bgra() const {
 
 // ---------- VideoReader ----------
 
+namespace {
+
+// The GPU every reader decodes on: hardware decoding takes a fraction of the CPU Media Foundation's software
+// decoder does (~1.5 vs ~10 ms a frame at 1080p), which leaves the cores to an export's renderers. H.264 decoding
+// is exact, so the frames are the same. Null when there is no hardware device (or ATHER_NO_GPU_DECODE is set).
+struct Gpu {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<IMFDXGIDeviceManager> mgr;
+};
+
+Gpu* SharedGpu() {
+    static Gpu* const gpu = []() -> Gpu* {
+        if (GetEnvironmentVariableW(L"ATHER_NO_GPU_DECODE", nullptr, 0)) return nullptr;
+        EnsureMediaFoundation();
+        auto g = std::make_unique<Gpu>();
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+        ComPtr<ID3D10Multithread> mt;
+        UINT token = 0;
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, (UINT)std::size(levels),
+                                     D3D11_SDK_VERSION, &g->dev, nullptr, &g->ctx)) ||
+            FAILED(g->dev.As(&mt)) || FAILED(MFCreateDXGIDeviceManager(&token, &g->mgr)) || FAILED(g->mgr->ResetDevice(g->dev.Get(), token)))
+            return nullptr;
+        mt->SetMultithreadProtected(TRUE);  // Media Foundation's threads and the readers share it
+        return g.release();
+    }();
+    return gpu && gpu->dev->GetDeviceRemovedReason() == S_OK ? gpu : nullptr;
+}
+
+constexpr size_t kGpuAhead = 4;  // frames copied off the GPU ahead of the one read back, so reading never waits
+
+}  // namespace
+
 struct VideoReader::Impl {
     ComPtr<IMFSourceReader> reader;
     UINT32 w = 0, h = 0, cw = 0, ch = 0;  // shown size (before rotation), decoded size
@@ -241,6 +276,26 @@ struct VideoReader::Impl {
     bool audio = false;
     bool nv12 = false;  // decoded to NV12 and converted here; else Media Foundation converts to RGB32
     YuvMatrix matrix;
+    // Hardware decoding: decoded surfaces are copied into a ring of staging textures and read back a few frames
+    // later, by then without waiting on the GPU.
+    Gpu* gpu = nullptr;
+    struct Slot {
+        ComPtr<ID3D11Texture2D> tex;
+        bool busy = false;
+    };
+    std::vector<Slot> slots;
+    struct Pending {
+        int slot = -1;     // still on its way off the GPU
+        VideoFrame frame;  // or here already
+        double t = 0;
+    };
+    std::deque<Pending> pending;
+    bool eof = false;
+
+    bool Open(const std::wstring& path, bool convert, Gpu* gpu);
+    bool Next();  // decodes one more frame into `pending`; false at the end
+    VideoFrame FromBuffer(IMFMediaBuffer* buf);
+    VideoFrame Download(int slot);
 };
 
 VideoReader::VideoReader() : p_(std::make_unique<Impl>()) {}
@@ -254,54 +309,70 @@ bool VideoReader::HasAudio() const { return p_->audio; }
 
 bool VideoReader::Open(const std::wstring& path, bool convert) {
     EnsureMediaFoundation();
+    if (Gpu* gpu = convert ? SharedGpu() : nullptr) {
+        if (p_->Open(path, convert, gpu)) return true;
+        p_ = std::make_unique<Impl>();  // no hardware decoding for this one: the software decoder, as before
+    }
+    return p_->Open(path, convert, nullptr);
+}
+
+bool VideoReader::Impl::Open(const std::wstring& path, bool convert, Gpu* withGpu) {
     ComPtr<IMFAttributes> attr;
     HRESULT hr = MFCreateAttributes(&attr, 1);
-    if (SUCCEEDED(hr)) hr = attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &p_->reader);
+    if (SUCCEEDED(hr)) hr = withGpu ? attr->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, withGpu->mgr.Get()) : attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &reader);
     if (FAILED(hr)) return false;
-    IMFSourceReader* r = p_->reader.Get();
+    gpu = withGpu;
+    IMFSourceReader* r = reader.Get();
     PROPVARIANT var;
     PropVariantInit(&var);
-    if (SUCCEEDED(r->GetPresentationAttribute((DWORD)MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var))) p_->duration = var.uhVal.QuadPart / kTicks;
+    if (SUCCEEDED(r->GetPresentationAttribute((DWORD)MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var))) duration = var.uhVal.QuadPart / kTicks;
     PropVariantClear(&var);
-    ComPtr<IMFMediaType> native, audio, rgb, cur;
+    ComPtr<IMFMediaType> native, audioType, rgb, cur;
     if (FAILED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native))) return false;
-    p_->audio = SUCCEEDED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &audio));
+    audio = SUCCEEDED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &audioType));
     UINT32 num = 0, den = 0;
-    MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &p_->w, &p_->h);
+    MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &w, &h);
     MFVideoArea area{};
     if (SUCCEEDED(native->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8*)&area, sizeof(area), nullptr)) && area.Area.cx > 0) {
-        p_->w = (UINT32)area.Area.cx;  // 1920x1088 coded, 1920x1080 shown
-        p_->h = (UINT32)area.Area.cy;
+        w = (UINT32)area.Area.cx;  // 1920x1088 coded, 1920x1080 shown
+        h = (UINT32)area.Area.cy;
     }
-    if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && den) p_->fps = (double)num / den;
+    if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && den) fps = (double)num / den;
     // Turned like the preview player turns it (IMFMediaEngine applies this itself).
-    p_->rotation = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, 0) % 360;
-    if (p_->rotation % 90) p_->rotation = 0;
+    rotation = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, 0) % 360;
+    if (rotation % 90) rotation = 0;
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
     // NV12 straight from the decoder when it can (interlaced video keeps Media Foundation's deinterlacing).
     const UINT32 interlace = MFGetAttributeUINT32(native.Get(), MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     if (convert && (interlace == MFVideoInterlace_Progressive || interlace == MFVideoInterlace_MixedInterlaceOrProgressive)) {
-        ComPtr<IMFMediaType> nv12;
-        p_->nv12 = SUCCEEDED(MFCreateMediaType(&nv12)) && SUCCEEDED(nv12->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
-                   SUCCEEDED(nv12->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) &&
-                   SUCCEEDED(r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nv12.Get()));
-        p_->matrix = MatrixFor(native.Get(), p_->h);
+        ComPtr<IMFMediaType> type;
+        nv12 = SUCCEEDED(MFCreateMediaType(&type)) && SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
+               SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) &&
+               SUCCEEDED(r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, type.Get()));
+        matrix = MatrixFor(native.Get(), h);
     }
+    if (gpu && !nv12) return false;  // only NV12 comes off the GPU here
     hr = S_OK;
-    if (!p_->nv12) {
+    if (!nv12) {
         hr = MFCreateMediaType(&rgb);
         if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
         if (SUCCEEDED(hr)) hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, rgb.Get());
     }
     if (SUCCEEDED(hr)) hr = r->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur);
-    if (SUCCEEDED(hr)) hr = MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &p_->cw, &p_->ch);
-    return SUCCEEDED(hr) && p_->w > 0 && p_->h > 0;
+    if (SUCCEEDED(hr)) hr = MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &cw, &ch);
+    if (gpu) slots.resize(kGpuAhead + 1);
+    return SUCCEEDED(hr) && w > 0 && h > 0;
 }
-
-bool VideoReader::Seek(double t) { return p_->reader && SetPosition(p_->reader.Get(), t); }
+bool VideoReader::Seek(double t) {
+    if (!p_->reader) return false;
+    p_->pending.clear();  // decoded ahead of the old position
+    for (auto& s : p_->slots) s.busy = false;
+    p_->eof = false;
+    return SetPosition(p_->reader.Get(), t);
+}
 
 bool VideoReader::Read(BitmapPtr* frame, double* t) {
     VideoFrame f;
@@ -311,82 +382,160 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
 }
 
 bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit) {
-    if (!p_->reader) return false;
+    Impl& p = *p_;
+    if (!p.reader) return false;
+    while (!p.eof && p.pending.size() < (p.gpu ? kGpuAhead : 1))
+        if (!p.Next()) p.eof = true;
+    if (p.pending.empty()) return false;
+    Impl::Pending next = std::move(p.pending.front());
+    p.pending.pop_front();
+    if (next.slot >= 0) {
+        next.frame = p.Download(next.slot);
+        p.slots[next.slot].busy = false;
+    }
+    if (!next.frame) return false;
+    next.frame.state()->fit = fit;  // nobody else has the frame yet
+    *frame = next.frame;
+    *t = next.t;
+    return true;
+}
+
+bool VideoReader::Impl::Next() {
     for (;;) {
         DWORD flags = 0;
         LONGLONG ts = 0;
         ComPtr<IMFSample> s;
-        if (FAILED(p_->reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) return false;
+        if (FAILED(reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) return false;
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
             ComPtr<IMFMediaType> cur;
-            if (SUCCEEDED(p_->reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)))
-                MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &p_->cw, &p_->ch);
+            if (SUCCEEDED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur))) MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &cw, &ch);
         }
         if (!s) {
             if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) return false;
             continue;
         }
+        Pending out;
+        out.t = ts / kTicks;
         ComPtr<IMFMediaBuffer> buf;
-        if (FAILED(s->ConvertToContiguousBuffer(&buf))) return false;
-        ComPtr<IMF2DBuffer> b2;
-        BYTE* scan0 = nullptr;
-        LONG pitch = 0;
-        DWORD len = 0;
-        const bool twoD = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&scan0, &pitch));
-        if (!twoD) {
-            if (FAILED(buf->Lock(&scan0, nullptr, &len))) return false;
-            pitch = (LONG)p_->cw * (p_->nv12 ? 1 : 4);
+        ComPtr<IMFDXGIBuffer> dx;
+        ComPtr<ID3D11Texture2D> tex;
+        UINT sub = 0;
+        D3D11_TEXTURE2D_DESC d{};
+        if (gpu && SUCCEEDED(s->GetBufferByIndex(0, &buf)) && SUCCEEDED(buf.As(&dx)) && SUCCEEDED(dx->GetResource(IID_PPV_ARGS(&tex))) &&
+            SUCCEEDED(dx->GetSubresourceIndex(&sub)) && (tex->GetDesc(&d), d.Format == DXGI_FORMAT_NV12) && d.Width >= w && d.Height >= h) {
+            // On the GPU: copied into a free staging texture now, read back once a few more are under way.
+            int slot = 0;
+            while (slot < (int)slots.size() && slots[slot].busy) ++slot;
+            if (slot == (int)slots.size()) return false;  // can't happen: one more slot than frames ahead
+            Slot& sl = slots[slot];
+            D3D11_TEXTURE2D_DESC have{};
+            if (sl.tex) sl.tex->GetDesc(&have);
+            if (!sl.tex || have.Width != d.Width || have.Height != d.Height) {
+                D3D11_TEXTURE2D_DESC sd{};
+                sd.Width = d.Width;
+                sd.Height = d.Height;
+                sd.MipLevels = 1;
+                sd.ArraySize = 1;
+                sd.Format = DXGI_FORMAT_NV12;
+                sd.SampleDesc.Count = 1;
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                sl.tex.Reset();
+                if (FAILED(gpu->dev->CreateTexture2D(&sd, nullptr, &sl.tex))) return false;
+            }
+            gpu->ctx->CopySubresourceRegion(sl.tex.Get(), 0, 0, 0, 0, tex.Get(), sub, nullptr);
+            sl.busy = true;
+            out.slot = slot;
         } else {
-            buf->GetCurrentLength(&len);
+            buf.Reset();
+            if (FAILED(s->ConvertToContiguousBuffer(&buf))) return false;
+            out.frame = FromBuffer(buf.Get());
+            if (!out.frame) return false;
         }
-        auto st = std::make_shared<VideoFrame::State>();
-        st->rotation = (int)p_->rotation;
-        st->fit = fit;
-        const int w = (int)p_->w, h = (int)p_->h;
-        bool ok = false;
-        if (p_->nv12) {
-            // Kept compact until converted. The chroma plane follows the decoded rows, which can be more than
-            // the shown ones (1088 for 1080).
-            const size_t rows = pitch > 0 ? (size_t)len / (size_t)pitch * 2 / 3 : 0;
-            ok = pitch >= ((w + 1) & ~1) && rows >= (size_t)h && (size_t)pitch * rows * 3 / 2 <= len;
-            if (ok) {
-                const int cp = (w + 1) & ~1;
-                st->w = w;
-                st->h = h;
-                st->pitch = cp;
-                st->matrix = p_->matrix;
-                st->yuv = RecycledBytes((size_t)cp * (h + (h + 1) / 2));
-                uint8_t* d = st->yuv->data();
-                if (pitch == cp) {
-                    memcpy(d, scan0, (size_t)cp * h);
-                } else {
-                    for (int y = 0; y < h; ++y) memcpy(d + (size_t)y * cp, scan0 + (size_t)pitch * y, (size_t)w);
-                }
-                const BYTE* uv = scan0 + (size_t)pitch * rows;
-                if (pitch == cp) {
-                    memcpy(d + (size_t)cp * h, uv, (size_t)cp * ((h + 1) / 2));
-                } else {
-                    for (int y = 0; y < (h + 1) / 2; ++y) memcpy(d + (size_t)(h + y) * cp, uv + (size_t)pitch * y, (size_t)cp);
-                }
-            }
-        } else if ((st->bgra = Bitmap::Create(w, h))) {
-            ok = true;
-            const UINT32 rows = std::min(p_->h, p_->ch), cols = std::min(p_->w, p_->cw);
-            for (UINT32 y = 0; y < rows; ++y) {
-                const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
-                uint32_t* dst = st->bgra->Bits() + (size_t)y * p_->w;
-                for (UINT32 x = 0; x < cols; ++x) dst[x] = row[x] | 0xFF000000u;
-            }
-        }
-        if (twoD) b2->Unlock2D();
-        else buf->Unlock();
-        if (!ok) return false;
-        *frame = VideoFrame(std::move(st));
-        *t = ts / kTicks;
+        pending.push_back(std::move(out));
         return true;
     }
 }
 
+VideoFrame VideoReader::Impl::Download(int slot) {
+    ID3D11Texture2D* tex = slots[slot].tex.Get();
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(gpu->ctx->Map(tex, 0, D3D11_MAP_READ, 0, &m))) return {};
+    // Kept compact until converted: w × h luma, then the chroma rows (after all the texture's luma rows).
+    auto st = std::make_shared<VideoFrame::State>();
+    const int fw = (int)w, fh = (int)h, cp = (fw + 1) & ~1;
+    st->w = fw;
+    st->h = fh;
+    st->pitch = cp;
+    st->matrix = matrix;
+    st->rotation = (int)rotation;
+    st->yuv = RecycledBytes((size_t)cp * (fh + (fh + 1) / 2));
+    uint8_t* dst = st->yuv->data();
+    const uint8_t* src = static_cast<const uint8_t*>(m.pData);
+    for (int y = 0; y < fh; ++y) memcpy(dst + (size_t)y * cp, src + (size_t)m.RowPitch * y, (size_t)fw);
+    const uint8_t* uv = src + (size_t)m.RowPitch * d.Height;
+    for (int y = 0; y < (fh + 1) / 2; ++y) memcpy(dst + (size_t)(fh + y) * cp, uv + (size_t)m.RowPitch * y, (size_t)cp);
+    gpu->ctx->Unmap(tex, 0);
+    return VideoFrame(std::move(st));
+}
+
+VideoFrame VideoReader::Impl::FromBuffer(IMFMediaBuffer* buffer) {
+    ComPtr<IMFMediaBuffer> buf(buffer);
+    ComPtr<IMF2DBuffer> b2;
+    BYTE* scan0 = nullptr;
+    LONG pitch = 0;
+    DWORD len = 0;
+    const bool twoD = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&scan0, &pitch));
+    if (!twoD) {
+        if (FAILED(buf->Lock(&scan0, nullptr, &len))) return {};
+        pitch = (LONG)cw * (nv12 ? 1 : 4);
+    } else {
+        buf->GetCurrentLength(&len);
+    }
+    auto st = std::make_shared<VideoFrame::State>();
+    st->rotation = (int)rotation;
+    const int fw = (int)w, fh = (int)h;
+    bool ok = false;
+    if (nv12) {
+        // Kept compact until converted. The chroma plane follows the decoded rows, which can be more than
+        // the shown ones (1088 for 1080).
+        const size_t rows = pitch > 0 ? (size_t)len / (size_t)pitch * 2 / 3 : 0;
+        ok = pitch >= ((fw + 1) & ~1) && rows >= (size_t)fh && (size_t)pitch * rows * 3 / 2 <= len;
+        if (ok) {
+            const int cp = (fw + 1) & ~1;
+            st->w = fw;
+            st->h = fh;
+            st->pitch = cp;
+            st->matrix = matrix;
+            st->yuv = RecycledBytes((size_t)cp * (fh + (fh + 1) / 2));
+            uint8_t* d = st->yuv->data();
+            if (pitch == cp) {
+                memcpy(d, scan0, (size_t)cp * fh);
+            } else {
+                for (int y = 0; y < fh; ++y) memcpy(d + (size_t)y * cp, scan0 + (size_t)pitch * y, (size_t)fw);
+            }
+            const BYTE* uv = scan0 + (size_t)pitch * rows;
+            if (pitch == cp) {
+                memcpy(d + (size_t)cp * fh, uv, (size_t)cp * ((fh + 1) / 2));
+            } else {
+                for (int y = 0; y < (fh + 1) / 2; ++y) memcpy(d + (size_t)(fh + y) * cp, uv + (size_t)pitch * y, (size_t)cp);
+            }
+        }
+    } else if ((st->bgra = Bitmap::Create(fw, fh))) {
+        ok = true;
+        const UINT32 rows = std::min(h, ch), cols = std::min(w, cw);
+        for (UINT32 y = 0; y < rows; ++y) {
+            const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
+            uint32_t* dst = st->bgra->Bits() + (size_t)y * w;
+            for (UINT32 x = 0; x < cols; ++x) dst[x] = row[x] | 0xFF000000u;
+        }
+    }
+    if (twoD) b2->Unlock2D();
+    else buf->Unlock();
+    return ok ? VideoFrame(std::move(st)) : VideoFrame();
+}
 // ---------- sequences ----------
 
 bool AudioDecodes(const std::wstring& path);
@@ -1035,8 +1184,12 @@ void ExportFrames(EditFrames& frames, int n, const std::function<T(const VideoFr
     const SIZE full = frames.Full(), out = frames.Out();
     const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
     OrderedWork<T> work(workers, depth);
+    static const bool hi = GetEnvironmentVariableW(L"ATHER_HIPRIO", nullptr, 0) > 0;  // EXP-TEMP
+    const int oldPrio = GetThreadPriority(GetCurrentThread());  // EXP-TEMP
+    if (hi) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);  // EXP-TEMP
     std::thread reader([&] {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (hi) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);  // EXP-TEMP
         for (int i = 0; i < n; ++i) {
             VideoFrame src;
             double st = 0;
@@ -1052,6 +1205,7 @@ void ExportFrames(EditFrames& frames, int n, const std::function<T(const VideoFr
     }
     work.Stop();
     reader.join();
+    SetThreadPriority(GetCurrentThread(), oldPrio);  // EXP-TEMP
 }
 
 // An output frame ready for the encoder (and, for --bench-export's tap, as rendered).
