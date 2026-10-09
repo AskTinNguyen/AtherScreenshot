@@ -1,6 +1,7 @@
 #include "media.h"
 
 #include <codecapi.h>
+#include <emmintrin.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -163,6 +164,25 @@ void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
     const int yr = hd ? 47 : 66, yg = hd ? 157 : 129, yb = hd ? 16 : 25;
     const int ur = hd ? -26 : -38, ug = hd ? -87 : -74, ub = 112;
     const int vr = 112, vg = hd ? -102 : -94, vb = hd ? -10 : -18;
+    // Eight pixels of two rows at a time; per pixel the same integer arithmetic as the scalar tail below.
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i cy = _mm_setr_epi16((short)yb, (short)yg, (short)yr, 0, (short)yb, (short)yg, (short)yr, 0);
+    const __m128i cu = _mm_setr_epi16((short)ub, (short)ug, (short)ur, 0, (short)ub, (short)ug, (short)ur, 0);
+    const __m128i cv = _mm_setr_epi16((short)vb, (short)vg, (short)vr, 0, (short)vb, (short)vg, (short)vr, 0);
+    const __m128i r128 = _mm_set1_epi32(128), y16 = _mm_set1_epi32(16), two = _mm_set1_epi32(2);
+    // Σ coefficient × channel for four pixels (one 32-bit lane each), rounded and shifted like `(s + 128) >> 8`.
+    auto dot4 = [&](__m128i p, __m128i c) {
+        const __m128i lo = _mm_madd_epi16(_mm_unpacklo_epi8(p, zero), c), hi = _mm_madd_epi16(_mm_unpackhi_epi8(p, zero), c);
+        const __m128 a = _mm_castsi128_ps(lo), b = _mm_castsi128_ps(hi);
+        const __m128i s = _mm_add_epi32(_mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0))),
+                                        _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1))));
+        return _mm_srai_epi32(_mm_add_epi32(s, r128), 8);
+    };
+    // Each pair of neighbors summed: lanes (0+1, 2+3) of a and of b.
+    auto pairs = [](__m128i a, __m128i b) {
+        const __m128 x = _mm_castsi128_ps(a), y = _mm_castsi128_ps(b);
+        return _mm_add_epi32(_mm_castps_si128(_mm_shuffle_ps(x, y, _MM_SHUFFLE(2, 0, 2, 0))), _mm_castps_si128(_mm_shuffle_ps(x, y, _MM_SHUFFLE(3, 1, 3, 1))));
+    };
     uint8_t* uv = out + (size_t)w * h;
     for (int y = 0; y < h; y += 2) {
         const uint32_t* r0 = px + (size_t)y * w;
@@ -170,7 +190,25 @@ void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
         uint8_t* y0 = out + (size_t)y * w;
         uint8_t* y1 = y0 + w;
         uint8_t* c = uv + (size_t)(y / 2) * w;
-        for (int x = 0; x < w; x += 2) {
+        int x = 0;
+        for (; x + 8 <= w; x += 8) {
+            const __m128i a0 = _mm_loadu_si128((const __m128i*)(r0 + x)), a1 = _mm_loadu_si128((const __m128i*)(r0 + x + 4));
+            const __m128i b0 = _mm_loadu_si128((const __m128i*)(r1 + x)), b1 = _mm_loadu_si128((const __m128i*)(r1 + x + 4));
+            const __m128i ya = _mm_packs_epi32(_mm_add_epi32(dot4(a0, cy), y16), _mm_add_epi32(dot4(a1, cy), y16));
+            const __m128i yb8 = _mm_packs_epi32(_mm_add_epi32(dot4(b0, cy), y16), _mm_add_epi32(dot4(b1, cy), y16));
+            _mm_storel_epi64((__m128i*)(y0 + x), _mm_packus_epi16(ya, ya));
+            _mm_storel_epi64((__m128i*)(y1 + x), _mm_packus_epi16(yb8, yb8));
+            // U and V of each pixel (the +128 offsets cancel out of the rounding: 4 × 128 is added back below).
+            const __m128i su = _mm_add_epi32(pairs(dot4(a0, cu), dot4(a1, cu)), pairs(dot4(b0, cu), dot4(b1, cu)));
+            const __m128i sv = _mm_add_epi32(pairs(dot4(a0, cv), dot4(a1, cv)), pairs(dot4(b0, cv), dot4(b1, cv)));
+            const __m128i off = _mm_set1_epi32(4 * 128);
+            const __m128i u = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(su, off), two), 2);
+            const __m128i v = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(sv, off), two), 2);
+            const __m128i uvw = _mm_or_si128(u, _mm_slli_epi32(v, 16));  // U, V as 16-bit pairs
+            const __m128i b = _mm_packus_epi16(uvw, uvw);
+            _mm_storel_epi64((__m128i*)(c + x), b);
+        }
+        for (; x < w; x += 2) {
             int su = 0, sv = 0;
             for (int k = 0; k < 4; ++k) {
                 const uint32_t p = (k < 2 ? r0 : r1)[x + (k & 1)];
@@ -184,7 +222,6 @@ void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
         }
     }
 }
-
 BitmapPtr RotateBitmap(const Bitmap& src, int degrees) {
     const int w = src.Width(), h = src.Height();
     auto out = degrees == 180 ? Bitmap::Create(w, h) : Bitmap::Create(h, w);
@@ -552,26 +589,29 @@ HRESULT GifWriter::Begin(const std::wstring& path, int w, int h) {
     return hr;
 }
 
-HRESULT GifWriter::Add(const uint32_t* px, int delayCs) {
-    if (!p_->enc) return E_UNEXPECTED;
-    const int w = p_->w, h = p_->h;
-    ComPtr<IWICBitmapFrameEncode> frame;
+struct GifWriter::Quantized {
+    HRESULT hr = E_FAIL;
+    int w = 0, h = 0;
+    std::vector<WICColor> colors;
+    std::vector<uint8_t> pixels;  // palette indices, w per row
+};
+
+std::shared_ptr<GifWriter::Quantized> GifWriter::Quantize(const uint32_t* px, int w, int h) {
+    auto q = std::make_shared<Quantized>();
+    q->w = w;
+    q->h = h;
+    ComPtr<IWICImagingFactory> f;
     ComPtr<IWICBitmap> src;
     ComPtr<IWICPalette> pal;
     ComPtr<IWICFormatConverter> conv;
-    ComPtr<IWICMetadataQueryWriter> meta;
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat8bppIndexed;
-    HRESULT hr = p_->enc->CreateNewFrame(&frame, nullptr);
-    if (SUCCEEDED(hr)) hr = frame->Initialize(nullptr);
-    if (SUCCEEDED(hr)) hr = frame->SetSize(w, h);
-    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
-    if (SUCCEEDED(hr)) hr = p_->f->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, w * h * 4, (BYTE*)px, &src);
-    if (SUCCEEDED(hr)) hr = p_->f->CreatePalette(&pal);
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
+    if (SUCCEEDED(hr)) hr = f->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, w * h * 4, (BYTE*)px, &src);
+    if (SUCCEEDED(hr)) hr = f->CreatePalette(&pal);
     if (SUCCEEDED(hr)) {
         // Build the palette from a downscaled copy for big frames: much faster, visually the same.
         ComPtr<IWICBitmapScaler> scaler;
         const double area = (double)w * h;
-        if (area > 250000 && SUCCEEDED(p_->f->CreateBitmapScaler(&scaler))) {
+        if (area > 250000 && SUCCEEDED(f->CreateBitmapScaler(&scaler))) {
             const double k = std::sqrt(250000 / area);
             scaler->Initialize(src.Get(), std::max(1, (int)(w * k)), std::max(1, (int)(h * k)), WICBitmapInterpolationModeNearestNeighbor);
             hr = pal->InitializeFromBitmap(scaler.Get(), 256, FALSE);
@@ -579,16 +619,49 @@ HRESULT GifWriter::Add(const uint32_t* px, int delayCs) {
             hr = pal->InitializeFromBitmap(src.Get(), 256, FALSE);
         }
     }
-    if (SUCCEEDED(hr)) hr = p_->f->CreateFormatConverter(&conv);
+    if (SUCCEEDED(hr)) hr = f->CreateFormatConverter(&conv);
     if (SUCCEEDED(hr)) hr = conv->Initialize(src.Get(), GUID_WICPixelFormat8bppIndexed, WICBitmapDitherTypeNone, pal.Get(), 0, WICBitmapPaletteTypeCustom);
+    UINT n = 0;
+    if (SUCCEEDED(hr)) hr = pal->GetColorCount(&n);
+    if (SUCCEEDED(hr)) {
+        q->colors.resize(n);
+        hr = pal->GetColors(n, q->colors.data(), &n);
+        q->colors.resize(n);
+    }
+    if (SUCCEEDED(hr)) {
+        q->pixels.resize((size_t)w * h);
+        hr = conv->CopyPixels(nullptr, (UINT)w, (UINT)(w * h), q->pixels.data());
+    }
+    q->hr = hr;
+    return q;
+}
+
+HRESULT GifWriter::AddQuantized(const Quantized& q, int delayCs) {
+    if (!p_->enc) return E_UNEXPECTED;
+    if (FAILED(q.hr)) return q.hr;
+    if (q.w != p_->w || q.h != p_->h) return E_INVALIDARG;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IWICPalette> pal;
+    ComPtr<IWICMetadataQueryWriter> meta;
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat8bppIndexed;
+    HRESULT hr = p_->enc->CreateNewFrame(&frame, nullptr);
+    if (SUCCEEDED(hr)) hr = frame->Initialize(nullptr);
+    if (SUCCEEDED(hr)) hr = frame->SetSize(q.w, q.h);
+    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
+    if (SUCCEEDED(hr)) hr = p_->f->CreatePalette(&pal);
+    if (SUCCEEDED(hr)) hr = pal->InitializeCustom(const_cast<WICColor*>(q.colors.data()), (UINT)q.colors.size());
     if (SUCCEEDED(hr)) hr = frame->SetPalette(pal.Get());
     if (SUCCEEDED(hr) && SUCCEEDED(frame->GetMetadataQueryWriter(&meta)))
         SetUShort(meta.Get(), L"/grctlext/Delay", (USHORT)std::clamp(delayCs, 2, 65535));
-    if (SUCCEEDED(hr)) hr = frame->WriteSource(conv.Get(), nullptr);
+    if (SUCCEEDED(hr)) hr = frame->WritePixels((UINT)q.h, (UINT)q.w, (UINT)q.pixels.size(), const_cast<BYTE*>(q.pixels.data()));
     if (SUCCEEDED(hr)) hr = frame->Commit();
     return hr;
 }
 
+HRESULT GifWriter::Add(const uint32_t* px, int delayCs) {
+    if (!p_->enc) return E_UNEXPECTED;
+    return AddQuantized(*Quantize(px, p_->w, p_->h), delayCs);
+}
 HRESULT GifWriter::Finish() {
     if (!p_->enc) return E_UNEXPECTED;
     const HRESULT hr = p_->enc->Commit();

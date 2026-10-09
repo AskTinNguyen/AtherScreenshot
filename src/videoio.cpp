@@ -15,6 +15,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <deque>
+#include <emmintrin.h>
 #include <mutex>
 #include <thread>
 
@@ -91,11 +92,41 @@ inline uint32_t Clamp8(int v) { return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v)
 
 // NV12 (`w` × `h`, rows `pitch` bytes apart, chroma plane at `uv`) → opaque BGRA.
 void Nv12ToBgra(const uint8_t* yp, const uint8_t* uvp, int pitch, int w, int h, uint32_t* dst, const YuvMatrix& m) {
+    // Eight pixels at a time, each with exactly the integer arithmetic of the scalar tail below.
+    const __m128i zero = _mm_setzero_si128(), c128 = _mm_set1_epi16(128), y16 = _mm_set1_epi16((short)m.yOff), r128 = _mm_set1_epi32(128);
+    const __m128i kR = _mm_setr_epi16((short)m.y, (short)m.rv, (short)m.y, (short)m.rv, (short)m.y, (short)m.rv, (short)m.y, (short)m.rv);
+    const __m128i kB = _mm_setr_epi16((short)m.y, (short)m.bu, (short)m.y, (short)m.bu, (short)m.y, (short)m.bu, (short)m.y, (short)m.bu);
+    const __m128i kG = _mm_setr_epi16((short)m.y, (short)-m.gu, (short)m.y, (short)-m.gu, (short)m.y, (short)-m.gu, (short)m.y, (short)-m.gu);
+    const __m128i kGv = _mm_setr_epi16((short)-m.gv, 0, (short)-m.gv, 0, (short)-m.gv, 0, (short)-m.gv, 0);
+    const __m128i alpha = _mm_set1_epi8(-1);
+    // (pairs · k + 128) >> 8 for the four (luma, chroma) pairs in each half of a and b.
+    auto ch = [&](__m128i yy, __m128i cc, __m128i k) {
+        const __m128i lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(yy, cc), k), r128), 8);
+        const __m128i hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(yy, cc), k), r128), 8);
+        return _mm_packs_epi32(lo, hi);
+    };
     for (int y = 0; y < h; ++y) {
         const uint8_t* yr = yp + (size_t)pitch * y;
         const uint8_t* cr = uvp + (size_t)pitch * (y / 2);
         uint32_t* d = dst + (size_t)w * y;
-        for (int x = 0; x < w; x += 2) {
+        int x0 = 0;
+        for (; x0 + 8 <= w; x0 += 8) {
+            const __m128i yy = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(yr + x0)), zero), y16);
+            const __m128i c = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(cr + x0)), zero), c128);  // u0 v0 u1 v1 …
+            // Each chroma sample twice, for its two pixels: uu = u0 u0 u1 u1 …, vv = v0 v0 v1 v1 …
+            const __m128i u = _mm_shufflehi_epi16(_mm_shufflelo_epi16(c, _MM_SHUFFLE(2, 2, 0, 0)), _MM_SHUFFLE(2, 2, 0, 0));
+            const __m128i v = _mm_shufflehi_epi16(_mm_shufflelo_epi16(c, _MM_SHUFFLE(3, 3, 1, 1)), _MM_SHUFFLE(3, 3, 1, 1));
+            const __m128i R = ch(yy, v, kR), B = ch(yy, u, kB);
+            // G = (y·Y − gu·u + 128 − gv·v) >> 8: the two products of the pair, then the third.
+            const __m128i glo = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(yy, u), kG), _mm_madd_epi16(_mm_unpacklo_epi16(v, zero), kGv));
+            const __m128i ghi = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(yy, u), kG), _mm_madd_epi16(_mm_unpackhi_epi16(v, zero), kGv));
+            const __m128i G = _mm_packs_epi32(_mm_srai_epi32(_mm_add_epi32(glo, r128), 8), _mm_srai_epi32(_mm_add_epi32(ghi, r128), 8));
+            const __m128i b8 = _mm_packus_epi16(B, B), g8 = _mm_packus_epi16(G, G), r8 = _mm_packus_epi16(R, R);
+            const __m128i bg = _mm_unpacklo_epi8(b8, g8), ra = _mm_unpacklo_epi8(r8, alpha);
+            _mm_storeu_si128((__m128i*)(d + x0), _mm_unpacklo_epi16(bg, ra));
+            _mm_storeu_si128((__m128i*)(d + x0 + 4), _mm_unpackhi_epi16(bg, ra));
+        }
+        for (int x = x0; x < w; x += 2) {
             const int u = cr[x] - 128, v = cr[x + 1] - 128;
             const int r = m.rv * v + 128, g = 128 - m.gu * u - m.gv * v, b = m.bu * u + 128;
             for (int k = x; k < x + 2 && k < w; ++k) {
@@ -843,8 +874,8 @@ void TimeStretch::Run(bool final, std::vector<float>& out) {
 
 // ---------- export ----------
 
-extern double g_prof[8];  // PROF-TEMP
-struct ProfT { int i; LARGE_INTEGER a; ProfT(int k) : i(k) { QueryPerformanceCounter(&a); } ~ProfT() { LARGE_INTEGER b, f; QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f); g_prof[i] += double(b.QuadPart - a.QuadPart) / f.QuadPart; } };  // PROF-TEMP
+extern double g_prof[16];  // PROF-TEMP
+struct ProfT { int i; ULONG64 a; ProfT(int k) : i(k) { QueryThreadCycleTime(GetCurrentThread(), &a); } ~ProfT() { ULONG64 b; QueryThreadCycleTime(GetCurrentThread(), &b); g_prof[i] += double(b - a) / 1e9; } };  // PROF-TEMP
 namespace {
 
 // The edited video's frames in output order: output time i/fps shows the source frame at
@@ -989,7 +1020,8 @@ private:
 // that the frames in flight stay within ~600 MB.
 std::pair<int, size_t> ExportWorkers(SIZE px) {
     const int cores = (int)std::max(1u, std::thread::hardware_concurrency());
-    const int workers = std::clamp(cores - 1, 1, 24);
+    int workers = std::clamp(cores - 1, 1, 24);
+    { wchar_t b[16]; if (GetEnvironmentVariableW(L"ATHER_WORKERS", b, 16)) workers = _wtoi(b); }  // EXP-TEMP
     const double perFrame = std::max(1.0, (double)px.cx * px.cy * 14);  // NV12 source, its BGRA, the render and its copy
     const size_t depth = (size_t)std::clamp((int)(600e6 / perFrame), 2, workers * 2);
     return {workers, depth};
@@ -1031,7 +1063,7 @@ struct EncoderFrame {
 }  // namespace
 
 std::function<void(int, const Bitmap&)> g_exportTap;
-double g_prof[8];  // PROF-TEMP
+double g_prof[16];  // PROF-TEMP
 
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
     const Sequence seq = SequenceOf(source, e);
@@ -1064,10 +1096,11 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     };
     ExportFrames<EncoderFrame>(frames, n, make, [&](int i, EncoderFrame& f) {
         if (g_exportTap) g_exportTap(i, *f.bgra);
-        { ProfT pt(3); hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
+        static const bool noEnc = GetEnvironmentVariableW(L"ATHER_NO_ENCODE", nullptr, 0) > 0;  // EXP-TEMP
+        if (!noEnc || i == 0) { ProfT pt(3); hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
         f = {};
         ProfT pt4(4);  // PROF-TEMP
-        if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
+        if (SUCCEEDED(hr) && audio && !noEnc) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
         if (FAILED(hr)) return false;
         cancelled = progress && !progress((i + 1.0) / n);
         return !cancelled;
@@ -1077,7 +1110,7 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
         w.Finalize();
         return false;
     }
-    if (audio) audio->WriteUntil(w, audioTotal);
+    if (audio && !GetEnvironmentVariableW(L"ATHER_NO_ENCODE", nullptr, 0)) audio->WriteUntil(w, audioTotal);  // EXP-TEMP
     { ProfT pt(5); hr = w.Finalize(); }  // PROF-TEMP
     if (FAILED(hr) && error) *error = HrText(L"Couldn't finish the MP4", hr);
     return SUCCEEDED(hr);
@@ -1093,15 +1126,25 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
     HRESULT hr = g.Begin(out, gw, gh);
     const int n = frames.Count(false);
     bool cancelled = false;
+    struct GifFrame {
+        std::shared_ptr<GifWriter::Quantized> q;
+        BitmapPtr bgra;  // for --bench-export's tap
+        explicit operator bool() const { return q != nullptr; }
+    };
     auto make = [&](const VideoFrame& src, double st) {
+        GifFrame gf;
         BitmapPtr f = frames.Render(src, st);
-        return f && (f->Width() != gw || f->Height() != gh) ? Resample(*f, gw, gh) : f;
+        if (f && (f->Width() != gw || f->Height() != gh)) f = Resample(*f, gw, gh);
+        if (!f) return gf;
+        gf.q = GifWriter::Quantize(f->Bits(), gw, gh);  // the slow part of a GIF frame, on the workers
+        if (g_exportTap) gf.bgra = f;
+        return gf;
     };
     if (SUCCEEDED(hr))
-        ExportFrames<BitmapPtr>(frames, n, make, [&](int i, BitmapPtr& f) {
-            if (g_exportTap) g_exportTap(i, *f);
+        ExportFrames<GifFrame>(frames, n, make, [&](int i, GifFrame& f) {
+            if (g_exportTap) g_exportTap(i, *f.bgra);
             const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
-            { ProfT pt(6); hr = g.Add(f->Bits(), delay); }  // PROF-TEMP
+            { ProfT pt(6); hr = g.AddQuantized(*f.q, delay); }  // PROF-TEMP
             cancelled = SUCCEEDED(hr) && progress && !progress((i + 1.0) / n);
             return SUCCEEDED(hr) && !cancelled;
         });

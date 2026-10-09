@@ -65,6 +65,11 @@ public:
     ~GifWriter();
     HRESULT Begin(const std::wstring& path, int w, int h);
     HRESULT Add(const uint32_t* px, int delayCs);  // delay in 1/100 s
+    // Add in two steps: Quantize does the slow part (the frame's palette and 8-bit pixels) on any thread, many
+    // at once; AddQuantized writes them, in order. Same file as Add.
+    struct Quantized;
+    static std::shared_ptr<Quantized> Quantize(const uint32_t* px, int w, int h);
+    HRESULT AddQuantized(const Quantized& q, int delayCs);
     HRESULT Finish();
 
 private:

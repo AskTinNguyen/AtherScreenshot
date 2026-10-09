@@ -26,7 +26,7 @@
 #include "videoio.h"
 
 namespace ather {
-extern double g_prof[8];  // PROF-TEMP
+extern double g_prof[16];  // PROF-TEMP
 
 namespace {
 
@@ -124,6 +124,13 @@ std::vector<Scenario> Scenarios(const Clip& c) {
         out.push_back(s);
     }
     return out;
+}
+
+double CpuSeconds() {
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    auto s = [](FILETIME f) { return (((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime) / 1e7; };
+    return s(k) + s(u);
 }
 
 uint64_t Hash(const Bitmap& b) {
@@ -510,6 +517,41 @@ int EncodeExp(const std::wstring& outDir, int w, int h, int frames, int fps) {
     Say(line);
     return 0;
 }
+// ---- experiment: one render step in isolation, single-threaded (EXP-TEMP) ----
+int RenderExp(const std::wstring& raw, const std::wstring& what, int reps) {
+    auto ref = ReadAll(raw);
+    const int W = ((int32_t*)ref.data())[0], H = ((int32_t*)ref.data())[1];
+    auto frame = Bitmap::Create(W, H);
+    memcpy(frame->Bits(), ref.data() + 8, (size_t)W * H * 4);
+    VideoEdit e;
+    e.trimEnd = 10;
+    if (what == L"blur") e.marks.push_back(M(MarkKind::Blur, W * 0.6, H * 0.6, W * 0.85, H * 0.75, 0, 10, AnimStyle::None));
+    if (what == L"zoom") e.marks.push_back(M(MarkKind::Zoom, W * 0.3, H * 0.3, W * 0.5, H * 0.5, 0, 10));
+    if (what == L"pixelate") e.marks.push_back(M(MarkKind::Pixelate, W * 0.05, H * 0.75, W * 0.3, H * 0.92, 0, 10, AnimStyle::None));
+    if (what == L"title") e.marks.push_back(M(MarkKind::Title, 0, 0, W, H, 0, 10, AnimStyle::None, L"Release 1.2"));
+    if (what == L"box") e.marks.push_back(M(MarkKind::Box, W * 0.1, H * 0.2, W * 0.4, H * 0.45, 0, 10, AnimStyle::None));
+    if (what == L"caption") {
+        Caption c;
+        c.start = 0, c.end = 10, c.text = L"Open the project settings";
+        e.captions.push_back(c);
+    }
+    FrameRenderer r(e, {W, H}, false);
+    std::vector<uint8_t> nv((size_t)W * H * 3 / 2);
+    BitmapPtr out;
+    ULONG64 c0, c1;
+    QueryThreadCycleTime(GetCurrentThread(), &c0);
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) {
+        if (what == L"nv12") BgraToNv12(frame->Bits(), W & ~1, H & ~1, nv.data());
+        else out = r.Render(frame, 5.0 + i * 1e-6);
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    QueryThreadCycleTime(GetCurrentThread(), &c1);
+    char line[200];
+    sprintf_s(line, "%-8s %.2f ms/frame, %.1f Mcycles/frame\n", Narrow(what).c_str(), secs * 1000 / reps, (c1 - c0) / 1e6 / reps);
+    Say(line);
+    return 0;
+}
 int Bench(const std::vector<std::wstring>& args) {
     if (args.size() < 2) return 2;
     const std::wstring dir = args[0];
@@ -545,21 +587,25 @@ int Bench(const std::vector<std::wstring>& args) {
                     }
                 };
             std::wstring err;
-            std::fill(g_prof, g_prof + 8, 0.0);  // PROF-TEMP
+            std::fill(g_prof, g_prof + 16, 0.0);  // PROF-TEMP
+            const double cpu0 = CpuSeconds();
             const auto start = std::chrono::steady_clock::now();
             VideoEdit e = s.edit;
             e.clips = {*clip};
             const bool done = s.gif ? ExportGif(L"", e, out, &err, 12, [&](double) { ++frames; return true; })
                                     : ExportMp4(L"", e, out, &err, [&](double) { ++frames; return true; });
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            const double cpu = CpuSeconds() - cpu0;
             g_exportTap = nullptr;
             total += secs;
             char line[256];
-            sprintf_s(line, "  %-7s %7.2f s  %5d frames  %7.1f fps%s%s\n", Narrow(s.name).c_str(), secs, frames, frames / std::max(1e-9, secs),
+            sprintf_s(line, "  %-7s %7.2f s  %5d frames  %7.1f fps  cpu %6.2f s%s%s\n", Narrow(s.name).c_str(), secs, frames, frames / std::max(1e-9, secs), cpu,
                       done ? "" : "  FAILED: ", done ? "" : Narrow(err).c_str());
             Say(line);
             sprintf_s(line, "          decode %.2f fit %.2f render %.2f write %.2f audio %.2f final %.2f gif %.2f wait %.2f\n", g_prof[0], g_prof[1], g_prof[2], g_prof[3], g_prof[4], g_prof[5], g_prof[6], g_prof[7]);  // PROF-TEMP
             Say(line);  // PROF-TEMP
+            sprintf_s(line, "          blur %.2f pixelate %.2f marks %.2f sample %.2f captions %.2f titles %.2f copy %.2f\n", g_prof[8], g_prof[9], g_prof[10], g_prof[11], g_prof[12], g_prof[13], g_prof[14]);  // PROF-TEMP
+            Say(line);  // PROF-TEMP2
             if (tap) {
                 std::string text;
                 for (uint64_t h : hashes) text += std::to_string(h) + "\n";
@@ -635,6 +681,7 @@ int VideoBench(const std::vector<std::wstring>& args) {
         else if (args[0] == L"--bench-color") code = ColorExp(args[1], args[2]);  // EXP-TEMP
         else if (args[0] == L"--bench-rgb2yuv") code = Rgb2YuvExp(args[1], args.size() > 3 ? _wtoi(args[2].c_str()) : 0, args.size() > 3 ? _wtoi(args[3].c_str()) : 0);  // EXP-TEMP
         else if (args[0] == L"--bench-encode") code = EncodeExp(args[1], _wtoi(args[2].c_str()), _wtoi(args[3].c_str()), _wtoi(args[4].c_str()), _wtoi(args[5].c_str()));  // EXP-TEMP
+        else if (args[0] == L"--bench-render") code = RenderExp(args[1], args[2], _wtoi(args[3].c_str()));  // EXP-TEMP
         else code = Bench(std::vector<std::wstring>(args.begin() + 1, args.end()));
         CoUninitialize();
     }).join();
