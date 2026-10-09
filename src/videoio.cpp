@@ -2285,6 +2285,57 @@ ATHER_TEST(video_export_joins_pieces_from_several_encoders) {
     SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
 }
 
+// An export in pieces shows exactly the frames one pass does, also where a piece starts inside a later clip of a
+// joined video (of other sizes and frame rates, turned, silent) and with the speed changed.
+ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a.mp4", b = dir + L"\\b.mp4", c = dir + L"\\c.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 5, true));
+    CHECK(WriteTestClip(b, 320, 320, 30, 4, false));       // square, silent
+    CHECK(WriteTestClip(c, 640, 360, 25, 4, true, 90));    // a phone clip: upright 360 × 640, 25 fps
+    auto ca = ClipOf(a), cb = ClipOf(b), cc = ClipOf(c);
+    CHECK(ca && cb && cc);
+    if (!ca || !cb || !cc) return;
+    ca->in = 0.5, ca->out = 4.5;
+    cc->in = 1;
+    for (double speed : {1.0, 1.5}) {
+        VideoEdit e;
+        e.clips = {*ca, *cb, *cc};
+        e.frameW = 640;
+        e.frameH = 360;
+        e.speed = speed;
+        e.trimStart = 0.2;
+        e.trimEnd = ClipsDuration(e.clips);
+        Caption cap;
+        cap.start = 3, cap.end = 6, cap.text = L"Across the cut";
+        e.captions = {cap};
+        std::vector<uint64_t> first;
+        for (const wchar_t* encoders : {L"1", L"2", L"3"}) {
+            std::vector<uint64_t> hashes;
+            std::mutex mu;
+            g_exportTap = [&](int i, const Bitmap& f) {
+                uint64_t h = 1469598103934665603ull;
+                for (size_t k = 0, n = (size_t)f.Width() * f.Height(); k < n; ++k) h = (h ^ f.Bits()[k]) * 1099511628211ull;
+                std::lock_guard l(mu);
+                if (hashes.size() <= (size_t)i) hashes.resize((size_t)i + 1);
+                hashes[i] = h;
+            };
+            SetEnvironmentVariableW(L"ATHER_ENCODERS", encoders);
+            std::wstring err;
+            const std::wstring out = dir + L"\\out" + encoders + L".mp4";
+            CHECK(ExportMp4(L"", e, out, &err));
+            g_exportTap = nullptr;
+            VideoInfo vi;
+            CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - e.OutputDuration()) < 0.1 && vi.hasAudio);
+            if (first.empty()) first = hashes;
+            test::Note("speed " + std::to_string(speed) + ", encoders " + ToUtf8(encoders) + ": " + std::to_string(hashes.size()) + " frames");
+            CHECK_EQ(hashes.size(), first.size());
+            CHECK(hashes == first);
+        }
+    }
+    SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
+}
+
 // Cancelling halfway stops the export (one encoder or several) and leaves no pieces behind.
 ATHER_TEST(video_export_cancels_cleanly) {
     const std::wstring dir = test::TempDir();
