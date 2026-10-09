@@ -45,8 +45,7 @@ public:
     // `nv12`: frames come through WriteNv12 (see BgraToNv12) instead of WriteFrame. `w` ≤ 0: sound only.
     HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0, bool nv12 = false);
     HRESULT WriteFrame(const uint32_t* px, int64_t t, int64_t duration);
-    HRESULT WriteNv12(const uint8_t* yuv, int64_t t, int64_t duration);
-    // The same without a copy: `yuv` stays alive, unchanged, until the encoder is done with it.
+    // NV12 frames (BgraToNv12's layout), uncopied: `yuv` stays alive, unchanged, until the encoder is done with it.
     HRESULT WriteNv12(std::shared_ptr<const uint8_t> yuv, int64_t t, int64_t duration);
     // Interleaved 16-bit PCM at the rate and channel count given to Begin.
     HRESULT WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t);
@@ -60,19 +59,16 @@ private:
 };
 
 // Joins MP4s of H.264 video (pieces of one video, encoded at the same settings) frame by frame into one, without
-// re-encoding, with AAC sound written as by Mp4Writer. Thread-safe.
+// re-encoding, with the sound of another MP4 copied in alongside. Thread-safe.
 class Mp4Joiner {
 public:
     Mp4Joiner();
     ~Mp4Joiner();
-    // Fails unless all `parts` hold H.264 with the same parameter sets. The sound is encoded here (WriteAudio, at
-    // `audioRate`), or copied from `audioPart`, an MP4 of sound only (CopyAudio).
-    HRESULT Begin(const std::wstring& path, const std::vector<std::wstring>& parts, int audioRate = 0, int audioChannels = 2,
-                  const std::wstring& audioPart = {});
+    // Fails unless all `parts` hold H.264 with the same parameter sets. `audioPart`: an MP4 of sound only, or none.
+    HRESULT Begin(const std::wstring& path, const std::vector<std::wstring>& parts, const std::wstring& audioPart = {});
     // The next `count` frames of `part` become frames `first`… of the joined video (at `fps`). Each part must
     // start on a key frame.
     HRESULT CopyFrames(size_t part, int64_t first, int count, int fps);
-    HRESULT WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t);
     HRESULT CopyAudio(int64_t until);  // `audioPart`'s sound up to (not including) time `until` (100 ns)
     HRESULT Finalize();
 

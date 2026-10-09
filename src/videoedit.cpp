@@ -503,6 +503,7 @@ std::vector<uint32_t> BlurArea(const Bitmap& img, const RECT& inner, double sigm
     if (mem.capacity() > (1u << 19)) std::vector<__m128>().swap(mem);  // 8 MB
     return out;
 }
+
 // Bilinear sample of a premultiplied image; transparent outside it.
 inline uint32_t Sample(const Bitmap& b, double sx, double sy) {
     const int W = b.Width(), H = b.Height();
@@ -695,9 +696,6 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
 
 // ---------- the renderer ----------
 
-extern double g_prof[16];  // PROF-TEMP
-struct ProfE { int i; ULONG64 a; ProfE(int k) : i(k) { QueryThreadCycleTime(GetCurrentThread(), &a); } ~ProfE() { ULONG64 b; QueryThreadCycleTime(GetCurrentThread(), &b); g_prof[i] += double(b - a) / 1e9; } };  // PROF-TEMP
-
 FrameRenderer::FrameRenderer(const VideoEdit& edit, SIZE full, bool preview) : edit_(edit), full_(full), preview_(preview) {
     const VRect f{0, 0, (double)full.cx, (double)full.cy};
     VRect v = f;
@@ -718,8 +716,7 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     // them reads the source as is.
     bool onVideo = false;
     for (const auto& m : edit_.marks) onVideo = onVideo || (m.kind != MarkKind::Title && m.kind != MarkKind::Zoom && m.Active(t));
-    BitmapPtr img;
-    { ProfE pe(14); img = preview_ || onVideo ? (owned && shared && !preview_ ? *shared : Copy(src)) : nullptr; }  // PROF-TEMP
+    const BitmapPtr img = preview_ || onVideo ? (owned && shared && !preview_ ? *shared : Copy(src)) : nullptr;
     if ((preview_ || onVideo) && !img) return nullptr;
     const VRect extent{0, 0, (double)src.Width(), (double)src.Height()};
     // 1. Blur and pixelate, in the order they were added.
@@ -730,7 +727,6 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
         const VRect q = ri->Integral();
         const RECT rc{(LONG)q.x, (LONG)q.y, (LONG)q.MaxX(), (LONG)q.MaxY()};
         if (RectW(rc) < 1 || RectH(rc) < 1) continue;
-        ProfE pe(m.kind == MarkKind::Blur ? 8 : 9);  // PROF-TEMP
         const Motion mo = MotionOf(m, t);
         const double k = mo.blur > 0 ? std::max(0.15, 1 - mo.blur / (12 * unit_)) : 1;  // blur in: the effect strengthens
         const double side = std::min(ri->w, ri->h);
@@ -757,7 +753,6 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     // 2. Markup that sits on the video (moves with zoom).
     for (const auto& m : edit_.marks) {
         if (!img || KindIsRegion(m.kind) || m.kind == MarkKind::Title || !m.Active(t)) continue;
-        ProfE pe(10);  // PROF-TEMP
         const Motion mo = MotionOf(m, t);
         if (mo.alpha <= 0.001) continue;
         auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
@@ -782,21 +777,19 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     if (preview_ && r == view_) framed = nullptr;  // drawn in place
     else if (!preview_ && r == extent && tsize.cx == src.Width() && tsize.cy == src.Height())  // the whole frame, unscaled
         framed = img ? img : shared && (!overlays || owned) ? *shared : Copy(src);
-    else { ProfE pe(11); framed = SampleRect(video, r, tsize.cx, tsize.cy); }  // PROF-TEMP
+    else framed = SampleRect(video, r, tsize.cx, tsize.cy);
     if (!framed && !(preview_ && r == view_)) return nullptr;
     // 4. Captions and title cards stay put on screen.
     Bitmap& target = framed ? *framed : *img;
     const double ox = framed ? 0 : view_.x, oy = framed ? 0 : view_.y;
     for (const auto& c : edit_.captions) {
         if (!c.Active(t) || (!preview_ && Trimmed(c.text).empty())) continue;
-        ProfE pe(12);  // PROF-TEMP
         const Motion mo = CaptionMotion(c, t);
         if (mo.alpha <= 0.001) continue;
         if (auto pl = CaptionImage(c, tsize, t, mo.reveal)) PlaceImage(target, *pl->image, pl->rect.Offset(ox, oy), mo);
     }
     for (const auto& m : edit_.marks) {
         if (m.kind != MarkKind::Title || !m.Active(t)) continue;
-        ProfE pe(13);  // PROF-TEMP
         const Motion mo = MotionOf(m, t);
         if (auto card = TitleImage(m, tsize)) PlaceImage(target, *card, {ox, oy, (double)tsize.cx, (double)tsize.cy}, mo);
     }

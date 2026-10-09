@@ -111,6 +111,7 @@ void Bitmap::ReleaseRecycled() {
     }
     for (Bitmap* o : old) delete o;
 }
+
 uint32_t Bitmap::Pixel(int x, int y) const {
     x = std::clamp(x, 0, w_ - 1);
     y = std::clamp(y, 0, h_ - 1);

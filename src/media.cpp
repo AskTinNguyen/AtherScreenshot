@@ -206,8 +206,7 @@ void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
             const __m128i u = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(su, off), two), 2);
             const __m128i v = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(sv, off), two), 2);
             const __m128i uvw = _mm_or_si128(u, _mm_slli_epi32(v, 16));  // U, V as 16-bit pairs
-            const __m128i b = _mm_packus_epi16(uvw, uvw);
-            _mm_storel_epi64((__m128i*)(c + x), b);
+            _mm_storel_epi64((__m128i*)(c + x), _mm_packus_epi16(uvw, uvw));
         }
         for (; x < w; x += 2) {
             int su = 0, sv = 0;
@@ -223,6 +222,7 @@ void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
         }
     }
 }
+
 BitmapPtr RotateBitmap(const Bitmap& src, int degrees) {
     const int w = src.Width(), h = src.Height();
     auto out = degrees == 180 ? Bitmap::Create(w, h) : Bitmap::Create(h, w);
@@ -436,11 +436,12 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
         UINT32 n = 0;
         p_->hardware = SUCCEEDED(enc->GetAttributes(&ea)) && SUCCEEDED(ea->GetStringLength(MFT_ENUM_HARDWARE_URL_Attribute, &n));
     }
-    if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();    if (FAILED(hr)) p_->writer.Reset();
+    if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
+    if (FAILED(hr)) p_->writer.Reset();
     return hr;
 }
 
-// A media buffer over memory someone else owns (kept alive by `owner`), so a frame reaches the encoder uncopied.
+// A media buffer over memory someone else owns (kept alive here), so a frame reaches the encoder uncopied.
 class HeldBuffer : public IMFMediaBuffer {
 public:
     HeldBuffer(std::shared_ptr<const uint8_t> data, DWORD len) : data_(std::move(data)), len_(len) {}
@@ -512,14 +513,6 @@ HRESULT Mp4Writer::WriteFrame(const uint32_t* px, int64_t t, int64_t duration) {
     return hr;
 }
 
-HRESULT Mp4Writer::WriteNv12(const uint8_t* yuv, int64_t t, int64_t duration) {
-    std::lock_guard lock(p_->mu);
-    if (!p_->writer || !p_->nv12) return E_UNEXPECTED;
-    const HRESULT hr = WriteBytes(p_->writer.Get(), p_->video, yuv, (DWORD)((size_t)p_->w * p_->h * 3 / 2), t, duration);
-    if (SUCCEEDED(hr)) ++p_->frames;
-    return hr;
-}
-
 HRESULT Mp4Writer::WriteNv12(std::shared_ptr<const uint8_t> yuv, int64_t t, int64_t duration) {
     std::lock_guard lock(p_->mu);
     if (!p_->writer || !p_->nv12 || !yuv) return E_UNEXPECTED;
@@ -547,17 +540,14 @@ struct Mp4Joiner::Impl {
     std::vector<bool> started;  // a frame of the part copied already
     std::mutex mu;
     DWORD video = 0, audio = 0;
-    int rate = 0, channels = 0;
     int64_t frames = 0;
 };
 
 Mp4Joiner::Mp4Joiner() : p_(std::make_unique<Impl>()) {}
 Mp4Joiner::~Mp4Joiner() = default;
 
-HRESULT Mp4Joiner::Begin(const std::wstring& path, const std::vector<std::wstring>& parts, int audioRate, int audioChannels, const std::wstring& audioPart) {
+HRESULT Mp4Joiner::Begin(const std::wstring& path, const std::vector<std::wstring>& parts, const std::wstring& audioPart) {
     EnsureMediaFoundation();
-    p_->rate = audioRate;
-    p_->channels = audioChannels;
     ComPtr<IMFMediaType> type;  // the first part's, for the joined stream
     std::vector<UINT8> sets;    // its parameter sets: every part must have the same
     HRESULT hr = parts.empty() ? E_INVALIDARG : S_OK;
@@ -598,8 +588,6 @@ HRESULT Mp4Joiner::Begin(const std::wstring& path, const std::vector<std::wstrin
         if (SUCCEEDED(hr)) hr = p_->sound->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, native.Get());  // as stored
         if (SUCCEEDED(hr)) hr = p_->writer->AddStream(native.Get(), &p_->audio);
         if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->audio, native.Get(), nullptr);
-    } else if (SUCCEEDED(hr) && audioRate > 0) {
-        hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio);
     }
     if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
     if (FAILED(hr)) {
@@ -661,12 +649,6 @@ HRESULT Mp4Joiner::CopyFrames(size_t part, int64_t first, int count, int fps) {
         ++p_->frames;
     }
     return S_OK;
-}
-
-HRESULT Mp4Joiner::WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t) {
-    std::lock_guard lock(p_->mu);
-    if (!p_->writer || p_->rate <= 0 || !frames) return E_UNEXPECTED;
-    return WriteBytes(p_->writer.Get(), p_->audio, pcm, frames * p_->channels * 2, t, (int64_t)frames * 10'000'000 / p_->rate);
 }
 
 HRESULT Mp4Joiner::Finalize() {

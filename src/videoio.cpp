@@ -37,8 +37,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace ather {
 
-extern double g_prof[16];  // PROF-TEMP
-
 namespace {
 
 constexpr int kRate = 48000;  // export audio: 48 kHz stereo
@@ -63,8 +61,8 @@ std::wstring HrText(const wchar_t* what, HRESULT hr) {
 // ---------- frames ----------
 
 // YUV → RGB for 8-bit 4:2:0 video, bit for bit the way Media Foundation's own converter does it (which is ~15×
-// slower): 8-bit fixed point; the file's matrix, else BT.709 above 576 rows and BT.601 up to that; studio range unless the file
-// says full; each chroma sample used as is for its 2 × 2 pixels.
+// slower): 8-bit fixed point; the file's matrix, else BT.709 above 576 rows and BT.601 up to that; studio range
+// unless the file says full; each chroma sample used as is for its 2 × 2 pixels.
 struct YuvMatrix {
     int y = 0, rv = 0, gu = 0, gv = 0, bu = 0, yOff = 16;
 };
@@ -211,8 +209,8 @@ void ReleaseRecycledBytes() {
 
 struct VideoFrame::State {
     std::once_flag once;
-    BitmapPtr bgra;            // the picture, once converted (or as decoded, when the decoder made BGRA)
-    Bytes yuv;  // NV12 until converted: w × h luma, then the chroma rows, `pitch` bytes each
+    BitmapPtr bgra;  // the picture, once converted (or as decoded, when the decoder made BGRA)
+    Bytes yuv;       // NV12 until converted: w × h luma, then the chroma rows, `pitch` bytes each
     int pitch = 0, w = 0, h = 0;
     YuvMatrix matrix;
     int rotation = 0;  // applied on conversion
@@ -369,6 +367,7 @@ bool VideoReader::Impl::Open(const std::wstring& path, bool convert, Gpu* withGp
     if (gpu) slots.resize(kGpuAhead + 1);
     return SUCCEEDED(hr) && w > 0 && h > 0;
 }
+
 bool VideoReader::Seek(double t) {
     if (!p_->reader) return false;
     p_->pending.clear();  // decoded ahead of the old position
@@ -418,7 +417,8 @@ bool VideoReader::Impl::Next() {
         if (FAILED(reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) return false;
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
             ComPtr<IMFMediaType> cur;
-            if (SUCCEEDED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur))) MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &cw, &ch);
+            if (SUCCEEDED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)))
+                MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &cw, &ch);
         }
         if (!s) {
             if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) return false;
@@ -469,12 +469,7 @@ VideoFrame VideoReader::Impl::Download(int slot) {
     D3D11_TEXTURE2D_DESC d{};
     tex->GetDesc(&d);
     D3D11_MAPPED_SUBRESOURCE m{};
-    ULONG64 c0, c1;  // PROF-TEMP
-    QueryThreadCycleTime(GetCurrentThread(), &c0);  // PROF-TEMP
-    const HRESULT mhr = gpu->ctx->Map(tex, 0, D3D11_MAP_READ, 0, &m);
-    QueryThreadCycleTime(GetCurrentThread(), &c1);  // PROF-TEMP
-    g_prof[15] += (c1 - c0) / 1e9;  // PROF-TEMP
-    if (FAILED(mhr)) return {};
+    if (FAILED(gpu->ctx->Map(tex, 0, D3D11_MAP_READ, 0, &m))) return {};
     // Kept compact until converted: w × h luma, then the chroma rows (after all the texture's luma rows).
     auto st = std::make_shared<VideoFrame::State>();
     const int fw = (int)w, fh = (int)h, cp = (fw + 1) & ~1;
@@ -548,6 +543,7 @@ VideoFrame VideoReader::Impl::FromBuffer(IMFMediaBuffer* buffer) {
     else buf->Unlock();
     return ok ? VideoFrame(std::move(st)) : VideoFrame();
 }
+
 // ---------- sequences ----------
 
 bool AudioDecodes(const std::wstring& path);
@@ -889,8 +885,7 @@ public:
     }
 
     // Writes audio up to `target` output frames, padding with silence when the source runs out.
-    template <class Writer>
-    HRESULT WriteUntil(Writer& w, int64_t target) {
+    HRESULT WriteUntil(Mp4Writer& w, int64_t target) {
         std::vector<int16_t> pcm;
         while (written_ < target) {
             const int64_t n = std::min<int64_t>(1024, target - written_);
@@ -953,6 +948,7 @@ private:
     bool eof_ = false, quit_ = false;
     int64_t written_ = 0;
 };
+
 }  // namespace
 
 bool AudioDecodes(const std::wstring& path) {
@@ -1054,8 +1050,6 @@ void TimeStretch::Run(bool final, std::vector<float>& out) {
 
 // ---------- export ----------
 
-extern double g_prof[16];  // PROF-TEMP
-struct ProfT { int i; ULONG64 a; ProfT(int k) : i(k) { QueryThreadCycleTime(GetCurrentThread(), &a); } ~ProfT() { ULONG64 b; QueryThreadCycleTime(GetCurrentThread(), &b); g_prof[i] += double(b - a) / 1e9; } };  // PROF-TEMP
 namespace {
 
 // The edited video's frames in output order: output time i/fps shows the source frame at
@@ -1105,14 +1099,12 @@ public:
         return (bool)*src;
     }
     BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
-        ProfT pt(2);  // PROF-TEMP
         const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
         return renderer_->Render(f, st, alone);
     }
 
 private:
     void Advance(double skipTo = -1e300) {
-        ProfT pt(0);  // PROF-TEMP
         double t = 0;
         if (!reader_.ReadFrame(&next_, &t, skipTo)) next_ = {};
         nextT_ = t;
@@ -1246,6 +1238,7 @@ private:
     WorkerPool& pool_;
     std::shared_ptr<Shared> s_;
 };
+
 // Workers and frames in flight for an export of `px`-pixel frames: enough to keep the cores busy, few enough that
 // the frames in flight stay within ~600 MB (less on a PC with under 10 GB).
 std::pair<int, size_t> ExportWorkers(SIZE px) {
@@ -1259,9 +1252,8 @@ std::pair<int, size_t> ExportWorkers(SIZE px) {
 }
 
 // Makes output frames first…end−1 on worker threads (`make` turns a source frame, its time and whether it's shown
-// alone into one) and hands
-// them to `use` in order, on this thread, while another thread decodes ahead. Stops when `use` returns false or
-// a frame can't be made. With `shared`, on that pool, alongside `share` − 1 others (they split the frames in flight).
+// alone into one) and hands them to `use` in order, on this thread, while another thread decodes ahead. Stops when
+// `use` returns false or a frame can't be made. With `shared`, on that pool, alongside `share` − 1 others (they split the frames in flight).
 // Decoding and handing over are one thread each, so they go before the renderers: above normal priority.
 template <class T>
 void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(const VideoFrame&, double, bool)>& make,
@@ -1286,23 +1278,23 @@ void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(
     });
     T f{};
     for (int i = first; work.Pop(&f); ++i) {
-        ProfT pt(7);  // PROF-TEMP
         if (!f || !use(i, f)) break;
     }
     work.Stop();
     reader.join();
     SetThreadPriority(GetCurrentThread(), oldPrio);
 }
+
 // An output frame ready for the encoder (and, for --bench-export's tap, as rendered).
 struct EncoderFrame {
     Bytes nv12;
     BitmapPtr bgra;
     explicit operator bool() const { return nv12 != nullptr; }
 };
+
 }  // namespace
 
 std::function<void(int, const Bitmap&)> g_exportTap;
-double g_prof[16];  // PROF-TEMP
 
 namespace {
 
@@ -1313,14 +1305,13 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
         const BitmapPtr f = frames.Render(src, st, alone);
         if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
         ef.nv12 = RecycledBytes((size_t)sz.cx * sz.cy * 3 / 2);
-        { ProfT pt(1); BgraToNv12(f->Bits(), sz.cx, sz.cy, ef.nv12->data()); }  // PROF-TEMP
+        BgraToNv12(f->Bits(), sz.cx, sz.cy, ef.nv12->data());
         if (g_exportTap) ef.bgra = f;
         return ef;
     };
 }
 
 bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress) {
-    LARGE_INTEGER q0, q1, q2, q3, q4, qf; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&qf);  // PROF-TEMP
     const int fps = (int)std::lround(seq.Fps());
     const SIZE sz = FrameRenderer(e, seq.size, false).Out();
     std::unique_ptr<AudioPipe> audio;
@@ -1341,7 +1332,6 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
         if (SUCCEEDED(begun.get())) w.Finalize();
         return false;
     }
-    QueryPerformanceCounter(&q1);  // PROF-TEMP
     HRESULT hr = S_OK;
     bool started = false;
     auto start = [&] {
@@ -1350,14 +1340,13 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
         if (FAILED(hr = begun.get()) && error) *error = HrText(L"Can't start the MP4 encoder", hr);
         return SUCCEEDED(hr);
     };
-    QueryPerformanceCounter(&q2);  // PROF-TEMP
     const int n = frames.Count(true);
     const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
     bool cancelled = false;
     ExportFrames<EncoderFrame>(frames, 0, n, Mp4Frames(frames, sz), [&](int i, EncoderFrame& f) {
         if (!start()) return false;
         if (g_exportTap) g_exportTap(i, *f.bgra);
-        { ProfT pt(3); hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
+        hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps));
         f = {};
         if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
         if (FAILED(hr)) return false;
@@ -1371,10 +1360,8 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
         return false;
     }
     if (audio) hr = audio->WriteUntil(w, audioTotal);
-    QueryPerformanceCounter(&q3);  // PROF-TEMP
-    { ProfT pt(5); const HRESULT fin = w.Finalize(); if (SUCCEEDED(hr)) hr = fin; }  // PROF-TEMP
-    QueryPerformanceCounter(&q4);  // PROF-TEMP
-    { char b[200]; auto s = [&](LARGE_INTEGER a, LARGE_INTEGER z) { return double(z.QuadPart - a.QuadPart) / qf.QuadPart; }; sprintf_s(b, "          [single: open %.3f begin %.3f frames %.3f finalize %.3f]\n", s(q0, q1), s(q1, q2), s(q2, q3), s(q3, q4)); test::Out(b); }  // PROF-TEMP
+    const HRESULT fin = w.Finalize();
+    if (SUCCEEDED(hr)) hr = fin;
     if (FAILED(hr) && error) *error = HrText(L"Couldn't finish the MP4", hr);
     return SUCCEEDED(hr);
 }
@@ -1401,7 +1388,6 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     const int n = std::max(1, (int)std::ceil(e.OutputDuration() * fps - 1e-6));  // as EditFrames::Count(true)
     const int want = EncodersFor(n, fps);
     if (want < 2 || seq.clips.empty()) return Outcome::Retry;
-    LARGE_INTEGER q0, q1, q2, q3, qf; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&qf);  // PROF-TEMP
     std::vector<std::unique_ptr<Mp4Writer>> writers;
     std::vector<std::wstring> parts;
     {  // started side by side (each takes a moment)
@@ -1435,7 +1421,6 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
         removeParts();
         return Outcome::Retry;
     }
-    QueryPerformanceCounter(&q1);  // PROF-TEMP
     std::unique_ptr<AudioPipe> audio;
     if (!e.muted && seq.HasAudio()) {
         audio = std::make_unique<AudioPipe>();
@@ -1502,7 +1487,6 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     for (auto& t : pieces) t.join();
     if (cancelled) stop = true;
     if (sound.joinable()) sound.join();
-    QueryPerformanceCounter(&q2);  // PROF-TEMP
     writers.clear();  // finalized by their threads
     auto removeFiles = [&] {
         for (const auto& p : parts) DeleteFileW(p.c_str());
@@ -1522,7 +1506,7 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     }
     // Joined a second at a time, with the sound in between (the writer won't let one stream run far ahead).
     Mp4Joiner j;
-    HRESULT hr = j.Begin(out, parts, 0, 2, audio ? soundPart : std::wstring());
+    HRESULT hr = j.Begin(out, parts, audio ? soundPart : std::wstring());
     for (int s = 0; s < k && SUCCEEDED(hr); ++s)
         for (int first = from[s]; SUCCEEDED(hr) && first < from[s + 1]; first += fps) {
             const int count = std::min(fps, from[s + 1] - first);
@@ -1531,8 +1515,6 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
         }
     if (SUCCEEDED(hr) && audio) hr = j.CopyAudio(INT64_MAX);
     const HRESULT fin = j.Finalize();
-    QueryPerformanceCounter(&q3);  // PROF-TEMP
-    { char b[160]; sprintf_s(b, "          [pieces: begin %.2f s, encode %.2f s, join %.2f s]\n", double(q1.QuadPart - q0.QuadPart) / qf.QuadPart, double(q2.QuadPart - q1.QuadPart) / qf.QuadPart, double(q3.QuadPart - q2.QuadPart) / qf.QuadPart); test::Out(b); }  // PROF-TEMP
     removeFiles();
     if (FAILED(hr) || FAILED(fin)) {
         DeleteFileW(out.c_str());
@@ -1542,15 +1524,16 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     g_joined = k;
     return Outcome::Done;
 }
-}  // namespace
 
-// The memory kept for the next frames once an export is over.
+// Frees the memory kept for the next frames once an export is over.
 struct ReleaseFrameMemory {
     ~ReleaseFrameMemory() {
         Bitmap::ReleaseRecycled();
         ReleaseRecycledBytes();
     }
 };
+
+}  // namespace
 
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
     ReleaseFrameMemory release;
@@ -1563,6 +1546,7 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     }
     return ExportMp4Single(seq, e, out, error, progress);
 }
+
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps, ExportProgress progress) {
     ReleaseFrameMemory release;
     EditFrames frames;
@@ -1592,7 +1576,7 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
         ExportFrames<GifFrame>(frames, 0, n, make, [&](int i, GifFrame& f) {
             if (g_exportTap) g_exportTap(i, *f.bgra);
             const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
-            { ProfT pt(6); hr = g.AddQuantized(*f.q, delay); }  // PROF-TEMP
+            hr = g.AddQuantized(*f.q, delay);
             cancelled = SUCCEEDED(hr) && progress && !progress((i + 1.0) / n);
             return SUCCEEDED(hr) && !cancelled;
         });
@@ -2264,9 +2248,9 @@ ATHER_TEST(video_export_trim_speed_crop_captions) {
     CHECK(ImageSize(gif, &gw, &gh) && gw == 320 && gh == 200);
 }
 
-// A longer export goes to several encoders a second at a time (where the GPU has them) and comes out joined in
+// A longer export is made in pieces on several encoders at once (where the GPU has them) and comes out joined in
 // order: every second in its place, all the frames and sound, nothing left behind. The single encoder too.
-ATHER_TEST(video_export_joins_seconds_from_several_encoders) {
+ATHER_TEST(video_export_joins_pieces_from_several_encoders) {
     const std::wstring dir = test::TempDir();
     const std::wstring clip = dir + L"\\clip.mp4";
     CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));  // red, green, blue, red… a second each
@@ -2279,7 +2263,7 @@ ATHER_TEST(video_export_joins_seconds_from_several_encoders) {
         const bool ok = ExportMp4(clip, e, out, &err);
         test::Note("encoders " + ToUtf8(encoders) + ": " + ToUtf8(err));
         CHECK(ok);
-        test::Out("  (" + ToUtf8(encoders) + " wanted: joined from " + std::to_string(g_joined.load()) + " encoders)\n");
+        test::Out("  (" + ToUtf8(encoders) + " encoders wanted, " + std::to_string(std::max(1, g_joined.load())) + " used)\n");
         CHECK(wcscmp(encoders, L"1") != 0 || g_joined == 0);
         VideoInfo vi;
         CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 9) < 0.1 && vi.w == 640 && vi.h == 360 && vi.hasAudio);

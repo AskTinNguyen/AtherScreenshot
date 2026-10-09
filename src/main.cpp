@@ -1342,7 +1342,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool editVideo = n >= 3 && _wcsicmp(av[1], L"--edit-video") == 0;
         const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps || videoSnaps || editVideo) && n >= 3 ? av[2] : L"";
         std::vector<std::wstring> bench;
-        if (n >= 3 && (_wcsicmp(av[1], L"--bench-export") == 0 || _wcsicmp(av[1], L"--bench-compare") == 0 || _wcsicmp(av[1], L"--bench-decode") == 0 || _wcsicmp(av[1], L"--bench-color") == 0 || _wcsicmp(av[1], L"--bench-rgb2yuv") == 0 || _wcsicmp(av[1], L"--bench-encode") == 0 || _wcsicmp(av[1], L"--bench-render") == 0)) bench.assign(av + 1, av + n);
+        if (n >= 3 && (_wcsicmp(av[1], L"--bench-export") == 0 || _wcsicmp(av[1], L"--bench-compare") == 0)) bench.assign(av + 1, av + n);
         LocalFree(av);
         if (!bench.empty()) return VideoBench(bench);  // developer tool, see videobench.cpp
         if (writeIcon) return ok ? 0 : 1;

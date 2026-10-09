@@ -6,9 +6,10 @@
 
 namespace ather {
 
-// Video in and out for the video editor: Media Foundation decoding (Source Reader), export through the frame
-// renderer to H.264/AAC MP4 or GIF, a pitch-keeping speed change for the audio, preview playback
-// (IMFMediaEngine in frame-server mode) and on-device speech-to-text (SAPI dictation).
+// Video in and out for the video editor: Media Foundation decoding (Source Reader, on the GPU where it can), export
+// through the frame renderer to H.264/AAC MP4 or GIF (frames made on worker threads; long MP4s in two pieces on two
+// encoders at once), a pitch-keeping speed change for the audio, preview playback (IMFMediaEngine in frame-server
+// mode) and on-device speech-to-text (SAPI dictation).
 
 // A decoded frame that turns into opaque top-down BGRA only when asked: an export skips the frames it doesn't
 // use and converts the others on its worker threads. Copies share one conversion; Bgra is thread-safe.
