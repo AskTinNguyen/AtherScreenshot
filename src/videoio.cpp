@@ -953,7 +953,7 @@ public:
     HRESULT WriteUntil(Mp4Writer& w, int64_t target) {
         std::vector<int16_t> pcm;
         while (written_ < target) {
-            const int64_t n = std::min<int64_t>(1024, target - written_);
+            const int64_t n = std::min<int64_t>(kRate, target - written_);  // in big writes: the encoder takes small ones slowly
             pcm.assign((size_t)n * 2, 0);
             {
                 std::unique_lock l(mu_);
@@ -1505,11 +1505,12 @@ enum class Outcome { Done, Failed, Retry };  // Retry: this way doesn't work her
 std::atomic<int> g_joined{0};  // encoders the last export's video was joined from (0: one encoder), for the tests
 
 // Encoders for an export of `n` frames at `fps`: two from three seconds on (shorter, starting the second one costs
-// what it saves), three from fifteen (measured on an RTX 5090 with --bench-export: at 10 s two beat three, at 20 s
-// three beat two).
+// what it saves), three from fifteen, four from forty (measured on an RTX 5090 with --bench-export: at 10 s two beat
+// three, at 20 s three beat two, at 74 s four beat three by 13%; a GPU's sessions share its encoders, but each
+// session also waits on its own frames).
 int EncodersFor(int n, int fps) {
     if (g_exportEncoders > 0) return g_exportEncoders;
-    return n >= 15 * fps ? 3 : n >= 3 * fps ? 2 : 1;
+    return n >= 40 * fps ? 4 : n >= 15 * fps ? 3 : n >= 3 * fps ? 2 : 1;
 }
 
 // Encoding is what holds a plain export back: a hardware encoder does ~300–450 frames a second, and a GPU often
