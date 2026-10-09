@@ -91,6 +91,19 @@ YuvMatrix MatrixFor(IMFMediaType* native, UINT32 height) {
     return x;
 }
 
+bool operator==(const YuvMatrix& a, const YuvMatrix& b) {
+    return a.y == b.y && a.rv == b.rv && a.gu == b.gu && a.gv == b.gv && a.bu == b.bu && a.yOff == b.yOff;
+}
+
+// The coefficients for unmarked studio-range video: BT.709 (hd) or BT.601.
+YuvMatrix StudioMatrix(bool hd) {
+    ComPtr<IMFMediaType> t;
+    MFCreateMediaType(&t);
+    t->SetUINT32(MF_MT_YUV_MATRIX, hd ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601);
+    t->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    return MatrixFor(t.Get(), hd ? 720 : 480);
+}
+
 inline uint32_t Clamp8(int v) { return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
 // NV12 (`w` × `h`, rows `pitch` bytes apart, chroma plane at `uv`) → opaque BGRA.
@@ -1098,6 +1111,16 @@ public:
         shown_ = *src;
         return (bool)*src;
     }
+    // The source frame as the encoder's NV12 when the export shows it as it is (no edit at `st`, the same size,
+    // and colors the encoder side reads the same way: the matrix BgraToNv12 would use, studio range), else null.
+    // Then nothing is converted, and the frame keeps its colors exactly instead of going through RGB and back.
+    Bytes Passthrough(const VideoFrame& src, double st) const {
+        const VideoFrame::State* s = src.state();
+        if (!s || !s->yuv || s->rotation || s->w != s->fit.cx || s->h != s->fit.cy || (s->w & 1) || (s->h & 1) || s->pitch != s->w) return nullptr;
+        static const YuvMatrix hd = StudioMatrix(true), sd = StudioMatrix(false);
+        if (!(s->matrix == (s->h > 576 ? hd : sd)) || !renderer_->Untouched(st)) return nullptr;
+        return s->yuv;
+    }
     BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
         const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
         return renderer_->Render(f, st, alone);
@@ -1302,6 +1325,10 @@ namespace {
 auto Mp4Frames(EditFrames& frames, SIZE sz) {
     return [&frames, sz](const VideoFrame& src, double st, bool alone) {
         EncoderFrame ef;
+        if ((ef.nv12 = frames.Passthrough(src, st))) {  // shown as decoded: straight to the encoder
+            if (g_exportTap) ef.bgra = src.Bgra();
+            return ef;
+        }
         const BitmapPtr f = frames.Render(src, st, alone);
         if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
         ef.nv12 = RecycledBytes((size_t)sz.cx * sz.cy * 3 / 2);
@@ -1371,11 +1398,11 @@ enum class Outcome { Done, Failed, Retry };  // Retry: this way doesn't work her
 std::atomic<int> g_joined{0};  // encoders the last export's video was joined from (0: one encoder), for the tests
 
 // Encoders for an export of `n` frames at `fps`: two from eight seconds on (shorter, starting the second one and
-// joining cost what it saves). A third gains little more on plain exports and costs on ones with edits (measured
-// on an RTX 5090 with --bench-export).
+// joining cost what it saves), three from a minute (on shorter ones a third costs about what it gains; measured on an
+// RTX 5090 with --bench-export).
 int EncodersFor(int n, int fps) {
     if (wchar_t v[8]; GetEnvironmentVariableW(L"ATHER_ENCODERS", v, 8)) return std::max(1, _wtoi(v));  // developer switch (--bench-export)
-    return n >= 8 * fps ? 2 : 1;
+    return n >= 60 * fps ? 3 : n >= 8 * fps ? 2 : 1;
 }
 
 // Encoding is what holds a plain export back: a hardware encoder does ~300–450 frames a second, and a GPU often

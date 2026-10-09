@@ -117,6 +117,11 @@ std::vector<Scenario> Scenarios(const Clip& c) {
         s.edit.speed = 2;
         out.push_back(s);
     }
+    if (D >= 40) {  // a whole long recording, as it is
+        Scenario s{L"long", false, {}};
+        s.edit.trimEnd = D;
+        out.push_back(s);
+    }
     {
         Scenario s{L"gif", true, {}};
         s.edit.trimEnd = std::min(D, 8.0);

@@ -174,6 +174,9 @@ public:
     // `owned`: nothing else will look at `src` again, so it can be drawn on instead of a copy of it.
     BitmapPtr Render(const BitmapPtr& src, double t, bool owned = false) const;
 
+    // An export frame at `t` is the source frame as it is: no edit shows, and nothing is cropped or zoomed.
+    bool Untouched(double t) const;
+
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
     Motion MotionOf(const Mark& m, double t) const;

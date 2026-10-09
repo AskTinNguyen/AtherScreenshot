@@ -800,6 +800,15 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     return img;
 }
 
+bool FrameRenderer::Untouched(double t) const {
+    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy) return false;
+    for (const auto& m : edit_.marks)
+        if (m.Active(t) && m.kind != MarkKind::Zoom) return false;
+    for (const auto& c : edit_.captions)
+        if (c.Active(t) && !Trimmed(c.text).empty()) return false;
+    return ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy};
+}
+
 VRect FrameRenderer::ViewRect(double t) const {
     if (preview_ && !zoomInPreview) return view_;
     const Mark* z = nullptr;
