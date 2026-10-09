@@ -91,6 +91,17 @@ YuvMatrix MatrixFor(IMFMediaType* native, UINT32 height) {
     return x;
 }
 
+// Whether the file's video is stored as 8-bit 4:2:0, so its NV12 is the decoder's own pictures. Others (MJPEG's
+// 4:2:2, raw RGB, 10-bit HEVC) keep Media Foundation's RGB, as before.
+bool Is420(IMFMediaType* native) {
+    GUID sub{};
+    if (FAILED(native->GetGUID(MF_MT_SUBTYPE, &sub))) return false;
+    if (sub == MFVideoFormat_HEVC || sub == MFVideoFormat_HEVC_ES)
+        return MFGetAttributeUINT32(native, MF_MT_MPEG2_PROFILE, 1) == 1;  // Main (eAVEncH265VProfile_Main_420_8)
+    return sub == MFVideoFormat_H264 || sub == MFVideoFormat_H264_ES || sub == MFVideoFormat_VP80 ||
+           sub == MFVideoFormat_VP90 || sub == MFVideoFormat_AV1;
+}
+
 bool operator==(const YuvMatrix& a, const YuvMatrix& b) {
     return a.y == b.y && a.rv == b.rv && a.gu == b.gu && a.gv == b.gv && a.bu == b.bu && a.yOff == b.yOff;
 }
@@ -253,7 +264,7 @@ namespace {
 
 // The GPU every reader decodes on: hardware decoding takes a fraction of the CPU Media Foundation's software
 // decoder does (~1.5 vs ~10 ms a frame at 1080p), which leaves the cores to an export's renderers. H.264 decoding
-// is exact, so the frames are the same. Null when there is no hardware device (or ATHER_NO_GPU_DECODE is set).
+// is exact, so the frames are the same. Null when there is no hardware device (or g_noGpuDecode was set first).
 struct Gpu {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
@@ -262,7 +273,7 @@ struct Gpu {
 
 Gpu* SharedGpu() {
     static Gpu* const gpu = []() -> Gpu* {
-        if (GetEnvironmentVariableW(L"ATHER_NO_GPU_DECODE", nullptr, 0)) return nullptr;
+        if (g_noGpuDecode) return nullptr;
         EnsureMediaFoundation();
         auto g = std::make_unique<Gpu>();
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
@@ -305,8 +316,12 @@ struct VideoReader::Impl {
     };
     std::deque<Pending> pending;
     bool eof = false;
+    std::wstring file;
+    double from = -1e300, last = -1e300;  // where it was last sought, the last frame given since
+    bool lost = false;                    // a frame couldn't be read back off the GPU
 
     bool Open(const std::wstring& path, bool convert, Gpu* gpu);
+    bool Read(VideoFrame* frame, double* t, SIZE fit, double skipTo);  // as ReadFrame
     bool Next();  // decodes one more frame into `pending`; false at the end
     VideoFrame FromBuffer(IMFMediaBuffer* buf);
     VideoFrame Download(int slot);
@@ -337,6 +352,7 @@ bool VideoReader::Impl::Open(const std::wstring& path, bool convert, Gpu* withGp
     if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &reader);
     if (FAILED(hr)) return false;
     gpu = withGpu;
+    file = path;
     IMFSourceReader* r = reader.Get();
     PROPVARIANT var;
     PropVariantInit(&var);
@@ -358,9 +374,9 @@ bool VideoReader::Impl::Open(const std::wstring& path, bool convert, Gpu* withGp
     if (rotation % 90) rotation = 0;
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
     r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-    // NV12 straight from the decoder when it can (interlaced video keeps Media Foundation's deinterlacing).
+    // NV12 straight from the decoder when it can (4:2:0 video; interlaced video keeps Media Foundation's deinterlacing).
     const UINT32 interlace = MFGetAttributeUINT32(native.Get(), MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    if (convert && (interlace == MFVideoInterlace_Progressive || interlace == MFVideoInterlace_MixedInterlaceOrProgressive)) {
+    if (convert && Is420(native.Get()) && (interlace == MFVideoInterlace_Progressive || interlace == MFVideoInterlace_MixedInterlaceOrProgressive)) {
         ComPtr<IMFMediaType> type;
         nv12 = SUCCEEDED(MFCreateMediaType(&type)) && SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
                SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) &&
@@ -386,6 +402,8 @@ bool VideoReader::Seek(double t) {
     p_->pending.clear();  // decoded ahead of the old position
     for (auto& s : p_->slots) s.busy = false;
     p_->eof = false;
+    p_->from = t;
+    p_->last = -1e300;
     return SetPosition(p_->reader.Get(), t);
 }
 
@@ -397,8 +415,26 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
 }
 
 bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit, double skipTo) {
-    Impl& p = *p_;
-    if (!p.reader) return false;
+    if (!p_->reader) return false;
+    if (p_->Read(frame, t, fit, skipTo)) return true;
+    if (!p_->gpu || (!p_->lost && p_->gpu->dev->GetDeviceRemovedReason() == S_OK)) return false;  // the end
+    // The GPU stopped giving frames (its driver restarted, say): on from the last one given, decoded without it.
+    auto fresh = std::make_unique<Impl>();
+    if (!fresh->Open(p_->file, true, nullptr)) return false;
+    const double from = p_->from, after = p_->last;
+    p_ = std::move(fresh);
+    if (from > -1e300) Seek(from);
+    double ts = 0;
+    while (p_->Read(frame, &ts, fit, std::max(skipTo, after + 1e-4)))
+        if (ts > after + 1e-4) {
+            *t = p_->last = ts;
+            return true;
+        }
+    return false;
+}
+
+bool VideoReader::Impl::Read(VideoFrame* frame, double* t, SIZE fit, double skipTo) {
+    Impl& p = *this;
     // A frame or more ahead, so it's known whether the next one supersedes this one.
     while (!p.eof && p.pending.size() < (p.gpu ? kGpuAhead : 2))
         if (!p.Next()) p.eof = true;
@@ -410,6 +446,7 @@ bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit, double skipT
         f = VideoFrame(std::make_shared<VideoFrame::State>());  // superseded: no picture
     } else if (next.slot >= 0) {
         f = p.Download(next.slot);
+        p.lost = !f;
     } else {
         ComPtr<IMFMediaBuffer> buf;
         if (SUCCEEDED(next.decoded->ConvertToContiguousBuffer(&buf))) f = p.FromBuffer(buf.Get());
@@ -418,7 +455,7 @@ bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit, double skipT
     if (!f) return false;
     f.state()->fit = fit;  // nobody else has the frame yet
     *frame = f;
-    *t = next.t;
+    *t = p.last = next.t;
     return true;
 }
 
@@ -1070,7 +1107,9 @@ namespace {
 // as it goes, converting nothing); Render makes the frame, on any thread.
 class EditFrames {
 public:
-    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error) {
+    // From output frame `first` on (asked in order): reading from a second before it (for an export in pieces), from
+    // where Next picks the same source frames as when reading from the start.
+    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error, int first = 0) {
         if (!reader_.Open(seq)) {
             if (error) *error = L"Can't read this video.";
             return false;
@@ -1078,7 +1117,7 @@ public:
         e_ = e;
         fps_ = fps;
         renderer_ = std::make_unique<FrameRenderer>(e, reader_.Size(), false);
-        reader_.Seek(e.trimStart);
+        reader_.Seek(std::max(e.trimStart, e.trimStart + first / fps * e.speed - 1.0));
         Advance();
         return true;
     }
@@ -1088,14 +1127,6 @@ public:
     int Count(bool roundUp) const {
         const double n = e_.OutputDuration() * fps_;
         return std::max(1, roundUp ? (int)std::ceil(n - 1e-6) : (int)std::floor(n + 1e-6));
-    }
-
-    // Reads on from a second before output frame `i` (for an export in pieces): from there Next picks the same
-    // source frames as when reading from the start.
-    void StartAt(int i) {
-        reader_.Seek(std::max(e_.trimStart, e_.trimStart + i / fps_ * e_.speed - 1.0));
-        cur_ = {};
-        Advance();
     }
 
     // The source frame of output frame `i` (asked in order) and its source time.
@@ -1358,6 +1389,8 @@ struct EncoderFrame {
 }  // namespace
 
 std::function<void(int, const Bitmap&)> g_exportTap;
+std::atomic<int> g_exportEncoders{0};
+bool g_noGpuDecode = false;
 
 namespace {
 
@@ -1437,6 +1470,21 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
     return SUCCEEDED(hr);
 }
 
+// Whether this PC encodes H.264 on a GPU (else several encoders at once only share the cores the renderers use).
+bool HardwareH264Encoder() {
+    static const bool has = [] {
+        EnsureMediaFoundation();
+        const MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, MFVideoFormat_NV12}, out{MFMediaType_Video, MFVideoFormat_H264};
+        IMFActivate** found = nullptr;
+        UINT32 n = 0;
+        if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out, &found, &n))) return false;
+        for (UINT32 i = 0; i < n; ++i) found[i]->Release();
+        CoTaskMemFree(found);
+        return n > 0;
+    }();
+    return has;
+}
+
 enum class Outcome { Done, Failed, Retry };  // Retry: this way doesn't work here, export the usual way
 
 std::atomic<int> g_joined{0};  // encoders the last export's video was joined from (0: one encoder), for the tests
@@ -1445,7 +1493,7 @@ std::atomic<int> g_joined{0};  // encoders the last export's video was joined fr
 // joining cost what it saves), three from a minute (on shorter ones a third costs about what it gains; measured on an
 // RTX 5090 with --bench-export).
 int EncodersFor(int n, int fps) {
-    if (wchar_t v[8]; GetEnvironmentVariableW(L"ATHER_ENCODERS", v, 8)) return std::max(1, _wtoi(v));  // developer switch (--bench-export)
+    if (g_exportEncoders > 0) return g_exportEncoders;
     return n >= 60 * fps ? 3 : n >= 8 * fps ? 2 : 1;
 }
 
@@ -1458,7 +1506,7 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     const SIZE sz = FrameRenderer(e, seq.size, false).Out();
     const int n = std::max(1, (int)std::ceil(e.OutputDuration() * fps - 1e-6));  // as EditFrames::Count(true)
     const int want = EncodersFor(n, fps);
-    if (want < 2 || seq.clips.empty()) return Outcome::Retry;
+    if (want < 2 || seq.clips.empty() || !HardwareH264Encoder()) return Outcome::Retry;
     std::vector<std::unique_ptr<Mp4Writer>> writers;
     std::vector<std::wstring> parts;
     {  // started side by side (each takes a moment)
@@ -1522,15 +1570,14 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     std::vector<HRESULT> result((size_t)k, S_OK);
     std::atomic<int> done{0};
     std::mutex progressMu;  // progress hears from one piece at a time
-    bool cancelled = false;
+    std::atomic<bool> cancelled{false};
     WorkerPool pool(ExportWorkers({std::max(sz.cx, seq.size.cx), std::max(sz.cy, seq.size.cy)}).first);  // the renderers, for all the pieces
     std::vector<std::thread> pieces;
     for (int s = 0; s < k; ++s)
         pieces.emplace_back([&, s] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             EditFrames frames;
-            HRESULT hr = frames.Open(seq, e, fps, nullptr) ? S_OK : E_FAIL;
-            if (SUCCEEDED(hr) && s > 0) frames.StartAt(from[s]);
+            HRESULT hr = frames.Open(seq, e, fps, nullptr, from[s]) ? S_OK : E_FAIL;
             Mp4Writer& w = *writers[s];
             if (SUCCEEDED(hr))
                 ExportFrames<EncoderFrame>(frames, from[s], from[s + 1], Mp4Frames(frames, sz), [&](int i, EncoderFrame& ef) {
@@ -1610,12 +1657,15 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     ReleaseFrameMemory release;
     const Sequence seq = SequenceOf(source, e);
     g_joined = 0;
-    switch (ExportMp4Parallel(seq, e, out, error, progress)) {
+    double shown = 0;  // by the try in pieces: the usual way carries on from there rather than going back
+    const ExportProgress tracked = progress ? ExportProgress([&](double p) { return progress(shown = p); }) : ExportProgress();
+    switch (ExportMp4Parallel(seq, e, out, error, tracked)) {
         case Outcome::Done: return true;
         case Outcome::Failed: return false;
         case Outcome::Retry: break;
     }
-    return ExportMp4Single(seq, e, out, error, progress);
+    if (shown <= 0) return ExportMp4Single(seq, e, out, error, progress);
+    return ExportMp4Single(seq, e, out, error, [&](double p) { return progress(shown + (1 - shown) * p); });
 }
 
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps, ExportProgress progress) {
@@ -2326,7 +2376,7 @@ ATHER_TEST(video_export_joins_pieces_from_several_encoders) {
     const std::wstring clip = dir + L"\\clip.mp4";
     CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));  // red, green, blue, red… a second each
     for (const wchar_t* encoders : {L"3", L"1"}) {
-        SetEnvironmentVariableW(L"ATHER_ENCODERS", encoders);
+        g_exportEncoders = _wtoi(encoders);
         const std::wstring out = dir + L"\\out" + encoders + L".mp4";
         VideoEdit e;
         e.trimEnd = 9;
@@ -2353,7 +2403,7 @@ ATHER_TEST(video_export_joins_pieces_from_several_encoders) {
         CHECK_EQ(wrong, 0);
         for (int i = 0; i < 3; ++i) CHECK(GetFileAttributesW((out + L".part" + std::to_wstring(i) + L".mp4").c_str()) == INVALID_FILE_ATTRIBUTES);
     }
-    SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
+    g_exportEncoders = 0;
 }
 
 // An export in pieces shows exactly the frames one pass does, also where a piece starts inside a later clip of a
@@ -2391,7 +2441,7 @@ ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
                 if (hashes.size() <= (size_t)i) hashes.resize((size_t)i + 1);
                 hashes[i] = h;
             };
-            SetEnvironmentVariableW(L"ATHER_ENCODERS", encoders);
+            g_exportEncoders = _wtoi(encoders);
             std::wstring err;
             const std::wstring out = dir + L"\\out" + encoders + L".mp4";
             CHECK(ExportMp4(L"", e, out, &err));
@@ -2404,7 +2454,7 @@ ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
             CHECK(hashes == first);
         }
     }
-    SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
+    g_exportEncoders = 0;
 }
 
 // A frame whose edits change only parts of it gets just those converted and drawn on: there it is byte for byte the
@@ -2532,7 +2582,7 @@ ATHER_TEST(video_export_cancels_cleanly) {
     const std::wstring clip = dir + L"\\clip.mp4";
     CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));
     for (const wchar_t* encoders : {L"2", L"1"}) {
-        SetEnvironmentVariableW(L"ATHER_ENCODERS", encoders);
+        g_exportEncoders = _wtoi(encoders);
         const std::wstring out = dir + L"\\out" + encoders + L".mp4";
         VideoEdit e;
         e.trimEnd = 9;
@@ -2548,7 +2598,7 @@ ATHER_TEST(video_export_cancels_cleanly) {
         for (const wchar_t* part : {L".part0.mp4", L".part1.mp4", L".sound.mp4"})
             CHECK(GetFileAttributesW((out + part).c_str()) == INVALID_FILE_ATTRIBUTES);
     }
-    SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
+    g_exportEncoders = 0;
 }
 
 // Speech made by Windows text-to-speech, transcribed by Windows dictation. Skipped where no recognizer is installed.

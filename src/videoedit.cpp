@@ -617,6 +617,22 @@ BitmapPtr Cached(const std::wstring& key, F make) {
     return img;
 }
 
+// textdraw::Measure, remembered: a caption is laid out for every frame it shows on (and asked for twice on some).
+textdraw::Extent Measured(const std::wstring& text, const textdraw::Style& st, float maxWidth) {
+    static std::mutex mu;
+    static std::unordered_map<std::wstring, textdraw::Extent> known;
+    const std::wstring key = std::format(L"{}|{}|{}|{}|{}|{}", st.family, st.weight, st.size, st.center, maxWidth, text);
+    {
+        std::lock_guard lock(mu);
+        if (auto it = known.find(key); it != known.end()) return it->second;
+    }
+    const textdraw::Extent e = textdraw::Measure(text, st, maxWidth);
+    std::lock_guard lock(mu);
+    if (known.size() >= 1000) known.clear();
+    known.emplace(key, e);
+    return e;
+}
+
 std::wstring Typed(const std::wstring& s, double reveal) {
     if (reveal >= 1) return s;
     size_t n = std::min(s.size(), (size_t)std::ceil(s.size() * reveal));
@@ -1156,9 +1172,7 @@ std::optional<Placed> FrameRenderer::CaptionImage(const Caption& c, SIZE size, s
         st.edgeWidth = (float)std::max(1.0, fontSize * 0.03);
     }
     if (hot && hot->first + hot->second <= shown.size()) st.ranges.push_back({hot->first, hot->second, highlight});
-    textdraw::Style measure = st;
-    measure.ranges.clear();
-    const auto tb = textdraw::Measure(whole, measure, (float)maxW);
+    const auto tb = Measured(whole, st, (float)maxW);
     const double tbw = std::ceil(tb.w), tbh = std::ceil(tb.h);
     const double pad = fontSize * 0.45;
     double w = tbw + pad * 2, h = tbh + pad * 1.2;

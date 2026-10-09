@@ -16,6 +16,7 @@
 #include <mutex>
 #include <thread>
 
+#include "json.h"
 #include "media.h"
 #include "selftest.h"
 #include "videoio.h"
@@ -33,12 +34,6 @@ namespace {
 void Say(const std::string& s) {
     test::Out(s);
     test::FlushOut();
-}
-
-std::string Narrow(const std::wstring& w) {
-    std::string s(WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), (int)s.size(), nullptr, nullptr);
-    return s;
 }
 
 std::wstring BaseName(const std::wstring& p) {
@@ -209,11 +204,11 @@ int Bench(const std::vector<std::wstring>& args) {
     for (size_t a = first; a < args.size(); ++a) {
         const auto clip = ClipOf(args[a]);
         if (!clip) {
-            Say("can't open " + Narrow(args[a]) + "\n");
+            Say("can't open " + ToUtf8(args[a]) + "\n");
             return 1;
         }
         char head[256];
-        sprintf_s(head, "%s  %dx%d  %.0f fps  %.1f s%s\n", Narrow(BaseName(args[a])).c_str(), clip->w, clip->h, clip->fps, clip->length,
+        sprintf_s(head, "%s  %dx%d  %.0f fps  %.1f s%s\n", ToUtf8(BaseName(args[a])).c_str(), clip->w, clip->h, clip->fps, clip->length,
                   clip->hasAudio ? "  audio" : "");
         Say(head);
         wchar_t only[32] = L"";
@@ -253,8 +248,8 @@ int Bench(const std::vector<std::wstring>& args) {
             g_exportTap = nullptr;
             total += secs;
             char line[256];
-            sprintf_s(line, "  %-7s %7.2f s  %5d frames  %7.1f fps  cpu %6.2f s%s%s\n", Narrow(s.name).c_str(), secs, frames, frames / std::max(1e-9, secs), cpu,
-                      done ? "" : "  FAILED: ", done ? "" : Narrow(err).c_str());
+            sprintf_s(line, "  %-7s %7.2f s  %5d frames  %7.1f fps  cpu %6.2f s%s%s\n", ToUtf8(s.name).c_str(), secs, frames, frames / std::max(1e-9, secs), cpu,
+                      done ? "" : "  FAILED: ", done ? "" : ToUtf8(err).c_str());
             Say(line);
             if (tap) {
                 std::string text;
@@ -313,7 +308,7 @@ int Compare(const std::wstring& a, const std::wstring& b) {
             worst = std::min(worst, psnr);
         }
         char line[256];
-        sprintf_s(line, "%-28s frames %lld/%lld  identical %d  worst kept-frame PSNR %.1f dB, max diff %d, off by >1: %.4f%%\n", Narrow(tag).c_str(), (long long)na, (long long)nb, same,
+        sprintf_s(line, "%-28s frames %lld/%lld  identical %d  worst kept-frame PSNR %.1f dB, max diff %d, off by >1: %.4f%%\n", ToUtf8(tag).c_str(), (long long)na, (long long)nb, same,
                   worst == 1e9 ? 99.0 : worst, maxDiff, all ? off * 100 / all : 0.0);
         Say(line);
         bad += na != nb || worst < 40;
@@ -326,6 +321,8 @@ int Compare(const std::wstring& a, const std::wstring& b) {
 
 int VideoBench(const std::vector<std::wstring>& args) {
     int code = 0;
+    if (wchar_t v[8]; GetEnvironmentVariableW(L"ATHER_ENCODERS", v, 8)) g_exportEncoders = std::max(1, _wtoi(v));
+    g_noGpuDecode = GetEnvironmentVariableW(L"ATHER_NO_GPU_DECODE", nullptr, 0) > 0;
     std::thread([&] {  // like the editor's save: a worker thread in the multithreaded apartment
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (!args.empty() && args[0] == L"--bench-compare") code = args.size() == 3 ? Compare(args[1], args[2]) : 2;

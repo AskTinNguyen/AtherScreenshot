@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <memory>
 
 #include "common.h"
@@ -116,6 +117,10 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
 
 // Developer tool (--bench-export): when set, sees every frame an export encodes, in order, before encoding.
 extern std::function<void(int index, const Bitmap& frame)> g_exportTap;
+// Developer switches (--bench-export, tests): encoders an MP4 export uses at once (0: as many as suits its length), and
+// Media Foundation's software decoder instead of the GPU (set before any video is read).
+extern std::atomic<int> g_exportEncoders;
+extern bool g_noGpuDecode;
 // `--bench-export <outDir> [tap] <clip>...` and `--bench-compare <dirA> <dirB>`: see videobench.cpp.
 int VideoBench(const std::vector<std::wstring>& args);
 
