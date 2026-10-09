@@ -1517,44 +1517,29 @@ int EncodersFor(int n, int fps) {
 // has more than one. The video is made in `k` pieces at once, each with its own reader and encoder (and so
 // starting on a key frame), then joined without re-encoding. Each piece reads on from a second before its first
 // frame, so it shows the same source frames as one pass would.
-Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress) {
+// `most`: at most so many encoders (0: as many as suit the length). When fewer could start (the GPU allows only so many
+// sessions), Retry says how many in `started`.
+Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress,
+                          int most, int* started) {
     const int fps = (int)std::lround(seq.Fps());
     const SIZE sz = FrameRenderer(e, seq.size, false).Out();
     const int n = std::max(1, (int)std::ceil(e.OutputDuration() * fps - 1e-6));  // as EditFrames::Count(true)
-    const int want = EncodersFor(n, fps);
-    if (want < 2 || seq.clips.empty() || !HardwareH264Encoder()) return Outcome::Retry;
+    const int k = most > 0 ? std::min(most, EncodersFor(n, fps)) : EncodersFor(n, fps);
+    if (k < 2 || seq.clips.empty() || !HardwareH264Encoder()) return Outcome::Retry;
+    // The encoders start side by side (each takes a moment) while the pieces get their first frames ready.
     std::vector<std::unique_ptr<Mp4Writer>> writers;
     std::vector<std::wstring> parts;
-    {  // started side by side (each takes a moment)
-        std::vector<std::unique_ptr<Mp4Writer>> all;
-        std::vector<std::future<HRESULT>> begun;
-        for (int i = 0; i < want; ++i) {
-            all.push_back(std::make_unique<Mp4Writer>());
-            begun.push_back(std::async(std::launch::async, [&, i] {
-                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-                const HRESULT r = all[i]->Begin(out + L".part" + std::to_wstring(i) + L".mp4", sz.cx, sz.cy, fps, 0, 2, 0, true);
-                CoUninitialize();
-                return r;
-            }));
-        }
-        for (int i = 0; i < want; ++i) {
-            const std::wstring part = out + L".part" + std::to_wstring(i) + L".mp4";
-            if (SUCCEEDED(begun[i].get())) {  // else e.g. the GPU allows no more encoding sessions
-                writers.push_back(std::move(all[i]));
-                parts.push_back(part);
-            } else {
-                DeleteFileW(part.c_str());
-            }
-        }
-    }
-    auto removeParts = [&] {
-        for (auto& w : writers) w->Finalize();
-        for (const auto& p : parts) DeleteFileW(p.c_str());
-    };
-    const int k = (int)writers.size();
-    if (k < 2 || !writers[0]->HardwareEncoder()) {
-        removeParts();
-        return Outcome::Retry;
+    std::vector<std::future<HRESULT>> begun;
+    for (int s = 0; s < k; ++s) {
+        writers.push_back(std::make_unique<Mp4Writer>());
+        parts.push_back(out + L".part" + std::to_wstring(s) + L".mp4");
+        begun.push_back(std::async(std::launch::async, [&, s] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            HRESULT r = writers[s]->Begin(parts[s], sz.cx, sz.cy, fps, 0, 2, 0, true);
+            if (SUCCEEDED(r) && !writers[s]->HardwareEncoder()) r = E_FAIL;  // no GPU session left for it
+            CoUninitialize();
+            return r;
+        }));
     }
     std::unique_ptr<AudioPipe> audio;
     if (!e.muted && seq.HasAudio()) {
@@ -1583,7 +1568,7 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     std::vector<int> from((size_t)k + 1);
     for (int s = 0; s <= k; ++s) from[s] = (int)((int64_t)n * s / k);
     std::vector<int> made((size_t)k, 0);
-    std::vector<HRESULT> result((size_t)k, S_OK);
+    std::vector<HRESULT> result((size_t)k, S_OK), began((size_t)k, E_PENDING);
     std::atomic<int> done{0};
     std::mutex progressMu;  // progress hears from one piece at a time
     std::atomic<bool> cancelled{false};
@@ -1595,9 +1580,13 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
             EditFrames frames;
             HRESULT hr = frames.Open(seq, e, fps, nullptr, from[s]) ? S_OK : E_FAIL;
             Mp4Writer& w = *writers[s];
+            auto start = [&] {  // the encoder, once the first frame is ready
+                if (began[s] == E_PENDING && FAILED(began[s] = begun[s].get())) stop = true;
+                return SUCCEEDED(began[s]);
+            };
             if (SUCCEEDED(hr))
                 ExportFrames<EncoderFrame>(frames, from[s], from[s + 1], Mp4Frames(frames, sz), [&](int i, EncoderFrame& ef) {
-                    if (stop) return false;
+                    if (stop || !start()) return false;
                     if (g_exportTap) g_exportTap(i, *ef.bgra);
                     hr = w.WriteNv12(std::shared_ptr<const uint8_t>(ef.nv12, ef.nv12->data()), std::llround((i - from[s]) * kTicks / fps), std::llround(kTicks / fps));
                     ef = {};
@@ -1614,7 +1603,8 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
                     if (cancelled) stop = true;
                     return !stop.load();
                 }, &pool, k);
-            const HRESULT fin = w.Finalize();
+            start();
+            const HRESULT fin = SUCCEEDED(began[s]) ? w.Finalize() : began[s];
             result[s] = FAILED(hr) ? hr : fin;
             CoUninitialize();
         });
@@ -1636,6 +1626,8 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     whole = whole && SUCCEEDED(soundHr);
     if (!whole) {
         removeFiles();
+        const int ok = (int)std::count_if(began.begin(), began.end(), [](HRESULT b) { return SUCCEEDED(b); });
+        if (started && ok < k) *started = ok;
         return Outcome::Retry;
     }
     std::vector<int> counts((size_t)k);
@@ -1666,11 +1658,19 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     const Sequence seq = SequenceOf(source, e);
     g_joined = 0;
     double shown = 0;  // by the try in pieces: the usual way carries on from there rather than going back
-    const ExportProgress tracked = progress ? ExportProgress([&](double p) { return progress(shown = p); }) : ExportProgress();
-    switch (ExportMp4Parallel(seq, e, out, error, tracked)) {
+    const ExportProgress tracked = progress ? ExportProgress([&](double p) { return progress(shown = std::max(shown, p)); }) : ExportProgress();
+    int started = 0;
+    switch (ExportMp4Parallel(seq, e, out, error, tracked, 0, &started)) {
         case Outcome::Done: return true;
         case Outcome::Failed: return false;
         case Outcome::Retry: break;
+    }
+    if (started >= 2) {  // fewer encoders could start: in as many pieces as did
+        switch (ExportMp4Parallel(seq, e, out, error, tracked, started, nullptr)) {
+            case Outcome::Done: return true;
+            case Outcome::Failed: return false;
+            case Outcome::Retry: break;
+        }
     }
     if (shown <= 0) return ExportMp4Single(seq, e, out, error, progress);
     return ExportMp4Single(seq, e, out, error, [&](double p) { return progress(shown + (1 - shown) * p); });
