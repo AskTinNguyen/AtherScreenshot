@@ -754,6 +754,16 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw
 BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t, bool owned) const { return src ? Draw(*src, &src, t, owned) : nullptr; }
 
 BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
+    if (!preview_) {  // an export frame under a title card that is fully shown and still: just the card (it's opaque)
+        const Mark* top = nullptr;
+        for (const auto& m : edit_.marks)
+            if (m.kind == MarkKind::Title && m.Active(t)) top = &m;
+        if (top) {
+            const Motion mo = MotionOf(*top, t);
+            if (mo.alpha >= 1 && mo.scale == 1 && mo.dx == 0 && mo.dy == 0 && mo.reveal >= 1 && !mo.wipe && mo.blur == 0 && !mo.ring)
+                if (const BitmapPtr card = TitleImage(*top, out_)) return Copy(*card);
+        }
+    }
     // Steps 1–2 change the video itself, on a copy of it (or on it, when it's `owned`). An export frame without
     // them reads the source as is.
     bool onVideo = false;
