@@ -1637,19 +1637,11 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
         removeFiles();
         return Outcome::Retry;
     }
-    // Joined a second at a time, with the sound in between (the writer won't let one stream run far ahead).
-    Mp4Joiner j;
-    HRESULT hr = j.Begin(out, parts, audio ? soundPart : std::wstring());
-    for (int s = 0; s < k && SUCCEEDED(hr); ++s)
-        for (int first = from[s]; SUCCEEDED(hr) && first < from[s + 1]; first += fps) {
-            const int count = std::min(fps, from[s + 1] - first);
-            hr = j.CopyFrames((size_t)s, first, count, fps);
-            if (SUCCEEDED(hr) && audio) hr = j.CopyAudio(std::llround((first + count) * kTicks / fps));
-        }
-    if (SUCCEEDED(hr) && audio) hr = j.CopyAudio(INT64_MAX);
-    const HRESULT fin = j.Finalize();
+    std::vector<int> counts((size_t)k);
+    for (int s = 0; s < k; ++s) counts[s] = from[s + 1] - from[s];
+    const HRESULT hr = JoinMp4(out, parts, counts, fps, audio ? soundPart : std::wstring());
     removeFiles();
-    if (FAILED(hr) || FAILED(fin)) {
+    if (FAILED(hr)) {
         DeleteFileW(out.c_str());
         return Outcome::Retry;
     }
@@ -2401,6 +2393,7 @@ ATHER_TEST(video_export_joins_pieces_from_several_encoders) {
         CHECK(ok);
         test::Out("  (" + ToUtf8(encoders) + " encoders wanted, " + std::to_string(std::max(1, g_joined.load())) + " used)\n");
         CHECK(wcscmp(encoders, L"1") != 0 || g_joined == 0);
+        CHECK(wcscmp(encoders, L"3") != 0 || !HardwareH264Encoder() || g_joined >= 2);  // joined, not made again in one
         VideoInfo vi;
         CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 9) < 0.1 && vi.w == 640 && vi.h == 360 && vi.hasAudio);
         VideoReader r;

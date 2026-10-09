@@ -61,22 +61,12 @@ private:
 
 // Joins MP4s of H.264 video (pieces of one video, encoded at the same settings) frame by frame into one, without
 // re-encoding, with the sound of another MP4 copied in alongside. Thread-safe.
-class Mp4Joiner {
-public:
-    Mp4Joiner();
-    ~Mp4Joiner();
-    // Fails unless all `parts` hold H.264 with the same parameter sets. `audioPart`: an MP4 of sound only, or none.
-    HRESULT Begin(const std::wstring& path, const std::vector<std::wstring>& parts, const std::wstring& audioPart = {});
-    // The next `count` frames of `part` become frames `first`… of the joined video (at `fps`). Each part must
-    // start on a key frame.
-    HRESULT CopyFrames(size_t part, int64_t first, int count, int fps);
-    HRESULT CopyAudio(int64_t until);  // `audioPart`'s sound up to (not including) time `until` (100 ns)
-    HRESULT Finalize();
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> p_;
-};
+// Joins MP4s that Mp4Writer made of pieces of one video (H.264, each starting on a key frame, all with the same
+// settings), the first `frames[i]` frames of each at `fps`, and `soundPart`'s sound (an MP4 of AAC only, or none):
+// the samples are copied as they are, a second of video and its sound at a time, and the index made anew.
+// Fails on anything else.
+HRESULT JoinMp4(const std::wstring& path, const std::vector<std::wstring>& parts, const std::vector<int>& frames, int fps,
+                const std::wstring& soundPart = {});
 
 // Animated GIF writer: one palette per frame, loops forever. Frames are top-down BGRA (alpha ignored).
 class GifWriter {
