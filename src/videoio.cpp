@@ -669,26 +669,49 @@ private:
     std::unique_ptr<Resampler> rs_;
 };
 
-// The edit's audio: the trimmed range, as 48 kHz stereo, at the edit's speed.
+// The edit's audio: the trimmed range, as 48 kHz stereo, at the edit's speed. Decoded, resampled and stretched
+// on a thread of its own, a little ahead of where the video is written.
 class AudioPipe {
 public:
+    ~AudioPipe() {
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
     bool Open(const Sequence& s, double from, double to, double speed) {
         audio_ = std::make_unique<SequenceAudio>(s, from, to, kRate, 2);
         if (!audio_->AnyAudio()) return false;
         if (std::fabs(speed - 1) > 1e-6) ts_ = std::make_unique<TimeStretch>(2, kRate, speed);
+        thread_ = std::thread([this] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            Produce();
+            CoUninitialize();
+        });
         return true;
     }
 
     // Writes audio up to `target` output frames, padding with silence when the source runs out.
     HRESULT WriteUntil(Mp4Writer& w, int64_t target) {
-        while ((int64_t)ready_.size() / 2 < target - written_ && !eof_) Fill();
         std::vector<int16_t> pcm;
         while (written_ < target) {
             const int64_t n = std::min<int64_t>(1024, target - written_);
             pcm.assign((size_t)n * 2, 0);
-            const size_t have = std::min(ready_.size(), (size_t)n * 2);
-            for (size_t i = 0; i < have; ++i) pcm[i] = (int16_t)std::lround(std::clamp(ready_[i], -1.f, 1.f) * 32767);
-            ready_.erase(ready_.begin(), ready_.begin() + have);
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return eof_ || ready_.size() - at_ >= (size_t)n * 2; });
+                const size_t have = std::min(ready_.size() - at_, (size_t)n * 2);
+                for (size_t i = 0; i < have; ++i) pcm[i] = (int16_t)std::lround(std::clamp(ready_[at_ + i], -1.f, 1.f) * 32767);
+                at_ += have;
+                if (at_ > (1u << 16)) {  // drop what was used now and then
+                    ready_.erase(ready_.begin(), ready_.begin() + (ptrdiff_t)at_);
+                    at_ = 0;
+                }
+            }
+            cv_.notify_all();
             const HRESULT hr = w.WriteAudio(pcm.data(), (uint32_t)n, (int64_t)std::llround(written_ * kTicks / kRate));
             if (FAILED(hr)) return hr;
             written_ += n;
@@ -697,28 +720,44 @@ public:
     }
 
 private:
-    void Fill() {
-        std::vector<float> chunk;
-        if (!audio_->Read(chunk)) {
-            eof_ = true;
-            if (ts_) ts_->Finish(ready_);
-            return;
-        }
-        if (ts_) {
-            ts_->Push(chunk.data(), chunk.size() / 2);
-            ts_->Pull(ready_);
-        } else {
-            ready_.insert(ready_.end(), chunk.begin(), chunk.end());
+    void Produce() {
+        constexpr size_t kAhead = kRate * 2 * 2;  // two seconds of samples
+        for (;;) {
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return quit_ || ready_.size() - at_ < kAhead; });
+                if (quit_) return;
+            }
+            std::vector<float> chunk, out;
+            const bool more = audio_->Read(chunk);
+            if (!more) {
+                if (ts_) ts_->Finish(out);
+            } else if (ts_) {
+                ts_->Push(chunk.data(), chunk.size() / 2);
+                ts_->Pull(out);
+            } else {
+                out = std::move(chunk);
+            }
+            {
+                std::lock_guard l(mu_);
+                ready_.insert(ready_.end(), out.begin(), out.end());
+                eof_ = !more;
+            }
+            cv_.notify_all();
+            if (!more) return;
         }
     }
 
     std::unique_ptr<SequenceAudio> audio_;
     std::unique_ptr<TimeStretch> ts_;
-    std::vector<float> ready_;
+    std::thread thread_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<float> ready_;  // made and not yet written from `at_` on
+    size_t at_ = 0;
+    bool eof_ = false, quit_ = false;
     int64_t written_ = 0;
-    bool eof_ = false;
 };
-
 }  // namespace
 
 bool AudioDecodes(const std::wstring& path) {
@@ -845,7 +884,7 @@ public:
     BitmapPtr Render(const VideoFrame& src, double st) const {
         ProfT pt(2);  // PROF-TEMP
         const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
-        return f ? renderer_->Render(*f, st) : nullptr;
+        return renderer_->Render(f, st);
     }
 
 private:
@@ -1025,7 +1064,7 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     };
     ExportFrames<EncoderFrame>(frames, n, make, [&](int i, EncoderFrame& f) {
         if (g_exportTap) g_exportTap(i, *f.bgra);
-        { ProfT pt(3); hr = w.WriteNv12(f.nv12->data(), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
+        { ProfT pt(3); hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
         f = {};
         ProfT pt4(4);  // PROF-TEMP
         if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));

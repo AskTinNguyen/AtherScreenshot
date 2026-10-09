@@ -360,7 +360,7 @@ inline uint32_t Mix(uint32_t a, uint32_t b, double t) {  // a·(1−t) + b·t
 }
 
 BitmapPtr Copy(const Bitmap& src) {
-    auto b = Bitmap::Create(src.Width(), src.Height());
+    auto b = Bitmap::CreateRecycled(src.Width(), src.Height());
     if (b) memcpy(b->Bits(), src.Bits(), (size_t)src.Width() * src.Height() * 4);
     return b;
 }
@@ -432,13 +432,18 @@ inline uint32_t Sample(const Bitmap& b, double sx, double sy) {
 
 // The part `r` of `src` (fractional, source pixels) scaled to w × h. Opaque frames, so edges clamp.
 BitmapPtr SampleRect(const Bitmap& src, VRect r, int w, int h) {
-    auto out = Bitmap::Create(w, h);
+    auto out = Bitmap::CreateRecycled(w, h);
     if (!out) return nullptr;
     const int W = src.Width(), H = src.Height();
     if (std::fabs(r.w - w) <= 1.01 && std::fabs(r.h - h) <= 1.01 && r.x == std::floor(r.x) && r.y == std::floor(r.y)) {  // a plain crop
+        const int x0 = (int)r.x;
         for (int y = 0; y < h; ++y) {
             const int sy = std::clamp((int)r.y + y, 0, H - 1);
-            for (int x = 0; x < w; ++x) out->Bits()[(size_t)y * w + x] = src.Bits()[(size_t)sy * W + std::clamp((int)r.x + x, 0, W - 1)];
+            uint32_t* d = out->Bits() + (size_t)y * w;
+            const uint32_t* s = src.Bits() + (size_t)sy * W;
+            if (x0 >= 0 && x0 + w <= W) memcpy(d, s + x0, (size_t)w * 4);
+            else
+                for (int x = 0; x < w; ++x) d[x] = s[std::clamp(x0 + x, 0, W - 1)];
         }
         return out;
     }
@@ -562,13 +567,20 @@ FrameRenderer::FrameRenderer(const VideoEdit& edit, SIZE full, bool preview) : e
     unit_ = std::max(1.0, full.cy / 720.0);
 }
 
-BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const {
-    BitmapPtr img = Copy(src);
-    if (!img) return nullptr;
-    const VRect extent{0, 0, (double)img->Width(), (double)img->Height()};
+BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw(src, nullptr, t); }
+
+BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t) const { return src ? Draw(*src, &src, t) : nullptr; }
+
+BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t) const {
+    // Steps 1–2 change the video itself, on a copy of it. An export frame without them reads the source as is.
+    bool onVideo = false;
+    for (const auto& m : edit_.marks) onVideo = onVideo || (m.kind != MarkKind::Title && m.kind != MarkKind::Zoom && m.Active(t));
+    BitmapPtr img = preview_ || onVideo ? Copy(src) : nullptr;
+    if ((preview_ || onVideo) && !img) return nullptr;
+    const VRect extent{0, 0, (double)src.Width(), (double)src.Height()};
     // 1. Blur and pixelate, in the order they were added.
     for (const auto& m : edit_.marks) {
-        if ((m.kind != MarkKind::Blur && m.kind != MarkKind::Pixelate) || !m.Active(t)) continue;
+        if (!img || (m.kind != MarkKind::Blur && m.kind != MarkKind::Pixelate) || !m.Active(t)) continue;
         auto ri = Intersect(m.Rect(), extent);
         if (!ri) continue;
         const VRect q = ri->Integral();
@@ -599,7 +611,7 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const {
     }
     // 2. Markup that sits on the video (moves with zoom).
     for (const auto& m : edit_.marks) {
-        if (KindIsRegion(m.kind) || m.kind == MarkKind::Title || !m.Active(t)) continue;
+        if (!img || KindIsRegion(m.kind) || m.kind == MarkKind::Title || !m.Active(t)) continue;
         const Motion mo = MotionOf(m, t);
         if (mo.alpha <= 0.001) continue;
         auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
@@ -616,9 +628,16 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const {
     // 3. The visible area: the crop, or a zoom into it.
     const VRect r = ViewRect(t);
     const SIZE tsize = preview_ ? SIZE{(LONG)view_.w, (LONG)view_.h} : out_;
+    const Bitmap& video = img ? *img : src;
+    bool overlays = false;  // anything for step 4 to draw
+    for (const auto& c : edit_.captions) overlays = overlays || (c.Active(t) && (preview_ || !Trimmed(c.text).empty()));
+    for (const auto& m : edit_.marks) overlays = overlays || (m.kind == MarkKind::Title && m.Active(t));
     BitmapPtr framed;
     if (preview_ && r == view_) framed = nullptr;  // drawn in place
-    else framed = SampleRect(*img, r, tsize.cx, tsize.cy);
+    else if (!preview_ && r == extent && tsize.cx == src.Width() && tsize.cy == src.Height())  // the whole frame, unscaled
+        framed = img ? img : shared && !overlays ? *shared : Copy(src);
+    else framed = SampleRect(video, r, tsize.cx, tsize.cy);
+    if (!framed && !(preview_ && r == view_)) return nullptr;
     // 4. Captions and title cards stay put on screen.
     Bitmap& target = framed ? *framed : *img;
     const double ox = framed ? 0 : view_.x, oy = framed ? 0 : view_.y;

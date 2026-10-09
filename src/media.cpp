@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 
@@ -381,8 +382,69 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
         if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->audio, ain.Get(), nullptr);
     }
     if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
+    if (SUCCEEDED(hr) && GetEnvironmentVariableW(L"ATHER_ENC_NAME", nullptr, 0)) {  // EXP-TEMP
+        ComPtr<IMFTransform> enc;
+        ComPtr<IMFAttributes> ea;
+        WCHAR* name = nullptr;
+        UINT32 nl = 0;
+        std::wstring s = L"unknown";
+        if (SUCCEEDED(p_->writer->GetServiceForStream(p_->video, GUID_NULL, IID_PPV_ARGS(&enc))) && SUCCEEDED(enc->GetAttributes(&ea)) &&
+            SUCCEEDED(ea->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nl))) {
+            s = name;
+            s += MFGetAttributeUINT32(ea.Get(), MF_TRANSFORM_ASYNC, 0) ? L" (async)" : L" (sync)";
+            CoTaskMemFree(name);
+        }
+        SetEnvironmentVariableW(L"ATHER_ENC_NAME", s.c_str());
+    }
     if (FAILED(hr)) p_->writer.Reset();
     return hr;
+}
+
+// A media buffer over memory someone else owns (kept alive by `owner`), so a frame reaches the encoder uncopied.
+class HeldBuffer : public IMFMediaBuffer {
+public:
+    HeldBuffer(std::shared_ptr<const uint8_t> data, DWORD len) : data_(std::move(data)), len_(len) {}
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFMediaBuffer)) {
+            *ppv = static_cast<IMFMediaBuffer*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG r = --ref_;
+        if (!r) delete this;
+        return r;
+    }
+    STDMETHODIMP Lock(BYTE** p, DWORD* max, DWORD* cur) override {
+        if (!p) return E_POINTER;
+        *p = const_cast<BYTE*>(data_.get());  // the encoder only reads it
+        if (max) *max = len_;
+        if (cur) *cur = len_;
+        return S_OK;
+    }
+    STDMETHODIMP Unlock() override { return S_OK; }
+    STDMETHODIMP GetCurrentLength(DWORD* n) override { return n ? (*n = len_, S_OK) : E_POINTER; }
+    STDMETHODIMP SetCurrentLength(DWORD n) override { return n <= len_ ? S_OK : E_INVALIDARG; }
+    STDMETHODIMP GetMaxLength(DWORD* n) override { return n ? (*n = len_, S_OK) : E_POINTER; }
+
+private:
+    std::atomic<ULONG> ref_{1};
+    std::shared_ptr<const uint8_t> data_;
+    DWORD len_;
+};
+
+static HRESULT WriteBuffer(IMFSinkWriter* w, DWORD stream, IMFMediaBuffer* buf, int64_t t, int64_t dur) {
+    ComPtr<IMFSample> sample;
+    HRESULT hr = MFCreateSample(&sample);
+    if (SUCCEEDED(hr)) hr = sample->AddBuffer(buf);
+    if (FAILED(hr)) return hr;
+    sample->SetSampleTime(t);
+    sample->SetSampleDuration(dur);
+    return w->WriteSample(stream, sample.Get());
 }
 
 static HRESULT WriteBytes(IMFSinkWriter* w, DWORD stream, const void* data, DWORD bytes, int64_t t, int64_t dur) {
@@ -414,6 +476,16 @@ HRESULT Mp4Writer::WriteNv12(const uint8_t* yuv, int64_t t, int64_t duration) {
     std::lock_guard lock(p_->mu);
     if (!p_->writer || !p_->nv12) return E_UNEXPECTED;
     const HRESULT hr = WriteBytes(p_->writer.Get(), p_->video, yuv, (DWORD)((size_t)p_->w * p_->h * 3 / 2), t, duration);
+    if (SUCCEEDED(hr)) ++p_->frames;
+    return hr;
+}
+
+HRESULT Mp4Writer::WriteNv12(std::shared_ptr<const uint8_t> yuv, int64_t t, int64_t duration) {
+    std::lock_guard lock(p_->mu);
+    if (!p_->writer || !p_->nv12 || !yuv) return E_UNEXPECTED;
+    ComPtr<IMFMediaBuffer> buf;
+    buf.Attach(new HeldBuffer(std::move(yuv), (DWORD)((size_t)p_->w * p_->h * 3 / 2)));
+    const HRESULT hr = WriteBuffer(p_->writer.Get(), p_->video, buf.Get(), t, duration);
     if (SUCCEEDED(hr)) ++p_->frames;
     return hr;
 }

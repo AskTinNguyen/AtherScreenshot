@@ -46,6 +46,8 @@ public:
     HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0, bool nv12 = false);
     HRESULT WriteFrame(const uint32_t* px, int64_t t, int64_t duration);
     HRESULT WriteNv12(const uint8_t* yuv, int64_t t, int64_t duration);
+    // The same without a copy: `yuv` stays alive, unchanged, until the encoder is done with it.
+    HRESULT WriteNv12(std::shared_ptr<const uint8_t> yuv, int64_t t, int64_t duration);
     // Interleaved 16-bit PCM at the rate and channel count given to Begin.
     HRESULT WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t);
     HRESULT Finalize();  // fails when no frame was written

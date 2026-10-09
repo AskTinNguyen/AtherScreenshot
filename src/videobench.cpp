@@ -481,6 +481,35 @@ int Rgb2YuvExp(const std::wstring& raw, int cw = 0, int chh = 0) {
     CoTaskMemFree(acts);
     return 0;
 }
+// ---- experiment: encoder throughput (EXP-TEMP) ----
+int EncodeExp(const std::wstring& outDir, int w, int h, int frames, int fps) {
+    std::vector<uint8_t> nv((size_t)w * h * 3 / 2);
+    uint32_t seed = 1;
+    for (auto& b : nv) b = (uint8_t)((seed = seed * 1664525u + 1013904223u) >> 24) / 4 + 100;
+    Mp4Writer mw;
+    const std::wstring out = outDir + L"\\enc.mp4";
+    CreateDirectoryW(outDir.c_str(), nullptr);
+    if (FAILED(mw.Begin(out, w, h, fps, 48000, 2, 0, true))) return Say("begin failed\n"), 1;
+    std::vector<int16_t> pcm(48000 / fps * 2 + 2, 0);
+    const auto start = std::chrono::steady_clock::now();
+    double inWrite = 0;
+    for (int i = 0; i < frames; ++i) {
+        nv[(size_t)(i * 7919) % nv.size()] ^= 0x55;
+        const auto a = std::chrono::steady_clock::now();
+        mw.WriteNv12(nv.data(), (int64_t)i * 10000000 / fps, 10000000 / fps);
+        inWrite += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+        mw.WriteAudio(pcm.data(), 48000 / fps, (int64_t)i * 10000000 / fps);
+    }
+    const auto b = std::chrono::steady_clock::now();
+    mw.Finalize();
+    { wchar_t nm[256] = L""; GetEnvironmentVariableW(L"ATHER_ENC_NAME", nm, 256); Say("encoder: " + Narrow(nm) + "\n"); }  // EXP-TEMP
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    char line[200];
+    sprintf_s(line, "%dx%d: %d frames in %.2f s (%.1f fps), in WriteNv12 %.2f s, finalize %.2f s\n", w, h, frames, secs, frames / secs, inWrite,
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - b).count());
+    Say(line);
+    return 0;
+}
 int Bench(const std::vector<std::wstring>& args) {
     if (args.size() < 2) return 2;
     const std::wstring dir = args[0];
@@ -605,6 +634,7 @@ int VideoBench(const std::vector<std::wstring>& args) {
         else if (args[0] == L"--bench-decode") code = DecodeExp(args[1], _wtoi(args[2].c_str()));  // EXP-TEMP
         else if (args[0] == L"--bench-color") code = ColorExp(args[1], args[2]);  // EXP-TEMP
         else if (args[0] == L"--bench-rgb2yuv") code = Rgb2YuvExp(args[1], args.size() > 3 ? _wtoi(args[2].c_str()) : 0, args.size() > 3 ? _wtoi(args[3].c_str()) : 0);  // EXP-TEMP
+        else if (args[0] == L"--bench-encode") code = EncodeExp(args[1], _wtoi(args[2].c_str()), _wtoi(args[3].c_str()), _wtoi(args[4].c_str()), _wtoi(args[5].c_str()));  // EXP-TEMP
         else code = Bench(std::vector<std::wstring>(args.begin() + 1, args.end()));
         CoUninitialize();
     }).join();
