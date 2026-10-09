@@ -29,6 +29,10 @@ BitmapPtr RotateBitmap(const Bitmap& src, int degrees);
 BitmapPtr FitInto(const Bitmap& src, int w, int h);
 // Area-averaging resample (box filter when shrinking, bilinear when growing).
 BitmapPtr Resample(const Bitmap& src, int w, int h);
+// BGRA → NV12 (w × h luma, then h/2 rows of interleaved chroma; w and h even), exactly as Media Foundation's
+// video processor makes it for the encoder: BT.709 above 576 rows and BT.601 up to that, studio range, 8-bit fixed
+// point, each chroma sample the rounded mean of its 2 × 2 pixels'.
+void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out);
 // Starts Media Foundation once per process.
 void EnsureMediaFoundation();
 
@@ -38,8 +42,10 @@ public:
     Mp4Writer();
     ~Mp4Writer();
     // `rotation` (0, 90, 180, 270) is stored for players to apply, as phones do; the frames stay as given.
-    HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0);
+    // `nv12`: frames come through WriteNv12 (see BgraToNv12) instead of WriteFrame.
+    HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0, bool nv12 = false);
     HRESULT WriteFrame(const uint32_t* px, int64_t t, int64_t duration);
+    HRESULT WriteNv12(const uint8_t* yuv, int64_t t, int64_t duration);
     // Interleaved 16-bit PCM at the rate and channel count given to Begin.
     HRESULT WriteAudio(const int16_t* pcm, uint32_t frames, int64_t t);
     HRESULT Finalize();  // fails when no frame was written

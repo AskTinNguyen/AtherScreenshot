@@ -5,6 +5,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <mutex>
 
 namespace ather {
 
@@ -32,6 +33,84 @@ Bitmap::~Bitmap() {
     if (hbm_) DeleteObject(hbm_);
 }
 
+namespace {
+
+// Bitmaps dropped by CreateRecycled users, kept for the next one of their size (newest last).
+struct Recycler {
+    std::mutex mu;
+    std::vector<std::pair<Bitmap*, ULONGLONG>> free;  // and when it was dropped
+    size_t bytes = 0;
+    static constexpr size_t kMaxBytes = 512u << 20;
+    static constexpr ULONGLONG kMaxAgeMs = 3000;
+
+    static size_t Size(const Bitmap* b) { return (size_t)b->Width() * b->Height() * 4; }
+    // Frees the ones nobody took for a while; returns them so they are deleted outside the lock.
+    std::vector<Bitmap*> Expire(ULONGLONG now, size_t keep) {
+        std::vector<Bitmap*> out;
+        while (!free.empty() && (bytes > keep || now - free.front().second > kMaxAgeMs)) {
+            out.push_back(free.front().first);
+            bytes -= Size(free.front().first);
+            free.erase(free.begin());
+        }
+        return out;
+    }
+};
+
+Recycler& TheRecycler() {
+    static Recycler* r = new Recycler();  // never destroyed: bitmaps may come back during shutdown
+    return *r;
+}
+
+}  // namespace
+
+std::shared_ptr<Bitmap> Bitmap::CreateRecycled(int w, int h) {
+    if (w <= 0 || h <= 0) return nullptr;
+    Recycler& r = TheRecycler();
+    Bitmap* b = nullptr;
+    std::vector<Bitmap*> old;
+    {
+        std::lock_guard l(r.mu);
+        for (size_t i = r.free.size(); i-- > 0;)
+            if (r.free[i].first->w_ == w && r.free[i].first->h_ == h) {
+                b = r.free[i].first;
+                r.bytes -= Recycler::Size(b);
+                r.free.erase(r.free.begin() + (ptrdiff_t)i);
+                break;
+            }
+        old = r.Expire(GetTickCount64(), Recycler::kMaxBytes);
+    }
+    for (Bitmap* o : old) delete o;
+    if (!b) {
+        auto fresh = Create(w, h);
+        if (!fresh) return nullptr;
+        b = new Bitmap();
+        std::swap(b->hbm_, fresh->hbm_);
+        std::swap(b->bits_, fresh->bits_);
+        b->w_ = w;
+        b->h_ = h;
+    }
+    return std::shared_ptr<Bitmap>(b, [](Bitmap* d) {
+        Recycler& r = TheRecycler();
+        std::vector<Bitmap*> old;
+        {
+            std::lock_guard l(r.mu);
+            r.free.push_back({d, GetTickCount64()});
+            r.bytes += Recycler::Size(d);
+            old = r.Expire(GetTickCount64(), Recycler::kMaxBytes);
+        }
+        for (Bitmap* o : old) delete o;
+    });
+}
+
+void Bitmap::ReleaseRecycled() {
+    Recycler& r = TheRecycler();
+    std::vector<Bitmap*> old;
+    {
+        std::lock_guard l(r.mu);
+        old = r.Expire(GetTickCount64(), 0);
+    }
+    for (Bitmap* o : old) delete o;
+}
 uint32_t Bitmap::Pixel(int x, int y) const {
     x = std::clamp(x, 0, w_ - 1);
     y = std::clamp(y, 0, h_ - 1);

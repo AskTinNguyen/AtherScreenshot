@@ -39,6 +39,11 @@ inline constexpr wchar_t kProductName[] = L"Ather Screenshot";
 class Bitmap {
 public:
     static std::shared_ptr<Bitmap> Create(int w, int h);
+    // Like Create, but the pixels start out as anything (the caller sets every one), and the memory can be that of
+    // a same-sized bitmap made this way and dropped in the last few seconds: video export makes and drops several
+    // frame-sized bitmaps per frame, and fresh memory costs a page fault per 4 KB. ReleaseRecycled frees the kept ones.
+    static std::shared_ptr<Bitmap> CreateRecycled(int w, int h);
+    static void ReleaseRecycled();
     ~Bitmap();
     Bitmap(const Bitmap&) = delete;
     Bitmap& operator=(const Bitmap&) = delete;

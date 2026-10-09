@@ -330,6 +330,157 @@ int ColorExp(const std::wstring& path, const std::wstring& refRaw) {
     else buf->Unlock();
     return 0;
 }
+// ---- experiment: how Media Foundation turns RGB32 into NV12 for the encoder (EXP-TEMP) ----
+int Rgb2YuvExp(const std::wstring& raw, int cw = 0, int chh = 0) {
+    EnsureMediaFoundation();
+    auto ref = ReadAll(raw);
+    const int W = cw ? cw : ((int32_t*)ref.data())[0] & ~1, H = chh ? chh : ((int32_t*)ref.data())[1] & ~1, SW = ((int32_t*)ref.data())[0];
+    const uint32_t* px = (const uint32_t*)(ref.data() + 8);
+    std::vector<uint32_t> rgb((size_t)W * H);
+    for (int y = 0; y < H; ++y) memcpy(rgb.data() + (size_t)y * W, px + (size_t)y * SW, (size_t)W * 4);
+    MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, MFVideoFormat_RGB32}, out{MFMediaType_Video, MFVideoFormat_NV12};
+    IMFActivate** acts = nullptr;
+    UINT32 count = 0;
+    MFTEnumEx(MFT_CATEGORY_VIDEO_PROCESSOR, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out, &acts, &count);
+    char line[512];
+    for (UINT32 a = 0; a < count; ++a) {
+        WCHAR* name = nullptr;
+        UINT32 nl = 0;
+        acts[a]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nl);
+        Microsoft::WRL::ComPtr<IMFTransform> mft;
+        HRESULT hr = acts[a]->ActivateObject(IID_PPV_ARGS(&mft));
+        Microsoft::WRL::ComPtr<IMFMediaType> ti, to;
+        MFCreateMediaType(&ti);
+        ti->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        ti->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        ti->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        ti->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32)(W * 4));
+        MFSetAttributeSize(ti.Get(), MF_MT_FRAME_SIZE, W, H);
+        MFSetAttributeRatio(ti.Get(), MF_MT_FRAME_RATE, 30, 1);
+        MFSetAttributeRatio(ti.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        MFCreateMediaType(&to);
+        to->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        to->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        to->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(to.Get(), MF_MT_FRAME_SIZE, W, H);
+        MFSetAttributeRatio(to.Get(), MF_MT_FRAME_RATE, 30, 1);
+        MFSetAttributeRatio(to.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (SUCCEEDED(hr)) hr = mft->SetInputType(0, ti.Get(), 0);
+        if (SUCCEEDED(hr)) hr = mft->SetOutputType(0, to.Get(), 0);
+        std::vector<uint8_t> nv((size_t)W * H * 3 / 2);
+        if (SUCCEEDED(hr)) {
+            Microsoft::WRL::ComPtr<IMFMediaBuffer> b;
+            Microsoft::WRL::ComPtr<IMFSample> s;
+            MFCreateMemoryBuffer((DWORD)(rgb.size() * 4), &b);
+            BYTE* d = nullptr;
+            b->Lock(&d, nullptr, nullptr);
+            memcpy(d, rgb.data(), rgb.size() * 4);
+            b->Unlock();
+            b->SetCurrentLength((DWORD)(rgb.size() * 4));
+            MFCreateSample(&s);
+            s->AddBuffer(b.Get());
+            s->SetSampleTime(0);
+            s->SetSampleDuration(333333);
+            hr = mft->ProcessInput(0, s.Get(), 0);
+            MFT_OUTPUT_STREAM_INFO info{};
+            mft->GetOutputStreamInfo(0, &info);
+            MFT_OUTPUT_DATA_BUFFER ob{};
+            Microsoft::WRL::ComPtr<IMFSample> os;
+            Microsoft::WRL::ComPtr<IMFMediaBuffer> obuf;
+            if (!(info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
+                MFCreateMemoryBuffer((DWORD)nv.size(), &obuf);
+                MFCreateSample(&os);
+                os->AddBuffer(obuf.Get());
+                ob.pSample = os.Get();
+            }
+            DWORD st = 0;
+            if (SUCCEEDED(hr)) hr = mft->ProcessOutput(0, 1, &ob, &st);
+            if (SUCCEEDED(hr)) {
+                Microsoft::WRL::ComPtr<IMFMediaBuffer> cb;
+                ob.pSample->ConvertToContiguousBuffer(&cb);
+                BYTE* q = nullptr;
+                DWORD len = 0;
+                cb->Lock(&q, nullptr, &len);
+                memcpy(nv.data(), q, std::min<size_t>(len, nv.size()));
+                cb->Unlock();
+            }
+            if (ob.pSample && !os) ob.pSample->Release();
+            if (ob.pEvents) ob.pEvents->Release();
+        }
+        sprintf_s(line, "MFT %u: %S  hr=0x%08X\n", a, name ? name : L"?", (unsigned)hr);
+        Say(line);
+        CoTaskMemFree(name);
+        if (FAILED(hr)) continue;
+        // Candidates: [Y coeffs r,g,b], [U], [V], chroma from: 0 top-left, 1 average 2x2, 2 average 2 horizontal, 3 average 2 vertical
+        struct C { const char* name; int yr, yg, yb, ur, ug, ub, vr, vg, vb; };
+        const C cs[] = {{"709", 47, 157, 16, -26, -87, 112, 112, -102, -10}, {"601", 66, 129, 25, -38, -74, 112, 112, -94, -18}};
+        for (const C& c : cs) {
+            size_t ny = 0, eqy = 0;
+            int maxy = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const uint32_t p = rgb[(size_t)y * W + x];
+                    const int R = (p >> 16) & 255, G = (p >> 8) & 255, B = p & 255;
+                    const int Y = ((c.yr * R + c.yg * G + c.yb * B + 128) >> 8) + 16;
+                    ++ny;
+                    eqy += Y == nv[(size_t)y * W + x];
+                    maxy = std::max(maxy, std::abs(Y - nv[(size_t)y * W + x]));
+                }
+            for (int mode = 0; mode < 6; ++mode) {
+                size_t nc = 0, eqc = 0;
+                int maxc = 0;
+                for (int y = 0; y < H; y += 2)
+                    for (int x = 0; x < W; x += 2) {
+                        int u = 0, v = 0;
+                        auto UV = [&](int xx, int yy, int* uu, int* vv) {
+                            const uint32_t p = rgb[(size_t)yy * W + xx];
+                            const int R = (p >> 16) & 255, G = (p >> 8) & 255, B = p & 255;
+                            *uu = ((c.ur * R + c.ug * G + c.ub * B + 128) >> 8) + 128;
+                            *vv = ((c.vr * R + c.vg * G + c.vb * B + 128) >> 8) + 128;
+                        };
+                        if (mode == 0) UV(x, y, &u, &v);
+                        else if (mode == 1 || mode == 4) {
+                            int su = 0, sv = 0;
+                            for (int k = 0; k < 4; ++k) {
+                                int a, b;
+                                UV(x + (k & 1), y + k / 2, &a, &b);
+                                su += a, sv += b;
+                            }
+                            u = mode == 1 ? (su + 2) / 4 : su / 4, v = mode == 1 ? (sv + 2) / 4 : sv / 4;
+                        } else if (mode == 2) {
+                            int a, b, a2, b2;
+                            UV(x, y, &a, &b);
+                            UV(x + 1, y, &a2, &b2);
+                            u = (a + a2 + 1) / 2, v = (b + b2 + 1) / 2;
+                        } else if (mode == 3) {
+                            int a, b, a2, b2;
+                            UV(x, y, &a, &b);
+                            UV(x, y + 1, &a2, &b2);
+                            u = (a + a2 + 1) / 2, v = (b + b2 + 1) / 2;
+                        } else {  // average RGB first
+                            int sr = 0, sg = 0, sb = 0;
+                            for (int k = 0; k < 4; ++k) {
+                                const uint32_t p = rgb[(size_t)(y + k / 2) * W + x + (k & 1)];
+                                sr += (p >> 16) & 255, sg += (p >> 8) & 255, sb += p & 255;
+                            }
+                            const int R = (sr + 2) / 4, G = (sg + 2) / 4, B = (sb + 2) / 4;
+                            u = ((c.ur * R + c.ug * G + c.ub * B + 128) >> 8) + 128;
+                            v = ((c.vr * R + c.vg * G + c.vb * B + 128) >> 8) + 128;
+                        }
+                        const uint8_t* q = nv.data() + (size_t)W * H + (size_t)(y / 2) * W + x;
+                        nc += 2;
+                        eqc += (u == q[0]) + (v == q[1]);
+                        maxc = std::max({maxc, std::abs(u - q[0]), std::abs(v - q[1])});
+                    }
+                sprintf_s(line, "   %s chroma mode %d: Y exact %.3f%% max %d | UV exact %.3f%% max %d\n", c.name, mode, eqy * 100.0 / ny, maxy, eqc * 100.0 / nc, maxc);
+                Say(line);
+            }
+        }
+    }
+    for (UINT32 a = 0; a < count; ++a) acts[a]->Release();
+    CoTaskMemFree(acts);
+    return 0;
+}
 int Bench(const std::vector<std::wstring>& args) {
     if (args.size() < 2) return 2;
     const std::wstring dir = args[0];
@@ -378,7 +529,7 @@ int Bench(const std::vector<std::wstring>& args) {
             sprintf_s(line, "  %-7s %7.2f s  %5d frames  %7.1f fps%s%s\n", Narrow(s.name).c_str(), secs, frames, frames / std::max(1e-9, secs),
                       done ? "" : "  FAILED: ", done ? "" : Narrow(err).c_str());
             Say(line);
-            sprintf_s(line, "          decode %.2f fit %.2f render %.2f write %.2f audio %.2f final %.2f gif %.2f\n", g_prof[0], g_prof[1], g_prof[2], g_prof[3], g_prof[4], g_prof[5], g_prof[6]);  // PROF-TEMP
+            sprintf_s(line, "          decode %.2f fit %.2f render %.2f write %.2f audio %.2f final %.2f gif %.2f wait %.2f\n", g_prof[0], g_prof[1], g_prof[2], g_prof[3], g_prof[4], g_prof[5], g_prof[6], g_prof[7]);  // PROF-TEMP
             Say(line);  // PROF-TEMP
             if (tap) {
                 std::string text;
@@ -453,6 +604,7 @@ int VideoBench(const std::vector<std::wstring>& args) {
         if (!args.empty() && args[0] == L"--bench-compare") code = args.size() == 3 ? Compare(args[1], args[2]) : 2;
         else if (args[0] == L"--bench-decode") code = DecodeExp(args[1], _wtoi(args[2].c_str()));  // EXP-TEMP
         else if (args[0] == L"--bench-color") code = ColorExp(args[1], args[2]);  // EXP-TEMP
+        else if (args[0] == L"--bench-rgb2yuv") code = Rgb2YuvExp(args[1], args.size() > 3 ? _wtoi(args[2].c_str()) : 0, args.size() > 3 ? _wtoi(args[3].c_str()) : 0);  // EXP-TEMP
         else code = Bench(std::vector<std::wstring>(args.begin() + 1, args.end()));
         CoUninitialize();
     }).join();

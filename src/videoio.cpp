@@ -57,7 +57,7 @@ std::wstring HrText(const wchar_t* what, HRESULT hr) {
 // ---------- frames ----------
 
 // YUV → RGB for 8-bit 4:2:0 video, bit for bit the way Media Foundation's own converter does it (which is ~15×
-// slower): 8-bit fixed point; the file's matrix, else BT.709 for HD and BT.601 below; studio range unless the file
+// slower): 8-bit fixed point; the file's matrix, else BT.709 above 576 rows and BT.601 up to that; studio range unless the file
 // says full; each chroma sample used as is for its 2 × 2 pixels.
 struct YuvMatrix {
     int y = 0, rv = 0, gu = 0, gv = 0, bu = 0, yOff = 16;
@@ -69,7 +69,7 @@ YuvMatrix MatrixFor(IMFMediaType* native, UINT32 height) {
     UINT32 m = MFGetAttributeUINT32(native, MF_MT_YUV_MATRIX, MFVideoTransferMatrix_Unknown);
     if (m != MFVideoTransferMatrix_BT709 && m != MFVideoTransferMatrix_BT601 && m != MFVideoTransferMatrix_SMPTE240M &&
         m != MFVideoTransferMatrix_BT2020_10 && m != MFVideoTransferMatrix_BT2020_12)
-        m = height >= 720 ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601;
+        m = height > 576 ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601;
     double kr = 0.2126, kb = 0.0722;
     if (m == MFVideoTransferMatrix_BT601) kr = 0.299, kb = 0.114;
     else if (m == MFVideoTransferMatrix_SMPTE240M) kr = 0.212, kb = 0.087;
@@ -106,12 +106,77 @@ void Nv12ToBgra(const uint8_t* yp, const uint8_t* uvp, int pitch, int w, int h, 
     }
 }
 
+// Frame-sized byte buffers (NV12) for an export's threads, reused like Bitmap::CreateRecycled's memory.
+using Bytes = std::shared_ptr<std::vector<uint8_t>>;
+struct BytePool {
+    std::mutex mu;
+    std::vector<std::pair<std::vector<uint8_t>*, ULONGLONG>> free;  // and when it was dropped
+    size_t bytes = 0;
+    static constexpr size_t kMaxBytes = 256u << 20;
+    std::vector<std::vector<uint8_t>*> Expire(size_t keep) {
+        std::vector<std::vector<uint8_t>*> out;
+        const ULONGLONG now = GetTickCount64();
+        while (!free.empty() && (bytes > keep || now - free.front().second > 3000)) {
+            bytes -= free.front().first->capacity();
+            out.push_back(free.front().first);
+            free.erase(free.begin());
+        }
+        return out;
+    }
+};
+BytePool& ThePool() {
+    static BytePool* p = new BytePool();  // never destroyed: buffers may come back during shutdown
+    return *p;
+}
+
+// `n` bytes, their values left as they were.
+Bytes RecycledBytes(size_t n) {
+    BytePool& p = ThePool();
+    std::vector<uint8_t>* v = nullptr;
+    std::vector<std::vector<uint8_t>*> old;
+    {
+        std::lock_guard l(p.mu);
+        for (size_t i = p.free.size(); i-- > 0;)
+            if (p.free[i].first->capacity() >= n && p.free[i].first->capacity() <= n + n / 4) {
+                v = p.free[i].first;
+                p.bytes -= v->capacity();
+                p.free.erase(p.free.begin() + (ptrdiff_t)i);
+                break;
+            }
+        old = p.Expire(BytePool::kMaxBytes);
+    }
+    for (auto* o : old) delete o;
+    if (!v) v = new std::vector<uint8_t>();
+    v->resize(n);
+    return Bytes(v, [](std::vector<uint8_t>* d) {
+        BytePool& p = ThePool();
+        std::vector<std::vector<uint8_t>*> old;
+        {
+            std::lock_guard l(p.mu);
+            p.free.push_back({d, GetTickCount64()});
+            p.bytes += d->capacity();
+            old = p.Expire(BytePool::kMaxBytes);
+        }
+        for (auto* o : old) delete o;
+    });
+}
+
+void ReleaseRecycledBytes() {
+    BytePool& p = ThePool();
+    std::vector<std::vector<uint8_t>*> old;
+    {
+        std::lock_guard l(p.mu);
+        old = p.Expire(0);
+    }
+    for (auto* o : old) delete o;
+}
+
 }  // namespace
 
 struct VideoFrame::State {
     std::once_flag once;
     BitmapPtr bgra;            // the picture, once converted (or as decoded, when the decoder made BGRA)
-    std::vector<uint8_t> yuv;  // NV12 until converted: w × h luma, then the chroma rows, `pitch` bytes each
+    Bytes yuv;  // NV12 until converted: w × h luma, then the chroma rows, `pitch` bytes each
     int pitch = 0, w = 0, h = 0;
     YuvMatrix matrix;
     int rotation = 0;  // applied on conversion
@@ -125,12 +190,12 @@ BitmapPtr VideoFrame::Bgra() const {
     State& s = *s_;
     std::call_once(s.once, [&s] {
         BitmapPtr out = s.bgra;
-        if (!out && !s.yuv.empty() && (out = Bitmap::Create(s.w, s.h)))
-            Nv12ToBgra(s.yuv.data(), s.yuv.data() + (size_t)s.pitch * s.h, s.pitch, s.w, s.h, out->Bits(), s.matrix);
+        if (!out && s.yuv && (out = Bitmap::CreateRecycled(s.w, s.h)))
+            Nv12ToBgra(s.yuv->data(), s.yuv->data() + (size_t)s.pitch * s.h, s.pitch, s.w, s.h, out->Bits(), s.matrix);
         if (out && s.rotation) out = RotateBitmap(*out, s.rotation);
         if (out && s.fit.cx > 0 && (out->Width() != s.fit.cx || out->Height() != s.fit.cy)) out = FitInto(*out, s.fit.cx, s.fit.cy);
         s.bgra = out;
-        std::vector<uint8_t>().swap(s.yuv);
+        s.yuv = nullptr;
     });
     return s.bgra;
 }
@@ -259,10 +324,19 @@ bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit) {
                 st->h = h;
                 st->pitch = cp;
                 st->matrix = p_->matrix;
-                st->yuv.resize((size_t)cp * (h + (h + 1) / 2));
-                for (int y = 0; y < h; ++y) memcpy(st->yuv.data() + (size_t)y * cp, scan0 + (size_t)pitch * y, (size_t)w);
+                st->yuv = RecycledBytes((size_t)cp * (h + (h + 1) / 2));
+                uint8_t* d = st->yuv->data();
+                if (pitch == cp) {
+                    memcpy(d, scan0, (size_t)cp * h);
+                } else {
+                    for (int y = 0; y < h; ++y) memcpy(d + (size_t)y * cp, scan0 + (size_t)pitch * y, (size_t)w);
+                }
                 const BYTE* uv = scan0 + (size_t)pitch * rows;
-                for (int y = 0; y < (h + 1) / 2; ++y) memcpy(st->yuv.data() + (size_t)(h + y) * cp, uv + (size_t)pitch * y, (size_t)cp);
+                if (pitch == cp) {
+                    memcpy(d + (size_t)cp * h, uv, (size_t)cp * ((h + 1) / 2));
+                } else {
+                    for (int y = 0; y < (h + 1) / 2; ++y) memcpy(d + (size_t)(h + y) * cp, uv + (size_t)pitch * y, (size_t)cp);
+                }
             }
         } else if ((st->bgra = Bitmap::Create(w, h))) {
             ok = true;
@@ -790,10 +864,12 @@ private:
     double nextT_ = 0;
 };
 
-// Runs jobs on worker threads (COM initialized) and hands the results back in the order they were pushed.
+// Runs jobs on worker threads (COM initialized) and hands the results back in the order they were pushed, with
+// at most `depth` pushed and not yet taken.
+template <class T>
 class OrderedWork {
 public:
-    explicit OrderedWork(int workers) {
+    OrderedWork(int workers, size_t depth) : depth_(depth) {
         for (int i = 0; i < workers; ++i)
             threads_.emplace_back([this] {
                 CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -802,46 +878,59 @@ public:
             });
     }
     ~OrderedWork() {  // drops what hasn't started, waits for what has
-        {
-            std::lock_guard l(mu_);
-            quit_ = true;
-        }
-        cv_.notify_all();
+        Stop();
         for (auto& t : threads_) t.join();
     }
-    size_t InFlight() const { return order_.size(); }
-    void Push(std::function<BitmapPtr()> job) {
+    // Waits for room; false once stopped.
+    bool Push(std::function<T()> job) {
         auto s = std::make_shared<Slot>();
         s->job = std::move(job);
-        std::lock_guard l(mu_);
+        std::unique_lock l(mu_);
+        room_.wait(l, [&] { return stop_ || order_.size() < depth_; });
+        if (stop_) return false;
         order_.push_back(s);
         todo_.push_back(s);
-        cv_.notify_one();
+        work_.notify_one();
+        return true;
     }
-    BitmapPtr Pop() {  // the oldest result, once it is ready
+    void Close() {  // nothing more comes: Pop says so once the rest are out
+        std::lock_guard l(mu_);
+        closed_ = true;
+        done_.notify_all();
+    }
+    void Stop() {  // refuses everything from now on
+        std::lock_guard l(mu_);
+        stop_ = true;
+        room_.notify_all();
+        work_.notify_all();
+        done_.notify_all();
+    }
+    // The oldest result, once it is ready; false when there is none left (closed) or after Stop.
+    bool Pop(T* out) {
         std::unique_lock l(mu_);
-        if (order_.empty()) return nullptr;
-        const auto s = order_.front();
+        done_.wait(l, [&] { return stop_ || (!order_.empty() && order_.front()->done) || (closed_ && order_.empty()); });
+        if (stop_ || order_.empty()) return false;
+        *out = std::move(order_.front()->result);
         order_.pop_front();
-        done_.wait(l, [&] { return s->done; });
-        return std::move(s->result);
+        room_.notify_one();
+        return true;
     }
 
 private:
     struct Slot {
-        std::function<BitmapPtr()> job;
-        BitmapPtr result;
+        std::function<T()> job;
+        T result{};
         bool done = false;
     };
     void Work() {
         std::unique_lock l(mu_);
         for (;;) {
-            cv_.wait(l, [&] { return quit_ || !todo_.empty(); });
-            if (quit_) return;
+            work_.wait(l, [&] { return stop_ || !todo_.empty(); });
+            if (stop_) return;
             const auto s = todo_.front();
             todo_.pop_front();
             l.unlock();
-            BitmapPtr r = s->job();
+            T r = s->job();
             s->job = nullptr;
             l.lock();
             s->result = std::move(r);
@@ -849,11 +938,12 @@ private:
             done_.notify_all();
         }
     }
+    const size_t depth_;
     std::mutex mu_;
-    std::condition_variable cv_, done_;
+    std::condition_variable work_, done_, room_;
     std::deque<std::shared_ptr<Slot>> order_, todo_;
     std::vector<std::thread> threads_;
-    bool quit_ = false;
+    bool closed_ = false, stop_ = false;
 };
 
 // Workers and frames in flight for an export of `px`-pixel frames: enough to keep every core busy, few enough
@@ -865,31 +955,40 @@ std::pair<int, size_t> ExportWorkers(SIZE px) {
     const size_t depth = (size_t)std::clamp((int)(600e6 / perFrame), 2, workers * 2);
     return {workers, depth};
 }
+
 // Makes output frames 0…n−1 on worker threads (`make` turns a source frame and its time into one) and hands
-// them to `use` in order, on this thread. Stops when `use` returns false or a frame can't be made.
-void ExportFrames(EditFrames& frames, int n, const std::function<BitmapPtr(const VideoFrame&, double)>& make,
-                  const std::function<bool(int, const BitmapPtr&)>& use) {
+// them to `use` in order, on this thread, while another thread decodes ahead. Stops when `use` returns false or
+// a frame can't be made.
+template <class T>
+void ExportFrames(EditFrames& frames, int n, const std::function<T(const VideoFrame&, double)>& make, const std::function<bool(int, T&)>& use) {
     const SIZE full = frames.Full(), out = frames.Out();
     const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
-    OrderedWork work(workers);
-    int pushed = 0;
-    for (int i = 0; i < n; ++i) {
-        while (pushed < n && work.InFlight() < depth) {
+    OrderedWork<T> work(workers, depth);
+    std::thread reader([&] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (int i = 0; i < n; ++i) {
             VideoFrame src;
             double st = 0;
-            if (!frames.Next(pushed, &src, &st)) {
-                n = pushed;
-                break;
-            }
-            work.Push([&make, src, st] { return make(src, st); });
-            ++pushed;
+            if (!frames.Next(i, &src, &st) || !work.Push([&make, src, st] { return make(src, st); })) break;
         }
-        if (i >= pushed) break;
-        const BitmapPtr f = work.Pop();
+        work.Close();
+        CoUninitialize();
+    });
+    T f{};
+    for (int i = 0; work.Pop(&f); ++i) {
+        ProfT pt(7);  // PROF-TEMP
         if (!f || !use(i, f)) break;
     }
+    work.Stop();
+    reader.join();
 }
 
+// An output frame ready for the encoder (and, for --bench-export's tap, as rendered).
+struct EncoderFrame {
+    Bytes nv12;
+    BitmapPtr bgra;
+    explicit operator bool() const { return nv12 != nullptr; }
+};
 }  // namespace
 
 std::function<void(int, const Bitmap&)> g_exportTap;
@@ -907,7 +1006,7 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
         if (!audio->Open(seq, e.trimStart, e.trimEnd, e.speed)) audio.reset();
     }
     Mp4Writer w;
-    HRESULT hr = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2);
+    HRESULT hr = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2, 0, true);
     if (FAILED(hr)) {
         if (error) *error = HrText(L"Can't start the MP4 encoder", hr);
         return false;
@@ -915,9 +1014,19 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     const int n = frames.Count(true);
     const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
     bool cancelled = false;
-    ExportFrames(frames, n, [&](const VideoFrame& src, double st) { return frames.Render(src, st); }, [&](int i, const BitmapPtr& f) {
-        if (g_exportTap) g_exportTap(i, *f);
-        { ProfT pt(3); hr = w.WriteFrame(f->Bits(), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
+    auto make = [&](const VideoFrame& src, double st) {
+        EncoderFrame ef;
+        const BitmapPtr f = frames.Render(src, st);
+        if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
+        ef.nv12 = RecycledBytes((size_t)sz.cx * sz.cy * 3 / 2);
+        { ProfT pt(1); BgraToNv12(f->Bits(), sz.cx, sz.cy, ef.nv12->data()); }  // PROF-TEMP
+        if (g_exportTap) ef.bgra = f;
+        return ef;
+    };
+    ExportFrames<EncoderFrame>(frames, n, make, [&](int i, EncoderFrame& f) {
+        if (g_exportTap) g_exportTap(i, *f.bgra);
+        { ProfT pt(3); hr = w.WriteNv12(f.nv12->data(), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
+        f = {};
         ProfT pt4(4);  // PROF-TEMP
         if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
         if (FAILED(hr)) return false;
@@ -950,7 +1059,7 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
         return f && (f->Width() != gw || f->Height() != gh) ? Resample(*f, gw, gh) : f;
     };
     if (SUCCEEDED(hr))
-        ExportFrames(frames, n, make, [&](int i, const BitmapPtr& f) {
+        ExportFrames<BitmapPtr>(frames, n, make, [&](int i, BitmapPtr& f) {
             if (g_exportTap) g_exportTap(i, *f);
             const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
             { ProfT pt(6); hr = g.Add(f->Bits(), delay); }  // PROF-TEMP
@@ -1491,7 +1600,7 @@ ATHER_TEST(video_sequence_joins_clips_into_one_video) {
 // Frames converted here come out exactly as Media Foundation's own (much slower) converter makes them, for SD
 // (BT.601) and HD (BT.709) sizes alike.
 ATHER_TEST(video_decoding_matches_media_foundation_colors) {
-    for (SIZE sz : {SIZE{640, 360}, SIZE{1024, 576}, SIZE{960, 720}, SIZE{1280, 720}, SIZE{1920, 1080}}) {
+    for (SIZE sz : {SIZE{640, 360}, SIZE{1024, 576}, SIZE{720, 580}, SIZE{800, 600}, SIZE{1280, 720}, SIZE{1920, 1080}}) {
         const std::wstring path = test::TempDir() + L"/colors.mp4";
         Mp4Writer mw;
         CHECK(SUCCEEDED(mw.Begin(path, sz.cx, sz.cy, 10)));

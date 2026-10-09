@@ -157,6 +157,33 @@ BitmapPtr Resample(const Bitmap& src, int w, int h) {
     return out;
 }
 
+void BgraToNv12(const uint32_t* px, int w, int h, uint8_t* out) {
+    const bool hd = h > 576;
+    const int yr = hd ? 47 : 66, yg = hd ? 157 : 129, yb = hd ? 16 : 25;
+    const int ur = hd ? -26 : -38, ug = hd ? -87 : -74, ub = 112;
+    const int vr = 112, vg = hd ? -102 : -94, vb = hd ? -10 : -18;
+    uint8_t* uv = out + (size_t)w * h;
+    for (int y = 0; y < h; y += 2) {
+        const uint32_t* r0 = px + (size_t)y * w;
+        const uint32_t* r1 = r0 + w;
+        uint8_t* y0 = out + (size_t)y * w;
+        uint8_t* y1 = y0 + w;
+        uint8_t* c = uv + (size_t)(y / 2) * w;
+        for (int x = 0; x < w; x += 2) {
+            int su = 0, sv = 0;
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t p = (k < 2 ? r0 : r1)[x + (k & 1)];
+                const int R = (p >> 16) & 255, G = (p >> 8) & 255, B = p & 255;
+                (k < 2 ? y0 : y1)[x + (k & 1)] = (uint8_t)(((yr * R + yg * G + yb * B + 128) >> 8) + 16);
+                su += ((ur * R + ug * G + ub * B + 128) >> 8) + 128;
+                sv += ((vr * R + vg * G + vb * B + 128) >> 8) + 128;
+            }
+            c[x] = (uint8_t)((su + 2) >> 2);
+            c[x + 1] = (uint8_t)((sv + 2) >> 2);
+        }
+    }
+}
+
 BitmapPtr RotateBitmap(const Bitmap& src, int degrees) {
     const int w = src.Width(), h = src.Height();
     auto out = degrees == 180 ? Bitmap::Create(w, h) : Bitmap::Create(h, w);
@@ -291,6 +318,7 @@ struct Mp4Writer::Impl {
     std::mutex mu;
     DWORD video = 0, audio = 0;
     int w = 0, h = 0, rate = 0, channels = 0;
+    bool nv12 = false;
     int64_t frames = 0;
 };
 
@@ -298,8 +326,9 @@ Mp4Writer::Mp4Writer() : p_(std::make_unique<Impl>()) {}
 Mp4Writer::~Mp4Writer() = default;
 int64_t Mp4Writer::Frames() const { return p_->frames; }
 
-HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels, int rotation) {
+HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels, int rotation, bool nv12) {
     EnsureMediaFoundation();
+    p_->nv12 = nv12;
     p_->w = w;
     p_->h = h;
     p_->rate = audioRate;
@@ -324,9 +353,9 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = p_->writer->AddStream(out.Get(), &p_->video);
     if (SUCCEEDED(hr)) hr = MFCreateMediaType(&in);
     if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+    if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_SUBTYPE, nv12 ? MFVideoFormat_NV12 : MFVideoFormat_RGB32);
     if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32)(w * 4));  // positive = top-down
+    if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32)(w * (nv12 ? 1 : 4)));  // positive = top-down
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, w, h);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -375,8 +404,16 @@ static HRESULT WriteBytes(IMFSinkWriter* w, DWORD stream, const void* data, DWOR
 
 HRESULT Mp4Writer::WriteFrame(const uint32_t* px, int64_t t, int64_t duration) {
     std::lock_guard lock(p_->mu);
-    if (!p_->writer) return E_UNEXPECTED;
+    if (!p_->writer || p_->nv12) return E_UNEXPECTED;
     const HRESULT hr = WriteBytes(p_->writer.Get(), p_->video, px, (DWORD)p_->w * p_->h * 4, t, duration);
+    if (SUCCEEDED(hr)) ++p_->frames;
+    return hr;
+}
+
+HRESULT Mp4Writer::WriteNv12(const uint8_t* yuv, int64_t t, int64_t duration) {
+    std::lock_guard lock(p_->mu);
+    if (!p_->writer || !p_->nv12) return E_UNEXPECTED;
+    const HRESULT hr = WriteBytes(p_->writer.Get(), p_->video, yuv, (DWORD)((size_t)p_->w * p_->h * 3 / 2), t, duration);
     if (SUCCEEDED(hr)) ++p_->frames;
     return hr;
 }
