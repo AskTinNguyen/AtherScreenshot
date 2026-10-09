@@ -40,7 +40,7 @@ struct Recycler {
     std::mutex mu;
     std::vector<std::pair<Bitmap*, ULONGLONG>> free;  // and when it was dropped
     size_t bytes = 0;
-    static constexpr size_t kMaxBytes = 512u << 20;
+    static constexpr size_t kMaxBytes = 256u << 20;
     static constexpr ULONGLONG kMaxAgeMs = 3000;
 
     static size_t Size(const Bitmap* b) { return (size_t)b->Width() * b->Height() * 4; }

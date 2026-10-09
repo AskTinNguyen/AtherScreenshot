@@ -24,6 +24,8 @@
 #include <wrl/client.h>
 #pragma comment(lib, "d3d11")
 #include <objbase.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi")
 #include "selftest.h"
 #include "videoio.h"
 
@@ -635,7 +637,10 @@ int Bench(const std::vector<std::wstring>& args) {
         sprintf_s(head, "%s  %dx%d  %.0f fps  %.1f s%s\n", Narrow(BaseName(args[a])).c_str(), clip->w, clip->h, clip->fps, clip->length,
                   clip->hasAudio ? "  audio" : "");
         Say(head);
+        wchar_t only[32] = L"";
+        GetEnvironmentVariableW(L"ATHER_BENCH_ONLY", only, 32);  // one scenario (e.g. to see its peak memory)
         for (const auto& s : Scenarios(*clip)) {
+            if (*only && wcscmp(only, s.name) != 0) continue;
             const std::wstring tag = BaseName(args[a]) + L"_" + s.name;
             const std::wstring out = dir + L"\\" + tag + (s.gif ? L".gif" : L".mp4");
             std::vector<uint64_t> hashes;
@@ -684,8 +689,10 @@ int Bench(const std::vector<std::wstring>& args) {
             }
         }
     }
-    char line[64];
-    sprintf_s(line, "total %.2f s\n", total);
+    PROCESS_MEMORY_COUNTERS pmc{sizeof(pmc)};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    char line[96];
+    sprintf_s(line, "total %.2f s, peak memory %.0f MB\n", total, pmc.PeakWorkingSetSize / 1048576.0);
     Say(line);
     return 0;
 }

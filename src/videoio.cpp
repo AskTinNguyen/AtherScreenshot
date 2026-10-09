@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <deque>
 #include <emmintrin.h>
+#include <future>
 #include <mutex>
 #include <thread>
 
@@ -147,7 +148,7 @@ struct BytePool {
     std::mutex mu;
     std::vector<std::pair<std::vector<uint8_t>*, ULONGLONG>> free;  // and when it was dropped
     size_t bytes = 0;
-    static constexpr size_t kMaxBytes = 256u << 20;
+    static constexpr size_t kMaxBytes = 128u << 20;
     std::vector<std::vector<uint8_t>*> Expire(size_t keep) {
         std::vector<std::vector<uint8_t>*> out;
         const ULONGLONG now = GetTickCount64();
@@ -1245,13 +1246,15 @@ private:
     WorkerPool& pool_;
     std::shared_ptr<Shared> s_;
 };
-// Workers and frames in flight for an export of `px`-pixel frames: enough to keep every core busy, few enough
-// that the frames in flight stay within ~600 MB.
+// Workers and frames in flight for an export of `px`-pixel frames: enough to keep the cores busy, few enough that
+// the frames in flight stay within ~600 MB (less on a PC with under 10 GB).
 std::pair<int, size_t> ExportWorkers(SIZE px) {
     const int cores = (int)std::max(1u, std::thread::hardware_concurrency());
     const int workers = std::clamp(cores - 2, 1, 16);
-    const double perFrame = std::max(1.0, (double)px.cx * px.cy * 14);  // NV12 source, its BGRA, the render and its copy
-    const size_t depth = (size_t)std::clamp((int)(600e6 / perFrame), 2, workers * 2);
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    const double budget = std::min(600e6, GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys / 16.0 : 300e6);
+    const double perFrame = std::max(1.0, (double)px.cx * px.cy * 14);  // NV12 source, its BGRA, the render, NV12 out
+    const size_t depth = (size_t)std::clamp((int)(budget / perFrame), 2, workers * 2);
     return {workers, depth};
 }
 
@@ -1317,25 +1320,42 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
 }
 
 bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress) {
+    LARGE_INTEGER q0, q1, q2, q3, q4, qf; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&qf);  // PROF-TEMP
     const int fps = (int)std::lround(seq.Fps());
-    EditFrames frames;
-    if (!frames.Open(seq, e, fps, error)) return false;  // "Can't read this video."
-    const SIZE sz = frames.Out();
+    const SIZE sz = FrameRenderer(e, seq.size, false).Out();
     std::unique_ptr<AudioPipe> audio;
     if (!e.muted && seq.HasAudio()) {
         audio = std::make_unique<AudioPipe>();
         if (!audio->Open(seq, e.trimStart, e.trimEnd, e.speed)) audio.reset();
     }
+    // The encoder takes a moment to start: meanwhile the video opens and the first frames are made.
     Mp4Writer w;
-    HRESULT hr = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2, 0, true);
-    if (FAILED(hr)) {
-        if (error) *error = HrText(L"Can't start the MP4 encoder", hr);
+    auto begun = std::async(std::launch::async, [&] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const HRESULT r = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2, 0, true);
+        CoUninitialize();
+        return r;
+    });
+    EditFrames frames;
+    if (!frames.Open(seq, e, fps, error)) {  // "Can't read this video."
+        if (SUCCEEDED(begun.get())) w.Finalize();
         return false;
     }
+    QueryPerformanceCounter(&q1);  // PROF-TEMP
+    HRESULT hr = S_OK;
+    bool started = false;
+    auto start = [&] {
+        if (started) return SUCCEEDED(hr);
+        started = true;
+        if (FAILED(hr = begun.get()) && error) *error = HrText(L"Can't start the MP4 encoder", hr);
+        return SUCCEEDED(hr);
+    };
+    QueryPerformanceCounter(&q2);  // PROF-TEMP
     const int n = frames.Count(true);
     const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
     bool cancelled = false;
     ExportFrames<EncoderFrame>(frames, 0, n, Mp4Frames(frames, sz), [&](int i, EncoderFrame& f) {
+        if (!start()) return false;
         if (g_exportTap) g_exportTap(i, *f.bgra);
         { ProfT pt(3); hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps)); }  // PROF-TEMP
         f = {};
@@ -1344,13 +1364,17 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
         cancelled = progress && !progress((i + 1.0) / n);
         return !cancelled;
     });
+    if (!start()) return false;  // "Can't start the MP4 encoder"
     if (FAILED(hr) || cancelled) {
         if (error) *error = cancelled ? L"Cancelled." : HrText(L"Encoding failed", hr);
         w.Finalize();
         return false;
     }
     if (audio) hr = audio->WriteUntil(w, audioTotal);
+    QueryPerformanceCounter(&q3);  // PROF-TEMP
     { ProfT pt(5); const HRESULT fin = w.Finalize(); if (SUCCEEDED(hr)) hr = fin; }  // PROF-TEMP
+    QueryPerformanceCounter(&q4);  // PROF-TEMP
+    { char b[200]; auto s = [&](LARGE_INTEGER a, LARGE_INTEGER z) { return double(z.QuadPart - a.QuadPart) / qf.QuadPart; }; sprintf_s(b, "          [single: open %.3f begin %.3f frames %.3f finalize %.3f]\n", s(q0, q1), s(q1, q2), s(q2, q3), s(q3, q4)); test::Out(b); }  // PROF-TEMP
     if (FAILED(hr) && error) *error = HrText(L"Couldn't finish the MP4", hr);
     return SUCCEEDED(hr);
 }
@@ -1359,11 +1383,12 @@ enum class Outcome { Done, Failed, Retry };  // Retry: this way doesn't work her
 
 std::atomic<int> g_joined{0};  // encoders the last export's video was joined from (0: one encoder), for the tests
 
-// Encoders for an export of `n` frames at `fps`: two from four seconds on. (A third gains little more on plain
-// exports and costs on ones with edits, measured on an RTX 5090 with --bench-export.)
+// Encoders for an export of `n` frames at `fps`: two from eight seconds on (shorter, starting the second one and
+// joining cost what it saves). A third gains little more on plain exports and costs on ones with edits (measured
+// on an RTX 5090 with --bench-export).
 int EncodersFor(int n, int fps) {
     if (wchar_t v[8]; GetEnvironmentVariableW(L"ATHER_ENCODERS", v, 8)) return std::max(1, _wtoi(v));  // developer switch (--bench-export)
-    return n >= 4 * fps ? 2 : 1;
+    return n >= 8 * fps ? 2 : 1;
 }
 
 // Encoding is what holds a plain export back: a hardware encoder does ~300–450 frames a second, and a GPU often
@@ -1379,16 +1404,27 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
     LARGE_INTEGER q0, q1, q2, q3, qf; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&qf);  // PROF-TEMP
     std::vector<std::unique_ptr<Mp4Writer>> writers;
     std::vector<std::wstring> parts;
-    for (int i = 0; i < want; ++i) {
-        auto w = std::make_unique<Mp4Writer>();
-        const std::wstring part = out + L".part" + std::to_wstring(i) + L".mp4";
-        if (FAILED(w->Begin(part, sz.cx, sz.cy, fps, 0, 2, 0, true))) {  // e.g. the GPU allows no more encoding sessions
-            DeleteFileW(part.c_str());
-            break;
+    {  // started side by side (each takes a moment)
+        std::vector<std::unique_ptr<Mp4Writer>> all;
+        std::vector<std::future<HRESULT>> begun;
+        for (int i = 0; i < want; ++i) {
+            all.push_back(std::make_unique<Mp4Writer>());
+            begun.push_back(std::async(std::launch::async, [&, i] {
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                const HRESULT r = all[i]->Begin(out + L".part" + std::to_wstring(i) + L".mp4", sz.cx, sz.cy, fps, 0, 2, 0, true);
+                CoUninitialize();
+                return r;
+            }));
         }
-        writers.push_back(std::move(w));
-        parts.push_back(part);
-        if (!writers[0]->HardwareEncoder()) break;  // a software encoder already keeps every core busy
+        for (int i = 0; i < want; ++i) {
+            const std::wstring part = out + L".part" + std::to_wstring(i) + L".mp4";
+            if (SUCCEEDED(begun[i].get())) {  // else e.g. the GPU allows no more encoding sessions
+                writers.push_back(std::move(all[i]));
+                parts.push_back(part);
+            } else {
+                DeleteFileW(part.c_str());
+            }
+        }
     }
     auto removeParts = [&] {
         for (auto& w : writers) w->Finalize();
@@ -1508,7 +1544,16 @@ Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::ws
 }
 }  // namespace
 
+// The memory kept for the next frames once an export is over.
+struct ReleaseFrameMemory {
+    ~ReleaseFrameMemory() {
+        Bitmap::ReleaseRecycled();
+        ReleaseRecycledBytes();
+    }
+};
+
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
+    ReleaseFrameMemory release;
     const Sequence seq = SequenceOf(source, e);
     g_joined = 0;
     switch (ExportMp4Parallel(seq, e, out, error, progress)) {
@@ -1519,6 +1564,7 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     return ExportMp4Single(seq, e, out, error, progress);
 }
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps, ExportProgress progress) {
+    ReleaseFrameMemory release;
     EditFrames frames;
     if (!frames.Open(SequenceOf(source, e), e, fps, error)) return false;
     const SIZE sz = frames.Out();
@@ -2223,12 +2269,12 @@ ATHER_TEST(video_export_trim_speed_crop_captions) {
 ATHER_TEST(video_export_joins_seconds_from_several_encoders) {
     const std::wstring dir = test::TempDir();
     const std::wstring clip = dir + L"\\clip.mp4";
-    CHECK(WriteTestClip(clip, 640, 360, 30, 7, true));  // red, green, blue, red… a second each
+    CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));  // red, green, blue, red… a second each
     for (const wchar_t* encoders : {L"3", L"1"}) {
         SetEnvironmentVariableW(L"ATHER_ENCODERS", encoders);
         const std::wstring out = dir + L"\\out" + encoders + L".mp4";
         VideoEdit e;
-        e.trimEnd = 7;
+        e.trimEnd = 9;
         std::wstring err;
         const bool ok = ExportMp4(clip, e, out, &err);
         test::Note("encoders " + ToUtf8(encoders) + ": " + ToUtf8(err));
@@ -2236,7 +2282,7 @@ ATHER_TEST(video_export_joins_seconds_from_several_encoders) {
         test::Out("  (" + ToUtf8(encoders) + " wanted: joined from " + std::to_string(g_joined.load()) + " encoders)\n");
         CHECK(wcscmp(encoders, L"1") != 0 || g_joined == 0);
         VideoInfo vi;
-        CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 7) < 0.1 && vi.w == 640 && vi.h == 360 && vi.hasAudio);
+        CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 9) < 0.1 && vi.w == 640 && vi.h == 360 && vi.hasAudio);
         VideoReader r;
         CHECK(r.Open(out));
         BitmapPtr f;
@@ -2248,9 +2294,34 @@ ATHER_TEST(video_export_joins_seconds_from_several_encoders) {
             wrong += ((c >> (16 - 8 * want)) & 255) < 180;
             ++frames;
         }
-        CHECK_EQ(frames, 210);
+        CHECK_EQ(frames, 270);
         CHECK_EQ(wrong, 0);
         for (int i = 0; i < 3; ++i) CHECK(GetFileAttributesW((out + L".part" + std::to_wstring(i) + L".mp4").c_str()) == INVALID_FILE_ATTRIBUTES);
+    }
+    SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
+}
+
+// Cancelling halfway stops the export (one encoder or several) and leaves no pieces behind.
+ATHER_TEST(video_export_cancels_cleanly) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"\\clip.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));
+    for (const wchar_t* encoders : {L"2", L"1"}) {
+        SetEnvironmentVariableW(L"ATHER_ENCODERS", encoders);
+        const std::wstring out = dir + L"\\out" + encoders + L".mp4";
+        VideoEdit e;
+        e.trimEnd = 9;
+        std::wstring err;
+        double last = 0;
+        const bool ok = ExportMp4(clip, e, out, &err, [&](double p) {
+            last = p;
+            return p < 0.5;
+        });
+        CHECK(!ok);
+        CHECK(err == L"Cancelled.");
+        CHECK(last >= 0.5 && last < 0.6);
+        for (const wchar_t* part : {L".part0.mp4", L".part1.mp4", L".sound.mp4"})
+            CHECK(GetFileAttributesW((out + part).c_str()) == INVALID_FILE_ATTRIBUTES);
     }
     SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
 }
