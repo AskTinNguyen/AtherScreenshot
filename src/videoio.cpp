@@ -319,6 +319,7 @@ struct VideoReader::Impl {
     std::wstring file;
     double from = -1e300, last = -1e300;  // where it was last sought, the last frame given since
     bool lost = false;                    // a frame couldn't be read back off the GPU
+    bool decoded = false;                 // a frame decoded since it was opened or sought
 
     bool Open(const std::wstring& path, bool convert, Gpu* gpu);
     bool Read(VideoFrame* frame, double* t, SIZE fit, double skipTo);  // as ReadFrame
@@ -399,11 +400,23 @@ bool VideoReader::Impl::Open(const std::wstring& path, bool convert, Gpu* withGp
 
 bool VideoReader::Seek(double t) {
     if (!p_->reader) return false;
+    // A hardware decoder sought before it has decoded anything can end the stream at once (now and then, with other
+    // decoders busy): one frame decoded first keeps it going.
+    if (p_->gpu && !p_->decoded)
+        for (int tries = 0; tries < 16; ++tries) {
+            DWORD flags = 0;
+            LONGLONG ts = 0;
+            ComPtr<IMFSample> s;
+            if (FAILED(p_->reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s)) || s ||
+                (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)))
+                break;
+        }
     p_->pending.clear();  // decoded ahead of the old position
     for (auto& s : p_->slots) s.busy = false;
     p_->eof = false;
     p_->from = t;
     p_->last = -1e300;
+    p_->decoded = false;
     return SetPosition(p_->reader.Get(), t);
 }
 
@@ -417,7 +430,8 @@ bool VideoReader::Read(BitmapPtr* frame, double* t) {
 bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit, double skipTo) {
     if (!p_->reader) return false;
     if (p_->Read(frame, t, fit, skipTo)) return true;
-    if (!p_->gpu || (!p_->lost && p_->gpu->dev->GetDeviceRemovedReason() == S_OK)) return false;  // the end
+    const bool stalled = !p_->decoded && p_->from < p_->duration - 1;  // ended right after a seek inside the video
+    if (!p_->gpu || (!p_->lost && !stalled && p_->gpu->dev->GetDeviceRemovedReason() == S_OK)) return false;  // the end
     // The GPU stopped giving frames (its driver restarted, say): on from the last one given, decoded without it.
     auto fresh = std::make_unique<Impl>();
     if (!fresh->Open(p_->file, true, nullptr)) return false;
@@ -474,6 +488,7 @@ bool VideoReader::Impl::Next() {
             if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) return false;
             continue;
         }
+        decoded = true;
         Pending out;
         out.t = ts / kTicks;
         ComPtr<IMFMediaBuffer> buf;
