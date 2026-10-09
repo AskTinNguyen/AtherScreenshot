@@ -176,11 +176,11 @@ public:
 
     // An export frame at `t` is the source frame as it is: no edit shows, and nothing is cropped or zoomed.
     bool Untouched(double t) const;
-    // An export frame at `t` whose edits change only part of the source frame (nothing zooming, no title card, and
-    // a crop that starts on even pixels): that part, in source pixels on even coordinates (empty when nothing shows),
-    // else nothing. DrawEdits draws them on that part (`area`, whose top-left is `at`) exactly as Render does on the
-    // whole frame.
-    std::optional<RECT> EditArea(double t) const;
+    // An export frame at `t` whose edits change only parts of the source frame (nothing zooming, no title card, and
+    // a crop that starts on even pixels): those parts, apart from each other, in source pixels on even coordinates
+    // (none when nothing shows), else nothing. DrawEdits draws what falls on one (`area`, whose top-left is `at`)
+    // exactly as Render does on the whole frame.
+    std::optional<std::vector<RECT>> EditAreas(double t) const;
     void DrawEdits(Bitmap& area, POINT at, double t) const;
 
     VRect ViewRect(double t) const;  // the crop, or a zoom into it

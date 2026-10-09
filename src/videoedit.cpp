@@ -796,6 +796,7 @@ void FrameRenderer::DrawRegions(Bitmap& img, POINT at, double t) const {
         const auto fx = EffectOf(m, t);
         if (!fx) continue;
         const RECT rc{fx->rc.left - at.x, fx->rc.top - at.y, fx->rc.right - at.x, fx->rc.bottom - at.y};
+        if (rc.right <= 0 || rc.bottom <= 0 || rc.left >= img.Width() || rc.top >= img.Height()) continue;  // on another part
         std::vector<uint32_t> px;
         if (m.kind == MarkKind::Blur) {
             px = BlurArea(img, rc, fx->sigma);
@@ -851,15 +852,14 @@ bool FrameRenderer::Untouched(double t) const {
     return ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy};
 }
 
-std::optional<RECT> FrameRenderer::EditArea(double t) const {
+std::optional<std::vector<RECT>> FrameRenderer::EditAreas(double t) const {
     const int vx = (int)view_.x, vy = (int)view_.y;
     if (preview_ || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_)) return std::nullopt;
-    RECT a{full_.cx, full_.cy, 0, 0};
-    auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels, clipped to the frame
-        a.left = std::min(a.left, (LONG)std::max(0.0, std::floor(x0)));
-        a.top = std::min(a.top, (LONG)std::max(0.0, std::floor(y0)));
-        a.right = std::max(a.right, (LONG)std::min((double)full_.cx, std::ceil(x1)));
-        a.bottom = std::max(a.bottom, (LONG)std::min((double)full_.cy, std::ceil(y1)));
+    std::vector<RECT> areas;
+    auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels: whole 2 × 2 blocks, in the frame
+        const RECT r{(LONG)std::max(0.0, std::floor(x0)) & ~1L, (LONG)std::max(0.0, std::floor(y0)) & ~1L,
+                     std::min((LONG)full_.cx, ((LONG)std::ceil(x1) + 1) & ~1L), std::min((LONG)full_.cy, ((LONG)std::ceil(y1) + 1) & ~1L)};
+        if (r.left < r.right && r.top < r.bottom) areas.push_back(r);
     };
     auto addPlaced = [&](const Bitmap& img, VRect r, const Motion& mo, double dx, double dy) {
         if (auto c = PlacedRect(img, r, mo)) add(c->x + dx, c->y + dy, c->MaxX() + dx, c->MaxY() + dy);
@@ -888,9 +888,21 @@ std::optional<RECT> FrameRenderer::EditArea(double t) const {
         if (mo.alpha <= 0.001) continue;
         if (const auto pl = CaptionImage(c, out_, t, mo.reveal)) addPlaced(*pl->image, pl->rect, mo, vx, vy);
     }
-    if (a.left >= a.right || a.top >= a.bottom) return RECT{};
-    // Whole 2 × 2 blocks, as the chroma has them.
-    return RECT{a.left & ~1L, a.top & ~1L, std::min((LONG)full_.cx, (a.right + 1) & ~1L), std::min((LONG)full_.cy, (a.bottom + 1) & ~1L)};
+    // Ones that touch are drawn as one (in order; and a blur reads around it), until none touch.
+    for (bool merged = true; merged;) {
+        merged = false;
+        for (size_t i = 0; i < areas.size() && !merged; ++i)
+            for (size_t j = i + 1; j < areas.size() && !merged; ++j) {
+                RECT& a = areas[i];
+                const RECT& b = areas[j];
+                if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+                    a = {std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right), std::max(a.bottom, b.bottom)};
+                    areas.erase(areas.begin() + (ptrdiff_t)j);
+                    merged = true;
+                }
+            }
+    }
+    return areas;
 }
 
 void FrameRenderer::DrawEdits(Bitmap& area, POINT at, double t) const {

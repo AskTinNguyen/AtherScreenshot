@@ -131,6 +131,24 @@ std::vector<Scenario> Scenarios(const Clip& c) {
         }
         out.push_back(s);
     }
+    {  // a typical tutorial: captions all along, a box and an arrow now and then, a small blur hiding an address
+        Scenario s{L"light", false, {}};
+        s.edit.trimEnd = std::min(D, 20.0);
+        const double T = s.edit.trimEnd;
+        const wchar_t* lines[] = {L"Open the project settings", L"Pick the build target", L"Then click deploy",
+                                  L"Wait for the green check", L"That's it, it's live", L"Thanks for watching"};
+        for (int i = 0; i < 6; ++i) {
+            Caption cap;
+            cap.start = T * i / 6;
+            cap.end = T * (i + 0.95) / 6;
+            cap.text = lines[i];
+            s.edit.captions.push_back(cap);
+        }
+        s.edit.marks.push_back(M(MarkKind::Box, W * 0.1, H * 0.2, W * 0.3, H * 0.3, T * 0.1, T * 0.3, AnimStyle::DrawOn));
+        s.edit.marks.push_back(M(MarkKind::Arrow, W * 0.6, H * 0.6, W * 0.45, H * 0.45, T * 0.5, T * 0.7, AnimStyle::DrawOn));
+        s.edit.marks.push_back(M(MarkKind::Blur, W * 0.7, H * 0.06, W * 0.85, H * 0.1, 0, T));
+        out.push_back(s);
+    }
     if (D >= 40) {  // a whole long recording, as it is
         Scenario s{L"long", false, {}};
         s.edit.trimEnd = D;

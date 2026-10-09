@@ -1117,14 +1117,14 @@ public:
     Bytes Passthrough(const VideoFrame& src, double st) const {
         return Nv12Ready(src.state(), renderer_->Out().cy) && renderer_->Untouched(st) ? src.state()->yuv : nullptr;
     }
-    // The encoder's NV12 for a frame whose edits at `st` change only part of it, else null: the frame (its crop) as
-    // decoded, with just that part converted, drawn on and converted back (each pixel there as Render and
+    // The encoder's NV12 for a frame whose edits at `st` change only parts of it, else null: the frame (its crop) as
+    // decoded, with just those parts converted, drawn on and converted back (each pixel there as Render and
     // BgraToNv12 make it).
     Bytes WithEdits(const VideoFrame& src, double st) const {
         const VideoFrame::State* s = src.state();
         const SIZE out = renderer_->Out();
-        const auto area = Nv12Ready(s, out.cy) ? renderer_->EditArea(st) : std::nullopt;
-        if (!area) return nullptr;
+        const auto areas = Nv12Ready(s, out.cy) ? renderer_->EditAreas(st) : std::nullopt;
+        if (!areas) return nullptr;
         const VRect view = renderer_->View();
         const int w = s->w, vx = (int)view.x, vy = (int)view.y, ow = out.cx, oh = out.cy;
         const uint8_t* y = s->yuv->data();
@@ -1134,22 +1134,23 @@ public:
         uint8_t* ouv = oy + (size_t)ow * oh;
         for (int r = 0; r < oh; ++r) memcpy(oy + (size_t)r * ow, y + (size_t)(vy + r) * w + vx, (size_t)ow);
         for (int r = 0; r < oh / 2; ++r) memcpy(ouv + (size_t)r * ow, uv + (size_t)(vy / 2 + r) * w + vx, (size_t)ow);
-        // The part the edits change, where the crop shows it (all on even pixels).
-        const int x0 = std::max<int>(area->left, vx), x1 = std::min<int>(area->right, vx + ow);
-        const int y0 = std::max<int>(area->top, vy), y1 = std::min<int>(area->bottom, vy + oh);
-        if (x1 <= x0 || y1 <= y0) return o;
-        const int aw = area->right - area->left, ah = area->bottom - area->top;
-        const BitmapPtr part = Bitmap::CreateRecycled(aw, ah);
-        if (!part) return nullptr;
-        Nv12ToBgra(y + (size_t)area->top * w + area->left, uv + (size_t)(area->top / 2) * w + area->left, w, aw, ah, part->Bits(), s->matrix);
-        renderer_->DrawEdits(*part, {area->left, area->top}, st);
-        thread_local std::vector<uint8_t> nv;
-        nv.resize((size_t)aw * ah * 3 / 2);
-        BgraToNv12(part->Bits(), aw, ah, nv.data(), oh);
-        const uint8_t* ny = nv.data() + (x0 - area->left);
-        const uint8_t* nuv = nv.data() + (size_t)aw * ah + (x0 - area->left);
-        for (int r = y0; r < y1; ++r) memcpy(oy + (size_t)(r - vy) * ow + (x0 - vx), ny + (size_t)(r - area->top) * aw, (size_t)(x1 - x0));
-        for (int r = y0 / 2; r < y1 / 2; ++r) memcpy(ouv + (size_t)(r - vy / 2) * ow + (x0 - vx), nuv + (size_t)(r - area->top / 2) * aw, (size_t)(x1 - x0));
+        for (const RECT& area : *areas) {  // each part the edits change, where the crop shows it (all on even pixels)
+            const int x0 = std::max<int>(area.left, vx), x1 = std::min<int>(area.right, vx + ow);
+            const int y0 = std::max<int>(area.top, vy), y1 = std::min<int>(area.bottom, vy + oh);
+            if (x1 <= x0 || y1 <= y0) continue;
+            const int aw = area.right - area.left, ah = area.bottom - area.top;
+            const BitmapPtr part = Bitmap::CreateRecycled(aw, ah);
+            if (!part) return nullptr;
+            Nv12ToBgra(y + (size_t)area.top * w + area.left, uv + (size_t)(area.top / 2) * w + area.left, w, aw, ah, part->Bits(), s->matrix);
+            renderer_->DrawEdits(*part, {area.left, area.top}, st);
+            thread_local std::vector<uint8_t> nv;
+            nv.resize((size_t)aw * ah * 3 / 2);
+            BgraToNv12(part->Bits(), aw, ah, nv.data(), oh);
+            const uint8_t* ny = nv.data() + (x0 - area.left);
+            const uint8_t* nuv = nv.data() + (size_t)aw * ah + (x0 - area.left);
+            for (int r = y0; r < y1; ++r) memcpy(oy + (size_t)(r - vy) * ow + (x0 - vx), ny + (size_t)(r - area.top) * aw, (size_t)(x1 - x0));
+            for (int r = y0 / 2; r < y1 / 2; ++r) memcpy(ouv + (size_t)(r - vy / 2) * ow + (x0 - vx), nuv + (size_t)(r - area.top / 2) * aw, (size_t)(x1 - x0));
+        }
         return o;
     }
     BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
@@ -1368,7 +1369,7 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
             if (g_exportTap) ef.bgra = src.Bgra();
             return ef;
         }
-        if ((ef.nv12 = frames.WithEdits(src, st))) {  // edits on part of it: just that part converted
+        if ((ef.nv12 = frames.WithEdits(src, st))) {  // edits on parts of it: just those converted
             if (g_exportTap) ef.bgra = frames.Render(src, st, false);
             return ef;
         }
@@ -2406,8 +2407,8 @@ ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
     SetEnvironmentVariableW(L"ATHER_ENCODERS", nullptr);
 }
 
-// A frame whose edits change only part of it gets just that part converted and drawn on: there it is byte for byte
-// the whole frame rendered and converted, and elsewhere the frame (its crop) as decoded. Every kind of markup, with
+// A frame whose edits change only parts of it gets just those converted and drawn on: there it is byte for byte the
+// whole frame rendered and converted, and elsewhere the frame (its crop) as decoded. Every kind of markup, with
 // their animations, and captions; in SD and HD, cropped and not.
 ATHER_TEST(video_edits_drawn_on_their_part_match_the_whole_frame) {
     struct Case {
@@ -2459,16 +2460,16 @@ ATHER_TEST(video_edits_drawn_on_their_part_match_the_whole_frame) {
         CHECK(frames.Open(SequenceOf(clip, e), e, 10, nullptr));
         const SIZE out = frames.Out();
         const int vx = e.crop ? (int)frames.Renderer().View().x : 0, vy = e.crop ? (int)frames.Renderer().View().y : 0;
-        int checked = 0, insideWrong = 0, outsideWrong = 0;
+        int checked = 0, insideWrong = 0, outsideWrong = 0, parts = 0;
         for (int i = 0; i < 30; ++i) {
             VideoFrame src;
             double st = 0;
             bool alone = false;
             if (!frames.Next(i, &src, &st, &alone)) break;
-            const auto area = frames.Renderer().EditArea(st);
+            const auto areas = frames.Renderer().EditAreas(st);
             const Bytes got = frames.WithEdits(src, st);
-            CHECK(area && got);
-            if (!area || !got) continue;
+            CHECK(areas && got);
+            if (!areas || !got) continue;
             const std::vector<uint8_t> decoded = *src.state()->yuv;
             const BitmapPtr whole = frames.Render(src, st, false);
             std::vector<uint8_t> ref((size_t)out.cx * out.cy * 3 / 2);
@@ -2476,16 +2477,19 @@ ATHER_TEST(video_edits_drawn_on_their_part_match_the_whole_frame) {
             for (int y = 0; y < out.cy; ++y)
                 for (int x = 0; x < out.cx; ++x) {
                     const int sx = x + vx, sy = y + vy;  // source pixels
-                    const bool in = sx >= area->left && sx < area->right && sy >= area->top && sy < area->bottom;
+                    bool in = false;
+                    for (const RECT& ar : *areas) in = in || (sx >= ar.left && sx < ar.right && sy >= ar.top && sy < ar.bottom);
                     const size_t lk = (size_t)y * out.cx + x, ck = (size_t)out.cx * out.cy + (size_t)(y / 2) * out.cx + x;
                     const size_t sl = (size_t)sy * sz.cx + sx, sc = (size_t)sz.cx * sz.cy + (size_t)(sy / 2) * sz.cx + sx;
                     if (in) insideWrong += (*got)[lk] != ref[lk] || (*got)[ck] != ref[ck];
                     else outsideWrong += (*got)[lk] != decoded[sl] || (*got)[ck] != decoded[sc];
                 }
-            checked += area->right > area->left;
+            checked += !areas->empty();
+            parts = std::max(parts, (int)areas->size());
         }
         test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + (e.crop ? " cropped" : "") + ": " + std::to_string(checked) + " frames with edits");
         CHECK(checked >= 25);
+        CHECK(parts >= 2);  // some apart from others
         CHECK_EQ(insideWrong, 0);
         CHECK_EQ(outsideWrong, 0);
     }
