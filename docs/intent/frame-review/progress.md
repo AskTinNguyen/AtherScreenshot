@@ -2,9 +2,9 @@
 
 - Working under rev: 2
 - Worker: `frame-review-worker`
-- Current step: S4 (A3), J/K/L review playback with 0.25×/0.5×/1× preview speeds.
+- Current step: S5 (A4 + A11), notes in the editor with kinds and resolved status.
 - Next step: A4 (notes in the editor, with D11 kinds and status built in); then A11, A5, A9, A10, A6, A12, A7, A13, A8 (rev 2 order).
-- PR: none yet
+- PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/2
 
 ## Acceptance
 
@@ -37,6 +37,7 @@ Engineering decisions (S2):
 - The paused preview snaps its fetch to the nearest frame, so the frame shown and the frame number always agree; the playhead itself is not moved by scrubbing.
 - Our own encoder evens out irregular frame times, so there is no variable-rate test clip; the test checks file times against decoded times instead.
 - S3 (rev 2, 2026-10-10): the frame readout and Ctrl+G. A readout row under the video shows `m:ss:ff · frame n · fps` of the frame on screen (`TimelineFrames::Readout`; the timeline's time also reads `m:ss:ff`), with a key hint on the right; clicking it or Ctrl+G turns the inspector field into "Go to", which takes a frame number (757), a timecode (0:12:37, or h:mm:ss:ff) or seconds (12.6, 0:12.6); Enter lands on that frame (a toast says when the text isn't one), Esc or clicking away cancels, nothing goes on the undo stack. Evidence: `video_frame_readout_and_go_to` (formatting, round trip of every frame's timecode and number at 60, 30 and 29.97 fps, no repeated timecodes, joined clips) and `video_editor_readout_and_go_to` pass; full `test.bat` → `88 tests, 1117 checks, 0 failed`, exit 0; `--video-snapshots` renders `video-editor-readout.png` (copied to `docs/intent/frame-review/proof/a2-readout.png`), opened and checked. Acceptance: A2 met.
+- S4 (rev 2, 2026-10-10): J/K/L review playback. L plays forward, L again cycles the preview speed 0.25× → 0.5× → 1×, J plays backward (J again cycles too), K (or Space) pauses. Forward at 1× is the usual media-engine playback with sound; slower, or backward, the paused preview steps through every frame in turn, each decoded exactly, at that pace (never skipping: it waits for each frame), silent. A pill in the readout row shows "▶ Preview 0.25×" / "◀ Reverse 0.5×" while it plays that way. The speed is the preview's only (never written into `VideoEdit`). Evidence: `video_editor_review_playback_jkl` (cycle order, every frame in order at 0.25× and 0.5×, backward, stops at the trim start, `VideoEdit` unchanged, nothing on the undo stack) → `1 tests, 19 checks, 0 failed`, three reruns the same. Acceptance: A3 (full gate pending, with S5).
 
 ## Reconciliations
 
@@ -49,6 +50,7 @@ Engineering decisions (S2):
 <!-- D7: calls the contract reserves for the owner, made by the worker. Each: the call, the options weighed, why. -->
 
 - Readout placement (S3): a row of its own between the video and the inspector, left-aligned, in the editor's mono font, with the new keys as a muted hint at the right. Weighed: the timeline's left column (too narrow for the full readout), the toolbar (crowded at the 980 px minimum width), an overlay on the video (hides footage). The row costs 26 px of video height.
+- J/K/L (S4): the preview speed is sticky (the next J or L plays at the last speed chosen); starting from pause, L uses it, and 1× forward is the normal playback with sound. Weighed: always restart at 1× (classic J/K/L), but the team reviews at slow speeds and would cycle through 0.25× every time. Slow and backward playback are silent.
 - Go to (S3): the inspector's text field turns into a "Go to" field rather than a dialog box, the way captions and markup are edited in this editor. A time without a frame part (12.6) lands on the frame on screen at that time.
 
 ## Dev tools

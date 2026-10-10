@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -516,6 +518,7 @@ public:
     }
 
     void Pause() {
+        StopReview();
         if (!playing) return;
         paused = player ? player->Now() : paused;
         if (player) player->Pause();
@@ -525,7 +528,71 @@ public:
         Invalidate();
     }
 
-    void TogglePlay() { playing ? Pause() : Play(); }
+    void TogglePlay() { playing || reviewDir ? Pause() : Play(); }
+
+    // ---- review playback (J/K/L) ----
+    // L plays forward, J backward, K pauses; pressing L (or J) again while it plays that way cycles the preview speed
+    // 0.25× → 0.5× → 1×. Forward at 1× is the usual playback (with sound). Slower, or backward, the paused preview
+    // shows every frame in turn, each decoded exactly, at that pace (or slower when decoding can't keep up: it never
+    // skips one). The speed is the preview's only: the edit, and so what Save writes, stays as it is.
+    static constexpr double kPreviewRates[] = {0.25, 0.5, 1};
+    int reviewDir = 0;          // 1 forward, -1 backward: the exact-frame playback is on
+    double previewRate = 1;     // kept for the next J or L
+    double reviewDue = 0;       // when the next frame is due (seconds on the steady clock)
+    static double Seconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    double NextPreviewRate() const {
+        for (size_t i = 0; i < std::size(kPreviewRates); ++i)
+            if (std::fabs(kPreviewRates[i] - previewRate) < 1e-9) return kPreviewRates[(i + 1) % std::size(kPreviewRates)];
+        return 1;
+    }
+    bool Reviewing(int dir) const { return dir > 0 ? (reviewDir > 0 || playing) : reviewDir < 0; }
+    void Review(int dir) {
+        if (tframes.empty()) return;
+        if (Reviewing(dir)) previewRate = NextPreviewRate();
+        if (dir > 0 && previewRate == 1) {  // the usual playback, with sound
+            StopReview();
+            if (!playing) Play();
+            Invalidate();
+            return;
+        }
+        if (playing) Pause();
+        if (reviewDir != dir) {
+            const size_t n = tframes.Nearest(paused);
+            GoToFrame(n);  // starts from the frame on screen
+            reviewDir = dir;
+            reviewDue = Seconds() + FrameStep(n, dir);
+        }
+        Invalidate();
+    }
+    void StopReview() {
+        if (!reviewDir) return;
+        reviewDir = 0;
+        Invalidate();
+    }
+    // How long frame n shows going `dir` way at the preview speed.
+    double FrameStep(size_t n, int dir) const {
+        const size_t m = dir > 0 ? std::min(n + 1, tframes.size() - 1) : n > 0 ? n - 1 : 0;
+        double d = std::fabs(tframes.frames[m].t - tframes.frames[n].t);
+        if (d <= 0) d = 1 / tframes.Fps(n);
+        return d / (previewRate * edit.speed);
+    }
+    // Each tick: once the frame shown has come and its time is up, on to the next one.
+    void ReviewTick() {
+        if (!reviewDir || tframes.empty()) return;
+        if (!(raw && std::fabs(rawT - paused) < 1e-3)) return;  // still decoding the one asked for
+        const double now = Seconds();
+        if (now < reviewDue) return;
+        const size_t n = tframes.Nearest(paused);
+        const size_t first = tframes.At(edit.trimStart + 1e-3), last = tframes.At(edit.trimEnd - 1e-3);
+        if ((reviewDir > 0 && n >= last) || (reviewDir < 0 && n <= first)) return StopReview();  // at the trim's end
+        const size_t next = reviewDir > 0 ? n + 1 : n - 1;
+        GoToFrame(next);
+        reviewDue = std::max(reviewDue + FrameStep(n, reviewDir), now);  // no catching up by skipping
+        ++reviewFrames;
+    }
+    int reviewFrames = 0;  // tests: frames shown by review playback
+    std::function<void()> onFetched;  // tests: each paused frame as it's shown
+
 
     // ←/→: `frames` frames at the rate of the clip they're in, landing on each frame's own time.
     void Step(int frames) {
@@ -556,6 +623,7 @@ public:
     }
 
     void Tick() {
+        ReviewTick();
         if (!player) return;
         double t = 0;
         if (playing) {
@@ -1665,7 +1733,7 @@ public:
         // Play button and time, left of the timeline.
         const RECT play{S(14), tr.top + S(6), S(14) + S(34), tr.top + S(40)};
         if (EqualRect(&play, &hoverRect)) FillRR(g, play, (float)S(6), A(theme::kBgRaised));
-        Text(dc, fIcon, playing ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Text(dc, fIcon, playing || reviewDir ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         Hotspot(play, [this] { TogglePlay(); }, L"Play / pause (Space)");
         Text(dc, fMono, tframes.empty() ? Clock(Now()) : tframes.Timecode(FrameNow()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)},
              theme::kTextDim);
@@ -1750,13 +1818,22 @@ public:
     // m:ss:ff · frame n · fps of the frame on screen.
     std::wstring ReadoutText() const { return tframes.empty() ? Clock(Now()) : tframes.Readout(FrameNow()); }
 
-    void PaintReadout(HDC dc, gp::Graphics&) {
+    void PaintReadout(HDC dc, gp::Graphics& g) {
         const RECT r = ReadoutRect();
         const std::wstring text = ReadoutText();
         const int w = Measure(dc, fMonoBig, text).cx;
         Text(dc, fMonoBig, text, {r.left + S(2), r.top, r.left + S(2) + w + S(4), r.bottom}, theme::kText);
         Hotspot({r.left, r.top, r.left + w + S(8), r.bottom}, [this] { BeginGoTo(); }, L"Go to a frame or time (Ctrl+G)");
-        Text(dc, fSmall, L"←/→ frame · Shift+←/→ second · Home/End trim ends · Ctrl+G go to", {r.left + w + S(24), r.top, r.right, r.bottom},
+        int x = r.left + w + S(16);
+        if (reviewDir || (playing && previewRate != 1)) {  // the preview's own speed, while it plays that way
+            const std::wstring state = (reviewDir < 0 ? L"◀ Reverse " : L"▶ Preview ") + SpeedLabel(previewRate);
+            const SIZE sz = Measure(dc, fSmall, state);
+            const RECT pill{x, r.top + S(2), x + sz.cx + S(16), r.bottom - S(2)};
+            FillRR(g, pill, (float)S(5), A(theme::kSelected));
+            Text(dc, fSmall, state, pill, theme::kAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            x = pill.right + S(8);
+        }
+        Text(dc, fSmall, L"←/→ frame · Shift+←/→ second · J/K/L review · Home/End trim ends · Ctrl+G go to", {x, r.top, r.right, r.bottom},
              theme::kMuted, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
@@ -2144,6 +2221,10 @@ public:
         }
         switch (vk) {
             case VK_SPACE: TogglePlay(); break;
+            case 'J': Review(-1); break;
+            case 'K': Pause(); break;
+            case 'L': Review(1); break;
+
             case VK_LEFT: shift ? StepSecond(-1) : Step(-1); break;
             case VK_RIGHT: shift ? StepSecond(1) : Step(1); break;
             case VK_HOME: GoTrimEnd(false); break;
@@ -2414,6 +2495,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
                 rawT = r->t;
                 Rerender();
                 Invalidate();
+                if (onFetched) onFetched();
             }
             return 0;
         }
@@ -3036,6 +3118,81 @@ ATHER_TEST(video_editor_readout_and_go_to) {
     CHECK(goTo(L"0:03:00"));
     CHECK(ShownFrame(e) == std::make_pair(30, true));
     CHECK(e->ReadoutText() == L"0:03:00 · frame 150 · 30 fps");
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// J/K/L: L plays, L again cycles the preview speed 0.25× → 0.5× → 1×, J plays backward, K pauses. The preview speed
+// leaves the edit (and so the export) as it was, and slow playback shows every frame in turn, none skipped.
+ATHER_TEST(video_editor_review_playback_jkl) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    const VideoEdit before = e->edit;
+    // Every frame the editor shows during `ms`, by number, as it changes.
+    auto watch = [&](int ms) {
+        std::vector<int> seen;
+        e->onFetched = [&] {
+            const Bitmap& f = *e->raw;
+            const int n = NumberOf(f.Bits()[(size_t)(f.Height() / 2) * f.Width() + f.Width() / 2]);
+            if (seen.empty() || seen.back() != n) seen.push_back(n);
+        };
+        Pump(ms);
+        e->onFetched = nullptr;
+        return seen;
+    };
+    auto steps = [](const std::vector<int>& v, int by) {  // every frame after the first is the one `by` from the one before
+        for (size_t i = 1; i < v.size(); ++i)
+            if (v[i] - v[i - 1] != by) return false;
+        return v.size() > 1;
+    };
+    auto show = [](const std::vector<int>& v) {
+        std::string s;
+        for (int n : v) s += std::to_string(n) + " ";
+        return s;
+    };
+    e->GoToFrame(10);
+    ShownFrame(e);
+    e->Key('L', {});
+    CHECK(e->playing && e->previewRate == 1 && e->reviewDir == 0);  // the usual playback first
+    e->Key('L', {});
+    CHECK(!e->playing && e->reviewDir == 1 && e->previewRate == 0.25);
+    const int from = ShownFrame(e).first;
+    const auto slow = watch(1500);
+    test::Note("0.25x from " + std::to_string(from) + ": " + show(slow));
+    CHECK(steps(slow, 1));
+    CHECK(slow.size() >= 15 && slow.size() <= 26);  // 15 frames a second at 0.25× of 60 fps
+    CHECK(e->edit == before);
+    CHECK(e->edit.speed == 1);
+    e->Key('L', {});
+    CHECK(e->reviewDir == 1 && e->previewRate == 0.5);
+    const auto half = watch(600);
+    test::Note("0.5x: " + show(half));
+    CHECK(steps(half, 1) && half.size() >= 10);
+    e->Key('K', {});
+    CHECK(e->reviewDir == 0 && !e->playing);
+    const auto still = watch(300);
+    CHECK(still.size() <= 1);
+    // Backward at the speed kept (0.5×).
+    e->Key('J', {});
+    CHECK(e->reviewDir == -1 && e->previewRate == 0.5);
+    const auto back = watch(800);
+    test::Note("reverse: " + show(back));
+    CHECK(steps(back, -1) && back.size() >= 15);
+    e->Key('J', {});
+    CHECK(e->reviewDir == -1 && e->previewRate == 1);
+    // Runs into the start of the trim and stops there.
+    e->edit.trimStart = (double)(ShownFrame(e).first - 5) / 60;
+    watch(500);
+    CHECK(e->reviewDir == 0);
+    CHECK(ShownFrame(e).first == (int)std::lround(e->edit.trimStart * 60));
+    e->edit.trimStart = 0;
+    CHECK(e->edit == before);
+    CHECK(e->undoStack.empty() && !e->dirty);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
