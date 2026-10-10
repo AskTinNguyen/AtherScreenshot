@@ -308,6 +308,8 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     scrollDelayMs = std::clamp(_wtoi(Get(L"Scrolling", L"DelayMs", L"400").c_str()), 100, 3000);
     scrollMaxFrames = std::clamp(_wtoi(Get(L"Scrolling", L"MaxFrames", L"60").c_str()), 2, 400);
     styledExport = GetBool(L"Editor", L"StyledExport", false);
+    noteAuthor = Get(L"VideoEditor", L"NoteAuthor", L"");
+
     autoTag = GetBool(L"Gallery", L"AutoTag", false);
     checkUpdates = GetBool(L"Updates", L"CheckAutomatically", true);
     uploader = Lower(Get(L"Upload", L"Uploader", L"none"));

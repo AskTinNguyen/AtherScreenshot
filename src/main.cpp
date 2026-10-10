@@ -283,6 +283,11 @@ void ShowHotkeyErrors() {
 void ApplyEditorDefaults() {
     SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile});
     SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
+    SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
+        g_settings.noteAuthor = name;
+        g_settings.WriteString(L"VideoEditor", L"NoteAuthor", name);
+    });
+
     SetFileNameTemplate(g_settings.fileNameTemplate);
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);

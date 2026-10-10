@@ -7,6 +7,9 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
+#define SECURITY_WIN32
+#include <security.h>
+#pragma comment(lib, "secur32")
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +17,7 @@
 
 #include <cmath>
 #include <condition_variable>
+#include <ctime>
 #include <deque>
 
 #include <map>
@@ -58,6 +62,24 @@ const double kAspectValues[] = {0, 16.0 / 9, 4.0 / 3, 1, 9.0 / 16};
 
 std::wstring g_folder;
 HICON g_icon = nullptr;
+std::wstring g_noteAuthor;  // remembered in settings; empty: Windows' display name
+std::function<void(const std::wstring&)> g_rememberAuthor;
+
+// Who you are on this PC: the display name of the Windows account ("Tin Nguyen"), else the user name.
+std::wstring WindowsDisplayName() {
+    wchar_t buf[256];
+    ULONG n = (ULONG)std::size(buf);
+    if (GetUserNameExW(NameDisplay, buf, &n) && n > 0 && buf[0]) return buf;
+    DWORD m = (DWORD)std::size(buf);
+    if (GetUserNameW(buf, &m) && buf[0]) return buf;
+    return L"Reviewer";
+}
+std::wstring NoteAuthor() { return g_noteAuthor.empty() ? WindowsDisplayName() : g_noteAuthor; }
+// A note's author typed in the editor becomes the name on new notes, kept in settings.
+void RememberAuthor(const std::wstring& name) {
+    g_noteAuthor = name;
+    if (g_rememberAuthor) g_rememberAuthor(name);
+}
 
 gp::Color A(COLORREF c, BYTE a = 255) { return gp::Color(a, GetRValue(c), GetGValue(c), GetBValue(c)); }
 
@@ -402,6 +424,12 @@ public:
             if (edit.marks[i].id == *selected) return i;
         return std::nullopt;
     }
+    std::optional<size_t> SelNote() const {
+        if (!selected) return std::nullopt;
+        for (size_t i = 0; i < edit.notes.size(); ++i)
+            if (edit.notes[i].id == *selected) return i;
+        return std::nullopt;
+    }
     VRect ViewRect() const {
         const VRect f{0, 0, (double)videoSize.cx, (double)videoSize.cy};
         if (!edit.crop) return f;
@@ -421,13 +449,15 @@ public:
         if (undoStack.empty()) return;
         edit = undoStack.back();
         undoStack.pop_back();
-        if (selected && !SelCaption() && !SelMark()) selected.reset();
+        if (selected && !SelCaption() && !SelMark() && !SelNote()) selected.reset();
         Changed();
     }
 
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
         if (edit.clips != builtClips) RebuildSequence();
+        PlaceNotes();
+        NotesChanged();
         if (player) player->SetMuted(edit.muted);
         Rerender();
         SyncFields();
@@ -499,6 +529,7 @@ public:
             const auto it = frameTimes.find(FileKey(c.path));
             return it != frameTimes.end() && it->second && !it->second->empty() ? it->second.get() : nullptr;
         });
+        PlaceNotes();
     }
     size_t FrameNow() const { return tframes.Nearest(playing ? rawT : paused); }  // the frame on screen
     void GoToFrame(size_t n) {
@@ -905,9 +936,149 @@ public:
         const uint64_t id = *selected;
         std::erase_if(edit.captions, [&](const Caption& c) { return c.id == id; });
         std::erase_if(edit.marks, [&](const Mark& m) { return m.id == id; });
+        std::erase_if(edit.notes, [&](const Note& n) { return n.id == id; });
         selected.reset();
         SetFocus(hwnd);
         Changed();
+    }
+
+    // ---- notes ----
+
+    // The notes whose frames are on the timeline, in timeline order: (frame, index in edit.notes). Kept up to date by
+    // PlaceNotes (after any change to the edit or the frames).
+    std::vector<std::pair<size_t, size_t>> placed;
+    bool notesOpenOnly = false;  // the list shows only notes not resolved
+    int notesScroll = 0;         // the list's scroll, in pixels
+
+    void PlaceNotes() {
+        placed.clear();
+        for (size_t i = 0; i < edit.notes.size(); ++i)
+            if (const auto f = FrameOfSource(tframes, edit.clips, edit.notes[i].path, edit.notes[i].src)) placed.push_back({*f, i});
+        std::stable_sort(placed.begin(), placed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    // The notes the list shows (all, or the open ones).
+    std::vector<std::pair<size_t, size_t>> ListedNotes() const {
+        std::vector<std::pair<size_t, size_t>> v;
+        for (const auto& p : placed)
+            if (!notesOpenOnly || !edit.notes[p.second].resolved) v.push_back(p);
+        return v;
+    }
+    std::optional<size_t> NoteFrame(const Note& n) const { return FrameOfSource(tframes, edit.clips, n.path, n.src); }
+    std::optional<size_t> NoteEndFrame(const Note& n) const {
+        return n.srcEnd ? FrameOfSource(tframes, edit.clips, n.path, *n.srcEnd) : std::nullopt;
+    }
+    // Saves the notes next to their videos when they've changed (the sidecar comes with A5; until then nothing).
+    void NotesChanged() {}
+
+    // M: a note on the frame on screen, its text field ready for typing.
+    void AddNote() {
+        if (tframes.empty()) return;
+        Pause();
+        EndGoTo();
+        const size_t n = FrameNow();
+        const TimelineFrames::Frame& f = tframes.frames[n];
+        if (f.clip >= edit.clips.size()) return;
+        PushUndo();
+        Note note;
+        note.path = edit.clips[f.clip].path;
+        note.src = f.src;
+        note.author = NoteAuthor();
+        note.created = (int64_t)time(nullptr);
+        edit.notes.push_back(note);
+        selected = note.id;
+        selClip.reset();
+        GoToFrame(n);
+        Changed();
+        RevealNote(note.id);
+        FocusField();
+    }
+    // "Range to here": the selected note runs on to the frame on screen (a later frame of the same video).
+    void SetNoteRangeToPlayhead() {
+        const auto i = SelNote();
+        if (!i || tframes.empty()) return;
+        const Note& n = edit.notes[*i];
+        const auto f = NoteFrame(n);
+        const size_t now = FrameNow();
+        const TimelineFrames::Frame& fr = tframes.frames[now];
+        if (!f || now <= *f || fr.clip >= edit.clips.size() || _wcsicmp(edit.clips[fr.clip].path.c_str(), n.path.c_str()) != 0 || fr.src <= n.src) {
+            ShowToast(L"Move the playhead to a later frame first", L"The range runs from the note's frame to the frame on screen.", nullptr, nullptr, 3000);
+            return;
+        }
+        const double end = fr.src;
+        UpdateNote([end](Note& x) { x.srcEnd = end; });
+    }
+    void UpdateNote(const std::function<void(Note&)>& f) {
+        if (auto i = SelNote()) {
+            PushUndo();
+            f(edit.notes[*i]);
+            Changed();
+        }
+    }
+    // Selects a note and goes to its frame (from the list, a tick, [ or ]).
+    void SelectNote(uint64_t id) {
+        for (const auto& [frame, i] : placed)
+            if (edit.notes[i].id == id) {
+                EndGoTo();
+                Pause();
+                Select(id);
+                GoToFrame(frame);
+                RevealNote(id);
+                return;
+            }
+    }
+    // [ and ]: the note before or after the frame on screen (of those the list shows).
+    void JumpNote(int dir) {
+        const auto v = ListedNotes();
+        if (v.empty()) return;
+        const size_t now = FrameNow();
+        if (dir > 0) {
+            for (const auto& p : v)
+                if (p.first > now) return SelectNote(edit.notes[p.second].id);
+        } else {
+            for (auto it = v.rbegin(); it != v.rend(); ++it)
+                if (it->first < now) return SelectNote(edit.notes[it->second].id);
+        }
+    }
+    // Scrolls the list so that note's row shows.
+    void RevealNote(uint64_t id) {
+        const auto v = ListedNotes();
+        const RECT list = NotesListRect();
+        for (size_t k = 0; k < v.size(); ++k)
+            if (edit.notes[v[k].second].id == id) {
+                const int top = (int)k * NoteRowH(), bottom = top + NoteRowH();
+                if (top < notesScroll) notesScroll = top;
+                if (bottom > notesScroll + RectH(list)) notesScroll = bottom - RectH(list);
+            }
+        notesScroll = std::max(0, notesScroll);
+    }
+    std::vector<MenuItem> NoteKindMenu(uint64_t id) {
+        std::vector<MenuItem> v;
+        NoteKind cur = NoteKind::Note;
+        for (const auto& n : edit.notes)
+            if (n.id == id) cur = n.kind;
+        for (int k = 0; k < kNoteKinds; ++k) {
+            MenuItem it;
+            it.label = NoteKindLabel((NoteKind)k);
+            it.checked = cur == (NoteKind)k;
+            it.swatch = annot::Color(NoteKindColor((NoteKind)k));
+            it.run = [this, k] { UpdateNote([k](Note& x) { x.kind = (NoteKind)k; }); };
+            v.push_back(it);
+        }
+        return v;
+    }
+    // Where clip `c`'s picture sits in the sequence frame (as FitInto puts it there).
+    VRect ClipFit(const Clip& c) const {
+        const double W = videoSize.cx, H = videoSize.cy, cw = c.w > 0 ? c.w : W, ch = c.h > 0 ? c.h : H;
+        const double k = std::min(W / cw, H / ch);
+        const double fw = std::clamp((double)std::lround(cw * k), 1.0, W), fh = std::clamp((double)std::lround(ch * k), 1.0, H);
+        return {(double)(int)((W - fw) / 2), (double)(int)((H - fh) / 2), fw, fh};
+    }
+    // A note's pin in the sequence frame's pixels.
+    std::optional<VPoint> PinOnVideo(const Note& n) const {
+        const auto f = NoteFrame(n);
+        if (!n.pin || !f || tframes.frames[*f].clip >= edit.clips.size()) return std::nullopt;
+        const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
+        return VPoint{r.x + n.pin->x * r.w, r.y + n.pin->y * r.h};
     }
 
     void SetCrop(std::optional<VRect> r) {
@@ -1078,6 +1249,10 @@ public:
         cap.label = L"Caption\tT";
         cap.run = [this] { AddCaption(); };
         v.push_back(cap);
+        MenuItem note;
+        note.label = L"Review note\tM";
+        note.run = [this] { AddNote(); };
+        v.push_back(note);
         v.push_back(MenuItem::Sep());
         for (int k = 0; k < kMarkKinds; ++k) {
             const MarkKind kind = (MarkKind)k;
@@ -1132,6 +1307,11 @@ public:
         if (goingTo) {
             kind = 200;
             id = ~0ull;
+        } else if (auto ni = SelNote()) {
+            t1 = edit.notes[*ni].text;
+            t2 = edit.notes[*ni].author;
+            kind = 300;
+            id = edit.notes[*ni].id;
         } else if (auto ci = SelCaption()) {
             t1 = edit.captions[*ci].text;
             kind = 100;
@@ -1152,11 +1332,11 @@ public:
             SetWindowTextW(field1, t1.c_str());
             SetWindowTextW(field2, t2.c_str());
             settingText = false;
-            const wchar_t* cue = kind == 200 ? L"757, 0:12:37 or 12.6"
+            const wchar_t* cue = kind == 200 ? L"757, 0:12:37 or 12.6" : kind == 300 ? L"What's on this frame?"
                                  : kind == 100 ? L"Caption text" : kind == (int)MarkKind::Bubble ? L"Bubble text" : kind == (int)MarkKind::Title ? L"Title"
                                  : kind == (int)MarkKind::Emoji ? L"Emoji (Win+. for more)" : L"Text";
             SendMessageW(field1, EM_SETCUEBANNER, TRUE, (LPARAM)cue);
-            SendMessageW(field2, EM_SETCUEBANNER, TRUE, (LPARAM)L"Subtitle (optional)");
+            SendMessageW(field2, EM_SETCUEBANNER, TRUE, (LPARAM)(kind == 300 ? L"Your name" : L"Subtitle (optional)"));
         }
         if (id == 0) {
             if (GetFocus() == field1 || GetFocus() == field2) SetFocus(hwnd);
@@ -1170,6 +1350,17 @@ public:
         const int n = GetWindowTextLengthW(f);
         std::wstring t(n, L'\0');
         GetWindowTextW(f, t.data(), n + 1);
+        if (auto ni = SelNote()) {
+            if (f == field2) {
+                edit.notes[*ni].author = t;
+                RememberAuthor(t);
+            } else {
+                edit.notes[*ni].text = t;
+            }
+            NotesChanged();
+            Invalidate();
+            return;
+        }
         if (auto ci = SelCaption()) edit.captions[*ci].text = t;
         else if (auto mi = SelMark()) (f == field2 ? edit.marks[*mi].subtitle : edit.marks[*mi].text) = t;
         Rerender();
@@ -1229,10 +1420,27 @@ public:
         const int bottom = InspectorRect().top - S(4);
         return {S(14), bottom - S(22), c.right - S(14), bottom};
     }
-    RECT StageRect() const {
+    // The video and, when there are notes, the notes list at its right.
+    RECT StageArea() const {
         const RECT c = Client();
         return {S(14), S(50), c.right - S(14), ReadoutRect().top - S(4)};
     }
+    bool NotesShown() const { return !placed.empty(); }
+    RECT StageRect() const {
+        RECT r = StageArea();
+        if (NotesShown()) r.right -= S(kNotesW) + S(8);
+        return r;
+    }
+    static constexpr int kNotesW = 290;
+    RECT NotesRect() const {
+        const RECT a = StageArea();
+        return {a.right - S(kNotesW), a.top, a.right, a.bottom};
+    }
+    RECT NotesListRect() const {
+        const RECT r = NotesRect();
+        return {r.left, r.top + S(44), r.right, r.bottom - S(4)};
+    }
+    int NoteRowH() const { return S(52); }
     // Where the video is drawn.
     gp::RectF VideoRect() const {
         const RECT st = StageRect();
@@ -1471,6 +1679,101 @@ public:
             gp::Pen pen(A(accent), 1.5f * s);
             g.DrawPath(&pen, &p);
         }
+        // Pins of the notes on the frame on screen.
+        if (!playing && !tframes.empty()) {
+            const size_t frame = FrameNow();
+            for (const auto& [f, i] : placed) {
+                const Note& n = edit.notes[i];
+                const auto pin = f == frame ? PinOnVideo(n) : std::nullopt;
+                if (!pin) continue;
+                const gp::PointF c = ToView(*pin);
+                const bool sel = selected == n.id;
+                const float rr = (sel ? 9.f : 7.f) * s;
+                gp::SolidBrush fill(A(annot::Color(NoteKindColor(n.kind)), n.resolved ? 150 : 255));
+                gp::Pen ring(gp::Color(255, 255, 255, 255), (sel ? 3.f : 2.f) * s);
+                gp::Pen shadow(gp::Color(120, 0, 0, 0), 5.f * s);
+                g.DrawEllipse(&shadow, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
+                g.FillEllipse(&fill, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
+                g.DrawEllipse(&ring, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
+            }
+        }
+    }
+
+    // The notes list, right of the video: kind, timecode, author and first line of each; All or Open only; Copy.
+    void PaintNotes(HDC dc, gp::Graphics& g) {
+        if (!NotesShown()) return;
+        const RECT r = NotesRect();
+        FillRR(g, r, (float)S(8), A(theme::kSurface));
+        int open = 0;
+        for (const auto& p : placed) open += !edit.notes[p.second].resolved;
+        const int hy = r.top + S(8), hh = S(28);
+        const std::wstring title = L"Notes";
+        const int tw = Measure(dc, fUi, title).cx;
+        Text(dc, fUi, title, {r.left + S(12), hy, r.left + S(12) + tw + S(2), hy + hh}, theme::kText);
+        const std::wstring count = std::to_wstring(open) + L" open";
+        Text(dc, fSmall, count, {r.left + S(18) + tw, hy, r.left + S(18) + tw + Measure(dc, fSmall, count).cx + S(4), hy + hh}, theme::kMuted);
+        // Right to left: Copy, Open, All.
+        const int copyW = S(9) * 2 + S(22) + Measure(dc, fUi, L"Copy").cx;
+        RECT b = Button(dc, g, r.right - S(6) - copyW, hy, hh, 0xE8C8, L"Copy", false, false, [this] { CopyNotes(); },
+                        L"Copy notes: one line each, as in the review notes list");
+        const int openW = S(9) * 2 + Measure(dc, fUi, L"Open").cx, allW = S(9) * 2 + Measure(dc, fUi, L"All").cx;
+        b = Button(dc, g, b.left - S(4) - openW, hy, hh, 0, L"Open", false, notesOpenOnly, [this] { notesOpenOnly = true; notesScroll = 0; Invalidate(); },
+                   L"Only notes not resolved");
+        Button(dc, g, b.left - S(2) - allW, hy, hh, 0, L"All", false, !notesOpenOnly, [this] { notesOpenOnly = false; notesScroll = 0; Invalidate(); },
+               L"Every note, resolved ones too");
+        const RECT list = NotesListRect();
+        const auto v = ListedNotes();
+        const int rowH = NoteRowH();
+        notesScroll = std::clamp(notesScroll, 0, std::max(0, (int)v.size() * rowH - RectH(list)));
+        if (v.empty()) {
+            Text(dc, fSmall, L"No open notes", {list.left + S(12), list.top, list.right, list.top + S(30)}, theme::kMuted);
+            return;
+        }
+        HRGN clip = CreateRectRgn(list.left, list.top, list.right, list.bottom);
+        SelectClipRgn(dc, clip);
+        g.SetClip(gp::Rect(list.left, list.top, RectW(list), RectH(list)));
+        for (size_t k = 0; k < v.size(); ++k) {
+            const int y = list.top + (int)k * rowH - notesScroll;
+            if (y + rowH < list.top || y > list.bottom) continue;
+            const auto [frame, i] = v[k];
+            const Note& n = edit.notes[i];
+            const RECT row{list.left + S(6), y + S(2), list.right - S(6), y + rowH - S(2)};
+            const bool sel = selected == n.id;
+            if (sel) FillRR(g, row, (float)S(6), A(theme::kSelected));
+            else if (EqualRect(&row, &hoverRect)) FillRR(g, row, (float)S(6), A(theme::kBgRaised));
+            const COLORREF kc = annot::Color(NoteKindColor(n.kind));
+            FillRR(g, {row.left + S(6), row.top + S(8), row.left + S(10), row.bottom - S(8)}, (float)S(2), A(kc, n.resolved ? 110 : 255));
+            const int x = row.left + S(18);
+            const std::wstring tc = tframes.Timecode(frame);
+            const int tcw = Measure(dc, fMono, tc).cx;
+            Text(dc, fMono, tc, {x, row.top + S(5), x + tcw + S(2), row.top + S(23)}, theme::kText);
+            const std::wstring kind = n.resolved ? std::wstring(L"✓ Resolved") : std::wstring(NoteKindLabel(n.kind));
+            const int kw = Measure(dc, fSmall, kind).cx;
+            Text(dc, fSmall, kind, {row.right - S(10) - kw, row.top + S(5), row.right - S(8), row.top + S(23)}, n.resolved ? theme::kMuted : kc);
+            Text(dc, fSmall, n.author.empty() ? std::wstring(L"·") : n.author, {x + tcw + S(10), row.top + S(5), row.right - S(16) - kw, row.top + S(23)},
+                 theme::kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            std::wstring first = n.text.substr(0, n.text.find_first_of(L"\r\n"));
+            if (first.empty()) first = L"(no text yet)";
+            Text(dc, fUi, first, {x, row.top + S(25), row.right - S(8), row.bottom - S(4)}, n.resolved || n.text.empty() ? theme::kMuted : theme::kText,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            const uint64_t id = n.id;
+            RECT hot = row;
+            hot.top = std::max(hot.top, list.top);
+            hot.bottom = std::min(hot.bottom, list.bottom);
+            if (hot.bottom > hot.top) Hotspot(hot, [this, id] { SelectNote(id); });
+        }
+        g.ResetClip();
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(clip);
+    }
+
+    // The notes list as text, one line each (the review notes list and Copy): the notes in the trim, in order.
+    std::wstring NotesText() const { return std::wstring(); }
+    void CopyNotes() {
+        const std::wstring t = NotesText();
+        if (t.empty()) return;
+        CopyTextToClipboard(hwnd, t);
+        ShowToast(L"Notes copied", std::to_wstring(std::count(t.begin(), t.end(), L'\n')) + L" lines", nullptr, nullptr, 2000);
     }
 
     // The per-item settings row, or a hint when nothing is selected.
@@ -1520,10 +1823,24 @@ public:
         };
         const auto ci = goingTo ? std::nullopt : SelCaption();
         const auto mi = goingTo ? std::nullopt : SelMark();
+        const auto ni = goingTo ? std::nullopt : SelNote();
         if (goingTo) {
             label(L"Go to");
             field(1, 200);
             label(L"a frame number, a timecode (m:ss:ff) or a time in seconds · Enter goes, Esc cancels");
+        } else if (ni) {
+            const Note n = edit.notes[*ni];
+            const uint64_t id = n.id;
+            button(0, NoteKindLabel(n.kind), true, [this, id](RECT r) { Popup(r, NoteKindMenu(id)); }, L"Note, Issue, Question or Looks good");
+            field(1, 250);
+            label(L"by");
+            field(2, 110);
+            button(n.resolved ? 0xE73E : 0, n.resolved ? L"Resolved" : L"Resolve", false, [this](RECT) { UpdateNote([](Note& x) { x.resolved = !x.resolved; }); },
+                   n.resolved ? L"Open it again" : L"Mark as resolved: it stays in the list and the review video, marked Resolved");
+            if (n.pin) button(0, L"Clear pin", false, [this](RECT) { UpdateNote([](Note& x) { x.pin.reset(); }); }, L"Remove the spot it points at");
+            else label(L"Click the video to pin a spot");
+            if (n.srcEnd) button(0, L"No range", false, [this](RECT) { UpdateNote([](Note& x) { x.srcEnd.reset(); }); }, L"Back to a single frame");
+            else button(0, L"Range to here", false, [this](RECT) { SetNoteRangeToPlayhead(); }, L"Make the note run to the frame at the playhead");
         } else if (ci) {
             const Caption& c = edit.captions[*ci];
             field(1, 300);
@@ -1607,8 +1924,8 @@ public:
                 button(0xE768, L"", false, [this, m](RECT) { Replay(m); }, L"Play this item from just before it appears");
             }
         }
-        if (ci || mi) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
-        if (const auto k = SelClipIndex(); k && !ci && !mi && !goingTo) {
+        if (ci || mi || ni) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
+        if (const auto k = SelClipIndex(); k && !ci && !mi && !ni && !goingTo) {
             const size_t i = *k;
             const Clip& c = edit.clips[i];
             label(L"Clip " + std::to_wstring(i + 1) + L" of " + std::to_wstring(edit.clips.size()) + L":  " + FileNameOf(c.path) + L"  ·  " + Clock(c.Duration()));
@@ -1619,7 +1936,7 @@ public:
         }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · S split · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join them",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -1725,7 +2042,27 @@ public:
             const std::wstring label = KindHasText(m.kind) && !m.text.empty() ? m.text : m.kind == MarkKind::Step ? L"Step " + std::to_wstring(m.step) : KindLabel(m.kind);
             bar(barRect(m.start, m.end, markY + row * rowH + S(1), rowH - S(2)), label, KindGlyph(m.kind), selected == m.id);
         }
+        // Notes: a flag at the top of the strip and a line down it, in the kind's color (faint once resolved); a range
+        // gets a band along the bottom.
+        for (const auto& [f, i] : placed) {
+            const Note& n = edit.notes[i];
+            const float x = (float)TX(tframes.frames[f].t);
+            const BYTE alpha = n.resolved ? 120 : 255;
+            const gp::Color kc = A(annot::Color(NoteKindColor(n.kind)), alpha);
+            if (const auto e = NoteEndFrame(n); e && *e > f) {
+                gp::SolidBrush band(A(annot::Color(NoteKindColor(n.kind)), 150));
+                g.FillRectangle(&band, x, (float)(strip.bottom - S(6)), (float)TX(tframes.frames[*e].t) - x, (float)S(5));
+            }
+            gp::SolidBrush line(kc), edge(gp::Color(n.resolved ? 90 : 170, 0, 0, 0));
+            g.FillRectangle(&edge, x - 2 * s, (float)strip.top, 4 * s, (float)stripH);  // a dark edge, to show on any picture
+            g.FillRectangle(&line, x - 1 * s, (float)strip.top, 2 * s, (float)stripH);
+            gp::PointF flag[] = {{x - 7 * s, (float)strip.top}, {x + 7 * s, (float)strip.top}, {x, (float)strip.top + 11 * s}};
+            g.FillPolygon(&line, flag, 3);
+            gp::Pen outline(selected == n.id ? gp::Color(255, 255, 255, 255) : gp::Color(170, 0, 0, 0), (selected == n.id ? 1.5f : 1.f) * s);
+            g.DrawPolygon(&outline, flag, 3);
+        }
         const float px = (float)TX(Now());
+
         gp::SolidBrush white(gp::Color(255, 255, 255, 255));
         g.FillRectangle(&white, px - s, (float)tr.top - S(2), 2 * s, (float)RectH(tr) + S(2));
         g.FillEllipse(&white, px - 5 * s, (float)tr.top - S(4), 10 * s, 10 * s);
@@ -1804,6 +2141,7 @@ public:
             g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
             PaintToolbar(dc, g);
             PaintStage(dc, g);
+            PaintNotes(dc, g);
             PaintReadout(dc, g);
             PaintInspector(dc, g);
             PaintTimeline(dc, g);
@@ -1902,6 +2240,17 @@ public:
             drag.from = vp;
             return;
         }
+        if (auto ni = SelNote()) {  // a note selected: the click pins the spot it points at
+            const Note& n = edit.notes[*ni];
+            if (const auto f = NoteFrame(n); f && tframes.frames[*f].clip < edit.clips.size()) {
+                ReleaseCapture();
+                const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
+                const VPoint pin{std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)};
+                UpdateNote([pin](Note& x) { x.pin = pin; });
+                if (FrameNow() != *f) GoToFrame(*f);
+                return;
+            }
+        }
         const double t = Now();
         if (auto mi = SelMark(); mi && edit.marks[*mi].Active(t)) {  // handles of the selected mark first
             const Mark& m = edit.marks[*mi];
@@ -1985,6 +2334,13 @@ public:
             SelectClip(std::nullopt);
             return;
         }
+        if (p.y >= top && p.y <= top + S(14))  // a note's flag at the top of the strip
+            for (auto it = placed.rbegin(); it != placed.rend(); ++it)
+                if (std::abs(p.x - TX(tframes.frames[it->first].t)) <= S(6)) {
+                    ReleaseCapture();
+                    SelectNote(edit.notes[it->second].id);
+                    return;
+                }
         auto grab = [&](uint64_t id, bool isCaption, double s0, double e0) {
             drag = {};
             drag.kind = DragKind::Item;
@@ -2169,7 +2525,17 @@ public:
         }
     }
 
+    // The wheel: scrolls the notes list.
+    void OnWheel(POINT p, int delta, WPARAM) {
+        const RECT nl = NotesListRect();
+        if (NotesShown() && PtInRect(&nl, p)) {
+            notesScroll = std::max(0, notesScroll - delta * NoteRowH() / WHEEL_DELTA);
+            Invalidate();
+        }
+    }
+
     void OnMouseUp() {
+
         const Drag d = drag;
         if (d.kind == DragKind::ClipIn || d.kind == DragKind::ClipOut || d.kind == DragKind::ClipMove) {
             drag = {};
@@ -2240,6 +2606,9 @@ public:
             case 'X': AddMark(MarkKind::Blur); break;
             case 'Z': AddMark(MarkKind::Zoom); break;
             case 'C': cropping = !cropping; Invalidate(); break;
+            case 'M': AddNote(); break;
+            case VK_OEM_4: JumpNote(-1); break;  // [
+            case VK_OEM_6: JumpNote(1); break;   // ]
             case VK_DELETE:
             case VK_BACK:
                 if (SelClipIndex() && !selected) RemoveClip(*SelClipIndex());
@@ -2470,6 +2839,12 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             if ((HWND)l != hwnd) CancelDrag();  // Alt+Tab, a menu, another window took the mouse mid-drag
             return 0;
         case WM_MOUSELEAVE: hoverRect = {}; tipShown = false; Invalidate(); return 0;
+        case WM_MOUSEWHEEL: {
+            POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ScreenToClient(hwnd, &p);
+            OnWheel(p, GET_WHEEL_DELTA_WPARAM(w), GET_KEYSTATE_WPARAM(w));
+            return 0;
+        }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (OnKey(w)) return 0;
@@ -2633,6 +3008,12 @@ void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon) {
     g_folder = capturesFolder;
     g_icon = icon;
 }
+
+void SetVideoEditorAuthor(const std::wstring& author, std::function<void(const std::wstring&)> remember) {
+    g_noteAuthor = author;
+    g_rememberAuthor = std::move(remember);
+}
+
 
 bool IsVideoFile(const std::wstring& path) { return MediaTypeOf(path) == MediaType::Video; }  // one list, in library.cpp
 
@@ -2848,6 +3229,37 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->GoToFrame(757);
         Pump(800);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-readout.png");
+        // Notes of every kind, one resolved, the selected one pinned.
+        struct Spec {
+            size_t frame;
+            NoteKind kind;
+            const wchar_t* text;
+            const wchar_t* author;
+            bool resolved;
+        };
+        const Spec specs[] = {{95, NoteKind::Note, L"Intro starts a beat late", L"Tin Nguyen", false},
+                              {260, NoteKind::Issue, L"Health bar flickers for one frame when the shield breaks", L"Tin Nguyen", false},
+                              {410, NoteKind::Question, L"Is this hit-stop intended?", L"Mai", false},
+                              {540, NoteKind::Good, L"Dash trail reads well now", L"Mai", true},
+                              {757, NoteKind::Issue, L"Muzzle flash missing on this frame", L"Tin Nguyen", false}};
+        for (const Spec& sp : specs) {
+            const TimelineFrames::Frame& f = e->tframes.frames[sp.frame];
+            Note n;
+            n.path = e->edit.clips[f.clip].path;
+            n.src = f.src;
+            n.kind = sp.kind;
+            n.text = sp.text;
+            n.author = sp.author;
+            n.resolved = sp.resolved;
+            e->edit.notes.push_back(n);
+        }
+        e->edit.notes.back().pin = VPoint{0.62, 0.38};
+        e->edit.notes[1].srcEnd = e->edit.notes[1].src + 0.5;
+        e->Changed();
+        e->SelectNote(e->edit.notes.back().id);
+        Pump(800);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-notes.png");
+        e->edit.notes.clear();  // nothing written next to the snapshot clip
         e->dirty = false;
         DestroyWindow(e->hwnd);
     }
@@ -3193,6 +3605,111 @@ ATHER_TEST(video_editor_review_playback_jkl) {
     e->edit.trimStart = 0;
     CHECK(e->edit == before);
     CHECK(e->undoStack.empty() && !e->dirty);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Review notes: M adds one on the frame on screen with its field ready; typing edits it; a click on the video pins a
+// spot; kinds and Resolved; ticks and list rows go to their frames; [ and ] jump; Delete, and undo covers all of it.
+ATHER_TEST(video_editor_notes_add_edit_pin_jump_undo) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(!e->NotesShown());
+    // M on frame 30.
+    e->GoToFrame(30);
+    e->Key('M', {});
+    CHECK_EQ(e->edit.notes.size(), 1u);
+    if (e->edit.notes.size() != 1) return DestroyWindow(e->hwnd), void();
+    const uint64_t first = e->edit.notes[0].id;
+    CHECK(e->selected == first);
+    CHECK_NEAR(e->edit.notes[0].src, 0.5, 1e-3);
+    CHECK(!e->edit.notes[0].author.empty() && e->edit.notes[0].author == NoteAuthor());
+    CHECK(e->fieldsFor == first && e->fieldsKind == 300);  // its text field
+    CHECK(e->NotesShown());
+    CHECK_EQ(e->undoStack.size(), 1u);
+    SetWindowTextW(e->field1, L"Button flickers here");
+    CHECK(e->edit.notes[0].text == L"Button flickers here");
+    // A click in the middle of the video pins the middle of the frame (one undo step).
+    Snapshot(e);  // lays out the video
+    const gp::PointF mid = e->ToView(VPoint{160, 90});
+    e->OnMouseDown({(LONG)std::lround(mid.X), (LONG)std::lround(mid.Y)}, false);
+    e->OnMouseUp();
+    CHECK(e->edit.notes[0].pin && std::fabs(e->edit.notes[0].pin->x - 0.5) < 0.02 && std::fabs(e->edit.notes[0].pin->y - 0.5) < 0.02);
+    CHECK_EQ(e->undoStack.size(), 2u);
+    // Kind and Resolved, each undoable.
+    auto kinds = e->NoteKindMenu(first);
+    CHECK_EQ(kinds.size(), 4u);
+    if (kinds.size() == 4) kinds[1].run();
+    CHECK(e->edit.notes[0].kind == NoteKind::Issue);
+    e->Undo();
+    CHECK(e->edit.notes[0].kind == NoteKind::Note && e->edit.notes[0].pin);
+    if (kinds.size() == 4) kinds[1].run();
+    // Two more: frame 90 (a question), then frame 60 (looks good, resolved).
+    e->Select(std::nullopt);
+    e->GoToFrame(90);
+    e->Key('M', {});
+    e->NoteKindMenu(e->edit.notes.back().id)[2].run();
+    e->GoToFrame(60);
+    e->Key('M', {});
+    e->NoteKindMenu(e->edit.notes.back().id)[3].run();
+    e->UpdateNote([](Note& n) { n.resolved = true; });
+    CHECK_EQ(e->placed.size(), 3u);
+    std::vector<size_t> frames;
+    for (const auto& p : e->placed) frames.push_back(p.first);
+    CHECK(frames == std::vector<size_t>({30, 60, 90}));
+    // ] and [ from the start: 30, 60, 90, (stays), back to 60.
+    e->Select(std::nullopt);
+    e->GoToFrame(0);
+    std::vector<size_t> seen;
+    for (WPARAM k : {VK_OEM_6, VK_OEM_6, VK_OEM_6, VK_OEM_6, VK_OEM_4}) {
+        e->Key(k, {});
+        seen.push_back(e->FrameNow());
+        CHECK(e->SelNote().has_value());
+    }
+    CHECK(seen == std::vector<size_t>({30, 60, 90, 90, 60}));
+    CHECK(ShownFrame(e).first == 60);
+    // Only open notes: the resolved one at 60 is skipped by the list and by ] and [.
+    e->notesOpenOnly = true;
+    CHECK_EQ(e->ListedNotes().size(), 2u);
+    e->GoToFrame(0);
+    e->Key(VK_OEM_6, {});
+    e->Key(VK_OEM_6, {});
+    CHECK_EQ(e->FrameNow(), 90u);
+    e->notesOpenOnly = false;
+    // Clicking a list row, then a tick on the timeline, goes to that note's frame.
+    auto snap = Snapshot(e);  // lays out the list's rows
+    const RECT list = e->NotesListRect();
+    e->OnMouseDown({list.left + e->S(60), list.top + e->NoteRowH() / 2}, false);  // first row: frame 30
+    e->OnMouseUp();
+    CHECK(e->selected == first && e->FrameNow() == 30);
+    const RECT tr = e->TimelineRect();
+    e->OnMouseDown({(LONG)e->TX(e->tframes.frames[90].t), tr.top + e->LaneH() + e->S(4)}, false);
+    e->OnMouseUp();
+    CHECK(e->FrameNow() == 90 && e->SelNote() && e->edit.notes[*e->SelNote()].kind == NoteKind::Question);
+    // Ticks wear their kind's color: the Issue's flag at frame 30 is red.
+    snap = Snapshot(e);
+    const uint32_t flag = snap->Bits()[(size_t)(tr.top + e->LaneH() + e->S(2)) * snap->Width() + (LONG)e->TX(e->tframes.frames[30].t)];
+    test::Note("flag pixel " + std::to_string(flag & 0xFFFFFF));
+    const COLORREF red = annot::Color(0);
+    CHECK(std::abs((int)((flag >> 16) & 255) - GetRValue(red)) < 30 && std::abs((int)((flag >> 8) & 255) - GetGValue(red)) < 30 &&
+          std::abs((int)(flag & 255) - GetBValue(red)) < 30);
+    // Delete, then undo it.
+    e->SelectNote(first);
+    e->Key(VK_DELETE, {});
+    CHECK_EQ(e->edit.notes.size(), 2u);
+    CHECK_EQ(e->placed.size(), 2u);
+    e->Undo();
+    CHECK_EQ(e->edit.notes.size(), 3u);
+    CHECK(e->edit.notes[0].text == L"Button flickers here" && e->edit.notes[0].kind == NoteKind::Issue);
+    // None of this touched the picture's edit.
+    VideoEdit plain = e->edit;
+    plain.notes.clear();
+    CHECK(plain.marks.empty() && plain.captions.empty());
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

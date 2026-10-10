@@ -49,6 +49,9 @@ public:
     int scrollMaxFrames = 60;
     // editor
     bool styledExport = false;
+    // video editor
+    std::wstring noteAuthor;  // [VideoEditor] NoteAuthor: the name on review notes (empty: Windows' display name)
+
     // gallery
     bool autoTag = false;  // [Gallery] AutoTag: apply suggested tags
     bool checkUpdates = true;  // [Updates] CheckAutomatically

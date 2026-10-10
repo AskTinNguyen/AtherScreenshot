@@ -9,6 +9,9 @@ namespace ather {
 
 // Where saved videos go, and the window icon. Call at startup and whenever settings change.
 void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon);
+// The name on new review notes (empty: Windows' display name), and where a name typed in the editor is remembered.
+void SetVideoEditorAuthor(const std::wstring& author, std::function<void(const std::wstring&)> remember);
+
 // Opens (or brings back) the editor for an MP4.
 bool OpenVideoEditor(const std::wstring& path);
 bool IsVideoFile(const std::wstring& path);

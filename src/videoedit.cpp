@@ -309,7 +309,43 @@ void ApplyClips(VideoEdit& e, std::vector<Clip> clips) {
     e.clips = std::move(clips);
 }
 
+// ---------- notes ----------
+
+const wchar_t* NoteKindLabel(NoteKind k) {
+    switch (k) {
+        case NoteKind::Issue: return L"Issue";
+        case NoteKind::Question: return L"Question";
+        case NoteKind::Good: return L"Looks good";
+        default: return L"Note";
+    }
+}
+
+const char* NoteKindKey(NoteKind k) {
+    switch (k) {
+        case NoteKind::Issue: return "issue";
+        case NoteKind::Question: return "question";
+        case NoteKind::Good: return "good";
+        default: return "note";
+    }
+}
+
+NoteKind NoteKindOf(const std::string& key) {
+    for (int i = 0; i < kNoteKinds; ++i)
+        if (key == NoteKindKey((NoteKind)i)) return (NoteKind)i;
+    return NoteKind::Note;
+}
+
+int NoteKindColor(NoteKind k) {
+    switch (k) {
+        case NoteKind::Issue: return 0;     // red
+        case NoteKind::Question: return 4;  // blue
+        case NoteKind::Good: return 3;      // green
+        default: return 5;                  // Ather lime
+    }
+}
+
 // ---------- frames ----------
+
 
 std::vector<double> FrameGrid(double length, double fps) {
     std::vector<double> v;
@@ -325,6 +361,7 @@ TimelineFrames TimelineFrames::Of(const std::vector<Clip>& clips, const std::fun
         const Clip& c = clips[i];
         const double fps = c.fps > 1 ? c.fps : 30;
         tf.fps.push_back(fps);
+        tf.clipFirst.push_back(tf.frames.size());
         const std::vector<double>* known = times ? times(c) : nullptr;
         std::vector<double> grid;
         if (!known || known->empty()) {
@@ -339,7 +376,20 @@ TimelineFrames TimelineFrames::Of(const std::vector<Clip>& clips, const std::fun
         for (; k < T.size() && T[k] < c.out - 1e-4; ++k) tf.frames.push_back({start + std::max(0.0, T[k] - c.in), T[k], (uint32_t)i});
         start += c.Duration();
     }
+    tf.clipFirst.push_back(tf.frames.size());
     return tf;
+}
+
+std::optional<size_t> FrameOfSource(const TimelineFrames& tf, const std::vector<Clip>& clips, const std::wstring& path, double src) {
+    for (size_t i = 0; i < clips.size() && i + 1 < tf.clipFirst.size(); ++i) {
+        if (_wcsicmp(clips[i].path.c_str(), path.c_str()) != 0) continue;
+        const auto b = tf.frames.begin() + (ptrdiff_t)tf.clipFirst[i], e = tf.frames.begin() + (ptrdiff_t)tf.clipFirst[i + 1];
+        if (b == e) continue;
+        auto it = std::lower_bound(b, e, src, [](const TimelineFrames::Frame& f, double v) { return f.src < v; });
+        if (it == e || (it != b && src - (it - 1)->src < it->src - src)) --it;  // the nearest
+        if (std::fabs(it->src - src) <= 0.5 / tf.fps[i] + 1e-6) return (size_t)(it - tf.frames.begin());
+    }
+    return std::nullopt;
 }
 
 size_t TimelineFrames::Nearest(double t) const {
