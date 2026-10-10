@@ -1,4 +1,6 @@
 import AVFoundation
+import ImageIO
+import UniformTypeIdentifiers
 import VideoToolbox
 
 // Saving an MP4: the composition is read back through the frame renderer (AVAssetReaderVideoCompositionOutput) and
@@ -100,5 +102,71 @@ extension VideoExport {
         writer.endSession(atSourceTime: p.composition.duration)
         await writer.finishWriting()
         if writer.status != .completed { throw Failure.failed(writer.error?.localizedDescription ?? "Export failed.") }
+    }
+}
+
+// Saving a GIF: the composition renders straight at the GIF's rate and size (≤ 960 px), one pass, no MP4 in between.
+extension VideoExport {
+    static func gifSize(_ s: CGSize, max m: CGFloat = 960) -> CGSize {
+        let k = min(1, m / s.width, m / s.height)
+        return CGSize(width: max(1, (s.width * k).rounded(.down)), height: max(1, (s.height * k).rounded(.down)))
+    }
+
+    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
+        let p = try await prepare(e)
+        let probe = VideoExport.probe
+        VideoExport.probe = nil   // the bench taps the GIF's frames, not the compositor's
+        defer { VideoExport.probe = probe }
+        let vc = p.video.mutableCopy() as! AVMutableVideoComposition
+        vc.frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 600)
+        vc.renderSize = gifSize(p.size)
+        let reader = try AVAssetReader(asset: p.composition)
+        let vo = AVAssetReaderVideoCompositionOutput(videoTracks: p.composition.tracks(withMediaType: .video), videoSettings: nil)
+        vo.videoComposition = vc
+        vo.alwaysCopiesSampleData = false
+        reader.add(vo)
+        // As many frames as the saved MP4 is long (whole frames of the sequence), like before.
+        let fd = p.video.frameDuration.seconds
+        let n = max(1, Int((p.composition.duration.seconds / fd).rounded(.up) * fd * fps + 1e-6))
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.gif.identifier as CFString, n, nil) else { throw Failure.failed("Can't write the GIF.") }
+        CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        probe?.note("gif 1 pass")
+        guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+        // Each frame shows until the next one; a frame the compositor skipped (nothing new) lengthens the one before.
+        var pending: (Int, CGImage)?
+        func add(_ img: CGImage, frames: Int) {
+            CGImageDestinationAddImage(dest, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
+        }
+        while let s = vo.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            guard let pb = CMSampleBufferGetImageBuffer(s), let img = cgImage(pb) else { continue }
+            let i = Int((CMSampleBufferGetPresentationTimeStamp(s).seconds * fps).rounded())
+            guard i < n else { break }
+            if let (j, prev) = pending {
+                guard i > j else { pending = (j, img); continue }
+                add(prev, frames: i - j)
+            }
+            probe?.frame(i, img)
+            pending = (i, img)
+        }
+        if reader.status == .failed { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+        if let (j, prev) = pending { add(prev, frames: max(1, n - j)) }
+        let t0 = Date()
+        defer { probe?.note(String(format: "finalize %.2f s", Date().timeIntervalSince(t0))) }
+        guard CGImageDestinationFinalize(dest) else { throw Failure.failed("Can't write the GIF.") }
+    }
+
+    // A copy of a BGRA frame as a CGImage (the buffer goes back to the pool).
+    static func cgImage(_ pb: CVPixelBuffer) -> CGImage? {
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        guard let base = CVPixelBufferGetBaseAddress(pb),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+              let dst = ctx.data else { return nil }
+        let src = CVPixelBufferGetBytesPerRow(pb), dr = ctx.bytesPerRow
+        for y in 0..<h { memcpy(dst + y * dr, base + y * src, w * 4) }
+        return ctx.makeImage()
     }
 }

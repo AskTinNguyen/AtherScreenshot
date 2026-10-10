@@ -330,7 +330,11 @@ final class SequenceCompositor: NSObject, AVVideoCompositing {
         let size = req.renderContext.size
         let src = req.sourceFrame(byTrackID: ins.track).map { VideoSequence.place(CIImage(cvPixelBuffer: $0), clip: ins.clip(for: $0), frame: ins.frame) }
             ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: ins.frame))
-        let img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
+        var img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
+        let full = ins.box.renderer.out
+        if abs(size.width - full.width) > 0.5 || abs(size.height - full.height) > 0.5 {   // a smaller render (the GIF)
+            img = img.transformed(by: CGAffineTransform(scaleX: size.width / full.width, y: size.height / full.height))
+        }
         SequenceCompositor.context.render(img, to: out, bounds: CGRect(origin: .zero, size: size), colorSpace: space)
         if let p = VideoExport.probe { p.frame(Int((req.compositionTime.seconds / req.renderContext.videoComposition.frameDuration.seconds).rounded()), out) }
         req.finish(withComposedVideoFrame: out)
