@@ -10,7 +10,16 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new
+## What's new in this update (Windows, build 0.0.2.2)
+
+### Saving videos is much faster
+- **How much:** saving from the video editor is about 36 times faster than before. A 20-second 1440p recording saves in about a second instead of half a minute; with captions, callouts, blur and zoom, in about 1.5 s instead of more than a minute. A 5-minute 1080p recording saves in about 7 s.
+- **GIFs:** about 25 to 45 times faster too.
+- **How:** the video is decoded on the graphics card, the frames are drawn on all your processor's cores, only the parts your edits change are redrawn, and longer videos are encoded in pieces on several hardware encoders at once, then joined without re-encoding.
+- **What you get is the same:** your edits look exactly as before. Without a graphics card that encodes video, saving still works the usual way.
+- **Crops:** a saved crop can sit one pixel up or left of where you dragged it, so its colors go to the encoder as they were recorded.
+
+## What's new in 0.0.2
 
 ### Updates from inside the app
 - **Checking:** Ather Screenshot looks for a new version a minute after it starts and then once a day, and tells you once when there is one. "Check for updates…" in the tray menu or the palette checks right away.
