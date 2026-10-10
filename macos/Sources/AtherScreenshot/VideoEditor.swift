@@ -121,14 +121,7 @@ enum VideoExport {
 
     static func mp4(_ e: VideoEdit, to url: URL) async throws {
         let p = try await prepare(e)
-        guard let s = AVAssetExportSession(asset: p.composition, presetName: AVAssetExportPresetHighestQuality) else { throw Failure.failed("Can't export this video.") }
-        s.videoComposition = p.video
-        s.audioTimePitchAlgorithm = .spectral   // sped-up audio keeps its pitch
-        s.outputURL = url
-        s.outputFileType = .mp4
-        s.shouldOptimizeForNetworkUse = true
-        probe?.note("session HighestQuality")
-        try await run(s)
+        try await write(p, speed: e.speed, to: url)
     }
 
     // Renders the edit to MP4 first, then samples it into a GIF (≤ 960 px wide).
