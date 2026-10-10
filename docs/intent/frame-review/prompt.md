@@ -1,6 +1,6 @@
 # Frame Review: Step 60 fps Video Frame by Frame, Leave Notes, Export a Review Video
 
-- Rev: 2
+- Rev: 3
 - Status: active
 - Area: Video
 - Owner: Tin Nguyen
@@ -81,6 +81,8 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
   - The review video opens with a 3 s summary card: the video's name, the date, reviewers, counts by kind, and the notes with their timecodes, up to as many as fit.
   - Save review video also writes `<name> review sheet.png`: a contact sheet with one tile per note. Each tile has the noted frame (with its pin), the timecode and frame number, the kind, the author and the text. It is readable when posted in a chat.
 
+- **D13 (rev 3):** F-1 accepted. Ctrl+Alt+S in the video editor saves the review video and wins over the global scrolling-capture hotkey while an editor is in front; elsewhere it stays scrolling capture. Source: F-1, R-1.
+
 ## Acceptance
 
 - **A1: exact stepping.** ←/→ moves exactly one frame at the clip's own rate, and the editor shows that exact frame.
@@ -115,7 +117,8 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
   - At full zoom, each frame has its own tick, and clicking a tick lands on that frame.
   - Ctrl+0 fits the trim.
   - Notes, captions and bars stay aligned with their frames.
-  - Proof: `gate: test.bat` (pixel-to-frame and frame-to-pixel round trip at several zooms, and clicking a tick lands on its frame), plus a `snapshot` of the zoomed-in timeline with frame ticks and a note tick.
+  - (rev 3) The filmstrip thumbnails show frames from under their tile at every zoom. At full zoom, each tile shows a frame inside the frames it covers, never a frame from before or after it. The strip refreshes as you zoom and pan, without stalling the UI.
+  - Proof: `gate: test.bat` (pixel-to-frame and frame-to-pixel round trip at several zooms; clicking a tick lands on its frame; at full zoom every thumbnail's frame lies inside its tile's span), plus a `snapshot` of the zoomed-in timeline with frame ticks, a note tick and matching thumbnails.
 - **A10: pixel magnifier (D10).**
   - The zoom stays centered on the cursor.
   - At 2× and above, pixels are sharp: a 1-pixel checkerboard in a test clip shows as hard-edged blocks.
@@ -157,6 +160,7 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
 ## Changelog
 
 - rev 1 (2026-10-10): created from L-1, with the orchestrator's proposed feature set (D1–D6, A1–A8) for the owner to review.
+- rev 3 (2026-10-10): from R-1. F-1 accepted (D13). A9 now requires the filmstrip to show frames from under each tile at every zoom, and A13 image 3 must be redone. A8 passed review.
 - rev 2 (2026-10-10): from L-2 (owner away 8 h, full autonomy):
   - D1–D6 accepted.
   - D7: owner-level calls are made and recorded, not waited on.

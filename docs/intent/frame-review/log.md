@@ -18,3 +18,23 @@ Rev 2:
 - Every UI item now needs a visual proof.
 - Installing tools is allowed, if recorded.
 - Merge authority is unchanged (none): no merge was granted.
+
+## R-1 (2026-10-10 13:25) | orchestrator review at fc83e9e | -> rev 3
+
+The owner is away (L-2), so this review stands in for the owner's calls.
+
+**Checks:** `test.bat` in the worktree, run by the orchestrator: `96 tests, 1448 checks, 0 failed`.
+
+**A13 (the seven images in `proof/a13/`):**
+- Images 1, 2, 4, 5, 6 and 7 pass:
+  - The readout matches the frame (0:12:37 = frame 757 at 60 fps).
+  - Notes of all four kinds have the right colors; a resolved note is dimmed, and a pin is drawn.
+  - The magnifier is sharp at 4×, with its label.
+  - The summary card counts by kind.
+  - The note card and burn-in are taken from the exported MP4.
+  - On the contact sheet, frame numbers match the timecodes.
+- **Image 3 fails one point.** At full timeline zoom, the frame ticks are right (665…755), but the filmstrip thumbnails are stale: tiles over frames 665–700 show frame 657's picture, and tiles over 735–755 show 754's. For frame-level review, the picture strip has to show frames from under each tile. This goes into rev 3 as part of A9; A13 needs image 3 redone after the fix.
+
+**A8 (README and RELEASE_NOTES):** passes. They cover stepping, the readout, J/K/L, both zooms, notes, the sidecar, Copy, the review video and its two side files, the shortcuts (including the Ctrl+Alt+S precedence), and Windows-only status.
+
+**F-1:** accepted as the worker built it. In the video editor, Ctrl+Alt+S saves the review video and wins over the global scrolling-capture hotkey while the editor is in front. Everywhere else it stays scrolling capture. Recorded as D13.
