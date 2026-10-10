@@ -18,7 +18,7 @@ xcrun swift test      # unit tests; ATHER_TEST_OUT=<dir> also renders the editor
 
 Saving speed: `AtherScreenshot --bench-export <outDir> [tap] <clips…>` exports each clip in the same scenarios as the Windows bench (plain, edits, speed2, captions, light, long, gif) and prints time, frames and how each export ran; `tap` keeps frame hashes for `AtherScreenshot --bench-compare <dirA> <dirB>`. `ATHER_BENCH_ONLY=<scenario>`, `ATHER_ENCODERS=n` and `ATHER_GIF_PARTS=n` narrow or change a run.
 
-Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.1), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
+Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.3), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
 
 ## Permissions
 

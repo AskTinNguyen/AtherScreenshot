@@ -1,16 +1,16 @@
 {
-    "windows":  {
-                    "version":  "0.0.2.3",
-                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "1d67995e8d711f66df278a1d0a642353b0ad8c486d388998577f951acb197b7e",
-                    "size":  3550208,
-                    "notes":  "Review recordings frame by frame: exact 60 fps stepping, notes on frames, and a review video for other teams."
-                },
-    "macos":  {
-                  "version":  "0.0.2.1",
-                  "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-                  "sha256":  "f227f41701c1c8ad985a1d0f6a9b13e4891fd11e714eca2f806149200fe3c2e0",
-                  "size":  3431024,
-                  "notes":  "Game controller overlay, edit any picture or video, join videos into one, updates from inside the app, and many fixes."
-              }
+    "windows": {
+        "version": "0.0.2.3",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+        "sha256": "1d67995e8d711f66df278a1d0a642353b0ad8c486d388998577f951acb197b7e",
+        "size": 3550208,
+        "notes": "Review recordings frame by frame: exact 60 fps stepping, notes on frames, and a review video for other teams."
+    },
+    "macos": {
+        "version": "0.0.2.3",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+        "sha256": "736d53f136c00cd98715073887ac361d059065d0dee97c0e14075d75d7fed5e7",
+        "size": 3581140,
+        "notes": "Saving videos is about twice as fast and GIFs about 9 times (videos are now saved as HEVC)."
+    }
 }

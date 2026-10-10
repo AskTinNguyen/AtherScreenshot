@@ -10,6 +10,15 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## What's new in this update (macOS, build 0.0.2.3)
+
+### Saving videos is about twice as fast, GIFs about 9 times
+- **How much:** on an M4 Max, a 20-second 3K recording saves in about 2 s instead of 3.6 s, also with captions, callouts, blur and zoom; a 1080p one in 0.7 s instead of 1.5 s; a 2-minute 3K recording in about 15 s instead of 27 s. GIFs save in under half a second instead of 2.5 to 4.5 s.
+- **How:** videos are saved as HEVC, longer ones in two pieces on the Mac's video encoders at once and then joined without re-encoding. GIFs are made in one pass, straight from your edits, in a few parts at once.
+- **What you get:** your edits look exactly as before, as close to the original as the old files or closer. Files are often smaller; a busy short clip can come out bigger, because it keeps more detail.
+- **HEVC:** the saved MP4s play in QuickTime, Safari and current browsers. On Windows they need Microsoft's HEVC Video Extensions; some older players and sites may not take them.
+- **GIFs:** the same size and length as before. During a fast zoom a frame can sit a moment earlier or later than before.
+
 ## What's new in this update (Windows, build 0.0.2.3)
 
 ### Review recordings frame by frame, with notes
