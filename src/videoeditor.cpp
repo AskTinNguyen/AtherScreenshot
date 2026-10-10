@@ -405,7 +405,7 @@ public:
     std::vector<Hot> hots;
     RECT hoverRect{};
 
-    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut };
+    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan };
     struct Drag {
         DragKind kind = DragKind::None;
         VPoint from;
@@ -506,6 +506,7 @@ public:
     void Seek(double t) {
         t = std::clamp(t, 0.0, std::max(0.0, duration));
         paused = t;
+        KeepOnView(t);
         if (player) player->Seek(t);
         if (!playing) Fetch(t);
         Invalidate();
@@ -677,6 +678,7 @@ public:
             if (auto f = player->NewFrame(&t)) {
                 raw = f;  // already fitted into the sequence frame
                 rawT = t;
+                KeepOnView(t);
                 Rerender();
                 Invalidate();  // only when there's a new frame (the playhead moves with it)
             }
@@ -726,6 +728,7 @@ public:
             LoadFrameTimes();
         }
         if (selClip && !SelClipIndex()) selClip.reset();
+        ClampTimeline();
     }
 
     void LoadThumbs() {
@@ -1573,11 +1576,56 @@ public:
 
     double TX(double t) const {  // timeline x for a time
         const RECT r = TimelineRect();
-        return r.left + RectW(r) * (t / std::max(0.001, duration));
+        return r.left + RectW(r) * ((t - tlStart) / TlSpan());
     }
     double TT(int x) const {
         const RECT r = TimelineRect();
-        return std::clamp((double)(x - r.left) / std::max(1, RectW(r)), 0.0, 1.0) * duration;
+        return std::clamp(tlStart + (double)(x - r.left) / std::max(1, RectW(r)) * TlSpan(), 0.0, std::max(0.0, duration));
+    }
+
+    // ---- timeline zoom ----
+    // Ctrl+wheel or Ctrl+= / Ctrl+− zoom in around the playhead, to about 14 px a frame; Ctrl+0 fits the trim. The wheel,
+    // or dragging an empty lane, pans. Everything on the timeline goes through TX and TT, so it stays on its frames.
+    double tlZoom = 1;   // 1: the whole timeline fits
+    double tlStart = 0;  // the time at its left edge
+    double TlSpan() const { return std::max(1e-6, std::max(0.001, duration) / tlZoom); }
+    double PxPerFrame() const { return RectW(TimelineRect()) / TlSpan() / Seq().Fps(); }
+    double MaxTlZoom() const { return std::max(1.0, std::max(0.001, duration) * Seq().Fps() * 14.0 / std::max(1, RectW(TimelineRect()))); }
+    void ClampTimeline() {
+        tlZoom = std::clamp(tlZoom, 1.0, MaxTlZoom());
+        tlStart = std::clamp(tlStart, 0.0, std::max(0.0, duration - TlSpan()));
+    }
+    // Zooms by `factor`, keeping time `at` (the playhead) under the same spot (or centering it, when it was off view).
+    void ZoomTimeline(double factor, std::optional<double> at = std::nullopt) {
+        const double t = at ? *at : (playing ? rawT : paused);
+        const RECT r = TimelineRect();
+        double frac = (TX(t) - r.left) / std::max(1, RectW(r));
+        if (frac < 0 || frac > 1) frac = 0.5;
+        tlZoom *= factor;
+        tlZoom = std::clamp(tlZoom, 1.0, MaxTlZoom());
+        tlStart = t - frac * TlSpan();
+        ClampTimeline();
+        Invalidate();
+    }
+    void FitTrim() {
+        const double span = std::max(0.01, edit.trimEnd - edit.trimStart);
+        tlZoom = std::max(1.0, std::max(0.001, duration) / span);
+        tlStart = edit.trimStart;
+        ClampTimeline();
+        Invalidate();
+    }
+    // Pans so time `t` is on view (stepping or playing past the edge turns the page).
+    void KeepOnView(double t) {
+        if (tlZoom <= 1) return;
+        const double span = TlSpan();
+        if (t < tlStart || t > tlStart + span) tlStart = t - span * 0.15;
+        else if (t > tlStart + span * 0.97) tlStart = t - span * 0.15;
+        ClampTimeline();
+    }
+    // A click on the timeline lands on the nearest frame once frames are a few pixels apart.
+    double SnapToFrame(double t) const {
+        if (tframes.empty() || PxPerFrame() < 3) return t;
+        return tframes.frames[tframes.Nearest(t)].t;
     }
 
     // ---- stage geometry ----
@@ -2084,14 +2132,20 @@ public:
         const int stripH = S(52), capY = top + S(62), capH = S(22), markY = top + S(90), rowH = S(18);
         const RECT strip{tr.left, top, tr.right, top + stripH};
         FillRR(g, strip, (float)S(6), A(theme::kSurface));
+        // Zoomed in, things off the edges are cut off there.
+        const RECT view{tr.left - S(6), tr.top - S(8), tr.right + S(6), tr.bottom};
+        HRGN viewRgn = CreateRectRgnIndirect(&view);
+        SelectClipRgn(dc, viewRgn);
+        g.SetClip(gp::Rect(view.left, view.top, RectW(view), RectH(view)));
         if (!thumbs.empty()) {
-            const double w = RectW(strip) / (double)thumbs.size();
+            const double D = std::max(0.001, duration);
             HRGN clip = CreateRectRgn(strip.left, strip.top, strip.right, strip.bottom);
             SelectClipRgn(dc, clip);
             SetStretchBltMode(dc, HALFTONE);
             for (size_t i = 0; i < thumbs.size(); ++i) {
                 const auto& img = thumbs[i];
-                const RECT cell{(LONG)(strip.left + i * w), strip.top, (LONG)std::ceil(strip.left + (i + 1) * w), strip.bottom};
+                const RECT cell{(LONG)TX(D * i / thumbs.size()), strip.top, (LONG)std::ceil(TX(D * (i + 1) / thumbs.size())), strip.bottom};
+                if (cell.right < strip.left || cell.left > strip.right) continue;
                 const double k = std::max(RectW(cell) / (double)img->Width(), RectH(cell) / (double)img->Height());
                 const int dw = (int)std::ceil(img->Width() * k), dh = (int)std::ceil(img->Height() * k);
                 HRGN cr = CreateRectRgnIndirect(&cell);
@@ -2105,6 +2159,7 @@ public:
             DeleteObject(clip);
         }
         if (edit.clips.size() > 1) PaintClips(dc, g, tr, strip);
+        PaintRuler(dc, g, strip);
         const int xs = (int)TX(edit.trimStart), xe = (int)TX(edit.trimEnd);
         gp::SolidBrush dim(gp::Color(166, 0, 0, 0));
         g.FillRectangle(&dim, (float)strip.left, (float)strip.top, (float)(xs - strip.left), (float)stripH);
@@ -2172,6 +2227,9 @@ public:
         gp::SolidBrush white(gp::Color(255, 255, 255, 255));
         g.FillRectangle(&white, px - s, (float)tr.top - S(2), 2 * s, (float)RectH(tr) + S(2));
         g.FillEllipse(&white, px - 5 * s, (float)tr.top - S(4), 10 * s, 10 * s);
+        g.ResetClip();
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(viewRgn);
 
         // Play button and time, left of the timeline.
         const RECT play{S(14), tr.top + S(6), S(14) + S(34), tr.top + S(40)};
@@ -2181,6 +2239,34 @@ public:
         Text(dc, fMono, tframes.empty() ? Clock(Now()) : tframes.Timecode(FrameNow()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)},
              theme::kTextDim);
         Text(dc, fMono, Clock(edit.OutputDuration()) + L" out", {S(12), play.bottom + S(24), tr.left - S(4), play.bottom + S(40)}, theme::kMuted);
+    }
+
+    // Zoomed in: a ruler along the bottom of the strip, a tick per frame once they're 4 px apart, and frame numbers
+    // every so many frames, far enough apart to read.
+    void PaintRuler(HDC dc, gp::Graphics& g, const RECT& strip) {
+        if (tlZoom <= 1.001 || tframes.empty()) return;
+        const int bandH = S(17);
+        const RECT band{strip.left, strip.bottom - bandH, strip.right, strip.bottom};
+        gp::SolidBrush bg(gp::Color(170, 0, 0, 0));
+        g.FillRectangle(&bg, (float)band.left, (float)band.top, (float)RectW(band), (float)bandH);
+        const double pf = PxPerFrame();
+        size_t step = 1;
+        for (size_t k : {1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 3000, 6000, 18000, 36000})
+            if ((step = k) * pf >= S(46)) break;
+        const size_t first = tframes.At(tlStart), last = std::min(tframes.size() - 1, tframes.At(tlStart + TlSpan()) + 1);
+        gp::SolidBrush tick(gp::Color(200, 255, 255, 255)), major(gp::Color(255, 255, 255, 255));
+        const size_t every = pf >= 4 ? 1 : step;
+        for (size_t n = first - first % every; n <= last; n += every) {
+            const float x = (float)TX(tframes.frames[n].t);
+            if (x < strip.left - 1 || x > strip.right + 1) continue;
+            const bool labeled = n % step == 0;
+            g.FillRectangle(labeled ? &major : &tick, x - 0.5f * s, (float)(band.bottom - (labeled ? S(7) : S(4))), 1 * s, (float)(labeled ? S(7) : S(4)));
+            if (labeled) {
+                const std::wstring num = std::to_wstring(n);
+                const int w = Measure(dc, fSmall, num).cx;
+                Text(dc, fSmall, num, {(LONG)x + S(3), band.top, (LONG)x + S(3) + w + S(2), band.bottom - S(4)}, RGB(255, 255, 255));
+            }
+        }
     }
 
     // Clip lane: one bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
@@ -2474,8 +2560,7 @@ public:
                 }
             }
             Select(std::nullopt);
-            Seek(TT(p.x));
-            ReleaseCapture();
+            BeginPan(p);
             return;
         }
         if (p.y >= capY) {
@@ -2486,8 +2571,7 @@ public:
                     return;
                 }
             Select(std::nullopt);
-            Seek(TT(p.x));
-            ReleaseCapture();
+            BeginPan(p);
             return;
         }
         drag = {};
@@ -2503,7 +2587,15 @@ public:
         }
         drag.kind = DragKind::Playhead;
         Pause();
-        Seek(TT(p.x));
+        Seek(SnapToFrame(TT(p.x)));
+    }
+    // An empty lane: a drag pans the timeline (zoomed in), a click goes to that time.
+    void BeginPan(POINT p) {
+        drag = {};
+        drag.kind = DragKind::Pan;
+        drag.downX = p.x;
+        drag.grab = tlStart;
+        drag.value = SnapToFrame(TT(p.x));
     }
 
     void OnMouseMove(POINT p, WPARAM keys) {
@@ -2534,7 +2626,14 @@ public:
                 SetTrim(std::nullopt, now);
                 Seek(edit.trimEnd);
                 break;
-            case DragKind::Playhead: Seek(now); break;
+            case DragKind::Playhead: Seek(SnapToFrame(now)); break;
+            case DragKind::Pan:
+                if (drag.target < 0 && std::abs(p.x - drag.downX) < S(4)) break;
+                drag.target = 1;  // moved: a pan, not a click
+                tlStart = drag.grab - (p.x - drag.downX) * TlSpan() / std::max(1, RectW(TimelineRect()));
+                ClampTimeline();
+                Invalidate();
+                break;
             case DragKind::ClipIn:
             case DragKind::ClipOut: {
                 if (drag.clip >= edit.clips.size()) break;
@@ -2631,18 +2730,36 @@ public:
         }
     }
 
-    // The wheel: scrolls the notes list.
-    void OnWheel(POINT p, int delta, WPARAM) {
+    // The wheel: scrolls the notes list; over the timeline, Ctrl+wheel zooms it and the wheel pans it.
+    void OnWheel(POINT p, int delta, WPARAM keys) {
         const RECT nl = NotesListRect();
         if (NotesShown() && PtInRect(&nl, p)) {
             notesScroll = std::max(0, notesScroll - delta * NoteRowH() / WHEEL_DELTA);
             Invalidate();
+            return;
+        }
+        const RECT tr = TimelineRect();
+        if (p.y >= tr.top - S(8) && p.y <= tr.bottom && p.x >= S(14)) {
+            if (keys & MK_CONTROL) ZoomTimeline(std::pow(1.25, delta / (double)WHEEL_DELTA));
+            else if (tlZoom > 1) {
+                tlStart -= delta / (double)WHEEL_DELTA * TlSpan() * 0.15;
+                ClampTimeline();
+                Invalidate();
+            }
+            return;
         }
     }
 
     void OnMouseUp() {
 
         const Drag d = drag;
+        if (d.kind == DragKind::Pan) {
+            drag = {};
+            ReleaseCapture();
+            if (d.target < 0) Seek(d.value);  // a click: go there
+            Invalidate();
+            return;
+        }
         if (d.kind == DragKind::ClipIn || d.kind == DragKind::ClipOut || d.kind == DragKind::ClipMove) {
             drag = {};
             ReleaseCapture();
@@ -2687,6 +2804,13 @@ public:
                 case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
                 case 'G': BeginGoTo(); return true;
+                case VK_OEM_PLUS:
+                case VK_ADD: ZoomTimeline(1.5); return true;
+                case VK_OEM_MINUS:
+                case VK_SUBTRACT: ZoomTimeline(1 / 1.5); return true;
+                case '0':
+                case VK_NUMPAD0: FitTrim(); return true;
+
                 case 'W': PostMessageW(hwnd, WM_CLOSE, 0, 0); return true;
                 default: return false;
             }
@@ -3369,6 +3493,24 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->SelectNote(e->edit.notes.back().id);
         Pump(800);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-notes.png");
+        // Zoomed all the way in around frame 757, with a second note close by: a tick per frame, numbered.
+        {
+            const TimelineFrames::Frame& f = e->tframes.frames[742];
+            Note n;
+            n.path = e->edit.clips[f.clip].path;
+            n.src = f.src;
+            n.kind = NoteKind::Question;
+            n.text = L"Recoil starts here?";
+            n.author = L"Mai";
+            e->edit.notes.push_back(n);
+            e->Changed();
+        }
+        e->ZoomTimeline(1000);
+        e->tlStart = e->tframes.frames[757].t - e->TlSpan() * 0.6;
+        e->ClampTimeline();
+        e->RevealNote(*e->selected);
+        Pump(300);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-timeline-zoom.png");
         e->edit.notes.clear();  // its sidecar goes again
         e->Changed();
 
@@ -3983,6 +4125,113 @@ ATHER_TEST(video_editor_notes_kept_next_to_the_video) {
     e->Select(e->edit.notes[0].id);
     e->Key(VK_DELETE, {});
     CHECK(!exists(NotesPath(d)));
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Timeline zoom: Ctrl+= zooms around the playhead (its frame stays put) down to about 14 px a frame; pixels and frames
+// map both ways at every zoom and pan; at full zoom a click on a frame's tick lands on that frame; Ctrl+0 fits the
+// trim; notes and caption bars stay on their frames.
+ATHER_TEST(video_editor_timeline_zoom) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    const RECT tr = e->TimelineRect();
+    CHECK_NEAR(e->TX(0), tr.left, 1e-9);
+    CHECK_NEAR(e->TX(e->duration), tr.right, 1e-6);
+    e->GoToFrame(50);
+    const double t50 = e->tframes.frames[50].t;
+    // Every frame's x leads back to that frame, and every pixel to the frame nearest it.
+    auto roundTrip = [&] {
+        int wrong = 0;
+        for (size_t n = 0; n < e->tframes.size(); ++n) {
+            const double x = e->TX(e->tframes.frames[n].t);
+            if (x < tr.left || x > tr.right) continue;
+            wrong += e->tframes.Nearest(e->TT((int)std::lround(x))) != n;
+        }
+        for (int x = tr.left; x <= tr.right; x += 7) {
+            const size_t n = e->tframes.Nearest(e->TT(x));
+            const double half = (double)RectW(tr) / e->TlSpan() / 120.0;  // half a frame in pixels
+            const bool pastLast = n + 1 == e->tframes.size() && x >= e->TX(e->tframes.frames[n].t);  // the last frame shows to the end
+            wrong += !pastLast && std::fabs(e->TX(e->tframes.frames[n].t) - x) > half + 1;
+        }
+        return wrong;
+    };
+    CHECK_EQ(roundTrip(), 0);
+    double x50 = e->TX(t50);
+    int presses = 0;
+    while (e->tlZoom < e->MaxTlZoom() - 1e-9 && presses < 40) {
+        e->Key(VK_OEM_PLUS, {true, false, false});
+        ++presses;
+        test::Note("zoom " + std::to_string(e->tlZoom) + ", frame 50 at " + std::to_string(e->TX(t50)) + " (was " + std::to_string(x50) + ")");
+        CHECK(std::fabs(e->TX(t50) - x50) <= 1);  // the playhead's frame stays under the same spot
+        CHECK_EQ(roundTrip(), 0);
+    }
+    const double pf = e->PxPerFrame();
+    test::Note("full zoom: " + std::to_string(pf) + " px a frame after " + std::to_string(presses) + " presses");
+    CHECK(pf >= 13.5 && pf <= 14.5);
+    // At full zoom, a click on a frame's tick lands on that frame (and shows it).
+    const int stripY = tr.top + e->LaneH() + e->S(30);
+    for (size_t n : {48, 53, 57}) {
+        e->OnMouseDown({(LONG)std::lround(e->TX(e->tframes.frames[n].t)), stripY}, false);
+        e->OnMouseUp();
+        CHECK_EQ(e->FrameNow(), n);
+        CHECK(ShownFrame(e).first == (int)n);
+    }
+    // Panning with the wheel moves everything together; the mapping still holds.
+    const double before = e->tlStart;
+    e->OnWheel({tr.left + 100, stripY}, -WHEEL_DELTA, 0);
+    CHECK(e->tlStart > before);
+    CHECK_EQ(roundTrip(), 0);
+    // Dragging an empty lane pans; a click there (no drag) goes to that time.
+    const int laneY = tr.top + e->LaneH() + e->S(70);
+    const double s0 = e->tlStart;
+    e->OnMouseDown({tr.left + 300, laneY}, false);
+    e->OnMouseMove({tr.left + 200, laneY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(e->tlStart > s0);
+    const size_t clickAt = e->tframes.Nearest(e->TT(tr.left + 400));
+    e->OnMouseDown({tr.left + 400, laneY}, false);
+    e->OnMouseUp();
+    CHECK_EQ(e->FrameNow(), clickAt);
+    // A note and a caption bar sit on their frames, zoomed in: the note's flag shows its color at its frame's x.
+    e->GoToFrame(60);
+    e->Key('M', {});
+    e->UpdateNote([](Note& n) { n.kind = NoteKind::Question; });
+    e->Select(std::nullopt);
+    e->Seek(e->tframes.frames[62].t);
+    e->AddCaption();
+    e->edit.captions.back().start = e->tframes.frames[62].t;
+    e->edit.captions.back().text = L"Here";
+    e->Select(std::nullopt);
+    e->Changed();
+    auto snap = Snapshot(e);
+    auto px = [&](double x, int y) { return snap->Bits()[(size_t)y * snap->Width() + (int)std::lround(x)] & 0xFFFFFF; };
+    const COLORREF blue = annot::Color(4);
+    const uint32_t flag = px(e->TX(e->tframes.frames[60].t), tr.top + e->LaneH() + e->S(2));
+    test::Note("flag " + std::to_string(flag));
+    CHECK(std::abs((int)(flag & 255) - GetBValue(blue)) < 40 && std::abs((int)((flag >> 16) & 255) - GetRValue(blue)) < 40);
+    const int capMid = tr.top + e->LaneH() + e->S(62) + e->S(11);
+    const uint32_t onBar = px(e->TX(e->tframes.frames[62].t) + e->S(3), capMid), before62 = px(e->TX(e->tframes.frames[62].t) - e->S(3), capMid);
+    test::Note("caption bar " + std::to_string(onBar) + " before it " + std::to_string(before62));
+    CHECK(onBar != before62);
+    // Ctrl+0 fits the trim.
+    e->edit.trimStart = 0.2;  // 1.6 s: within the 1.58x a 2 s clip zooms to
+    e->edit.trimEnd = 1.8;
+    e->Key('0', {true, false, false});
+    test::Note("fit: zoom " + std::to_string(e->tlZoom) + " start " + std::to_string(e->tlStart) + " x " + std::to_string(e->TX(0.2)) + ".." +
+               std::to_string(e->TX(1.8)) + " of " + std::to_string(tr.left) + ".." + std::to_string(tr.right));
+    CHECK(std::fabs(e->TX(0.2) - tr.left) <= 1 && std::fabs(e->TX(1.8) - tr.right) <= 1);
+    e->edit.trimStart = 0;
+    e->edit.trimEnd = e->duration;
+    e->Key('0', {true, false, false});
+    CHECK_NEAR(e->tlZoom, 1, 1e-9);
+    // Zooming never touches the edit.
+    CHECK(e->edit.speed == 1 && !e->edit.crop);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
