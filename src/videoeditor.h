@@ -11,6 +11,10 @@ namespace ather {
 void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon);
 // The name on new review notes (empty: Windows' display name), and where a name typed in the editor is remembered.
 void SetVideoEditorAuthor(const std::wstring& author, std::function<void(const std::wstring&)> remember);
+// A global hotkey pressed while a video editor is in front: Ctrl+Alt+S is the editor's "Save review video" there
+// (rather than scrolling capture). True when the editor took it.
+bool VideoEditorHotkey(UINT mods, UINT vk);
+
 
 // Opens (or brings back) the editor for an MP4.
 bool OpenVideoEditor(const std::wstring& path);

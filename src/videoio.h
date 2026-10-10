@@ -118,6 +118,19 @@ using ExportProgress = std::function<bool(double)>;
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress = {});
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps = 12,
                ExportProgress progress = {});
+// "Save review video": the edit as an MP4 with `plan`'s summary card, burn-in and held note frames (silent while
+// held). One encoder; the frames go through the same frame renderer as Save's. A plain Save never comes here.
+bool ExportReviewMp4(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& out, std::wstring* error,
+                     ExportProgress progress = {});
+// Each note's frame as the review video shows it (the edit's frame, without the burn-in and card), with its pin.
+std::vector<BitmapPtr> NoteFrames(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan);
+// The review's contact sheet ("<video> review sheet.png"): a header (title, date, reviewers, count), then one tile per
+// note in timeline order: its frame (NoteFrames, scaled), the kind in its color, timecode and frame number, the text and
+// the author. Two tiles a row, made to read well when posted in a chat. `pictures`: where each tile's frame went.
+BitmapPtr ContactSheet(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, std::vector<RECT>* pictures = nullptr);
+bool WriteContactSheet(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& path);
+
+
 
 // Developer tool (--bench-export): when set, sees every frame an export encodes, in order, before encoding.
 extern std::function<void(int index, const Bitmap& frame)> g_exportTap;

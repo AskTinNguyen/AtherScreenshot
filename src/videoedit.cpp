@@ -1519,6 +1519,145 @@ BitmapPtr FrameRenderer::TitleImage(const Mark& m, SIZE size) const {
     });
 }
 
+// ---------- the review video ----------
+
+std::wstring BurnInText(const TimelineFrames& tf, size_t n) { return tf.Timecode(n) + L" · frame " + std::to_wstring(n); }
+
+std::wstring NoteKindLine(NoteKind k, bool resolved) { return std::wstring(NoteKindLabel(k)) + (resolved ? L" · Resolved" : L""); }
+
+namespace {
+void FillOpaque(Bitmap& b, RECT r, COLORREF c) {
+    r.left = std::max(0L, r.left), r.top = std::max(0L, r.top), r.right = std::min((LONG)b.Width(), r.right), r.bottom = std::min((LONG)b.Height(), r.bottom);
+    const uint32_t px = 0xFF000000u | (uint32_t)GetRValue(c) << 16 | (uint32_t)GetGValue(c) << 8 | GetBValue(c);
+    for (LONG y = r.top; y < r.bottom; ++y) std::fill_n(b.Bits() + (size_t)y * b.Width() + r.left, std::max(0L, r.right - r.left), px);
+}
+// `text` cut (with …) to fit on one line `width` wide.
+std::wstring OneLine(std::wstring text, const textdraw::Style& st, float width) {
+    if (const size_t nl = text.find_first_of(L"\r\n"); nl != std::wstring::npos) text = text.substr(0, nl) + L" …";
+    if (textdraw::Measure(text, st, 1e6f).w <= width) return text;
+    while (text.size() > 1 && textdraw::Measure(text + L"…", st, 1e6f).w > width) text.pop_back();
+    return text + L"…";
+}
+}  // namespace
+
+RECT DrawBurnIn(Bitmap& frame, const std::wstring& text) {
+    const double u = std::max(0.4, frame.Height() / 720.0);
+    textdraw::Style st;
+    st.family = L"Consolas";
+    st.weight = 700;
+    st.size = (float)(20 * u);
+    st.center = false;
+    const auto ext = textdraw::Measure(text, st, 1e6f);
+    const int pad = (int)std::lround(8 * u), x = (int)std::lround(12 * u), y = (int)std::lround(12 * u);
+    const RECT r{x, y, x + (int)std::ceil(ext.w) + 2 * pad, y + (int)std::ceil(ext.h) + pad};
+    FillOpaque(frame, r, RGB(12, 12, 12));
+    textdraw::Draw(frame, text, st, (float)(x + pad), (float)(y + pad / 2), ext.w + 2);
+    return r;
+}
+
+void DrawNotePin(Bitmap& frame, const ReviewNote& n) {
+    if (!n.pin) return;
+    const float u = (float)std::max(0.4, frame.Height() / 720.0);
+    const float r = 16 * u, x = (float)n.pin->x, y = (float)n.pin->y;
+    textdraw::FillRounded(frame, x - r - 4 * u, y - r - 4 * u, 2 * (r + 4 * u), 2 * (r + 4 * u), r + 4 * u, RGB(0, 0, 0), 0.45f);
+    textdraw::FillRounded(frame, x - r, y - r, 2 * r, 2 * r, r, annot::Color(NoteKindColor(n.kind)), n.resolved ? 0.6f : 1.f);
+    textdraw::StrokeEllipse(frame, x - r, y - r, 2 * r, 2 * r, 3 * u, RGB(255, 255, 255));
+}
+
+RECT DrawNoteCard(Bitmap& frame, const ReviewNote& n) {
+    const float W = (float)frame.Width(), H = (float)frame.Height(), u = (float)std::max(0.4, frame.Height() / 720.0);
+    const COLORREF kc = annot::Color(NoteKindColor(n.kind));
+    DrawNotePin(frame, n);  // the spot it points at
+    textdraw::Style meta, body, by;
+    meta.size = 17 * u, meta.weight = 700, meta.color = kc, meta.center = false;
+    body.size = 28 * u, body.weight = 600, body.color = RGB(255, 255, 255), body.center = false;
+    by.size = 18 * u, by.weight = 500, by.color = RGB(170, 170, 170), by.center = false;
+    const float cw = std::min(W * 0.7f, 1000 * u), pad = 18 * u, bar = 6 * u, inner = cw - 2 * pad - bar - 8 * u;
+    const std::wstring metaText = Upper(NoteKindLine(n.kind, n.resolved)) + L"   " + n.timecode + L"   FRAME " + std::to_wstring(n.frame);
+    std::wstring text = n.text.empty() ? L"(no text)" : n.text.substr(0, 400);
+    const float maxBody = body.size * 1.35f * 4;  // four lines at most
+    while (text.size() > 8 && textdraw::Measure(text, body, inner).h > maxBody) text = text.substr(0, text.size() * 9 / 10) + L"…";
+    const auto me = textdraw::Measure(metaText, meta, inner), be = textdraw::Measure(text, body, inner);
+    const std::wstring author = L"— " + (n.author.empty() ? std::wstring(L"Reviewer") : n.author);
+    const auto ae = textdraw::Measure(author, by, inner);
+    const float h = pad + me.h + 6 * u + be.h + 8 * u + ae.h + pad;
+    const float x = std::round((W - cw) / 2);
+    const float y = std::round(n.pin && n.pin->y > H * 0.55 ? 60 * u : H - h - 40 * u);  // out of the pin's way
+    textdraw::FillRounded(frame, x, y, cw, h, 14 * u, RGB(26, 26, 26), 1.f);
+    textdraw::FillRounded(frame, x + pad * 0.6f, y + pad, bar, h - 2 * pad, bar / 2, kc, 1.f);
+    const float tx = x + pad + bar + 8 * u;
+    textdraw::Draw(frame, metaText, meta, tx, y + pad, inner);
+    textdraw::Draw(frame, text, body, tx, y + pad + me.h + 6 * u, inner);
+    textdraw::Draw(frame, author, by, tx, y + pad + me.h + 6 * u + be.h + 8 * u, inner);
+    return {(LONG)x, (LONG)y, (LONG)(x + cw), (LONG)std::ceil(y + h)};
+}
+
+BitmapPtr SummaryCard(SIZE size, const ReviewPlan& plan) {
+    auto b = Bitmap::Create(size.cx, size.cy);
+    if (!b) return b;
+    FillOpaque(*b, {0, 0, size.cx, size.cy}, RGB(18, 18, 18));
+    const float W = (float)size.cx, H = (float)size.cy, u = (float)std::max(0.4, size.cy / 720.0);
+    const float x = 70 * u, width = W - 140 * u;
+    float y = 56 * u;
+    textdraw::Style title, sub, chip, tc, kind, line;
+    title.size = 40 * u, title.weight = 700, title.center = false;
+    sub.size = 20 * u, sub.weight = 500, sub.color = RGB(170, 170, 170), sub.center = false;
+    chip.size = 21 * u, chip.weight = 700, chip.center = false;
+    tc.family = L"Consolas", tc.size = 19 * u, tc.weight = 700, tc.color = RGB(200, 200, 200), tc.center = false;
+    kind.size = 18 * u, kind.weight = 700, kind.center = false;
+    line.size = 20 * u, line.weight = 500, line.color = RGB(235, 235, 235), line.center = false;
+    const std::wstring t = OneLine(L"Review · " + plan.title, title, width);
+    textdraw::Draw(*b, t, title, x, y, width);
+    y += textdraw::Measure(t, title, width).h + 8 * u;
+    std::wstring who;
+    for (const auto& r : plan.reviewers) who += (who.empty() ? L"" : L", ") + r;
+    const std::wstring s = OneLine(plan.date + (who.empty() ? L"" : L"   ·   " + who), sub, width);
+    textdraw::Draw(*b, s, sub, x, y, width);
+    y += textdraw::Measure(s, sub, width).h + 26 * u;
+    // Counts by kind, each in its color; then how many are resolved.
+    int counts[kNoteKinds] = {}, resolved = 0;
+    for (const auto& n : plan.notes) ++counts[(int)n.kind], resolved += n.resolved;
+    static const wchar_t* const singular[] = {L"note", L"issue", L"question", L"looks good"};
+    static const wchar_t* const plural[] = {L"notes", L"issues", L"questions", L"looks good"};
+    float cx = x;
+    const float chipH = textdraw::Measure(L"0", chip, 1e6f).h;
+    for (int k : {1, 2, 0, 3}) {  // issues first
+        if (!counts[k]) continue;
+        const std::wstring label = std::to_wstring(counts[k]) + L" " + (counts[k] == 1 ? singular[k] : plural[k]);
+        chip.color = annot::Color(NoteKindColor((NoteKind)k));
+        textdraw::FillRounded(*b, cx, y + chipH / 2 - 6 * u, 12 * u, 12 * u, 6 * u, chip.color, 1.f);
+        textdraw::Draw(*b, label, chip, cx + 20 * u, y, 1e6f);
+        cx += 20 * u + textdraw::Measure(label, chip, 1e6f).w + 34 * u;
+    }
+    if (plan.notes.empty()) {
+        chip.color = RGB(170, 170, 170);
+        textdraw::Draw(*b, L"No notes", chip, cx, y, 1e6f);
+    } else if (resolved) {
+        chip.color = RGB(140, 140, 140);
+        textdraw::Draw(*b, std::to_wstring(resolved) + L" resolved", chip, cx, y, 1e6f);
+    }
+    y += chipH + 30 * u;
+    // The notes, as many as fit, then how many more.
+    const float lh = 36 * u, bottom = H - 50 * u;
+    for (size_t i = 0; i < plan.notes.size(); ++i) {
+        if (y + lh * 2 > bottom && i + 1 < plan.notes.size()) {
+            textdraw::Draw(*b, L"+ " + std::to_wstring(plan.notes.size() - i) + L" more in the video", sub, x, y + 4 * u, width);
+            break;
+        }
+        const ReviewNote& n = plan.notes[i];
+        kind.color = annot::Color(NoteKindColor(n.kind));
+        textdraw::FillRounded(*b, x, y + 4 * u, 5 * u, lh - 12 * u, 2.5f * u, kind.color, n.resolved ? 0.5f : 1.f);
+        textdraw::Draw(*b, n.timecode, tc, x + 16 * u, y + 4 * u, 1e6f);
+        const float kx = x + 16 * u + textdraw::Measure(L"00:00:00", tc, 1e6f).w + 18 * u;
+        textdraw::Draw(*b, NoteKindLabel(n.kind), kind, kx, y + 5 * u, 1e6f);
+        const float lx = kx + textdraw::Measure(L"Looks good", kind, 1e6f).w + 18 * u;
+        line.color = n.resolved ? RGB(140, 140, 140) : RGB(235, 235, 235);
+        textdraw::Draw(*b, OneLine((n.author.empty() ? L"" : n.author + L": ") + n.text, line, x + width - lx), line, lx, y + 3 * u, x + width - lx);
+        y += lh;
+    }
+    return b;
+}
+
 // ---------- tests (MarkupTests.swift, VideoTests.testCaptionChunking) ----------
 
 namespace {

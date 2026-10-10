@@ -75,6 +75,14 @@ std::wstring WindowsDisplayName() {
     return L"Reviewer";
 }
 std::wstring NoteAuthor() { return g_noteAuthor.empty() ? WindowsDisplayName() : g_noteAuthor; }
+bool WriteFileUtf8(const std::wstring& path, const std::string& text) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const bool ok = WriteFile(f, text.data(), (DWORD)text.size(), &wrote, nullptr) && wrote == text.size();
+    CloseHandle(f);
+    return ok;
+}
 // A small file's bytes (at most 16 MB).
 bool ReadFileUtf8(const std::wstring& path, std::string* out) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -335,6 +343,8 @@ struct TranscribeResult {
 struct SaveResult {
     bool ok, gif;
     std::wstring out, tmp, err;
+    bool review = false;          // a review video, with its notes list (and sheet) next to it
+    std::wstring md, mdText, sheet;
 };
 struct FrameTimesResult {
     std::wstring key;
@@ -1790,12 +1800,32 @@ public:
             const RECT cr = r;
             hots.back().click = [this, cr] { Popup(cr, CaptionsMenu()); };
         }
-        // Right side: Save GIF, Save.
-        const int saveW = S(68);
-        RECT save{c.right - S(14) - saveW, y, c.right - S(14), y + h};
+        // Right side: Save GIF, Save and its menu (▾: the review video).
+        const int saveW = S(68), moreW = S(28);
+        const RECT more{c.right - S(14) - moreW, y, c.right - S(14), y + h};
+        RECT save{more.left - S(2) - saveW, y, more.left - S(2), y + h};
         const int gifW = S(9) * 2 + S(22) + Measure(dc, fUi, L"Save GIF").cx;
         Button(dc, g, save.left - S(6) - gifW, y, h, 0xE8B9, L"Save GIF", false, false, [this] { Save(true); }, L"Save as a GIF (Ctrl+Shift+S)");
         Button(dc, g, save.left, y, h, 0, L"Save", false, false, [this] { Save(false); }, L"Save as a new MP4 in your captures (Ctrl+S)", true, saveW);
+        FillRR(g, more, (float)S(7), A(theme::kAccent));
+        Text(dc, fSmall, L"▾", more, theme::kOnAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Hotspot(more, [this, more] { Popup(more, SaveMenu()); }, L"More ways to save: GIF, review video with your notes");
+    }
+    std::vector<MenuItem> SaveMenu() {
+        std::vector<MenuItem> v;
+        MenuItem mp4, gif, review;
+        mp4.label = L"Save video\tCtrl+S";
+        mp4.run = [this] { Save(false); };
+        gif.label = L"Save GIF\tCtrl+Shift+S";
+        gif.run = [this] { Save(true); };
+        review.label = L"Save review video\tCtrl+Alt+S";
+        review.run = [this] { SaveReview(); };
+        review.enabled = !tframes.empty();
+        v.push_back(mp4);
+        v.push_back(gif);
+        v.push_back(MenuItem::Sep());
+        v.push_back(review);
+        return v;
     }
 
     void PaintStage(HDC dc, gp::Graphics& g) {
@@ -1984,12 +2014,57 @@ public:
         DeleteObject(clip);
     }
 
-    // The notes list as text, one line each (the review notes list and Copy): the notes in the trim, in order.
-    std::wstring NotesText() const { return std::wstring(); }
+    // The notes in the review video (those in the trim), in timeline order, as the review video shows them.
+    ReviewPlan MakeReviewPlan() const {
+        ReviewPlan p;
+        p.frames = tframes;
+        if (tframes.empty()) return p;
+        const size_t first = tframes.At(edit.trimStart + 1e-3), last = tframes.At(edit.trimEnd - 1e-3);
+        for (const auto& [f, i] : placed) {
+            if (f < first || f > last) continue;
+            const Note& n = edit.notes[i];
+            ReviewNote r;
+            r.t = tframes.frames[f].t;
+            r.frame = f;
+            r.timecode = tframes.Timecode(f);
+            r.kind = n.kind;
+            r.resolved = n.resolved;
+            r.author = n.author.empty() ? std::wstring(L"Reviewer") : n.author;
+            r.text = n.text;
+            r.pin = PinOnVideo(n);
+            if (std::find(p.reviewers.begin(), p.reviewers.end(), r.author) == p.reviewers.end()) p.reviewers.push_back(r.author);
+            p.notes.push_back(r);
+        }
+        p.title = FileNameOf(path);
+        wchar_t date[128] = L"";
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, nullptr, nullptr, date, (int)std::size(date), nullptr);
+        p.date = date;
+        return p;
+    }
+    // The notes list as text, one line each (the review notes list and Copy): "m:ss:ff (frame n), Author: [Kind] text"
+    // for the notes in the review video, a blank line between them so Markdown shows each on its own line.
+    static std::wstring NoteLine(const ReviewNote& n) {
+        std::wstring text = n.text;
+        for (size_t at = 0; (at = text.find_first_of(L"\r\n", at)) != std::wstring::npos;) {
+            const size_t end = text.find_first_not_of(L"\r\n", at);
+            text.replace(at, (end == std::wstring::npos ? text.size() : end) - at, L" / ");
+            at += 3;
+        }
+        return n.timecode + L" (frame " + std::to_wstring(n.frame) + L"), " + n.author + L": [" + NoteKindLine(n.kind, n.resolved) + L"] " + text;
+    }
+    static std::wstring NotesListText(const ReviewPlan& p) {
+        std::wstring s;
+        for (const auto& n : p.notes) s += (s.empty() ? L"" : L"\r\n\r\n") + NoteLine(n);
+        return s.empty() ? s : s + L"\r\n";
+    }
+    std::wstring NotesText() const { return NotesListText(MakeReviewPlan()); }
+    std::function<void(const std::wstring&)> copyHook;  // tests: instead of the clipboard
     void CopyNotes() {
         const std::wstring t = NotesText();
         if (t.empty()) return;
+        if (copyHook) return copyHook(t);
         CopyTextToClipboard(hwnd, t);
+
         ShowToast(L"Notes copied", std::to_wstring(std::count(t.begin(), t.end(), L'\n')) + L" lines", nullptr, nullptr, 2000);
     }
 
@@ -2876,6 +2951,10 @@ public:
             if (vk == VK_ESCAPE) CancelDrag();
             return true;
         }
+        if (mods.ctrl && mods.alt && !mods.shift && vk == 'S') {
+            SaveReview();
+            return true;
+        }
         const bool ctrl = mods.ctrl && !mods.alt, shift = mods.shift;
         if (ctrl) {
             switch (vk) {
@@ -3026,6 +3105,83 @@ public:
                 }
             }
         }).detach();
+    }
+
+    // Save review video (Ctrl+Alt+S): "<video> review.mp4" in the captures folder (the summary card, the edit with the
+    // timecode and frame number burned in, each note's frame held under its card), with "<video> review notes.md" and
+    // "<video> review sheet.png" next to it.
+    std::wstring lastReviewOut;  // tests
+    void SaveReview() {
+        if (busy || tframes.empty()) return;
+        SetFocus(hwnd);  // commits a field being edited
+        EndGoTo();
+        busy = saving = true;
+        Pause();
+        const ReviewPlan plan = MakeReviewPlan();
+        const std::wstring capture = MakeCapturePath(g_folder, L"mp4", {window, app});
+        const std::wstring folder = capture.substr(0, capture.find_last_of(L'\\'));
+        SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
+        std::wstring stem = FileNameOf(path);
+        if (const size_t dot = stem.find_last_of(L'.'); dot != std::wstring::npos) stem.resize(dot);
+        std::wstring name;
+        for (int k = 1;; ++k) {  // never over an earlier one
+            name = folder + L"\\" + stem + L" review" + (k > 1 ? L" " + std::to_wstring(k) : L"");
+            bool taken = false;
+            for (const wchar_t* ext : {L".mp4", L" notes.md", L" sheet.png"}) taken = taken || GetFileAttributesW((name + ext).c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (!taken) break;
+        }
+        const std::wstring out = name + L".mp4", md = name + L" notes.md", sheet = name + L" sheet.png";
+        wchar_t tdir[MAX_PATH];
+        GetTempPathW(MAX_PATH, tdir);
+        const std::wstring tmp = std::wstring(tdir) + L"ather-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".mp4";
+        const uint64_t toast = ShowToast(L"Saving review video…", std::to_wstring(plan.notes.size()) + (plan.notes.size() == 1 ? L" note" : L" notes"), nullptr,
+                                         nullptr, 600000);
+        const VideoEdit e = edit;
+        const std::wstring src = path, mdText = NotesListText(plan);
+        HWND h = hwnd;
+        std::thread([=] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            std::wstring err;
+            int lastPct = -1;
+            auto progress = [&](double p) {
+                const int pct = (int)(p * 100);
+                if (pct / 5 != lastPct / 5) {
+                    lastPct = pct;
+                    const std::wstring body = std::to_wstring(pct) + L"%";
+                    RunOnUi([toast, body] { UpdateToastBody(toast, body); });
+                }
+                return true;
+            };
+            const bool ok = ExportReviewMp4(src, e, plan, tmp, &err, progress);
+            const bool sheetOk = ok && WriteContactSheet(src, e, plan, sheet);
+            CoUninitialize();
+            auto* r = new SaveResult{ok, false, out, tmp, err, true, md, mdText, sheetOk ? sheet : L""};
+            if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {  // the editor was closed meanwhile
+                delete r;
+                if (!ok) DeleteFileW(tmp.c_str());
+                else RunOnUi([out, tmp, md, mdText] {
+                    MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+                    WriteFileUtf8(md, ToUtf8(mdText));
+                });
+            }
+        }).detach();
+    }
+    void ReviewSaved(const SaveResult& r) {
+        busy = saving = false;
+        lastSaveError = r.ok ? L"" : r.err;
+        Invalidate();
+        if (!r.ok || !MoveFileExW(r.tmp.c_str(), r.out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            DeleteFileW(r.tmp.c_str());
+            ShowToast(L"Saving the review video failed", r.ok ? r.out : r.err, nullptr, nullptr, 8000);
+            return;
+        }
+        lastReviewOut = r.out;
+        Library::Shared().NoteEdit(r.out, path, app, window, true);  // stacks with the original in the gallery
+        WriteFileUtf8(r.md, ToUtf8(r.mdText));
+        std::vector<std::wstring> made = {r.out, r.md};
+        if (!r.sheet.empty()) made.push_back(r.sheet);
+        ShowToast(L"Review video saved", FileNameOf(r.out) + L", its notes list and contact sheet  ·  click to show in Explorer", nullptr,
+                  [made] { RevealInExplorer(made); }, 6000);
     }
 
     void Saved(bool ok, bool gif, const std::wstring& out, const std::wstring& tmp, const std::wstring& err) {
@@ -3232,7 +3388,8 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         }
         case WM_SAVED: {
             std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(l));
-            Saved(r->ok, r->gif, r->out, r->tmp, r->err);
+            if (r->review) ReviewSaved(*r);
+            else Saved(r->ok, r->gif, r->out, r->tmp, r->err);
             return 0;
         }
         case WM_CLOSE:
@@ -3339,7 +3496,19 @@ void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon) {
     g_icon = icon;
 }
 
+bool VideoEditorHotkey(UINT mods, UINT vk) {
+    if ((mods & (MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN)) != (MOD_CONTROL | MOD_ALT) || vk != 'S') return false;
+    const HWND fg = GetForegroundWindow();
+    for (auto* e : g_editors)
+        if (e->hwnd == fg) {
+            e->SaveReview();
+            return true;
+        }
+    return false;
+}
+
 void SetVideoEditorAuthor(const std::wstring& author, std::function<void(const std::wstring&)> remember) {
+
     g_noteAuthor = author;
     g_rememberAuthor = std::move(remember);
 }
@@ -3615,6 +3784,24 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->RevealNote(*e->selected);
         Pump(300);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-timeline-zoom.png");
+        // The review video: its summary card, a note card frame (the pinned Issue at frame 757) and the contact sheet.
+        {
+            const ReviewPlan plan = e->MakeReviewPlan();
+            size_t k = 0;
+            while (k + 1 < plan.notes.size() && plan.notes[k].frame != 757) ++k;
+            const int intro = (int)std::lround(plan.intro * 60), hold = (int)std::lround(plan.hold * 60);
+            const int cardAt = intro + (int)plan.notes[k].frame + (int)k * hold + hold / 2;  // trim from 0, 60 fps: output frame = frame number
+            std::mutex mu;
+            g_exportTap = [&](int i, const Bitmap& f) {
+                if (i != 0 && i != cardAt) return;
+                std::lock_guard l(mu);
+                SavePng(f, outDir + (i == 0 ? L"\\review-summary-card.png" : L"\\review-note-card.png"));
+            };
+            std::wstring err;
+            ExportReviewMp4(e->path, e->edit, plan, outDir + L"\\snapshot-review.mp4", &err);
+            g_exportTap = nullptr;
+            WriteContactSheet(e->path, e->edit, plan, outDir + L"\\review-sheet.png");
+        }
         e->edit.notes.clear();  // its sidecar goes again
         e->Changed();
 
@@ -4437,6 +4624,68 @@ ATHER_TEST(video_editor_pixel_magnifier) {
     CHECK(e->magZoom == 1);
     CHECK(e->edit == before);
     CHECK(e->undoStack.empty());
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Save review video (Ctrl+Alt+S, or Save ▾): "<video> review.mp4" with "… review notes.md" and "… review sheet.png"
+// next to it in the captures; the notes list has one line per note in the trim, "m:ss:ff (frame n), Author: [Kind] text",
+// and Copy puts the same text on the clipboard. The edit and the original are untouched; a second save never
+// overwrites the first.
+ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\shot 60.mp4", caps = dir + L"\\caps";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    const CapturesFolderForTest folder(caps);
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    auto noteAt = [&](size_t frame, NoteKind kind, const wchar_t* text, const wchar_t* author, bool resolved) {
+        e->Select(std::nullopt);
+        e->GoToFrame(frame);
+        e->Key('M', {});
+        e->UpdateNote([&](Note& n) {
+            n.kind = kind;
+            n.text = text;
+            n.author = author;
+            n.resolved = resolved;
+        });
+    };
+    noteAt(90, NoteKind::Question, L"Intended?", L"Mai", false);
+    noteAt(30, NoteKind::Issue, L"Flicker\nsecond line", L"Tin", false);
+    noteAt(5, NoteKind::Good, L"Cut before the trim", L"Tin", true);  // outside the trim below: not in the review
+    e->edit.trimStart = 0.25;
+    e->Changed();
+    const std::wstring want = L"0:00:30 (frame 30), Tin: [Issue] Flicker / second line\r\n\r\n0:01:30 (frame 90), Mai: [Question] Intended?\r\n";
+    test::Note("notes text: " + ToUtf8(e->NotesText()));
+    CHECK(e->NotesText() == want);
+    std::wstring copied;
+    e->copyHook = [&](const std::wstring& t) { copied = t; };
+    e->CopyNotes();
+    CHECK(copied == want);
+    const VideoEdit before = e->edit;
+    e->Key('S', {true, false, true});  // Ctrl+Alt+S
+    CHECK(e->busy);
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    test::Note("review save: " + ToUtf8(e->lastSaveError) + " → " + ToUtf8(e->lastReviewOut));
+    CHECK(!e->busy && e->lastSaveError.empty());
+    const std::wstring out = e->lastReviewOut;
+    CHECK(FileNameOf(out) == L"shot 60 review.mp4");
+    const std::wstring base = out.substr(0, out.size() - 4);
+    std::string md;
+    CHECK(ReadFileUtf8(base + L" notes.md", &md));
+    CHECK(FromUtf8(md) == want);
+    int sw = 0, sh = 0;
+    CHECK(ImageSize(base + L" sheet.png", &sw, &sh) && sw == 1600 && sh > 300);
+    VideoInfo vi;
+    CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - (1.75 + 3 + 2 * 3)) < 0.1);  // 1.75 s edit, card, two holds
+    CHECK(e->edit == before);
+    // Again: new names, the first files kept.
+    e->SaveReview();
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    CHECK(FileNameOf(e->lastReviewOut) == L"shot 60 review 2.mp4");
+    CHECK(GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

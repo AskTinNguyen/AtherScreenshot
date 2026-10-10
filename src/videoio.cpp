@@ -18,13 +18,19 @@
 #include <deque>
 #include <emmintrin.h>
 #include <future>
+#include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 
+#include "annot.h"
 #include "json.h"
 #include "library.h"
 #include "media.h"
+#include "output.h"
 #include "selftest.h"
+#include "textdraw.h"
+
 
 #pragma comment(lib, "d3d11")
 #pragma comment(lib, "mfplat")
@@ -1001,6 +1007,18 @@ public:
         }
         return S_OK;
     }
+    // Silence up to `target` output frames, without using any of the sound (a review video's held frames).
+    HRESULT WriteSilence(Mp4Writer& w, int64_t target) {
+        std::vector<int16_t> pcm;
+        while (written_ < target) {
+            const int64_t n = std::min<int64_t>(kRate, target - written_);
+            pcm.assign((size_t)n * 2, 0);
+            const HRESULT hr = w.WriteAudio(pcm.data(), (uint32_t)n, (int64_t)std::llround(written_ * kTicks / kRate));
+            if (FAILED(hr)) return hr;
+            written_ += n;
+        }
+        return S_OK;
+    }
 
 private:
     void Produce() {
@@ -1151,23 +1169,31 @@ namespace {
 class EditFrames {
 public:
     // From output frame `first` on (asked in order): reading from a second before it (for an export in pieces), from
-    // where Next picks the same source frames as when reading from the start.
-    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error, int first = 0) {
+    // where Next picks the same source frames as when reading from the start. `times`: the source time of each output
+    // frame, when they don't simply follow the edit (a review video's held frames); kept by the caller.
+    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error, int first = 0, const std::vector<double>* times = nullptr) {
         if (!reader_.Open(seq)) {
             if (error) *error = L"Can't read this video.";
             return false;
         }
         e_ = e;
         fps_ = fps;
+        times_ = times && !times->empty() ? times : nullptr;
         renderer_ = std::make_unique<FrameRenderer>(e, reader_.Size(), false);
-        reader_.Seek(std::max(e.trimStart, e.trimStart + first / fps * e.speed - 1.0));
+        reader_.Seek(std::max(e.trimStart, StAt(first) - 1.0));
         Advance();
         return true;
+    }
+    // The source time output frame `i` shows.
+    double StAt(int i) const {
+        if (times_) return (*times_)[(size_t)std::clamp(i, 0, (int)times_->size() - 1)];
+        return e_.trimStart + i / fps_ * e_.speed;
     }
     SIZE Out() const { return renderer_->Out(); }
     SIZE Full() const { return renderer_->Full(); }
     const FrameRenderer& Renderer() const { return *renderer_; }
     int Count(bool roundUp) const {
+        if (times_) return (int)times_->size();
         const double n = e_.OutputDuration() * fps_;
         return std::max(1, roundUp ? (int)std::ceil(n - 1e-6) : (int)std::floor(n + 1e-6));
     }
@@ -1175,14 +1201,14 @@ public:
     // The source frame of output frame `i` (asked in order) and its source time.
     // `alone`: no other output frame shows that source frame, so its rendering can draw on it.
     bool Next(int i, VideoFrame* src, double* st, bool* alone) {
-        *st = e_.trimStart + i / fps_ * e_.speed;
+        *st = StAt(i);
         while (next_ && nextT_ <= *st + 1e-3) {
             cur_ = next_;
             Advance(*st + 1e-3);  // frames that a later one up to here replaces needn't be copied off the GPU
         }
         *src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
         // Not the previous output frame's, and the next output frame shows a later one.
-        *alone = *src != shown_ && next_ && *src != next_ && nextT_ <= e_.trimStart + (i + 1) / fps_ * e_.speed + 1e-3;
+        *alone = *src != shown_ && next_ && *src != next_ && nextT_ <= (times_ && i + 1 >= (int)times_->size() ? -1e300 : StAt(i + 1)) + 1e-3;
         shown_ = *src;
         return (bool)*src;
     }
@@ -1250,6 +1276,7 @@ private:
     SequenceReader reader_;
     VideoEdit e_;
     double fps_ = 30;
+    const std::vector<double>* times_ = nullptr;
     std::unique_ptr<FrameRenderer> renderer_;
     VideoFrame cur_, next_, shown_;
     double nextT_ = 0;
@@ -1393,7 +1420,7 @@ std::pair<int, size_t> ExportWorkers(SIZE px) {
 // `use` returns false or a frame can't be made. With `shared`, on that pool, alongside `share` − 1 others (they split the frames in flight).
 // Decoding and handing over are one thread each, so they go before the renderers: above normal priority.
 template <class T>
-void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(const VideoFrame&, double, bool)>& make,
+void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(const VideoFrame&, double, bool, int)>& make,
                   const std::function<bool(int, T&)>& use, WorkerPool* shared = nullptr, int share = 1) {
     const SIZE full = frames.Full(), out = frames.Out();
     const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
@@ -1408,7 +1435,7 @@ void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(
             VideoFrame src;
             double st = 0;
             bool alone = false;
-            if (!frames.Next(i, &src, &st, &alone) || !work.Push([&make, src, st, alone] { return make(src, st, alone); })) break;
+            if (!frames.Next(i, &src, &st, &alone) || !work.Push([&make, src, st, alone, i] { return make(src, st, alone, i); })) break;
         }
         work.Close();
         CoUninitialize();
@@ -1439,7 +1466,7 @@ namespace {
 
 // Makes the MP4's frames: the rendered frame as NV12 for the encoder.
 auto Mp4Frames(EditFrames& frames, SIZE sz) {
-    return [&frames, sz](const VideoFrame& src, double st, bool alone) {
+    return [&frames, sz](const VideoFrame& src, double st, bool alone, int) {
         EncoderFrame ef;
         if ((ef.nv12 = frames.Passthrough(src, st))) {  // shown as decoded: straight to the encoder
             if (g_exportTap) ef.bgra = src.Bgra();
@@ -1458,9 +1485,76 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
     };
 }
 
-bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress) {
+// A review video's frames (see ReviewPlan): the summary card, then the edit's frames with the burn-in, and each note's
+// frame held under its card. `role[i]`: -1 the summary card, -2 an edit frame, k ≥ 0 note k's hold.
+auto ReviewFrames(EditFrames& frames, SIZE sz, const ReviewPlan& plan, const std::vector<int>& role, const FrameRenderer& view, BitmapPtr summary) {
+    struct Held {  // each note's held frame, made once
+        std::mutex mu;
+        std::map<int, BitmapPtr> made;
+    };
+    auto held = std::make_shared<Held>();
+    return [&frames, sz, &plan, &role, &view, summary, held](const VideoFrame& src, double st, bool, int i) {
+        EncoderFrame ef;
+        const int r = role[(size_t)i];
+        BitmapPtr f;
+        if (r == -1) {
+            f = summary;  // only read
+        } else if (r >= 0) {
+            std::lock_guard l(held->mu);
+            if (auto it = held->made.find(r); it != held->made.end()) f = it->second;
+        }
+        if (!f) {
+            const BitmapPtr decoded = src.Bgra();
+            f = frames.Render(src, st, false);
+            if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
+            if (f == decoded) f = f->Crop({0, 0, sz.cx, sz.cy});  // the decoded frame stays as it is
+            if (!f) return ef;
+            DrawBurnIn(*f, BurnInText(plan.frames, plan.frames.At(st + 1e-3)));
+            if (r >= 0) {
+                ReviewNote n = plan.notes[(size_t)r];
+                if (n.pin) {  // the sequence frame's pixels into the output's (the crop)
+                    const VRect v = view.View();
+                    n.pin = VPoint{n.pin->x - v.x, n.pin->y - v.y};
+                }
+                DrawNoteCard(*f, n);
+                std::lock_guard l(held->mu);
+                held->made[r] = f;
+            }
+        }
+        ef.nv12 = RecycledBytes((size_t)sz.cx * sz.cy * 3 / 2);
+        BgraToNv12(f->Bits(), sz.cx, sz.cy, ef.nv12->data());
+        if (g_exportTap) ef.bgra = f;
+        return ef;
+    };
+}
+
+bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress,
+                     const ReviewPlan* plan = nullptr) {
     const int fps = (int)std::lround(seq.Fps());
     const SIZE sz = FrameRenderer(e, seq.size, false).Out();
+    // A review video: which source time each output frame shows, and what it is.
+    std::vector<double> times;
+    std::vector<int> role;
+    BitmapPtr summary;
+    if (plan) {
+        const int base = std::max(1, (int)std::ceil(e.OutputDuration() * fps - 1e-6));  // as EditFrames::Count(true)
+        const int hold = (int)std::lround(plan->hold * fps), intro = (int)std::lround(plan->intro * fps);
+        for (int k = 0; k < intro; ++k) times.push_back(e.trimStart), role.push_back(-1);
+        size_t k = 0;
+        for (int i = 0; i < base; ++i) {
+            const double st = e.trimStart + i / (double)fps * e.speed;
+            // A note holds before the first output frame that would show its frame (or a later one).
+            for (; k < plan->notes.size() && plan->notes[k].t <= st + 1e-3; ++k)
+                for (int h = 0; h < hold; ++h) times.push_back(plan->notes[k].t), role.push_back((int)k);
+            times.push_back(st), role.push_back(-2);
+        }
+        for (; k < plan->notes.size(); ++k)  // past the last frame (can't happen within the trim): at the end
+            for (int h = 0; h < hold; ++h) times.push_back(plan->notes[k].t), role.push_back((int)k);
+        if (!(summary = SummaryCard(sz, *plan))) {
+            if (error) *error = L"Out of memory.";
+            return false;
+        }
+    }
     std::unique_ptr<AudioPipe> audio;
     if (!e.muted && seq.HasAudio()) {
         audio = std::make_unique<AudioPipe>();
@@ -1475,10 +1569,11 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
         return r;
     });
     EditFrames frames;
-    if (!frames.Open(seq, e, fps, error)) {  // "Can't read this video."
+    if (!frames.Open(seq, e, fps, error, 0, plan ? &times : nullptr)) {  // "Can't read this video."
         if (SUCCEEDED(begun.get())) w.Finalize();
         return false;
     }
+    const FrameRenderer view(e, seq.size, false);
     HRESULT hr = S_OK;
     bool started = false;
     auto start = [&] {
@@ -1488,14 +1583,19 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
         return SUCCEEDED(hr);
     };
     const int n = frames.Count(true);
-    const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
+    const int64_t audioTotal = plan ? std::llround((double)n * kRate / fps) : std::llround(e.OutputDuration() * kRate);
     bool cancelled = false;
-    ExportFrames<EncoderFrame>(frames, 0, n, Mp4Frames(frames, sz), [&](int i, EncoderFrame& f) {
+    std::function<EncoderFrame(const VideoFrame&, double, bool, int)> make = Mp4Frames(frames, sz);
+    if (plan) make = ReviewFrames(frames, sz, *plan, role, view, summary);
+    ExportFrames<EncoderFrame>(frames, 0, n, make, [&](int i, EncoderFrame& f) {
         if (!start()) return false;
         if (g_exportTap) g_exportTap(i, *f.bgra);
         hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps));
         f = {};
-        if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
+        if (SUCCEEDED(hr) && audio) {
+            const int64_t until = std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps));
+            hr = plan && role[(size_t)i] != -2 ? audio->WriteSilence(w, until) : audio->WriteUntil(w, until);  // held frames are silent
+        }
         if (FAILED(hr)) return false;
         cancelled = progress && !progress((i + 1.0) / n);
         return !cancelled;
@@ -1704,6 +1804,119 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     return ExportMp4Single(seq, e, out, error, [&](double p) { return progress(shown + (1 - shown) * p); });
 }
 
+bool ExportReviewMp4(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& out, std::wstring* error,
+                     ExportProgress progress) {
+    ReleaseFrameMemory release;
+    return ExportMp4Single(SequenceOf(source, e), e, out, error, progress, &plan);
+}
+
+std::vector<BitmapPtr> NoteFrames(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan) {
+    std::vector<BitmapPtr> out;
+    const Sequence seq = SequenceOf(source, e);
+    SequenceReader r;
+    if (!r.Open(seq)) return out;
+    const FrameRenderer renderer(e, seq.size, false);
+    for (const ReviewNote& n : plan.notes) {
+        // As the export picks it: the newest frame at or before the note's time.
+        r.Seek(n.t);
+        VideoFrame f, kept;
+        double ft = 0;
+        while (r.ReadFrame(&f, &ft, n.t + 1e-3)) {
+            if (ft > n.t + 1e-3) break;
+            kept = f;
+        }
+        BitmapPtr frame = kept ? kept.Bgra() : nullptr;
+        if (frame) frame = renderer.Render(frame, n.t, false);
+        if (frame) frame = frame->Crop({0, 0, frame->Width(), frame->Height()});  // drawn on next: a copy of its own
+        if (frame && n.pin) {
+            ReviewNote moved = n;
+            moved.pin = VPoint{n.pin->x - renderer.View().x, n.pin->y - renderer.View().y};
+            DrawNotePin(*frame, moved);
+        }
+        out.push_back(frame);
+    }
+    return out;
+}
+
+BitmapPtr ContactSheet(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, std::vector<RECT>* pictures) {
+    const std::vector<BitmapPtr> frames = NoteFrames(source, e, plan);
+    const SIZE out = FrameRenderer(e, SequenceOf(source, e).size, false).Out();
+    const int cols = plan.notes.size() >= 2 ? 2 : 1, margin = 40, gap = 28, sheetW = cols == 1 ? 1000 : 1600;
+    const int tileW = (sheetW - 2 * margin - (cols - 1) * gap) / cols;
+    const int picH = std::max(1, (int)std::lround((double)tileW * out.cy / std::max(1L, out.cx)));
+    textdraw::Style title, sub, meta, body, by;
+    title.size = 34, title.weight = 700, title.center = false;
+    sub.size = 18, sub.weight = 500, sub.color = RGB(170, 170, 170), sub.center = false;
+    meta.size = 19, meta.weight = 700, meta.center = false;
+    body.size = 23, body.weight = 600, body.color = RGB(240, 240, 240), body.center = false;
+    by.size = 18, by.weight = 500, by.color = RGB(170, 170, 170), by.center = false;
+    const float textW = (float)(tileW - 32);
+    // Each note's text block, cut to four lines.
+    struct Block {
+        std::wstring meta, text, by;
+        float h = 0;
+    };
+    std::vector<Block> blocks;
+    for (const ReviewNote& n : plan.notes) {
+        Block b;
+        b.meta = Upper(NoteKindLine(n.kind, n.resolved)) + L"   " + n.timecode + L"   FRAME " + std::to_wstring(n.frame);
+        b.text = n.text.empty() ? L"(no text)" : n.text.substr(0, 500);
+        while (b.text.size() > 8 && textdraw::Measure(b.text, body, textW).h > body.size * 1.35f * 4) b.text = b.text.substr(0, b.text.size() * 9 / 10) + L"…";
+        b.by = L"— " + n.author;
+        b.h = textdraw::Measure(b.meta, meta, textW).h + 6 + textdraw::Measure(b.text, body, textW).h + 8 + textdraw::Measure(b.by, by, textW).h;
+        blocks.push_back(b);
+    }
+    std::wstring who;
+    for (const auto& r : plan.reviewers) who += (who.empty() ? L"" : L", ") + r;
+    const std::wstring head = L"Review · " + plan.title, subText = plan.date + (who.empty() ? L"" : L"   ·   " + who) + L"   ·   " +
+                                                                     std::to_wstring(plan.notes.size()) + (plan.notes.size() == 1 ? L" note" : L" notes");
+    const int headH = (int)std::ceil(textdraw::Measure(head, title, (float)(sheetW - 2 * margin)).h + 6 + textdraw::Measure(subText, sub, 1e6f).h) + 30;
+    std::vector<int> rowH;
+    for (size_t i = 0; i < blocks.size(); i += cols) {
+        float h = 0;
+        for (size_t j = i; j < std::min(blocks.size(), i + cols); ++j) h = std::max(h, blocks[j].h);
+        rowH.push_back(picH + 16 + (int)std::ceil(h) + 18);
+    }
+    int sheetH = margin + headH + margin;
+    for (int h : rowH) sheetH += h + gap;
+    if (plan.notes.empty()) sheetH += 40;
+    auto sheet = Bitmap::Create(sheetW, sheetH);
+    if (!sheet) return nullptr;
+    std::fill_n(sheet->Bits(), (size_t)sheetW * sheetH, 0xFF121212u);
+    textdraw::Draw(*sheet, head, title, (float)margin, (float)margin, (float)(sheetW - 2 * margin));
+    textdraw::Draw(*sheet, subText, sub, (float)margin, (float)margin + textdraw::Measure(head, title, (float)(sheetW - 2 * margin)).h + 6, 1e6f);
+    if (plan.notes.empty()) textdraw::Draw(*sheet, L"No notes", body, (float)margin, (float)(margin + headH), 1e6f);
+    int y = margin + headH;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        const int col = (int)(i % cols), row = (int)(i / cols);
+        if (col == 0 && i) y += rowH[(size_t)row - 1] + gap;
+        const int x = margin + col * (tileW + gap);
+        const ReviewNote& n = plan.notes[i];
+        const COLORREF kc = annot::Color(NoteKindColor(n.kind));
+        textdraw::FillRounded(*sheet, (float)x, (float)y, (float)tileW, (float)rowH[(size_t)row], 12, RGB(30, 30, 30), 1.f);
+        const RECT pic{x, y, x + tileW, y + picH};
+        if (i < frames.size() && frames[i])
+            if (const BitmapPtr scaled = Resample(*frames[i], tileW, picH))
+                for (int r = 0; r < picH; ++r) memcpy(sheet->Bits() + (size_t)(y + r) * sheetW + x, scaled->Bits() + (size_t)r * tileW, (size_t)tileW * 4);
+        if (pictures) pictures->push_back(pic);
+        textdraw::FillRounded(*sheet, (float)x, (float)(y + picH), (float)tileW, 5, 0, kc, 1.f);  // the kind's color under the picture
+        float ty = (float)(y + picH + 16);
+        meta.color = kc;
+        textdraw::Draw(*sheet, blocks[i].meta, meta, (float)x + 16, ty, textW);
+        ty += textdraw::Measure(blocks[i].meta, meta, textW).h + 6;
+        body.color = n.resolved ? RGB(160, 160, 160) : RGB(240, 240, 240);
+        textdraw::Draw(*sheet, blocks[i].text, body, (float)x + 16, ty, textW);
+        ty += textdraw::Measure(blocks[i].text, body, textW).h + 8;
+        textdraw::Draw(*sheet, blocks[i].by, by, (float)x + 16, ty, textW);
+    }
+    return sheet;
+}
+
+bool WriteContactSheet(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& path) {
+    const BitmapPtr sheet = ContactSheet(source, e, plan);
+    return sheet && SavePng(*sheet, path);
+}
+
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps, ExportProgress progress) {
     ReleaseFrameMemory release;
     EditFrames frames;
@@ -1720,8 +1933,9 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
         BitmapPtr bgra;  // for --bench-export's tap
         explicit operator bool() const { return q != nullptr; }
     };
-    auto make = [&](const VideoFrame& src, double st, bool alone) {
+    auto make = [&](const VideoFrame& src, double st, bool alone, int) {
         GifFrame gf;
+
         BitmapPtr f = frames.Render(src, st, alone);
         if (f && (f->Width() != gw || f->Height() != gh)) f = Resample(*f, gw, gh);
         if (!f) return gf;
@@ -2649,6 +2863,229 @@ ATHER_TEST(video_export_frame_shown_twice_both_ways) {
         VideoInfo vi;
         CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 6) < 0.1);
     }
+}
+
+// The review video: a 3 s summary card, then the edit with the timecode and frame number burned in, and at each note
+// its frame held for 3 s under the note card (with its pin), silent; its length is the edit's plus 3 s plus 3 s a note.
+// A plain export of the same edit (notes and all) makes exactly the frames it made without notes.
+ATHER_TEST(video_review_export_holds_notes_with_cards_and_burn_in) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"\\numbered.mp4";
+    const int W = 640, H = 360, fps = 60;
+    {  // frame i: (16 · (i % 16), 16 · (i / 16), 0), with a 440 Hz tone
+        Mp4Writer mw;
+        CHECK(SUCCEEDED(mw.Begin(clip, W, H, fps, kRate, 2)));
+        std::vector<uint32_t> px((size_t)W * H);
+        std::vector<int16_t> pcm;
+        int64_t audio = 0;
+        for (int i = 0; i < 120; ++i) {
+            std::fill(px.begin(), px.end(), 0xFF000000u | (uint32_t)(16 * (i % 16)) << 16 | (uint32_t)(16 * (i / 16)) << 8);
+            CHECK(SUCCEEDED(mw.WriteFrame(px.data(), std::llround(i * kTicks / fps), std::llround(kTicks / fps))));
+            pcm.clear();
+            const int64_t until = std::llround((i + 1) * (double)kRate / fps);
+            for (const int64_t from = audio; audio < until; ++audio) {
+                const int16_t v = (int16_t)std::lround(std::sin(2 * 3.14159265358979 * 440 * audio / kRate) * 12000);
+                pcm.push_back(v), pcm.push_back(v);
+                (void)from;
+            }
+            mw.WriteAudio(pcm.data(), (uint32_t)(pcm.size() / 2), std::llround((audio - (int64_t)pcm.size() / 2) * kTicks / kRate));
+        }
+        CHECK(SUCCEEDED(mw.Finalize()));
+    }
+    auto c = ClipOf(clip);
+    CHECK(c.has_value());
+    if (!c) return;
+    VideoEdit e;
+    e.clips = {*c};
+    e.frameW = W, e.frameH = H;
+    e.trimStart = 0.25, e.trimEnd = 1.75;  // frames 15…104
+    const std::vector<double> times = FrameTimes(clip);
+    ReviewPlan plan;
+    plan.frames = TimelineFrames::Of(e.clips, [&](const Clip&) { return &times; });
+    plan.title = L"numbered.mp4";
+    plan.date = L"10 October 2026";
+    plan.reviewers = {L"Tin"};
+    auto note = [&](size_t frame, NoteKind kind, const wchar_t* text, std::optional<VPoint> pin) {
+        ReviewNote n;
+        n.frame = frame;
+        n.t = plan.frames.frames[frame].t;
+        n.timecode = plan.frames.Timecode(frame);
+        n.kind = kind;
+        n.author = L"Tin";
+        n.text = text;
+        n.pin = pin;
+        plan.notes.push_back(n);
+    };
+    note(30, NoteKind::Issue, L"Flicker on this frame", std::nullopt);
+    note(75, NoteKind::Question, L"Intended?", VPoint{160, 270});
+    std::mutex mu;
+    std::vector<int> number;         // the frame each output frame shows (-1: not a video frame)
+    std::vector<uint64_t> hashes;
+    std::map<int, BitmapPtr> kept;   // a few output frames, for a closer look
+    const std::set<int> keep = {0, 179, 194, 195, 300, 374, 375, 419, 420, 599, 600, 629};
+    g_exportTap = [&](int i, const Bitmap& f) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t k = 0, n = (size_t)f.Width() * f.Height(); k < n; ++k) h = (h ^ f.Bits()[k]) * 1099511628211ull;
+        const uint32_t p = f.Bits()[(size_t)180 * f.Width() + 600];  // clear of the burn-in, cards and pin
+        const int num = (int)std::lround(((p >> 8) & 255) / 16.0) * 16 + (int)std::lround(((p >> 16) & 255) / 16.0);
+        std::lock_guard l(mu);
+        if (number.size() <= (size_t)i) number.resize((size_t)i + 1, -2), hashes.resize((size_t)i + 1);
+        number[i] = num;
+        hashes[i] = h;
+        if (keep.count(i)) kept[i] = f.Crop({0, 0, f.Width(), f.Height()});
+    };
+    const std::wstring out = dir + L"\\review.mp4";
+    std::wstring err;
+    const bool ok = ExportReviewMp4(L"", e, plan, out, &err);
+    g_exportTap = nullptr;
+    test::Note("review export: " + ToUtf8(err));
+    CHECK(ok);
+    // 3 s card + 1.5 s edit + 2 × 3 s held.
+    CHECK_EQ(number.size(), 630u);
+    VideoInfo vi;
+    CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 10.5) < 0.1 && vi.hasAudio);
+    if (number.size() != 630) return;
+    std::vector<int> want(630, -1);
+    for (int o = 180; o < 195; ++o) want[o] = 15 + (o - 180);
+    for (int o = 195; o < 375; ++o) want[o] = 30;  // held
+    for (int o = 375; o < 420; ++o) want[o] = 30 + (o - 375);
+    for (int o = 420; o < 600; ++o) want[o] = 75;  // held
+    for (int o = 600; o < 630; ++o) want[o] = 75 + (o - 600);
+    int wrong = 0;
+    std::string first;
+    for (int o = 180; o < 630; ++o)
+        if (number[o] != want[o]) {
+            if (!wrong) first = "output " + std::to_string(o) + " shows " + std::to_string(number[o]) + ", wanted " + std::to_string(want[o]);
+            ++wrong;
+        }
+    test::Note("frames: " + std::to_string(wrong) + " wrong; " + first);
+    CHECK_EQ(wrong, 0);
+    // The summary card: every intro frame is the card, exactly.
+    const BitmapPtr card = SummaryCard({W, H}, plan);
+    bool introSame = true;
+    for (int o = 1; o < 180; ++o) introSame = introSame && hashes[o] == hashes[0];
+    CHECK(introSame);
+    CHECK(kept[0] && card && memcmp(kept[0]->Bits(), card->Bits(), (size_t)W * H * 4) == 0);
+    // Held frames are all one picture; the frame after the hold is the same video frame without the card.
+    bool heldSame = true;
+    for (int o = 196; o < 375; ++o) heldSame = heldSame && hashes[o] == hashes[195];
+    for (int o = 421; o < 600; ++o) heldSame = heldSame && hashes[o] == hashes[420];
+    CHECK(heldSame);
+    CHECK(hashes[375] != hashes[195]);
+    // Pixels the card and burn-in cover are exactly what DrawNoteCard and DrawBurnIn draw (they're opaque).
+    auto sameIn = [&](const Bitmap& got, const Bitmap& ref, RECT r) {
+        int diff = 0;
+        for (int y = std::max(0L, r.top); y < std::min((LONG)H, r.bottom); ++y)
+            for (int x = std::max(0L, r.left); x < std::min((LONG)W, r.right); ++x) diff += got.Bits()[(size_t)y * W + x] != ref.Bits()[(size_t)y * W + x];
+        return diff;
+    };
+    auto blank = [&] {
+        auto b = Bitmap::Create(W, H);
+        std::fill_n(b->Bits(), (size_t)W * H, 0xFF000000u);
+        return b;
+    };
+    for (const auto& [o, frame] : std::vector<std::pair<int, int>>{{194, 29}, {195, 30}, {374, 30}, {375, 30}, {419, 74}, {420, 75}, {600, 75}, {629, 104}}) {
+        auto ref = blank();
+        const RECT r = DrawBurnIn(*ref, BurnInText(plan.frames, (size_t)frame));
+        const int d = kept[o] ? sameIn(*kept[o], *ref, r) : -1;
+        test::Note("burn-in at output " + std::to_string(o) + " (frame " + std::to_string(frame) + "): " + std::to_string(d) + " pixels differ");
+        CHECK_EQ(d, 0);
+    }
+    for (const auto& [o, k] : std::vector<std::pair<int, int>>{{195, 0}, {420, 1}}) {
+        auto ref = blank();
+        ReviewNote n = plan.notes[(size_t)k];
+        const RECT r = DrawNoteCard(*ref, n);
+        const int inset = 8;  // past the rounded corners, which blend with the video
+        const int d = kept[o] ? sameIn(*kept[o], *ref, {r.left + inset, r.top + inset, r.right - inset, r.bottom - inset}) : -1;
+        test::Note("card " + std::to_string(k) + ": " + std::to_string(d) + " pixels differ");
+        CHECK_EQ(d, 0);
+        CHECK(RectW(r) > W / 2 && RectH(r) > 30);
+    }
+    // The pin of the second note, in its kind's color (blue), where it points.
+    if (kept[420]) {
+        const uint32_t p = kept[420]->Bits()[(size_t)270 * W + 160];
+        const COLORREF blue = annot::Color(4);
+        CHECK(std::abs((int)((p >> 16) & 255) - GetRValue(blue)) < 8 && std::abs((int)(p & 255) - GetBValue(blue)) < 8);
+    }
+    // Silent under the card and while held; the tone elsewhere.
+    {
+        AudioReader ar;
+        CHECK(ar.Open(out));
+        std::vector<float> all, buf;
+        double t = 0;
+        while (ar.Read(buf, &t)) all.insert(all.end(), buf.begin(), buf.end());
+        const int ch = std::max(1, ar.Channels()), rate = std::max(1, ar.Rate());
+        auto rms = [&](double a, double b) {
+            double s = 0;
+            size_t n = 0;
+            for (size_t k = (size_t)(a * rate) * ch; k < (size_t)(b * rate) * ch && k < all.size(); ++k, ++n) s += all[k] * all[k];
+            return n ? std::sqrt(s / n) : -1.0;
+        };
+        test::Note("rms: intro " + std::to_string(rms(0.2, 2.8)) + ", edit " + std::to_string(rms(3.05, 3.2)) + ", hold " + std::to_string(rms(3.4, 6.1)) +
+                   ", edit " + std::to_string(rms(6.4, 6.9)) + ", hold " + std::to_string(rms(7.2, 9.9)) + ", edit " + std::to_string(rms(10.1, 10.4)));
+        CHECK(rms(0.2, 2.8) >= 0 && rms(0.2, 2.8) < 0.003);
+        CHECK(rms(3.4, 6.1) >= 0 && rms(3.4, 6.1) < 0.003);
+        CHECK(rms(7.2, 9.9) >= 0 && rms(7.2, 9.9) < 0.003);
+        CHECK(rms(3.05, 3.2) > 0.1 && rms(6.4, 6.9) > 0.1 && rms(10.1, 10.4) > 0.1);
+    }
+    // The contact sheet: a tile per note in timeline order, each with its frame, which matches that frame in the review
+    // video itself (decoded back, scaled), away from the card, burn-in and pin.
+    {
+        std::vector<RECT> pics;
+        const BitmapPtr sheet = ContactSheet(L"", e, plan, &pics);
+        CHECK(sheet && pics.size() == 2);
+        VideoReader rv;
+        CHECK(rv.Open(out));
+        for (size_t k = 0; sheet && k < pics.size() && k < 2; ++k) {
+            const RECT p = pics[k];
+            const uint32_t mid = sheet->Bits()[(size_t)((p.top + p.bottom) / 2) * sheet->Width() + (p.left * 3 + p.right * 7) / 10];
+            const int num = (int)std::lround(((mid >> 8) & 255) / 16.0) * 16 + (int)std::lround(((mid >> 16) & 255) / 16.0);
+            CHECK_EQ(num, (int)plan.notes[k].frame);
+            const double at = (k == 0 ? 300 : 500) / 60.0;  // in the middle of its hold
+            rv.Seek(at);
+            BitmapPtr f, held;
+            double ft = 0;
+            while (rv.Read(&f, &ft)) {
+                held = f;
+                if (ft >= at - 0.01) break;
+            }
+            CHECK(held != nullptr);
+            if (!held) continue;
+            const BitmapPtr scaled = Resample(*held, RectW(p), RectH(p));
+            double diff = 0;
+            int n = 0;
+            for (int y = RectH(p) * 2 / 5; y < RectH(p) * 3 / 5; ++y)
+                for (int x = RectW(p) * 3 / 4; x < RectW(p) * 19 / 20; ++x, ++n) {
+                    const uint32_t s = sheet->Bits()[(size_t)(p.top + y) * sheet->Width() + p.left + x], v = scaled->Bits()[(size_t)y * RectW(p) + x];
+                    for (int sh = 0; sh < 24; sh += 8) diff += std::abs((int)((s >> sh) & 255) - (int)((v >> sh) & 255));
+                }
+            test::Note("tile " + std::to_string(k) + ": mean difference " + std::to_string(diff / std::max(1, n * 3)));
+            CHECK(diff / std::max(1, n * 3) < 6);
+        }
+    }
+    // A plain export doesn't change with notes in the edit: the same frames, by hash, as without them.
+    auto plain = [&](const VideoEdit& edit) {
+        std::vector<uint64_t> h;
+        std::mutex m;
+        g_exportTap = [&](int i, const Bitmap& f) {
+            uint64_t v = 1469598103934665603ull;
+            for (size_t k = 0, n = (size_t)f.Width() * f.Height(); k < n; ++k) v = (v ^ f.Bits()[k]) * 1099511628211ull;
+            std::lock_guard l(m);
+            if (h.size() <= (size_t)i) h.resize((size_t)i + 1);
+            h[i] = v;
+        };
+        std::wstring er;
+        CHECK(ExportMp4(L"", edit, dir + L"\\plain.mp4", &er));
+        g_exportTap = nullptr;
+        return h;
+    };
+    VideoEdit withNotes = e;
+    Note n;
+    n.path = clip, n.src = 0.5, n.text = L"Not in a plain Save";
+    withNotes.notes = {n};
+    const auto a = plain(e), b = plain(withNotes);
+    CHECK_EQ(a.size(), 90u);
+    CHECK(a == b);
 }
 
 // Cancelling halfway stops the export (one encoder or several) and leaves no pieces behind.

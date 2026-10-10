@@ -1258,7 +1258,11 @@ void ShowTrayMenu() {
 
 LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-        case WM_HOTKEY: Execute((int)w, false); return 0;
+        case WM_HOTKEY:
+            if (VideoEditorHotkey(LOWORD(l), HIWORD(l))) return 0;  // Ctrl+Alt+S in a video editor: Save review video
+            Execute((int)w, false);
+            return 0;
+
         case WM_APP_RUN: {
             auto* fn = reinterpret_cast<std::function<void()>*>(l);
             (*fn)();

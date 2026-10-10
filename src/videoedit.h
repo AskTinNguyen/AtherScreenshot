@@ -291,6 +291,38 @@ private:
     double unit_;
 };
 
+// ---- the review video ----
+
+// A note as the review video shows it.
+struct ReviewNote {
+    double t = 0;       // timeline time of the noted frame (that frame's own time)
+    size_t frame = 0;   // its timeline frame number
+    std::wstring timecode;  // m:ss:ff
+    NoteKind kind = NoteKind::Note;
+    bool resolved = false;
+    std::wstring author, text;
+    std::optional<VPoint> pin;  // in output pixels
+};
+
+// What "Save review video" adds to an edit: a summary card first, a burn-in of the timecode and frame number on every
+// frame, and at each note the noted frame held under its note card (silent), then on.
+struct ReviewPlan {
+    std::vector<ReviewNote> notes;  // in timeline order, within the trim
+    double intro = 3;               // seconds of the summary card
+    double hold = 3;                // seconds each note holds
+    TimelineFrames frames;          // of the edit's clips: for the burn-in's numbers
+    std::wstring title, date;       // the summary card's
+    std::vector<std::wstring> reviewers;
+};
+std::wstring BurnInText(const TimelineFrames& tf, size_t n);  // "0:12:37 · frame 757"
+// Draw onto an opaque output frame (all scaled to its height); each returns where it drew.
+RECT DrawBurnIn(Bitmap& frame, const std::wstring& text);  // top left, on an opaque box
+RECT DrawNoteCard(Bitmap& frame, const ReviewNote& n);      // the card, and the pin
+void DrawNotePin(Bitmap& frame, const ReviewNote& n);       // just the pin
+BitmapPtr SummaryCard(SIZE size, const ReviewPlan& plan);
+// The kind's line on cards and lists: "Issue", "Issue · Resolved".
+std::wstring NoteKindLine(NoteKind k, bool resolved);
+
 // ---- pixel helpers shared with the video window ----
 
 // Draws `img` stretched into `r` (destination pixels, fractional) on premultiplied `dst` with motion applied:
