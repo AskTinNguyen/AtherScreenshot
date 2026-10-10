@@ -116,6 +116,16 @@ struct Note {
     bool operator==(const Note&) const = default;
 };
 
+// The notes kept with a video: "<video file name>.notes.json" next to it (UTF-8 JSON, one entry per note with its
+// frame number and time in the file, kind, status, author, text, pin and when it was made), for the editor and for
+// other tools. `times`: the file's frame times (FrameTimes), for frame numbers; when empty, a grid at `fps`.
+std::wstring NotesPath(const std::wstring& video);
+std::string NotesJson(const std::wstring& video, std::vector<Note> notes, const std::vector<double>& times, double fps);
+// A sidecar's notes, on `video`; false when the text isn't one (damaged). A note without a time is placed by its frame.
+bool ParseNotes(const std::string& json, const std::wstring& video, const std::vector<double>& times, double fps, std::vector<Note>* out);
+// The order notes are kept and compared in: by frame, then as made.
+void SortNotes(std::vector<Note>& notes);
+
 // One video of the sequence: the stretch [in, out) of a file, in that file's seconds. Clips play back to back;
 // each is fitted into the sequence frame (black bars when the shape differs).
 struct Clip {

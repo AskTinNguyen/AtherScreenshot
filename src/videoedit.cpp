@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
+
 #include <emmintrin.h>
 #include <format>
 #include <mutex>
@@ -333,6 +336,104 @@ NoteKind NoteKindOf(const std::string& key) {
     for (int i = 0; i < kNoteKinds; ++i)
         if (key == NoteKindKey((NoteKind)i)) return (NoteKind)i;
     return NoteKind::Note;
+}
+
+std::wstring NotesPath(const std::wstring& video) { return video + L".notes.json"; }
+
+void SortNotes(std::vector<Note>& notes) {
+    std::stable_sort(notes.begin(), notes.end(), [](const Note& a, const Note& b) { return a.src != b.src ? a.src < b.src : a.created < b.created; });
+}
+
+namespace {
+// The frame number in the file of the frame at `src`: the nearest of its frame times, or on a grid at `fps`.
+int64_t FileFrame(double src, const std::vector<double>& times, double fps) {
+    if (times.empty()) return std::llround(src * (fps > 0 ? fps : 30));
+    const auto it = std::lower_bound(times.begin(), times.end(), src);
+    size_t k = (size_t)(it - times.begin());
+    if (k == times.size() || (k > 0 && src - times[k - 1] < times[k] - src)) --k;
+    return (int64_t)k;
+}
+double FileTime(int64_t frame, const std::vector<double>& times, double fps) {
+    if (!times.empty()) return times[(size_t)std::clamp<int64_t>(frame, 0, (int64_t)times.size() - 1)];
+    return frame / (fps > 0 ? fps : 30);
+}
+std::string IsoTime(int64_t t) {
+    tm u{};
+    const time_t tt = (time_t)t;
+    if (gmtime_s(&u, &tt)) return "";
+    return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec);
+}
+int64_t FromIsoTime(const std::string& s) {
+    tm u{};
+    if (sscanf_s(s.c_str(), "%d-%d-%dT%d:%d:%d", &u.tm_year, &u.tm_mon, &u.tm_mday, &u.tm_hour, &u.tm_min, &u.tm_sec) != 6) return 0;
+    u.tm_year -= 1900;
+    u.tm_mon -= 1;
+    const time_t t = _mkgmtime(&u);
+    return t < 0 ? 0 : (int64_t)t;
+}
+}  // namespace
+
+std::string NotesJson(const std::wstring& video, std::vector<Note> notes, const std::vector<double>& times, double fps) {
+    SortNotes(notes);
+    const size_t slash = video.find_last_of(L"\\/");
+    Json head = Json::Object();
+    head.Set("app", "Ather Screenshot");
+    head.Set("format", 1);
+    head.Set("video", slash == std::wstring::npos ? video : video.substr(slash + 1));
+    head.Set("fps", fps);
+    std::string out = head.Dump();
+    out.pop_back();  // the notes go in last, one per line
+    out += ",\"notes\":[";
+    for (size_t i = 0; i < notes.size(); ++i) {
+        const Note& n = notes[i];
+        Json j = Json::Object();
+        j.Set("id", n.id);
+        j.Set("frame", FileFrame(n.src, times, fps));
+        j.Set("time", n.src);
+        if (n.srcEnd) {
+            j.Set("endFrame", FileFrame(*n.srcEnd, times, fps));
+            j.Set("endTime", *n.srcEnd);
+        }
+        j.Set("kind", NoteKindKey(n.kind));
+        j.Set("resolved", n.resolved);
+        j.Set("author", n.author);
+        j.Set("text", n.text);
+        if (n.pin) {
+            Json p = Json::Object();
+            p.Set("x", n.pin->x);
+            p.Set("y", n.pin->y);
+            j.Set("pin", p);
+        }
+        if (n.created) j.Set("created", IsoTime(n.created));
+        out += (i ? ",\n  " : "\n  ") + j.Dump();
+    }
+    out += notes.empty() ? "]}\n" : "\n]}\n";
+    return out;
+}
+
+bool ParseNotes(const std::string& json, const std::wstring& video, const std::vector<double>& times, double fps, std::vector<Note>* out) {
+    bool ok = false;
+    const Json j = Json::Parse(json, &ok);
+    if (!ok || !j.IsObject() || !j["notes"].IsArray()) return false;
+    for (const Json& e : j["notes"].Items()) {
+        if (!e.IsObject() || (!e["time"].IsNumber() && !e["frame"].IsNumber())) continue;
+        Note n;
+        if (const uint64_t id = e["id"].UInt(0)) n.id = id;
+        n.path = video;
+        n.src = e["time"].IsNumber() ? e["time"].Num() : FileTime(e["frame"].Int(), times, fps);
+        if (e["endTime"].IsNumber()) n.srcEnd = e["endTime"].Num();
+        else if (e["endFrame"].IsNumber()) n.srcEnd = FileTime(e["endFrame"].Int(), times, fps);
+        if (n.srcEnd && *n.srcEnd <= n.src) n.srcEnd.reset();
+        n.kind = NoteKindOf(e["kind"].Str());
+        n.resolved = e["resolved"].Bool(false);
+        n.author = e["author"].WStr();
+        n.text = e["text"].WStr();
+        if (e["pin"].IsObject() && e["pin"]["x"].IsNumber() && e["pin"]["y"].IsNumber())
+            n.pin = VPoint{std::clamp(e["pin"]["x"].Num(), 0.0, 1.0), std::clamp(e["pin"]["y"].Num(), 0.0, 1.0)};
+        n.created = FromIsoTime(e["created"].Str());
+        out->push_back(n);
+    }
+    return true;
 }
 
 int NoteKindColor(NoteKind k) {
@@ -1782,6 +1883,52 @@ ATHER_TEST(video_clip_changes_move_items_with_their_footage) {
     ApplyClips(kept, {b, a});  // the ends would cross: back to the whole sequence
     CHECK_NEAR(kept.trimStart, 0, 1e-9);
     CHECK_NEAR(kept.trimEnd, 6, 1e-9);
+}
+
+// The sidecar reads back what it wrote (Unicode text, every field), one note per line; other tools' entries with only a
+// frame number are placed by it; junk is refused.
+ATHER_TEST(video_notes_sidecar_format) {
+    std::vector<double> times;
+    for (int i = 0; i < 900; ++i) times.push_back(i / 60.0);
+
+    Note a, b;
+    a.path = b.path = L"C:\\x\\clip.mp4";
+    a.src = 757 / 60.0;
+    a.srcEnd = 800 / 60.0;
+    a.text = L"Flash missing — “quote” \\ / ✅";
+    a.author = L"Tin Nguyễn";
+    a.kind = NoteKind::Issue;
+    a.resolved = true;
+    a.pin = VPoint{0.125, 0.875};
+    a.created = 1791633720;  // 2026-10-10
+    b.src = 0.5;
+    b.text = L"Second";
+    b.kind = NoteKind::Good;
+    const std::string json = NotesJson(L"C:\\x\\clip.mp4", {a, b}, times, 60);
+    test::Note(json);
+    CHECK(json.find("\"video\":\"clip.mp4\"") != std::string::npos);
+    CHECK(json.find("\"frame\":757") != std::string::npos && json.find("\"endFrame\":800") != std::string::npos);
+    CHECK(json.find("\"created\":\"2026-10-10T") != std::string::npos);
+    CHECK_EQ(std::count(json.begin(), json.end(), '\n'), 4);  // head, a note per line, end
+    std::vector<Note> back;
+    CHECK(ParseNotes(json, L"D:\\moved\\clip.mp4", times, 60, &back));
+    CHECK_EQ(back.size(), 2u);
+    if (back.size() == 2) {
+        CHECK(back[0].path == L"D:\\moved\\clip.mp4");
+        Note want = b;  // sorted by frame: b first
+        want.path = back[0].path;
+        CHECK(back[0] == want);
+        want = a;
+        want.path = back[1].path;
+        CHECK(back[1] == want);
+    }
+    std::vector<Note> other;
+    CHECK(ParseNotes("{\"notes\":[{\"frame\":120,\"text\":\"from a script\",\"kind\":\"weird\"},{\"text\":\"no frame\"},3]}", L"v.mp4", times, 60, &other));
+    CHECK(other.size() == 1 && std::fabs(other[0].src - 2) < 1e-9 && other[0].kind == NoteKind::Note && other[0].text == L"from a script");
+    std::vector<Note> none;
+    CHECK(!ParseNotes("{\"notes\": [ {", L"v.mp4", times, 60, &none));
+    CHECK(!ParseNotes("[]", L"v.mp4", times, 60, &none));
+    CHECK(ParseNotes(NotesJson(L"v.mp4", {}, {}, 30), L"v.mp4", {}, 30, &none) && none.empty());
 }
 
 // The readout is m:ss:ff · frame n · fps, at 60, 30 and 29.97 fps, and go to finds every frame by its number, its

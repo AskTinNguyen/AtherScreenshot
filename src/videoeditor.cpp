@@ -75,6 +75,21 @@ std::wstring WindowsDisplayName() {
     return L"Reviewer";
 }
 std::wstring NoteAuthor() { return g_noteAuthor.empty() ? WindowsDisplayName() : g_noteAuthor; }
+// A small file's bytes (at most 16 MB).
+bool ReadFileUtf8(const std::wstring& path, std::string* out) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(f, &size) && size.QuadPart <= (16 << 20);
+    if (ok) {
+        out->resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = out->empty() || (ReadFile(f, out->data(), (DWORD)out->size(), &got, nullptr) && got == out->size());
+    }
+    CloseHandle(f);
+    return ok;
+}
+
 // A note's author typed in the editor becomes the name on new notes, kept in settings.
 void RememberAuthor(const std::wstring& name) {
     g_noteAuthor = name;
@@ -456,6 +471,7 @@ public:
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
         if (edit.clips != builtClips) RebuildSequence();
+        LoadNotes();
         PlaceNotes();
         NotesChanged();
         if (player) player->SetMuted(edit.muted);
@@ -967,8 +983,98 @@ public:
     std::optional<size_t> NoteEndFrame(const Note& n) const {
         return n.srcEnd ? FrameOfSource(tframes, edit.clips, n.path, *n.srcEnd) : std::nullopt;
     }
-    // Saves the notes next to their videos when they've changed (the sidecar comes with A5; until then nothing).
-    void NotesChanged() {}
+    // ---- notes kept next to their videos ("<video>.notes.json") ----
+
+    std::map<std::wstring, std::vector<Note>> savedNotes;  // by file: as last read or written
+    std::map<std::wstring, std::wstring> notePaths;        // by file: its path as the clips name it
+    std::set<std::wstring> damagedNotes;                   // files whose sidecar couldn't be read: kept aside on the first write
+    std::set<std::wstring> madeSidecars;                   // sidecars this editor made (gone again once their last note is)
+    std::set<std::wstring> unsaved;                        // files whose sidecar couldn't be written (said once)
+
+    // Reads the notes kept with the clips' files that the editor hasn't seen yet. They join the edit as if they had
+    // always been there: in every undo step too, so undoing never takes away notes that were saved.
+    void LoadNotes() {
+        for (const auto& c : edit.clips) {
+            const std::wstring key = FileKey(c.path);
+            if (savedNotes.count(key)) continue;
+            notePaths[key] = c.path;
+            std::vector<Note> loaded;
+            std::string text;
+            const std::wstring side = NotesPath(c.path);
+            const bool exists = GetFileAttributesW(side.c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (exists && (!ReadFileUtf8(side, &text) || !ParseNotes(text, c.path, FileTimesOf(key), c.fps, &loaded))) {
+                damagedNotes.insert(key);
+                loaded.clear();
+                if (!snapshotMode)
+                    ShowToast(L"Couldn't read the notes kept with this video", FileNameOf(side) + L" stays as it is. New notes are saved next to it.", nullptr,
+                              nullptr, 6000);
+            }
+            if (!exists) madeSidecars.insert(key);
+            SortNotes(loaded);
+            savedNotes[key] = loaded;
+            edit.notes.insert(edit.notes.end(), loaded.begin(), loaded.end());
+            for (auto& u : undoStack) u.notes.insert(u.notes.end(), loaded.begin(), loaded.end());
+        }
+    }
+    const std::vector<double>& FileTimesOf(const std::wstring& key) const {
+        static const std::vector<double> none;
+        const auto it = frameTimes.find(key);
+        return it != frameTimes.end() && it->second ? *it->second : none;
+    }
+    // Writes the sidecar of every file whose notes changed (as they change: typing, undo, everything).
+    void NotesChanged() {
+        std::map<std::wstring, std::vector<Note>> now;
+        for (const auto& n : edit.notes) now[FileKey(n.path)].push_back(n);
+        for (auto& [key, v] : now) SortNotes(v);
+        std::set<std::wstring> keys;
+        for (const auto& [k, v] : now) keys.insert(k);
+        for (const auto& [k, v] : savedNotes) keys.insert(k);
+        for (const auto& key : keys) {
+            const std::vector<Note>& cur = now[key];
+            if (savedNotes.count(key) && savedNotes[key] == cur) continue;
+            if (WriteNotes(key, cur)) savedNotes[key] = cur;
+        }
+    }
+    bool WriteNotes(const std::wstring& key, const std::vector<Note>& notes) {
+        const auto pit = notePaths.find(key);
+        if (pit == notePaths.end()) return false;
+        const std::wstring video = pit->second, side = NotesPath(video);
+        if (damagedNotes.count(key)) {  // kept aside, as it was, before the first write over it
+            std::wstring aside = video + L".notes.damaged.json";
+            for (int i = 2; GetFileAttributesW(aside.c_str()) != INVALID_FILE_ATTRIBUTES; ++i) aside = video + L".notes.damaged-" + std::to_wstring(i) + L".json";
+            MoveFileExW(side.c_str(), aside.c_str(), 0);
+            damagedNotes.erase(key);
+        }
+        if (notes.empty() && madeSidecars.count(key)) {  // a sidecar this editor made, now without notes: gone again
+            DeleteFileW(side.c_str());
+            return true;
+        }
+        double fps = 30;
+        for (const auto& c : edit.clips)
+            if (FileKey(c.path) == key && c.fps > 1) fps = c.fps;
+        const std::string text = NotesJson(video, notes, FileTimesOf(key), fps);
+        const std::wstring tmp = side + L".tmp";
+        bool ok = false;
+        if (HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); f != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+            ok = WriteFile(f, text.data(), (DWORD)text.size(), &wrote, nullptr) && wrote == text.size();
+            CloseHandle(f);
+            ok = ok && MoveFileExW(tmp.c_str(), side.c_str(), MOVEFILE_REPLACE_EXISTING);
+            if (!ok) DeleteFileW(tmp.c_str());
+        }
+        if (!ok && !unsaved.count(key)) {
+            unsaved.insert(key);
+            ShowToast(L"Can't save notes next to this video", FileNameOf(side) + L": the folder may be read-only. They stay while the editor is open.",
+                      nullptr, nullptr, 6000);
+        }
+        return ok;
+    }
+    // The edit as Save sees it (notes are never part of it), to tell whether closing loses anything.
+    static VideoEdit WithoutNotes(VideoEdit e) {
+        e.notes.clear();
+        return e;
+    }
+    VideoEdit savedEdit;  // the picture edit as opened or last saved
 
     // M: a note on the frame on screen, its text field ready for typing.
     void AddNote() {
@@ -2735,6 +2841,7 @@ public:
             return;
         }
         dirty = false;
+        savedEdit = WithoutNotes(edit);
         WIN32_FILE_ATTRIBUTE_DATA fa{};
         GetFileAttributesExW(out.c_str(), GetFileExInfoStandard, &fa);
         const double mb = ((uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) / 1048576.0;
@@ -2909,7 +3016,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CLOSE:
-            if (dirty && !snapshotMode &&
+            if (dirty && !snapshotMode && !(WithoutNotes(edit) == savedEdit) &&
                 MessageBoxW(hwnd, L"Close the video editor and discard your changes?", L"Edit video", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
                 return 0;
             DestroyWindow(hwnd);
@@ -2957,6 +3064,9 @@ bool VideoEditor::Create() {
     builtClips = edit.clips;
     duration = ClipsDuration(edit.clips);
     edit.trimEnd = duration;
+    LoadNotes();
+    savedEdit = WithoutNotes(edit);
+
     const ItemMeta& meta = Library::Shared().Meta(path);
     app = meta.app;
     window = meta.window;
@@ -3259,7 +3369,9 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->SelectNote(e->edit.notes.back().id);
         Pump(800);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-notes.png");
-        e->edit.notes.clear();  // nothing written next to the snapshot clip
+        e->edit.notes.clear();  // its sidecar goes again
+        e->Changed();
+
         e->dirty = false;
         DestroyWindow(e->hwnd);
     }
@@ -3710,6 +3822,167 @@ ATHER_TEST(video_editor_notes_add_edit_pin_jump_undo) {
     VideoEdit plain = e->edit;
     plain.notes.clear();
     CHECK(plain.marks.empty() && plain.captions.empty());
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Notes are kept next to their video as they change, and come back at the same frames: after reopening, in a joined
+// clip (each in its own file's sidecar), with a clip trimmed. A damaged sidecar never stops the video opening, and is
+// kept aside rather than written over.
+ATHER_TEST(video_editor_notes_kept_next_to_the_video) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b30.mp4", c = dir + L"\\c60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    CHECK(WriteNumberedClip(b, 320, 180, 30, 60, 255));
+    CHECK(WriteNumberedClip(c, 320, 180, 60, 60, 0));
+    auto open = [&](const std::wstring& path) {
+        VideoEditor* e = OpenHidden(path, 1180, 760);
+        for (int i = 0; e && i < 300 && !e->FramesKnown(); ++i) Pump(10);
+        return e;
+    };
+    auto sidecar = [](const std::wstring& video) {  // the sidecar's notes, read as another tool would
+        std::string text;
+        bool ok = false;
+        const Json j = ReadFileUtf8(NotesPath(video), &text) ? Json::Parse(text, &ok) : Json();
+        return ok ? j["notes"] : Json();
+    };
+    auto exists = [](const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    auto noteAt = [](VideoEditor* e, size_t frame, NoteKind kind, const wchar_t* text) {
+        e->Select(std::nullopt);
+        e->GoToFrame(frame);
+        e->Key('M', {});
+        e->UpdateNote([&](Note& n) {
+            n.kind = kind;
+            n.text = text;
+        });
+        e->Select(std::nullopt);
+    };
+    // Round trip: two notes on a, then reopen.
+    VideoEditor* e = open(a);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK(!exists(NotesPath(a)));  // opening alone writes nothing
+    noteAt(e, 30, NoteKind::Issue, L"Flicker");
+    noteAt(e, 90, NoteKind::Question, L"Intended?");
+    e->SelectNote(e->edit.notes[0].id);
+    e->UpdateNote([](Note& n) {
+        n.pin = VPoint{0.25, 0.75};
+        n.resolved = true;
+    });
+    e->SetNoteRangeToPlayhead();  // the playhead is on the note: not a range
+    e->GoToFrame(40);
+    e->SetNoteRangeToPlayhead();
+    const std::vector<Note> before = [&] {
+        auto v = e->edit.notes;
+        SortNotes(v);
+        return v;
+    }();
+    Json kept = sidecar(a);
+    CHECK_EQ(kept.size(), 2u);
+    CHECK(kept[0]["frame"].Int() == 30 && kept[0]["kind"].Str() == "issue" && kept[0]["resolved"].Bool() && kept[0]["endFrame"].Int() == 40);
+    CHECK(kept[1]["frame"].Int() == 90 && kept[1]["text"].Str() == "Intended?" && kept[0]["pin"]["x"].Num() == 0.25);
+    // Undo takes a change back out of the sidecar too.
+    noteAt(e, 100, NoteKind::Note, L"Gone again");
+    CHECK_EQ(sidecar(a).size(), 3u);
+    e->Undo();  // the text and kind
+    e->Undo();  // the note
+    CHECK_EQ(sidecar(a).size(), 2u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    e = open(a);
+    CHECK(e != nullptr);
+    if (!e) return;
+    auto after = e->edit.notes;
+    SortNotes(after);
+    CHECK_EQ(after.size(), 2u);
+    for (size_t i = 0; i < after.size() && i < before.size(); ++i) {
+        CHECK(after[i].text == before[i].text && after[i].kind == before[i].kind && after[i].resolved == before[i].resolved && after[i].pin == before[i].pin &&
+              after[i].author == before[i].author && after[i].srcEnd == before[i].srcEnd && after[i].src == before[i].src && after[i].id == before[i].id);
+    }
+    std::vector<size_t> at;
+    for (const auto& p : e->placed) at.push_back(p.first);
+    CHECK(at == std::vector<size_t>({30, 90}));
+    CHECK(!e->dirty && e->undoStack.empty());
+    // Joined: b's own note (made on b alone) shows at b's frame 10, frame 130 of a + b; a new note on b's footage
+    // goes into b's sidecar, not a's.
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    e = open(b);
+    CHECK(e != nullptr);
+    if (!e) return;
+    noteAt(e, 10, NoteKind::Good, L"b ten");
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    e = open(a);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->AddClips({b});
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    at.clear();
+    for (const auto& p : e->placed) at.push_back(p.first);
+    CHECK(at == std::vector<size_t>({30, 90, 130}));
+    e->SelectNote(e->edit.notes[e->placed[2].second].id);
+    CHECK(ShownFrame(e) == std::make_pair(10, true));
+    noteAt(e, 140, NoteKind::Note, L"b twenty");
+    CHECK_EQ(sidecar(a).size(), 2u);
+    CHECK_EQ(sidecar(b).size(), 2u);
+    CHECK(sidecar(b)[1]["frame"].Int() == 20 && sidecar(b)[1]["text"].Str() == "b twenty");
+    // b trimmed to start at its frame 15: the note at b's 10 isn't on the timeline (still kept), the one at 20 moves
+    // to 120 + 5; undo brings the trim back.
+    e->TrimClip(1, 0.5, std::nullopt);
+    at.clear();
+    for (const auto& p : e->placed) at.push_back(p.first);
+    CHECK(at == std::vector<size_t>({30, 90, 125}));
+    CHECK_EQ(sidecar(b).size(), 2u);
+    e->SelectNote(e->edit.notes[e->placed[2].second].id);
+    CHECK(ShownFrame(e) == std::make_pair(20, true));
+    e->Undo();
+    CHECK_EQ(e->placed.size(), 4u);
+    // Undoing the note on b takes it out of b's sidecar; undoing the joining of b leaves b's own note there.
+    e->Undo();
+    e->Undo();
+    CHECK_EQ(sidecar(b).size(), 1u);
+    e->Undo();
+    CHECK_EQ(e->edit.clips.size(), 1u);
+    CHECK(sidecar(b).size() == 1 && sidecar(b)[0]["text"].Str() == "b ten");
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    // Damaged: the video still opens, without notes; the first new note keeps the damaged file aside, as it was.
+    {
+        HANDLE f = CreateFileW(NotesPath(c).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD w = 0;
+        const char damaged[] = "{\"notes\": [ {\"frame\": 3,";
+        WriteFile(f, damaged, (DWORD)strlen(damaged), &w, nullptr);
+
+        CloseHandle(f);
+    }
+    e = open(c);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK(e->edit.notes.empty());
+    CHECK(e->raw != nullptr);
+    noteAt(e, 5, NoteKind::Note, L"After the damage");
+    std::string aside;
+    CHECK(ReadFileUtf8(c + L".notes.damaged.json", &aside) && aside == "{\"notes\": [ {\"frame\": 3,");
+    CHECK(sidecar(c).size() == 1 && sidecar(c)[0]["frame"].Int() == 5);
+    // A sidecar this editor made goes again with its last note.
+    e->Undo();
+    e->Undo();
+    CHECK(e->edit.notes.empty());
+    CHECK(exists(NotesPath(c)));  // it wasn't made here: written empty, not deleted
+    CHECK_EQ(sidecar(c).size(), 0u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    const std::wstring d = dir + L"\\d60.mp4";
+    CHECK(WriteNumberedClip(d, 320, 180, 60, 30, 0));
+    e = open(d);
+    CHECK(e != nullptr);
+    if (!e) return;
+    noteAt(e, 3, NoteKind::Note, L"Short-lived");
+    CHECK(exists(NotesPath(d)));
+    e->Select(e->edit.notes[0].id);
+    e->Key(VK_DELETE, {});
+    CHECK(!exists(NotesPath(d)));
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
