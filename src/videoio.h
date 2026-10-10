@@ -19,6 +19,7 @@ public:
     VideoFrame() = default;
     explicit VideoFrame(BitmapPtr bgra);
     BitmapPtr Bgra() const;  // null when out of memory
+    bool HasPicture() const;  // false for a frame read without its picture (see VideoReader::ReadFrame's `skipTo`)
     explicit operator bool() const { return s_ != nullptr; }
     bool operator==(const VideoFrame& o) const { return s_ == o.s_; }
 
@@ -66,6 +67,9 @@ struct Sequence {
 std::optional<Clip> ClipOf(const std::wstring& path);
 // The edit's clips in its frame, or the whole `source` file when the edit has no clips.
 Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
+// The time of every frame of a file's video in order (source seconds; decoding gives the frames these same times),
+// read from the file without decoding it. Empty when they can't be read.
+std::vector<double> FrameTimes(const std::wstring& path);
 
 // Reads a sequence like one video: frames in order with timeline times (Fit puts one into the sequence frame).
 class SequenceReader {

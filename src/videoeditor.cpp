@@ -12,9 +12,13 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
+
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
+
 #include <thread>
 
 namespace Gdiplus {
@@ -40,7 +44,8 @@ namespace gp = Gdiplus;
 
 constexpr wchar_t kClass[] = L"AtherScreenshotVideoEditor";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
-constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44;
+constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44,
+               WM_FRAMES = WM_APP + 45;
 enum : UINT_PTR { kTimerFrame = 1 };
 enum : int { kField1 = 200, kField2 };
 
@@ -192,7 +197,8 @@ void RunMenu(HWND owner, const std::vector<MenuItem>& items, POINT at) {
 
 // ---------- frames for the paused preview ----------
 
-// Decodes the frame at a time on a worker thread (keeps one reader open, so stepping forward is cheap).
+// Decodes the frame at a time on a worker thread. It keeps one reader open, so stepping forward is cheap, and the
+// last frames decoded on the way to an exact request (a step), so stepping back is too.
 class FrameFetcher {
 public:
     FrameFetcher(Sequence seq, HWND hwnd) : seq_(std::move(seq)), hwnd_(hwnd), worker_([this] { Work(); }) {}
@@ -204,10 +210,12 @@ public:
         cv_.notify_one();
         worker_.join();
     }
-    void Request(double t) {
+    // The frame at `t`: the first one from `tol` seconds before it on (by default half a frame, so the nearest one).
+    void Request(double t, double tol = -1) {
         {
             std::lock_guard l(mu_);
             want_ = t;
+            tol_ = tol;
         }
         cv_.notify_one();
     }
@@ -221,33 +229,50 @@ private:
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         SequenceReader r;
         const bool ok = r.Open(seq_);
-        VideoFrame last;
-        double lastT = -1;
+        const double fps = r.Fps() > 1 ? r.Fps() : 30;
+        // Frames read since the last seek, oldest first, with their times. The newest few keep their pictures
+        // (unconverted until shown), within ~150 MB: 25 frames of 1080p.
+        std::deque<std::pair<VideoFrame, double>> got;
+        const size_t keep = std::clamp<size_t>((size_t)(150e6 / std::max(1.0, 5.5 * r.Size().cx * r.Size().cy)), 4, 60);
         for (;;) {
-            double t;
+            double t, tol;
             {
                 std::unique_lock l(mu_);
                 cv_.wait(l, [&] { return quit_ || want_ >= 0; });
                 if (quit_) break;
                 t = want_;
+                tol = tol_;
                 want_ = -1;
             }
             if (!ok) continue;
-            if (!(last && t >= lastT && t - lastT < 1.0)) {  // stepping forward reads on; anything else seeks
-                r.Seek(t);
-                last = {};
-                lastT = -1;
+            const bool exact = tol >= 0;
+            const double from = t - (exact ? tol : 0.5 / fps);  // the frame shown is the first one from here on
+            const std::pair<VideoFrame, double>* hit = nullptr;
+            if (!got.empty() && got.front().second <= from + 1e-9)  // read already, unless it's still to come
+                for (const auto& g : got)
+                    if (g.second >= from) {
+                        hit = &g;
+                        break;
+                    }
+            if (!hit) {
+                if (got.empty() || from < got.front().second || t - got.back().second >= 1.0) {  // stepping forward reads on; anything else seeks
+                    r.Seek(t);
+                    got.clear();
+                }
+                // Only frames that may be shown come with their pictures: the one asked for, and before a step the
+                // ones a step back would show.
+                const double pictures = exact ? from - (double)keep / fps : from;
+                VideoFrame f;
+                double ft = 0;
+                while (!quit_ && (got.empty() || got.back().second < from) && r.ReadFrame(&f, &ft, pictures)) {
+                    got.emplace_back(f, ft);
+                    while (got.size() > keep || (got.size() > 1 && !got.front().first.HasPicture())) got.pop_front();
+                }
+                if (!got.empty()) hit = &got.back();
             }
-            VideoFrame f;
-            double ft = 0;
-            const double frameDur = r.Fps() > 1 ? 1 / r.Fps() : 1 / 30.0;
-            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.ReadFrame(&f, &ft, t - frameDur * 0.5)) {  // only the one shown is converted
-                last = f;
-                lastT = ft;
-            }
-            BitmapPtr fitted = last.Bgra();  // sequence-sized, like the playing frames
+            BitmapPtr fitted = hit ? hit->first.Bgra() : nullptr;  // sequence-sized, like the playing frames
             if (!fitted) continue;
-            auto* res = new Result{fitted, lastT};
+            auto* res = new Result{fitted, hit->second};
             if (!PostMessageW(hwnd_, WM_FETCHED, 0, (LPARAM)res)) delete res;
         }
         CoUninitialize();
@@ -257,7 +282,7 @@ private:
     HWND hwnd_;
     std::mutex mu_;
     std::condition_variable cv_;
-    double want_ = -1;
+    double want_ = -1, tol_ = -1;
     std::atomic<bool> quit_{false};  // also checked mid-decode, so replacing the fetcher never waits long
     std::thread worker_;
 };
@@ -271,6 +296,10 @@ struct TranscribeResult {
 struct SaveResult {
     bool ok, gif;
     std::wstring out, tmp, err;
+};
+struct FrameTimesResult {
+    std::wstring key;
+    std::shared_ptr<const std::vector<double>> times;
 };
 
 // ---------- the window ----------
@@ -295,6 +324,11 @@ public:
 
     std::unique_ptr<SequencePlayer> player;
     std::unique_ptr<FrameFetcher> fetcher;
+    // Every frame of the timeline (for stepping and the frame readout), from each file's frame times, read in the
+    // background (by lowercase path; a grid at the clip's rate until they come).
+    std::map<std::wstring, std::shared_ptr<const std::vector<double>>> frameTimes;
+    std::set<std::wstring> framesPending;
+    TimelineFrames tframes;
     SIZE videoSize{16, 9};  // the sequence frame: the first video's size
     double duration = 0;    // of all clips
     std::vector<Clip> builtClips;  // what the player, fetcher and thumbnails were made for
@@ -424,8 +458,48 @@ public:
         t = std::clamp(t, 0.0, std::max(0.0, duration));
         paused = t;
         if (player) player->Seek(t);
-        if (!playing && fetcher) fetcher->Request(t);
+        if (!playing) Fetch(t);
         Invalidate();
+    }
+
+    // The paused preview decodes the frame nearest `t`, exactly that one (by its own time).
+    void Fetch(double t) {
+        if (!fetcher) return;
+        if (tframes.empty()) return fetcher->Request(t);
+        fetcher->Request(tframes.frames[tframes.Nearest(t)].t, 5e-4);
+    }
+
+    // ---- frames ----
+
+    static std::wstring FileKey(const std::wstring& path) { return Lower(path); }
+    bool FramesKnown() const {
+        for (const auto& c : edit.clips)
+            if (!frameTimes.count(FileKey(c.path))) return false;
+        return true;
+    }
+    // Reads the frame times of files that are new to the editor, each on a thread of its own.
+    void LoadFrameTimes() {
+        for (const auto& c : edit.clips) {
+            const std::wstring key = FileKey(c.path);
+            if (frameTimes.count(key) || framesPending.count(key) || !hwnd) continue;
+            framesPending.insert(key);
+            std::thread([self = hwnd, path = c.path, key] {
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                auto* r = new FrameTimesResult{key, std::make_shared<const std::vector<double>>(FrameTimes(path))};
+                CoUninitialize();
+                if (!PostMessageW(self, WM_FRAMES, 0, (LPARAM)r)) delete r;
+            }).detach();
+        }
+    }
+    void RebuildFrames() {
+        tframes = TimelineFrames::Of(edit.clips, [this](const Clip& c) -> const std::vector<double>* {
+            const auto it = frameTimes.find(FileKey(c.path));
+            return it != frameTimes.end() && it->second && !it->second->empty() ? it->second.get() : nullptr;
+        });
+    }
+    size_t FrameNow() const { return tframes.Nearest(playing ? rawT : paused); }  // the frame on screen
+    void GoToFrame(size_t n) {
+        if (n < tframes.size()) Seek(tframes.frames[n].t);
     }
 
     void Play() {
@@ -445,18 +519,31 @@ public:
         paused = player ? player->Now() : paused;
         if (player) player->Pause();
         playing = false;
-        if (fetcher) fetcher->Request(paused);  // the exact frame (and zoom off) for editing
+        Fetch(paused);  // the exact frame (and zoom off) for editing
         Rerender();
         Invalidate();
     }
 
     void TogglePlay() { playing ? Pause() : Play(); }
 
-    bool FramesKnown() const { return true; }
-
-    void Step(double frames) {
+    // ←/→: `frames` frames at the rate of the clip they're in, landing on each frame's own time.
+    void Step(int frames) {
         Pause();
-        Seek(Now() + frames / 30);
+        if (tframes.empty()) return Seek(Now() + frames / 30.0);
+        const long long n = (long long)tframes.Nearest(paused) + frames;
+        GoToFrame((size_t)std::clamp<long long>(n, 0, (long long)tframes.size() - 1));
+    }
+    // Shift+←/→: the frame nearest a second away.
+    void StepSecond(int dir) {
+        Pause();
+        if (tframes.empty()) return Seek(Now() + dir);
+        GoToFrame(tframes.Nearest(tframes.frames[tframes.Nearest(paused)].t + dir));
+    }
+    // Home/End: the first and last frames of the trim (the saved video's first and last).
+    void GoTrimEnd(bool end) {
+        Pause();
+        if (tframes.empty()) return Seek(end ? edit.trimEnd : edit.trimStart);
+        GoToFrame(tframes.At(end ? edit.trimEnd - 1e-3 : edit.trimStart + 1e-3));
     }
 
     void Replay(const Mark& m) {
@@ -514,11 +601,13 @@ public:
             player->SetSequence(Seq());
             player->Seek(paused);
         }
+        RebuildFrames();
         if (hwnd) {
             fetcher = std::make_unique<FrameFetcher>(Seq(), hwnd);
-            fetcher->Request(paused);
+            Fetch(paused);
             thumbs.clear();  // the old ones would be stretched over the wrong clips
             LoadThumbs();
+            LoadFrameTimes();
         }
         if (selClip && !SelClipIndex()) selClip.reset();
     }
@@ -1992,8 +2081,10 @@ public:
         }
         switch (vk) {
             case VK_SPACE: TogglePlay(); break;
-            case VK_LEFT: Step(shift ? -30 : -1); break;
-            case VK_RIGHT: Step(shift ? 30 : 1); break;
+            case VK_LEFT: shift ? StepSecond(-1) : Step(-1); break;
+            case VK_RIGHT: shift ? StepSecond(1) : Step(1); break;
+            case VK_HOME: GoTrimEnd(false); break;
+            case VK_END: GoTrimEnd(true); break;
             case 'S': SplitAtPlayhead(); break;
             case 'I': PushUndo(); SetTrim(Now(), std::nullopt); break;
             case 'O': PushUndo(); SetTrim(std::nullopt, Now()); break;
@@ -2254,6 +2345,15 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        case WM_FRAMES: {
+            std::unique_ptr<FrameTimesResult> r(reinterpret_cast<FrameTimesResult*>(l));
+            framesPending.erase(r->key);
+            frameTimes[r->key] = r->times;
+            RebuildFrames();
+            if (!playing) Fetch(paused);
+            Invalidate();
+            return 0;
+        }
         case WM_THUMBS: {
             std::unique_ptr<std::vector<BitmapPtr>> t(reinterpret_cast<std::vector<BitmapPtr>*>(l));
             if (w != (WPARAM)thumbGen) return 0;  // for clips that have changed since
@@ -2357,9 +2457,12 @@ bool VideoEditor::Create() {
     std::wstring err;
     player = SequencePlayer::Open(Seq(), hwnd, WM_ENGINE, &err);
     fetcher = std::make_unique<FrameFetcher>(Seq(), hwnd);
+    RebuildFrames();
     Rerender();
     SetTimer(hwnd, kTimerFrame, 15, nullptr);
     LoadThumbs();
+    LoadFrameTimes();
+
     DragAcceptFiles(hwnd, TRUE);
     if (snapshotMode) return true;
     ShowWindow(hwnd, SW_SHOW);
@@ -2467,9 +2570,14 @@ bool BlueOf(uint32_t c) { return (c & 255) > 128; }
 // The frame the paused editor shows once the frame at the playhead has been decoded: its number and whether it has
 // blue (which clip), from the middle pixel. {-1, false} when it doesn't arrive.
 std::pair<int, bool> ShownFrame(VideoEditor* e) {
-    for (int i = 0; i < 150; ++i) {
+    for (const ULONGLONG end = GetTickCount64() + 2000; GetTickCount64() < end;) {
         if (e->raw && std::fabs(e->rawT - e->paused) < 1e-3) break;
-        Pump(5);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(1);
     }
     if (!e->raw || std::fabs(e->rawT - e->paused) >= 1e-3) return {-1, false};
     const uint32_t c = e->raw->Bits()[(size_t)(e->raw->Height() / 2) * e->raw->Width() + e->raw->Width() / 2];

@@ -151,6 +151,36 @@ struct Motion {
     static Motion Between(AnimStyle in, AnimStyle out, double start, double end, double t, int chars, double height);
 };
 
+// ---- frames ----
+
+// Every frame of the timeline in order: where it shows (timeline seconds), its clip, and its time in that clip's file.
+// Made from each file's frame times (FrameTimes in videoio.h), or a grid at the clip's rate for a file whose times
+// aren't known (yet). The frames are the ones SequenceReader gives: for each clip, the frame on screen at its in point
+// (from the clip's start), then the ones before its out point. Frame n counts from the timeline's start.
+struct TimelineFrames {
+    struct Frame {
+        double t = 0, src = 0;
+        uint32_t clip = 0;
+    };
+    std::vector<Frame> frames;
+    std::vector<double> fps;  // each clip's rate (30 when the file doesn't say)
+
+    // `times`: a file's frame times, or null when they aren't known.
+    static TimelineFrames Of(const std::vector<Clip>& clips, const std::function<const std::vector<double>*(const Clip&)>& times);
+    bool empty() const { return frames.empty(); }
+    size_t size() const { return frames.size(); }
+    size_t Nearest(double t) const;  // the frame closest to timeline time `t` (what the paused editor shows there)
+    size_t At(double t) const;       // the frame on screen at `t`: the last one starting at or before it
+    double Fps(size_t n) const;      // the rate of frame n's clip
+    std::wstring Timecode(size_t n) const;  // m:ss:ff, frames within the second at the clip's rate
+    std::wstring Readout(size_t n) const;   // "0:12:37 · frame 757 · 60 fps"
+    // Go to: a frame number ("757"), a timecode ("0:12:37", "1:02:03:04" with hours) or a time ("12.6", "0:12.6").
+    std::optional<size_t> Find(const std::wstring& text) const;
+};
+std::wstring Timecode(double t, double fps);  // m:ss:ff
+std::wstring FpsLabel(double fps);            // "60 fps", "29.97 fps"
+std::vector<double> FrameGrid(double length, double fps);  // k / fps for every frame starting before `length`
+
 // Replaces the clips and moves everything on the timeline with the clip it sits in: marks and captions keep
 // their place in the footage, items in a removed clip (or a cut-off part of one) go, and the trim follows.
 void ApplyClips(VideoEdit& e, std::vector<Clip> clips);

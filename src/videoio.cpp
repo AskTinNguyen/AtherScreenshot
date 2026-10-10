@@ -244,6 +244,8 @@ struct VideoFrame::State {
 
 VideoFrame::VideoFrame(BitmapPtr bgra) : s_(std::make_shared<State>()) { s_->bgra = std::move(bgra); }
 
+bool VideoFrame::HasPicture() const { return s_ && (s_->bgra || s_->yuv); }
+
 BitmapPtr VideoFrame::Bgra() const {
     if (!s_) return nullptr;
     State& s = *s_;
@@ -631,6 +633,32 @@ std::optional<Clip> ClipOf(const std::wstring& path) {
     c.fps = vi.fps;
     c.hasAudio = vi.hasAudio && AudioDecodes(path);
     return c;
+}
+
+std::vector<double> FrameTimes(const std::wstring& path) {
+    EnsureMediaFoundation();
+    std::vector<double> out;
+    ComPtr<IMFSourceReader> r;
+    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &r))) return out;
+    // No output type set: the samples come as they are stored, so nothing is decoded.
+    r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+    if (FAILED(r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE))) return out;
+    size_t samples = 0;
+    for (;;) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        ComPtr<IMFSample> s;
+        if (FAILED(r->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) break;
+        if (s && SUCCEEDED(s->GetSampleTime(&ts))) {
+            out.push_back(ts / kTicks);
+            ++samples;
+        }
+        if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) break;
+    }
+    std::sort(out.begin(), out.end());  // stored in decoding order
+    out.erase(std::unique(out.begin(), out.end(), [](double a, double b) { return b - a < 1e-6; }), out.end());
+    if (out.size() < samples / 2) out.clear();  // samples without their own times: not usable
+    return out;
 }
 
 Sequence SequenceOf(const std::wstring& source, const VideoEdit& e) {
@@ -2238,6 +2266,43 @@ ATHER_TEST(video_sequence_joins_clips_into_one_video) {
     CHECK(ordered);
     CHECK(n >= 85 && n <= 95);
     CHECK(prev > 2.9 && prev < 3.0);
+}
+
+// The frame times read from the file without decoding are the times decoding gives the frames (also for frames written
+// at uneven times, which our encoder evens out to its rate).
+ATHER_TEST(video_frame_times_match_the_decoded_frames) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring steady = dir + L"\\steady.mp4", uneven = dir + L"\\uneven.mp4";
+    CHECK(WriteTestClip(steady, 320, 180, 60, 1, false));
+    {
+        Mp4Writer mw;
+        CHECK(SUCCEEDED(mw.Begin(uneven, 320, 180, 30)));
+        std::vector<uint32_t> px((size_t)320 * 180, 0xFF336699u);
+        const double at[] = {0, 0.02, 0.1, 0.11, 0.3, 0.31, 0.32, 0.6};
+        for (size_t i = 0; i < std::size(at); ++i) {
+            const double next = i + 1 < std::size(at) ? at[i + 1] : at[i] + 0.1;
+            CHECK(SUCCEEDED(mw.WriteFrame(px.data(), std::llround(at[i] * kTicks), std::llround((next - at[i]) * kTicks))));
+        }
+        CHECK(SUCCEEDED(mw.Finalize()));
+    }
+    for (const std::wstring& path : {steady, uneven}) {
+        const std::vector<double> times = FrameTimes(path);
+        std::vector<double> decoded;
+        VideoReader r;
+        CHECK(r.Open(path));
+        BitmapPtr f;
+        double t = 0;
+        while (r.Read(&f, &t)) decoded.push_back(t);
+        test::Note(ToUtf8(path) + ": " + std::to_string(times.size()) + " times, " + std::to_string(decoded.size()) + " decoded");
+        CHECK_EQ(times.size(), decoded.size());
+        double worst = 0;
+        for (size_t i = 0; i < times.size() && i < decoded.size(); ++i) worst = std::max(worst, std::fabs(times[i] - decoded[i]));
+        CHECK(worst < 1e-6);
+    }
+    const std::vector<double> s = FrameTimes(steady);
+    CHECK_EQ(s.size(), 60u);
+    CHECK(s.size() == 60 && std::fabs(s[59] - 59 / 60.0) < 1e-4);
+    CHECK(FrameTimes(dir + L"\\missing.mp4").empty());
 }
 
 // Frames converted here come out exactly as Media Foundation's own (much slower) converter makes them, for SD

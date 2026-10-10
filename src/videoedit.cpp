@@ -307,6 +307,130 @@ void ApplyClips(VideoEdit& e, std::vector<Clip> clips) {
     e.clips = std::move(clips);
 }
 
+// ---------- frames ----------
+
+std::vector<double> FrameGrid(double length, double fps) {
+    std::vector<double> v;
+    if (fps <= 0) return v;
+    for (int64_t k = 0; k / fps < length - 1e-6; ++k) v.push_back(k / fps);
+    return v;
+}
+
+TimelineFrames TimelineFrames::Of(const std::vector<Clip>& clips, const std::function<const std::vector<double>*(const Clip&)>& times) {
+    TimelineFrames tf;
+    double start = 0;
+    for (size_t i = 0; i < clips.size(); ++i) {
+        const Clip& c = clips[i];
+        const double fps = c.fps > 1 ? c.fps : 30;
+        tf.fps.push_back(fps);
+        const std::vector<double>* known = times ? times(c) : nullptr;
+        std::vector<double> grid;
+        if (!known || known->empty()) {
+            grid = FrameGrid(std::max(c.length, c.out), fps);
+            known = &grid;
+        }
+        const std::vector<double>& T = *known;
+        // As SequenceReader: frames up to 0.1 ms before the in point count as in the clip; when none starts right at
+        // it (within 1 ms), the one on screen there shows first, from the clip's start.
+        size_t k = (size_t)(std::lower_bound(T.begin(), T.end(), c.in - 1e-4) - T.begin());
+        if (k > 0 && (k == T.size() || T[k] > c.in + 1e-3)) tf.frames.push_back({start, T[k - 1], (uint32_t)i});
+        for (; k < T.size() && T[k] < c.out - 1e-4; ++k) tf.frames.push_back({start + std::max(0.0, T[k] - c.in), T[k], (uint32_t)i});
+        start += c.Duration();
+    }
+    return tf;
+}
+
+size_t TimelineFrames::Nearest(double t) const {
+    if (frames.empty()) return 0;
+    const auto it = std::lower_bound(frames.begin(), frames.end(), t, [](const Frame& f, double v) { return f.t < v; });
+    if (it == frames.end()) return frames.size() - 1;
+    if (it == frames.begin()) return 0;
+    const size_t n = (size_t)(it - frames.begin());
+    return t - frames[n - 1].t <= frames[n].t - t ? n - 1 : n;
+}
+
+size_t TimelineFrames::At(double t) const {
+    const auto it = std::upper_bound(frames.begin(), frames.end(), t, [](double v, const Frame& f) { return v < f.t; });
+    return it == frames.begin() ? 0 : (size_t)(it - frames.begin()) - 1;
+}
+
+double TimelineFrames::Fps(size_t n) const { return n < frames.size() && frames[n].clip < fps.size() ? fps[frames[n].clip] : 30; }
+
+namespace {
+// The whole seconds and the frame within that second of time `t` at `fps`, allowing for times stored a hair early.
+std::pair<int64_t, int> SecondAndFrame(double t, double fps) {
+    t = std::max(0.0, t);
+    const int64_t secs = (int64_t)std::floor(t + 0.001 / fps);
+    const int ff = std::clamp((int)std::floor((t - (double)secs) * fps + 0.001), 0, std::max(0, (int)std::ceil(fps) - 1));
+    return {secs, ff};
+}
+}  // namespace
+
+std::wstring Timecode(double t, double fps) {
+    const auto [secs, ff] = SecondAndFrame(t, fps > 0 ? fps : 30);
+    return std::format(L"{}:{:02}:{:02}", secs / 60, secs % 60, ff);
+}
+
+std::wstring FpsLabel(double fps) {
+    if (std::fabs(fps - std::round(fps)) < 0.005) return std::format(L"{} fps", (int)std::lround(fps));
+    std::wstring s = std::format(L"{:.2f}", fps);
+    while (s.back() == L'0') s.pop_back();
+    return s + L" fps";
+}
+
+std::wstring TimelineFrames::Timecode(size_t n) const { return n < frames.size() ? ather::Timecode(frames[n].t, Fps(n)) : L""; }
+
+std::wstring TimelineFrames::Readout(size_t n) const {
+    if (n >= frames.size()) return L"";
+    return Timecode(n) + L" · frame " + std::to_wstring(n) + L" · " + FpsLabel(Fps(n));
+}
+
+std::optional<size_t> TimelineFrames::Find(const std::wstring& text) const {
+    if (frames.empty()) return std::nullopt;
+    std::wstring s;
+    for (wchar_t c : text)
+        if (!iswspace(c)) s += c;
+    if (s.empty()) return std::nullopt;
+    auto number = [](const std::wstring& p, double* v) {  // digits, with an optional fraction
+        if (p.empty() || p.find_first_not_of(L"0123456789.") != std::wstring::npos || std::count(p.begin(), p.end(), L'.') > 1 || p == L".") return false;
+        *v = _wtof(p.c_str());
+        return true;
+    };
+    std::vector<std::wstring> parts;
+    for (size_t at = 0;;) {
+        const size_t c = s.find(L':', at);
+        parts.push_back(s.substr(at, c == std::wstring::npos ? std::wstring::npos : c - at));
+        if (c == std::wstring::npos) break;
+        at = c + 1;
+    }
+    std::vector<double> v(parts.size());
+    for (size_t i = 0; i < parts.size(); ++i)
+        if (!number(parts[i], &v[i])) return std::nullopt;
+    if (parts.size() == 1) {
+        if (s.find(L'.') == std::wstring::npos) {  // a frame number
+            if (v[0] >= (double)frames.size()) return std::nullopt;
+            return (size_t)v[0];
+        }
+        return At(v[0] + 1e-6);  // seconds
+    }
+    if (parts.size() == 2) return At(v[0] * 60 + v[1] + 1e-6);  // m:ss(.s)
+    if (parts.size() > 4) return std::nullopt;
+    // m:ss:ff or h:mm:ss:ff: the frame of that second with that number (or the last one before it).
+    const double secs = parts.size() == 4 ? v[0] * 3600 + v[1] * 60 + v[2] : v[0] * 60 + v[1];
+    const int ff = (int)v.back();
+    std::optional<size_t> best;
+    for (size_t n = At(secs - 1e-3); n < frames.size() && frames[n].t < secs + 1; ++n) {
+        const auto [sec, f] = SecondAndFrame(frames[n].t, Fps(n));
+        if ((double)sec != secs) continue;
+        if (f > ff) break;
+        best = n;
+        if (f == ff) break;
+    }
+    if (best) return best;
+    if (secs > frames.back().t) return std::nullopt;  // past the end
+    return At(secs + 1e-6);
+}
+
 std::vector<Caption> ChunkCaptions(const std::vector<CaptionWord>& words) {
     std::vector<Caption> out;
     std::optional<Caption> cur;
