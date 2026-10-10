@@ -1,9 +1,9 @@
 # Frame Review: Progress
 
-- Working under rev: 2
+- Working under rev: 3
 - Worker: `frame-review-worker`
-- Current step: none: every row is met except A13 and A8, whose proof is `review` (the orchestrator's verdict).
-- Next step: the orchestrator reviews A13's images and A8's docs (and F-1); the owner merges. Afterwards, the Mac handoff (a Non-Goal here).
+- Current step: none: every row is met except A13, which waits for the orchestrator's re-review of the redone image 3.
+- Next step: the orchestrator re-reviews `proof/a13/a13-3-timeline-zoomed.png`; the owner merges. Afterwards, the Mac handoff (a Non-Goal here).
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/2
 
 ## Acceptance
@@ -17,12 +17,12 @@
 | A5 | met | S6: `test.bat` → `92 tests, 1227 checks, 0 failed` with `video_editor_notes_kept_next_to_the_video` (round trip, joined, trimmed, undo, damaged, made-and-emptied) and `video_notes_sidecar_format` |
 | A6 | met | S9: `test.bat` → `96 tests, 1448 checks, 0 failed` with `video_review_export_holds_notes_with_cards_and_burn_in` and `video_editor_saves_review_video_notes_list_and_sheet`; snapshot `docs/intent/frame-review/proof/a6-note-card-frame.png` (opened, checked); S10 bench: plain exports' frames identical to the pre-feature build in all 6 scenarios, and no slower |
 | A7 | met | S9: `test.bat` → `96 tests, 1448 checks, 0 failed` with `video_editor_saves_review_video_notes_list_and_sheet` (the `.md` text and Copy's text both equal the expected lines) |
-| A9 | met | S7; S9 gate `96 tests, 1448 checks, 0 failed` with `video_editor_timeline_zoom`; snapshot `docs/intent/frame-review/proof/a9-timeline-zoom.png` (opened, checked) |
+| A9 | met | S7, and S13 for rev 3's filmstrip: `test.bat` → `97 tests, 1463 checks, 0 failed` with `video_editor_timeline_zoom` and `video_editor_filmstrip_shows_frames_under_each_tile`; snapshot `docs/intent/frame-review/proof/a9-timeline-zoom.png` (redone in S13: thumbnails 705…771 over their ticks; opened, checked) |
 | A10 | met | S8; S9 gate `96 tests, 1448 checks, 0 failed` with `video_editor_pixel_magnifier`; snapshot `docs/intent/frame-review/proof/a10-magnifier-4x.png` (opened, checked) |
 | A11 | met | S5 (kinds, Resolved, Open filter, colored ticks and list), S6 (sidecar), S9 (card, `.md`, sheet, summary); gate `96 tests, 1448 checks, 0 failed`; snapshot `docs/intent/frame-review/proof/a4-a11-notes.png` (all four kinds and a resolved note), plus the S9 images |
 | A12 | met | S9: gate `96 tests, 1448 checks, 0 failed` with the review export test (180 summary-card frames equal `SummaryCard`, length 10.5 s, sheet tiles in order matching the decoded review video within 6/255); snapshots `docs/intent/frame-review/proof/a12-summary-card.png`, `a12-contact-sheet.png` (opened, checked) |
-| A13 | ready for review | S11: seven images in `docs/intent/frame-review/proof/a13/` (list in S11), each opened and checked; waits for the orchestrator's verdict in `log.md` |
-| A8 | ready for review | S12: README (Features row, Video editor guide: frame by frame, review notes, review video; the editor's shortcut line; Platform differences) and RELEASE_NOTES ("Coming in the next update (Windows)"); final gate `96 tests, 1448 checks, 0 failed` |
+| A13 | ready for re-review | R-1 (log.md): images 1, 2, 4, 5, 6, 7 pass; image 3 failed (stale filmstrip). S13: `proof/a13/a13-3-timeline-zoomed.png` redone (thumbnails 663, 672, 680 … 755, each the first frame at its tile's left edge, agreeing with the ticks under them; opened, checked), and image 4, which also shows the zoomed strip, redone the same way. Waits for the orchestrator's re-review of image 3 |
+| A8 | met | review R-1 in log.md (passes). S12: README (Features row, Video editor guide: frame by frame, review notes, review video; the editor's shortcut line; Platform differences) and RELEASE_NOTES ("Coming in the next update (Windows)"); final gate `96 tests, 1448 checks, 0 failed` |
 
 ## Steps
 
@@ -54,11 +54,13 @@ Engineering decisions (S2):
   - `proof/a13/a13-7-contact-sheet.png`: six tiles in timeline order, each showing its own frame number (95, 260, 410, 540, 742, 757), kinds in color, the resolved one dimmed.
   Fixed on the way (found in these images): zoomed-in thumbnails were stretched to the whole cell (now tiled at their own shape); the last ruler number was cut at the right edge (now drawn whole or not at all); the first capture attempts were scaled by Windows (the script now sets per-thread DPI awareness and leaves the window on its monitor). Evidence: the script re-run into a fresh folder produced the same four window images (same sizes); `video_editor` tests → pass (see the S12 gate). Acceptance: A13 ready for the orchestrator's review.
 - S12 (rev 2, 2026-10-10): docs (A8). README: a "Review video" row in Features; in the Video editor guide, "Frame by frame" (exact steps, Shift, Home/End, the readout, Ctrl+G, J/K/L and preview speeds, timeline zoom, the magnifier), "Review notes" (M, kinds, Resolved, pin, range, flags and list, [ and ], the author name, the sidecar, Copy) and "Review video" (Save ▾ › Save review video, Ctrl+Alt+S, what's in it, the notes list and contact sheet); the editor's shortcut line now lists Home/End, J/K/L, Ctrl+G, M, [ ], timeline zoom, the magnifier, the save shortcuts and Ctrl+Alt+S winning over scrolling capture in the editor; Platform differences says frame review is Windows only for now. RELEASE_NOTES: a "Coming in the next update (Windows)" section above build 0.0.2.2 (no build number: that's the owner's call at release). Evidence: final full `test.bat` → `96 tests, 1448 checks, 0 failed`, exit 0, at this commit's code (the S11 code; S12 changed docs only). Acceptance: A8 ready for review.
+- S13 (rev 3, 2026-10-10): the zoomed-in filmstrip shows frames from under each tile (rev 3's A9, from review R-1). Zoomed in, the strip is now tiles at the thumbnails' own shape on a grid from the timeline's start (so they stay put while panning); each tile shows the first frame that starts inside it (the frame on screen at its start when a tile is narrower than a frame). The pictures come from a background `StripFetcher` (its own reader; the tiles on view asked for in timeline order, reading on from one to the next; the newest view's request replaces older ones; scaled to the tile and posted back), kept by frame (up to 800, dropping the ones off view); a tile waits as empty strip until its picture comes, so painting never blocks and a wrong picture is never shown. At 1× the 16 fitted thumbnails stay as before (each is the frame at its cell's middle). Evidence: new `video_editor_filmstrip_shows_frames_under_each_tile`: at zooms 2×, 5× and full, panned to the start, middle and end, it reads the frame number from the painted strip at each tile's middle and checks it is the tile's own frame and lies inside the tile's span (more than 60 tiles, 0 wrong); paints with pictures still coming take under 250 ms; at full zoom a tile covers 3–12 frames → `1 tests, 15 checks, 0 failed`; full `test.bat` → `97 tests, 1463 checks, 0 failed`, exit 0. Pictures redone with the committed capture script and `--video-snapshots`, opened and checked: `proof/a13/a13-3-timeline-zoomed.png` (663, 672, 680, 688, 696, 705, 713, 721, 730, 738, 746, 755 over ticks 665…755; e.g. the "680" tile starts just left of tick 680), `proof/a13/a13-4-magnifier-4x.png` (same strip under the 4× view), `proof/a9-timeline-zoom.png` (705…771 over their ticks). Acceptance: A9 met (rev 3); A13 ready for re-review of image 3; A8 met by R-1.
 
 ## Reconciliations
 
 <!-- rev <old> -> <new>: still valid <...>; redo <...>; dropped <...>. -->
 
+- rev 2 -> 3 (2026-10-10, prompt commit 16c419f, review R-1 in log.md): still valid: A1–A7, A10–A12 (met), A8 (passed review R-1: now met), F-1 (accepted as built: D13). Redo: A9's filmstrip (rev 3 adds: thumbnails show frames from under each tile at every zoom, refreshed in the background; a gate test for it) and A13 image 3 (and image 4, which shows the same strip). Dropped: none.
 - rev 1 -> 2 (2026-10-10, prompt commit 8c794a3): still valid: A1 (met, S2) and the S3 work in progress on A2 (D1–D3 unchanged, accepted). Redo: none. Dropped: none. Added: D7 (owner-level calls made and recorded here), D8 (dev tools allowed, recorded), D9–D12 and rows A9–A13. A2/A4/A6/A9–A12 now also need a snapshot PNG opened and checked; note kinds and resolved status (D11) are designed into notes from the start of A4. Order from here: A2, A3, A4, A11, A5, A9, A10, A6, A12, A7, A13, A8.
 
 ## Owner-level calls
@@ -76,7 +78,7 @@ Engineering decisions (S2):
 - Save menu (S9): a small ▾ next to Save opens Save video / Save GIF / Save review video, since there was no Save menu; Save GIF keeps its button.
 - Ctrl+Alt+S (S9): it's also the app's global "Scrolling capture" hotkey, so the global hotkey now hands it to the video editor when an editor is the window in front (F-1). Weighed: another key for the review video (D2 named this one), or leaving scrolling capture to win (the shortcut would never work in the editor).
 - Notes list text (S9): one line per note in A7's format with the kind in brackets after the author (D11 wants kind and status in the list), and a blank line between notes in both the file and the clipboard, so Markdown shows them as separate lines.
-- Zoomed thumbnails (S11): side by side at their own shape once a cell is 1.5 thumbnails wide, as video editors do, instead of one stretched picture.
+- Zoomed thumbnails (S11, replaced in S13): S11 tiled the 16 coarse thumbnails, which R-1 rightly found stale. S13: each tile decodes its own frame in the background; until it comes the tile is empty strip (rather than a stand-in picture from elsewhere, which would look like the wrong frame).
 - Go to (S3): the inspector's text field turns into a "Go to" field rather than a dialog box, the way captions and markup are edited in this editor. A time without a frame part (12.6) lands on the frame on screen at that time.
 
 ## Dev tools

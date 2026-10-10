@@ -105,7 +105,7 @@ Start-Sleep -Seconds 2
 # Ctrl+wheel over the timeline: zoomed all the way in around the playhead.
 $tlTop = $ch - (S 14) - ((S 90) + (S 18) * 3)
 for ($i = 0; $i -lt 25; $i++) { [W]::Wheel($h, [int]($cw / 2), $tlTop + (S 26), 120, 0x0008) }
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 3   # the strip's pictures for the zoomed view, decoded in the background
 [W]::Capture($h, "$dir\a13-3-timeline-zoomed.png")
 # The wheel over the video: the magnifier at 4x around the pinned spot.
 $readTop = $tlTop - (S 8) - (S 30) - (S 4) - (S 22)

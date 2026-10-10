@@ -52,7 +52,7 @@ namespace gp = Gdiplus;
 constexpr wchar_t kClass[] = L"AtherScreenshotVideoEditor";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
 constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44,
-               WM_FRAMES = WM_APP + 45;
+               WM_FRAMES = WM_APP + 45, WM_STRIP = WM_APP + 46;
 enum : UINT_PTR { kTimerFrame = 1 };
 enum : int { kField1 = 200, kField2 };
 
@@ -335,6 +335,82 @@ private:
     std::thread worker_;
 };
 
+// The zoomed-in filmstrip's pictures: decodes the frames asked for (in timeline order, the newest request replacing the
+// rest) on a worker thread, scales each to `thumb` and posts it back as WM_STRIP. Reads on from one frame to the next,
+// so a view's worth of frames a few apart costs one seek.
+class StripFetcher {
+public:
+    struct Result {
+        uint64_t gen;
+        size_t frame;
+        BitmapPtr thumb;
+    };
+    StripFetcher(Sequence seq, TimelineFrames tf, SIZE thumb, HWND hwnd, uint64_t gen)
+        : seq_(std::move(seq)), tf_(std::move(tf)), thumb_(thumb), hwnd_(hwnd), gen_(gen), worker_([this] { Work(); }) {}
+    ~StripFetcher() {
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_one();
+        worker_.join();
+    }
+    void Want(std::vector<size_t> frames) {  // these, in this order, instead of whatever was asked before
+        {
+            std::lock_guard l(mu_);
+            want_ = std::move(frames);
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void Work() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        SequenceReader r;
+        const bool ok = r.Open(seq_);
+        double lastT = -1e300;
+        for (;;) {
+            size_t n;
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return quit_ || !want_.empty(); });
+                if (quit_) break;
+                n = want_.front();
+                want_.erase(want_.begin());
+            }
+            if (!ok || n >= tf_.size()) continue;
+            const double t = tf_.frames[n].t;
+            if (!(t > lastT && t - lastT < 2.0)) r.Seek(t);  // reading on beats seeking for frames close ahead
+            VideoFrame f, kept;
+            double ft = 0;
+            while (!quit_ && r.ReadFrame(&f, &ft, t - 5e-4)) {  // frames before it come without pictures
+                kept = f;
+                lastT = ft;
+                if (ft >= t - 5e-4) break;
+            }
+            const BitmapPtr full = kept ? kept.Bgra() : nullptr;
+            if (!full) {
+                lastT = -1e300;
+                continue;
+            }
+            auto* res = new Result{gen_, n, Resample(*full, thumb_.cx, thumb_.cy)};
+            if (!res->thumb || !PostMessageW(hwnd_, WM_STRIP, 0, (LPARAM)res)) delete res;
+        }
+        CoUninitialize();
+    }
+
+    Sequence seq_;
+    TimelineFrames tf_;
+    SIZE thumb_;
+    HWND hwnd_;
+    uint64_t gen_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<size_t> want_;
+    std::atomic<bool> quit_{false};
+    std::thread worker_;
+};
+
 // Results posted back from worker threads (one definition, shared by sender and receiver).
 struct TranscribeResult {
     bool ok = false;
@@ -552,7 +628,61 @@ public:
             }).detach();
         }
     }
+    // ---- the zoomed-in filmstrip ----
+    // Zoomed in, the strip is tiles at the thumbnails' own shape, each showing a frame from under it (the first frame
+    // starting in it), decoded in the background as the view changes; an empty tile until its picture comes.
+    std::unique_ptr<StripFetcher> stripFetcher;
+    uint64_t stripGen = 0;
+    std::map<size_t, BitmapPtr> stripThumbs;  // by timeline frame
+    std::vector<size_t> stripWanted;          // last asked for
+    struct StripTile {
+        double t0, t1;  // the timeline time it covers
+        size_t frame;   // the frame it shows
+    };
+    SIZE StripThumbSize() const {
+        const int h = S(52);
+        return {std::max(8, (int)std::lround(h * (double)videoSize.cx / std::max(1L, videoSize.cy))), h};
+    }
+    // The tiles on view at this zoom, on a grid from the timeline's start (so they stay put while panning).
+    std::vector<StripTile> StripTiles() const {
+        std::vector<StripTile> v;
+        if (tframes.empty() || tlZoom <= 1.001) return v;
+        const RECT tr = TimelineRect();
+        const double dt = StripThumbSize().cx * TlSpan() / std::max(1, RectW(tr));
+        const double end = std::min(duration, tlStart + TlSpan());
+        for (long long j = (long long)std::floor(tlStart / dt); j * dt < end; ++j) {
+            const double t0 = j * dt, t1 = std::min(duration, (j + 1) * dt);
+            const auto it = std::lower_bound(tframes.frames.begin(), tframes.frames.end(), t0 - 1e-9, [](const TimelineFrames::Frame& f, double x) { return f.t < x; });
+            const size_t n = it != tframes.frames.end() && it->t < t1 ? (size_t)(it - tframes.frames.begin()) : tframes.At(t0);
+            v.push_back({t0, t1, n});
+        }
+        return v;
+    }
+    void ResetStrip() {
+        stripFetcher.reset();
+        stripThumbs.clear();
+        stripWanted.clear();
+        ++stripGen;
+    }
+    // Asks for the pictures of the tiles on view that aren't there yet.
+    void RequestStrip(const std::vector<StripTile>& tiles) {
+        std::vector<size_t> want;
+        for (const auto& t : tiles)
+            if (!stripThumbs.count(t.frame) && std::find(want.begin(), want.end(), t.frame) == want.end()) want.push_back(t.frame);
+        if (want == stripWanted) return;
+        stripWanted = want;
+        if (want.empty() || !hwnd) return;
+        if (!stripFetcher) stripFetcher = std::make_unique<StripFetcher>(Seq(), tframes, StripThumbSize(), hwnd, stripGen);
+        stripFetcher->Want(want);
+    }
+    bool StripComplete() const {  // tests: every tile on view has its picture
+        for (const auto& t : StripTiles())
+            if (!stripThumbs.count(t.frame)) return false;
+        return true;
+    }
+
     void RebuildFrames() {
+        ResetStrip();
         tframes = TimelineFrames::Of(edit.clips, [this](const Clip& c) -> const std::vector<double>* {
             const auto it = frameTimes.find(FileKey(c.path));
             return it != frameTimes.end() && it->second && !it->second->empty() ? it->second.get() : nullptr;
@@ -2276,7 +2406,25 @@ public:
         HRGN viewRgn = CreateRectRgnIndirect(&view);
         SelectClipRgn(dc, viewRgn);
         g.SetClip(gp::Rect(view.left, view.top, RectW(view), RectH(view)));
-        if (!thumbs.empty()) {
+        if (const auto tiles = StripTiles(); !tiles.empty()) {  // zoomed in: tiles showing their own frames
+            HRGN clip = CreateRectRgn(strip.left, strip.top, strip.right, strip.bottom);
+            SelectClipRgn(dc, clip);
+            SetStretchBltMode(dc, HALFTONE);
+            for (const auto& tile : tiles) {
+                const int x0 = (int)std::lround(TX(tile.t0)), x1 = (int)std::lround(TX(tile.t1));
+                const auto it = stripThumbs.find(tile.frame);
+                if (it == stripThumbs.end() || !it->second) continue;  // still coming: the strip's own color meanwhile
+                MemDC src(it->second->Handle());
+                StretchBlt(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, 0, 0, it->second->Width(), it->second->Height(), SRCCOPY);
+            }
+            for (const auto& tile : tiles) {  // a hairline between tiles
+                const int x = (int)std::lround(TX(tile.t0));
+                FillSolid(dc, {x, strip.top, x + 1, strip.bottom}, RGB(0, 0, 0));
+            }
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
+            RequestStrip(tiles);
+        } else if (!thumbs.empty()) {
             const double D = std::max(0.001, duration);
             HRGN clip = CreateRectRgn(strip.left, strip.top, strip.right, strip.bottom);
             SelectClipRgn(dc, clip);
@@ -2289,15 +2437,8 @@ public:
                 const int dw = (int)std::ceil(img->Width() * k), dh = (int)std::ceil(img->Height() * k);
                 HRGN cr = CreateRectRgnIndirect(&cell);
                 ExtSelectClipRgn(dc, cr, RGN_AND);
-                MemDC src(img->Handle());
-                const int tw = (int)std::ceil(img->Width() * RectH(cell) / (double)img->Height());  // its own width at the strip's height
-                if (RectW(cell) > tw * 3 / 2) {  // zoomed in: side by side at their own shape, not stretched
-                    const int skip = cell.left < strip.left - tw ? (strip.left - tw - cell.left) / tw * tw : 0;  // off view on the left
-                    for (int x = cell.left + skip; x < std::min((int)cell.right, (int)strip.right); x += tw)
-                        StretchBlt(dc, x, cell.top, tw, RectH(cell), src, 0, 0, img->Width(), img->Height(), SRCCOPY);
-                } else {
-                    StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
-                }
+                MemDC src(img->Handle());  // fitted: each of the 16 shows the frame at its middle
+                StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
                 SelectClipRgn(dc, clip);
                 DeleteObject(cr);
             }
@@ -3366,6 +3507,19 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        case WM_STRIP: {
+            std::unique_ptr<StripFetcher::Result> r(reinterpret_cast<StripFetcher::Result*>(l));
+            if (r->gen != stripGen) return 0;  // for frames since rebuilt
+            stripThumbs[r->frame] = r->thumb;
+            if (stripThumbs.size() > 800) {  // keep the ones on view, drop the rest
+                std::map<size_t, BitmapPtr> keep;
+                for (const auto& t : StripTiles())
+                    if (auto it = stripThumbs.find(t.frame); it != stripThumbs.end()) keep.insert(*it);
+                stripThumbs = std::move(keep);
+            }
+            Invalidate();
+            return 0;
+        }
         case WM_FRAMES: {
             std::unique_ptr<FrameTimesResult> r(reinterpret_cast<FrameTimesResult*>(l));
             framesPending.erase(r->key);
@@ -3412,7 +3566,9 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             thumbLatest->store(~0ull);  // stops a thumbnail job still running
             player.reset();
             fetcher.reset();
+            stripFetcher.reset();
             return 0;
+
         case WM_NCDESTROY: {  // after the children: they still need FieldProc to find this editor
             std::erase(g_editors, this);
             if (g_editors.empty()) ClearRenderCache();  // rendered titles and captions can be large
@@ -3833,7 +3989,9 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->tlStart = e->tframes.frames[757].t - e->TlSpan() * 0.6;
         e->ClampTimeline();
         e->RevealNote(*e->selected);
-        Pump(300);
+        Snapshot(e);  // asks for the strip's pictures
+        for (int i = 0; i < 300 && !e->StripComplete(); ++i) Pump(10);
+        Pump(100);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-timeline-zoom.png");
         {  // the magnifier at 4× over the frame number's edge, the grid and the pin
             const gp::PointF at = e->ToView(VPoint{760, 300});
@@ -4582,6 +4740,65 @@ ATHER_TEST(video_editor_timeline_zoom) {
     CHECK_NEAR(e->tlZoom, 1, 1e-9);
     // Zooming never touches the edit.
     CHECK(e->edit.speed == 1 && !e->edit.crop);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Zoomed in, every filmstrip tile shows a frame from the frames it covers (the first one starting in it), read from the
+// painted strip itself, at several zooms and pans; the pictures come in the background, painting never waits for them.
+ATHER_TEST(video_editor_filmstrip_shows_frames_under_each_tile) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 240, 0));  // 4 s
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    const RECT tr = e->TimelineRect();
+    const int stripTop = tr.top + e->LaneH(), y = stripTop + e->S(22);  // under the flags, above the ruler
+    int tilesChecked = 0, wrong = 0, maxPaint = 0;
+    std::string first;
+    for (double zoom : {2.0, 5.0, 1000.0}) {
+        e->FitTrim();
+        e->GoToFrame(100);
+        e->ZoomTimeline(zoom);
+        for (double at : {0.0, 0.5, 1.0}) {  // panned to the start, the middle and the end
+            e->tlStart = at * std::max(0.0, e->duration - e->TlSpan());
+            e->ClampTimeline();
+            const ULONGLONG t0 = GetTickCount64();
+            Snapshot(e);  // asks for the tiles' pictures
+            maxPaint = std::max(maxPaint, (int)(GetTickCount64() - t0));
+            for (int i = 0; i < 300 && !e->StripComplete(); ++i) Pump(10);
+            CHECK(e->StripComplete());
+            const auto snap = Snapshot(e);
+            const double px = e->TX(e->Now());
+            for (const auto& tile : e->StripTiles()) {
+                const double xa = std::max(e->TX(tile.t0), (double)tr.left) + 3, xb = std::min(e->TX(tile.t1), (double)tr.right) - 3;
+                if (xb - xa < 4) continue;  // hardly on view
+                double x = (xa + xb) / 2;
+                if (std::fabs(x - px) < 4) x = x < px ? px - 5 : px + 5;  // not on the playhead's line
+                if (x < xa || x > xb) continue;
+                const int n = NumberOf(snap->Bits()[(size_t)y * snap->Width() + (int)x]);
+                const bool inside = n >= 0 && n < (int)e->tframes.size() && e->tframes.frames[(size_t)n].t >= tile.t0 - 1e-6 &&
+                                    (e->tframes.frames[(size_t)n].t < tile.t1 || tile.t1 - tile.t0 < 1 / 60.0);
+                if (!inside || n != (int)tile.frame) {
+                    if (!wrong)
+                        first = "zoom " + std::to_string(zoom) + " at " + std::to_string(at) + ": tile " + std::to_string(tile.t0) + "–" + std::to_string(tile.t1) +
+                                " shows frame " + std::to_string(n) + " (wanted " + std::to_string(tile.frame) + ")";
+                    ++wrong;
+                }
+                ++tilesChecked;
+            }
+        }
+    }
+    test::Note(std::to_string(tilesChecked) + " tiles, " + std::to_string(wrong) + " wrong; " + first + "; slowest paint " + std::to_string(maxPaint) + " ms");
+    CHECK(tilesChecked >= 60);
+    CHECK_EQ(wrong, 0);
+    CHECK(maxPaint < 250);  // painting never waits for pictures
+    // At full zoom each tile covers whole frames of its own: about 6 at 14 px a frame.
+    e->ZoomTimeline(1000);
+    const auto tiles = e->StripTiles();
+    CHECK(!tiles.empty() && (tiles[0].t1 - tiles[0].t0) * 60 > 3 && (tiles[0].t1 - tiles[0].t0) * 60 < 12);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
