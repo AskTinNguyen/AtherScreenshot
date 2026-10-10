@@ -268,55 +268,76 @@ extension VideoExport {
         let vc = p.video.mutableCopy() as! AVMutableVideoComposition
         vc.frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 600)
         vc.renderSize = gifSize(p.size)
-        let reader = try AVAssetReader(asset: p.composition)
-        let vo = AVAssetReaderVideoCompositionOutput(videoTracks: p.composition.tracks(withMediaType: .video), videoSettings: nil)
-        vo.videoComposition = vc
-        vo.alwaysCopiesSampleData = false
-        reader.add(vo)
         // As many frames as the saved MP4 is long (whole frames of the sequence), like before.
         let fd = p.video.frameDuration.seconds
         let n = max(1, Int((p.composition.duration.seconds / fd).rounded(.up) * fd * fps + 1e-6))
         // ImageIO picks the palette and compresses at finalize, on one thread. So the frames go out in a few chunks,
-        // each finalized on its own as soon as its frames are in, and the chunks are joined (joinGIFs).
+        // each finalized on its own as soon as its frames are in, and the chunks are joined (joinGIFs). And they're
+        // read in two halves at once, which mostly means decoding the source twice as fast.
         let k = max(1, min(chunks ?? gifChunks(n), n))
-        probe?.note(k == 1 ? "gif 1 pass" : "gif 1 pass, \(k) chunks")
-        guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
-        var parts: [Task<Data?, Never>] = []
-        var dest: CGImageDestination?, data: CFMutableData?, chunk = -1
-        func close() {
-            guard let d = dest, let m = data else { return }
-            parts.append(Task.detached { CGImageDestinationFinalize(d) ? m as Data : nil })
-            dest = nil
-        }
-        func add(_ j: Int, _ img: CGImage, frames: Int) throws {
-            let c = j * k / n
-            if c != chunk || dest == nil {
+        let halves = n >= 24 && k >= 2 ? 2 : 1
+        probe?.note(k == 1 ? "gif 1 pass" : "gif 1 pass, \(k) chunks, \(halves) readers")
+        let edges = (0...halves).map { $0 * n / halves }
+        let reads = (0..<halves).map { h in
+            Task { () throws -> [Task<Data?, Never>] in
+                let reader = try AVAssetReader(asset: p.composition)
+                reader.timeRange = CMTimeRange(start: CMTimeMultiply(vc.frameDuration, multiplier: Int32(edges[h])),
+                                               end: h == halves - 1 ? .positiveInfinity : CMTimeMultiply(vc.frameDuration, multiplier: Int32(edges[h + 1])))
+                let vo = AVAssetReaderVideoCompositionOutput(videoTracks: p.composition.tracks(withMediaType: .video), videoSettings: nil)
+                vo.videoComposition = vc
+                vo.alwaysCopiesSampleData = false
+                reader.add(vo)
+                defer { reader.cancelReading() }
+                guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+                var parts: [Task<Data?, Never>] = []
+                var dest: CGImageDestination?, data: CFMutableData?, chunk = -1
+                func close() {
+                    guard let d = dest, let m = data else { return }
+                    parts.append(Task.detached { CGImageDestinationFinalize(d) ? m as Data : nil })
+                    dest = nil
+                }
+                func add(_ j: Int, _ img: CGImage, frames: Int) throws {
+                    let c = j * k / n
+                    if c != chunk || dest == nil {
+                        close()
+                        chunk = c
+                        let m = CFDataCreateMutable(nil, 0)!
+                        // At most the frames j with j * k / n == c, in this half.
+                        let count = min((c + 1) * n + k - 1, edges[h + 1] * k + k - 1) / k - max(c * n + k - 1, edges[h] * k + k - 1) / k
+                        guard let d = CGImageDestinationCreateWithData(m, UTType.gif.identifier as CFString, max(1, count), nil) else { throw Failure.failed("Can't write the GIF.") }
+                        CGImageDestinationSetProperties(d, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+                        (dest, data) = (d, m)
+                    }
+                    CGImageDestinationAddImage(dest!, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
+                }
+                // Each frame shows until the next one; a frame the compositor skipped (nothing new) lengthens the one
+                // before, and the first one of a half covers its start.
+                var pending: (Int, CGImage)?
+                while let s = vo.copyNextSampleBuffer() {
+                    try Task.checkCancellation()
+                    guard let pb = CMSampleBufferGetImageBuffer(s), let img = cgImage(pb) else { continue }
+                    let i = max(edges[h], Int((CMSampleBufferGetPresentationTimeStamp(s).seconds * fps).rounded()))
+                    guard i < edges[h + 1] else { break }
+                    if let (j, prev) = pending {
+                        guard i > j else { pending = (j, img); continue }
+                        try add(j, prev, frames: i - j)
+                    }
+                    probe?.frame(i, img)
+                    pending = (pending == nil ? edges[h] : i, img)
+                }
+                if reader.status == .failed { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+                if let (j, prev) = pending { try add(j, prev, frames: max(1, edges[h + 1] - j)) }
                 close()
-                chunk = c
-                let m = CFDataCreateMutable(nil, 0)!
-                guard let d = CGImageDestinationCreateWithData(m, UTType.gif.identifier as CFString, ((c + 1) * n + k - 1) / k - (c * n + k - 1) / k, nil) else { throw Failure.failed("Can't write the GIF.") }
-                CGImageDestinationSetProperties(d, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-                (dest, data) = (d, m)
+                return parts
             }
-            CGImageDestinationAddImage(dest!, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
         }
-        // Each frame shows until the next one; a frame the compositor skipped (nothing new) lengthens the one before.
-        var pending: (Int, CGImage)?
-        while let s = vo.copyNextSampleBuffer() {
-            try Task.checkCancellation()
-            guard let pb = CMSampleBufferGetImageBuffer(s), let img = cgImage(pb) else { continue }
-            let i = Int((CMSampleBufferGetPresentationTimeStamp(s).seconds * fps).rounded())
-            guard i < n else { break }
-            if let (j, prev) = pending {
-                guard i > j else { pending = (j, img); continue }
-                try add(j, prev, frames: i - j)
-            }
-            probe?.frame(i, img)
-            pending = (i, img)
+        var parts: [Task<Data?, Never>] = []
+        do {
+            for r in reads { parts += try await r.value }
+        } catch {
+            for r in reads { r.cancel() }
+            throw error
         }
-        if reader.status == .failed { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
-        if let (j, prev) = pending { try add(j, prev, frames: max(1, n - j)) }
-        close()
         let t0 = Date()
         var done: [Data] = []
         for t in parts {
