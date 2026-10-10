@@ -38,3 +38,13 @@ The owner is away (L-2), so this review stands in for the owner's calls.
 **A8 (README and RELEASE_NOTES):** passes. They cover stepping, the readout, J/K/L, both zooms, notes, the sidecar, Copy, the review video and its two side files, the shortcuts (including the Ctrl+Alt+S precedence), and Windows-only status.
 
 **F-1:** accepted as the worker built it. In the video editor, Ctrl+Alt+S saves the review video and wins over the global scrolling-capture hotkey while the editor is in front. Everywhere else it stays scrolling capture. Recorded as D13.
+
+## R-2 (2026-10-10 13:55) | orchestrator review at c60e406 | -> rev unchanged
+
+**Checks:** `test.bat` in the worktree, run by the orchestrator: `97 tests, 1463 checks, 0 failed`.
+
+**A13 image 3 (redone), and image 4:** pass.
+- The filmstrip tiles read 663, 672, 680, 688, 696, 705, 713, 721, 730, 738, 746 and 755, increasing, each over its own ticks (665 … 755). The "680" tile starts at tick 680, and "755" sits at the end.
+- Notes, the playhead and the readout (0:12:37 · frame 757) are still right.
+
+**A13 passes review:** all seven images, at R-1 and R-2. With A1–A12 met in `progress.md`, the intent is complete pending the owner's merge of #1 and #2.
