@@ -124,9 +124,9 @@ enum VideoExport {
         if s.status != .completed { throw Failure.failed(s.error?.localizedDescription ?? "Export failed.") }
     }
 
-    static func mp4(_ e: VideoEdit, to url: URL) async throws {
+    static func mp4(_ e: VideoEdit, to url: URL, encoders: Int? = nil) async throws {
         let p = try await prepare(e)
-        try await write(p, speed: e.speed, to: url)
+        try await write(p, speed: e.speed, encoders: encoders, to: url)
     }
 
     // Speech in the trimmed range, as caption-sized chunks. On device when the Mac supports it.
