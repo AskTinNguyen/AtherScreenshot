@@ -1,6 +1,6 @@
 # Frame Review: Step 60 fps Video Frame by Frame, Leave Notes, Export a Review Video
 
-- Rev: 1
+- Rev: 2
 - Status: active
 - Area: Video
 - Owner: Tin Nguyen
@@ -57,6 +57,29 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
   - at each note, the video **holds the noted frame for 3 s**, showing a note card (author, timecode and frame, text, a pin at the note's point), then plays on;
   - silence during the hold.
   - It is saved next to a `.md` list of the notes, as `<name> review.mp4` and `<name> review notes.md`.
+- **D7 (rev 2): no waiting on the owner.** The owner is away and said not to stop for permission (L-2). D1–D6 are accepted as written.
+  - The worker makes any further owner-level call itself: wording, look, or a detail the spec leaves open. It picks the option that best fits the app's existing style, and records it in `progress.md` under "Owner-level calls", with the options it considered.
+  - Findings are still written for anything that changes the intent, but none is `blocking` unless continuing would be destructive, a release, or a security or credential matter.
+  - Merge authority is unchanged (none): the PR is left ready, and the owner merges.
+- **D8 (rev 2): tools.** Dev-only tools may be installed if they help verify or build, for example an image-diff helper or a Python package used by a test script. Each one is recorded in `progress.md` with why. Nothing is added to the app's own build or dependencies.
+- **D9 (rev 2): timeline zoom.**
+  - Ctrl+wheel over the timeline, or Ctrl+= and Ctrl+−, zooms around the playhead, down to about 14 px per frame. Ctrl+0 fits the whole trim.
+  - When zoomed in, the timeline draws a tick per frame and labels frame numbers at a readable interval. Dragging the empty timeline, or the wheel, pans.
+  - Notes, captions and markup bars stay on their frames at every zoom.
+- **D10 (rev 2): pixel magnifier.** The preview can zoom for inspecting detail:
+  - the wheel over the video zooms 1× to 8× around the cursor;
+  - right-drag pans;
+  - F (or a double-click) goes back to fit;
+  - from 2× up, pixels are drawn sharp (nearest neighbour), and a small "4×" label shows the zoom.
+  - It's for viewing only: it never changes the crop or the export.
+- **D11 (rev 2): note kinds and status.**
+  - Each note has a kind: **Note** (lime, the default), **Issue** (red), **Question** (blue) or **Looks good** (green). Use the editor's existing palette colors.
+  - Each note has a **Resolved** toggle. The notes list can show All or only Open notes.
+  - Kind and status are saved in the sidecar, and appear on the note card, in the `.md` list, on the contact sheet and as the tick color on the timeline.
+  - The review video includes resolved notes, marked "Resolved", so the other team sees the whole history.
+- **D12 (rev 2): review extras.**
+  - The review video opens with a 3 s summary card: the video's name, the date, reviewers, counts by kind, and the notes with their timecodes, up to as many as fit.
+  - Save review video also writes `<name> review sheet.png`: a contact sheet with one tile per note. Each tile has the noted frame (with its pin), the timecode and frame number, the kind, the author and the text. It is readable when posted in a chat.
 
 ## Acceptance
 
@@ -87,6 +110,31 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
   - Proof: `gate: test.bat` (an export of a generated clip with notes checks duration, held frames, card pixels and burn-in via `g_exportTap`, and that plain-Save frame hashes are unchanged). A `snapshot` of a note card frame.
 - **A7: notes list.** The `.md` list has one line per note: `m:ss:ff (frame n), Author: text`. A "Copy notes" button puts the same text on the clipboard.
   - Proof: `gate: test.bat`.
+- **A9: timeline zoom (D9).**
+  - Zooming keeps the playhead's frame under the same spot.
+  - At full zoom, each frame has its own tick, and clicking a tick lands on that frame.
+  - Ctrl+0 fits the trim.
+  - Notes, captions and bars stay aligned with their frames.
+  - Proof: `gate: test.bat` (pixel-to-frame and frame-to-pixel round trip at several zooms, and clicking a tick lands on its frame), plus a `snapshot` of the zoomed-in timeline with frame ticks and a note tick.
+- **A10: pixel magnifier (D10).**
+  - The zoom stays centered on the cursor.
+  - At 2× and above, pixels are sharp: a 1-pixel checkerboard in a test clip shows as hard-edged blocks.
+  - F resets the zoom.
+  - Crop and export are unchanged.
+  - Proof: `gate: test.bat` (view math, nearest-neighbour pixels, and `VideoEdit` unchanged), plus a `snapshot` at 4×.
+- **A11: note kinds and status (D11).**
+  - Kind and resolved status can be set, can be undone, are saved in the sidecar and are filtered in the list.
+  - They are colored on the timeline, the card, the `.md` list and the sheet.
+  - Proof: `gate: test.bat`, plus a `snapshot` of the notes list showing all four kinds and a resolved note.
+- **A12: review extras (D12).**
+  - The review video starts with the 3 s summary card, and its length matches.
+  - The contact sheet PNG has one tile per note, in timeline order, with the right frame in each tile: its pixels match that frame from the video, scaled.
+  - Proof: `gate: test.bat`, plus a `snapshot` of the summary card and the contact sheet.
+- **A13: visual proof of the whole flow.**
+  - The worker renders the new UI the way people see it: the editor with a 60 fps clip, the readout, the zoomed timeline with notes of several kinds, the notes list, the magnifier at 4×, a note card frame from the review video, and the contact sheet.
+  - It opens each image itself, checks it (text readable, nothing clipped, colors right), fixes what's wrong, and lists every image path in `progress.md`.
+  - The orchestrator then reviews the same images.
+  - Proof: `review`, recorded as a step with the image paths and the orchestrator's verdict in `log.md`.
 - **A8: docs.**
   - README's Video editor guide covers stepping, the readout, review playback, notes and the review video, and the shortcut list is updated.
   - `RELEASE_NOTES.md` gets a line under the next update.
@@ -109,3 +157,9 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
 ## Changelog
 
 - rev 1 (2026-10-10): created from L-1, with the orchestrator's proposed feature set (D1–D6, A1–A8) for the owner to review.
+- rev 2 (2026-10-10): from L-2 (owner away 8 h, full autonomy):
+  - D1–D6 accepted.
+  - D7: owner-level calls are made and recorded, not waited on.
+  - D8: dev tools allowed, if recorded.
+  - D9–D12 and A9–A13: timeline zoom, pixel magnifier, note kinds and status, a summary card and contact sheet, and visual proof of the whole flow.
+  - Merge stays with the owner.
