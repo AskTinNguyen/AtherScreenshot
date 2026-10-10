@@ -6,20 +6,23 @@ import VideoToolbox
 // Saving an MP4: the composition is read back through the frame renderer (AVAssetReaderVideoCompositionOutput) and
 // written with AVAssetWriter, so the encoder settings, the sound and the pieces are ours to choose.
 extension VideoExport {
-    // H.264 High at a constant quality: about the size and quality the HighestQuality preset gave, and faster.
+    // HEVC at a constant quality, encoder told to favour speed: on Apple silicon it encodes ~1.6x faster than H.264
+    // did, the frames are as close to what was rendered as the old HighestQuality H.264 files, and the files are
+    // ~25% smaller. (H.264 tops out at ~190 fps at 3K on an M4 Max's media engine.)
     // No B-frames, so every frame decodes in order and pieces join without edits between them.
     static func videoSettings(_ size: CGSize, fps: Double) -> [String: Any] {
-        [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: Int(size.width), AVVideoHeightKey: Int(size.height),
+        [AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: Int(size.width), AVVideoHeightKey: Int(size.height),
          AVVideoColorPropertiesKey: [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                                      AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2],
-         AVVideoCompressionPropertiesKey: [AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+         AVVideoCompressionPropertiesKey: [AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel as String,
                                            kVTCompressionPropertyKey_Quality as String: 0.85,
+                                           kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String: true,
                                            AVVideoAllowFrameReorderingKey: false,   // see writePieces
                                            AVVideoExpectedSourceFrameRateKey: fps] as [String: Any]]
     }
 
-    // How many encoders work on one MP4 at once: the media engine runs two H.264 sessions faster than one
-    // (M4 Max, 3K: +4%, 1080p: +17%); a third adds nothing. Under ~5 s, splitting and joining cost what it saves.
+    // How many encoders work on one MP4 at once: two HEVC sessions beat one (M4 Max: 1.25x over all the bench's
+    // exports); a third is slower. Under ~5 s, splitting and joining cost what it saves.
     static func encoders(for seconds: Double) -> Int {
         if let v = ProcessInfo.processInfo.environment["ATHER_ENCODERS"], let n = Int(v) { return max(1, n) }   // the bench
         return seconds >= 5 ? 2 : 1

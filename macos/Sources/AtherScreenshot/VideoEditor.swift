@@ -93,8 +93,8 @@ enum VideoExport {
         let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
         let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), speed: e.speed, muted: e.muted,
                                               box: RendererBox(renderer))
-        // Like the HighestQuality preset did: at most H.264 level 5.1's macroblock rate, so 3K at 60 fps saves at 30
-        // (1440p60 stays 60). Smoother would mean twice the frames to encode, and files fewer players can decode.
+        // The frame rates the HighestQuality preset saved at: at most H.264 level 5.1's macroblock rate, so 3K at 60 fps
+        // saves at 30 (1440p60 stays 60). Smoother would mean twice the frames to encode and much bigger files.
         let blocks = ceil(renderer.out.width / 16) * ceil(renderer.out.height / 16)
         let k = Int32(max(1, ceil(blocks / b.video.frameDuration.seconds / 983_040 - 1e-9)))
         if k > 1 { b.video.frameDuration = CMTimeMultiply(b.video.frameDuration, multiplier: k) }
