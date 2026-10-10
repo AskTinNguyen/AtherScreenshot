@@ -1,10 +1,10 @@
 {
     "windows":  {
-                    "version":  "0.0.2.2",
+                    "version":  "0.0.2.3",
                     "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "a3677942ea90eb7e2e08a90ca5560e4ba0cb2abc67d1a8635e609ecccee2687d",
-                    "size":  3140096,
-                    "notes":  "Saving videos is about 36 times faster."
+                    "sha256":  "1d67995e8d711f66df278a1d0a642353b0ad8c486d388998577f951acb197b7e",
+                    "size":  3550208,
+                    "notes":  "Review recordings frame by frame: exact 60 fps stepping, notes on frames, and a review video for other teams."
                 },
     "macos":  {
                   "version":  "0.0.2.1",
