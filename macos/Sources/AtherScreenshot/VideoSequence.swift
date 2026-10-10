@@ -332,6 +332,7 @@ final class SequenceCompositor: NSObject, AVVideoCompositing {
             ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: ins.frame))
         let img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
         SequenceCompositor.context.render(img, to: out, bounds: CGRect(origin: .zero, size: size), colorSpace: space)
+        if let p = VideoExport.probe { p.frame(Int((req.compositionTime.seconds / req.renderContext.videoComposition.frameDuration.seconds).rounded()), out) }
         req.finish(withComposedVideoFrame: out)
     }
 }

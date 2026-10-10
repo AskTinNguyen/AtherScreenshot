@@ -67,6 +67,21 @@ enum VideoExport {
         }
     }
 
+    // Developer hooks for the bench (VideoBench.swift): sees every frame an export renders, and notes how it ran.
+    final class Probe {
+        private let lock = NSLock()
+        private(set) var frames = 0
+        private(set) var notes: [String] = []
+        // Output frame index and the rendered frame (a CVPixelBuffer or a CGImage). Called from any thread.
+        var tap: ((Int, AnyObject) -> Void)?
+        func frame(_ index: Int, _ img: @autoclosure () -> AnyObject) {
+            lock.lock(); frames += 1; lock.unlock()
+            tap?(index, img())
+        }
+        func note(_ s: String) { lock.lock(); notes.append(s); lock.unlock() }
+    }
+    nonisolated(unsafe) static var probe: Probe?
+
     struct Prepared {
         let composition: AVMutableComposition
         let video: AVMutableVideoComposition
@@ -112,6 +127,7 @@ enum VideoExport {
         s.outputURL = url
         s.outputFileType = .mp4
         s.shouldOptimizeForNetworkUse = true
+        probe?.note("session HighestQuality")
         try await run(s)
     }
 
@@ -119,6 +135,10 @@ enum VideoExport {
     static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: tmp) }
+        let gifProbe = probe
+        probe = nil   // the bench taps the GIF's frames, not the MP4's
+        defer { probe = gifProbe }
+        gifProbe?.note("gif via mp4 + image generator")
         try await mp4(e, to: tmp)
         let src = AVURLAsset(url: tmp)
         let duration = try await src.load(.duration).seconds
@@ -133,6 +153,7 @@ enum VideoExport {
         let frame = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 1 / fps]] as CFDictionary
         for i in 0..<n {
             let img = try await gen.image(at: CMTime(seconds: Double(i) / fps, preferredTimescale: 600)).image
+            gifProbe?.frame(i, img)
             CGImageDestinationAddImage(dest, img, frame)
         }
         guard CGImageDestinationFinalize(dest) else { throw Failure.failed("Can't write the GIF.") }

@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if args.first == "--write-iconset", args.count >= 2 {
             exit(Logo.writeIconset(URL(fileURLWithPath: args[1])) ? 0 : 1)
         }
+        if args.first == "--bench-export" || args.first == "--bench-compare" { exit(VideoBench.main(args)) }
         if args.first == "--help" || args.first == "-h" {
             print("""
             Ather Screenshot \(version)
