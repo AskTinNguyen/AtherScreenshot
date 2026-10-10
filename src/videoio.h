@@ -19,6 +19,7 @@ public:
     VideoFrame() = default;
     explicit VideoFrame(BitmapPtr bgra);
     BitmapPtr Bgra() const;  // null when out of memory
+    bool HasPicture() const;  // false for a frame read without its picture (see VideoReader::ReadFrame's `skipTo`)
     explicit operator bool() const { return s_ != nullptr; }
     bool operator==(const VideoFrame& o) const { return s_ == o.s_; }
 
@@ -66,6 +67,9 @@ struct Sequence {
 std::optional<Clip> ClipOf(const std::wstring& path);
 // The edit's clips in its frame, or the whole `source` file when the edit has no clips.
 Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
+// The time of every frame of a file's video in order (source seconds; decoding gives the frames these same times),
+// read from the file without decoding it. Empty when they can't be read.
+std::vector<double> FrameTimes(const std::wstring& path);
 
 // Reads a sequence like one video: frames in order with timeline times (Fit puts one into the sequence frame).
 class SequenceReader {
@@ -114,6 +118,19 @@ using ExportProgress = std::function<bool(double)>;
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress = {});
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps = 12,
                ExportProgress progress = {});
+// "Save review video": the edit as an MP4 with `plan`'s summary card, burn-in and held note frames (silent while
+// held). One encoder; the frames go through the same frame renderer as Save's. A plain Save never comes here.
+bool ExportReviewMp4(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& out, std::wstring* error,
+                     ExportProgress progress = {});
+// Each note's frame as the review video shows it (the edit's frame, without the burn-in and card), with its pin.
+std::vector<BitmapPtr> NoteFrames(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan);
+// The review's contact sheet ("<video> review sheet.png"): a header (title, date, reviewers, count), then one tile per
+// note in timeline order: its frame (NoteFrames, scaled), the kind in its color, timecode and frame number, the text and
+// the author. Two tiles a row, made to read well when posted in a chat. `pictures`: where each tile's frame went.
+BitmapPtr ContactSheet(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, std::vector<RECT>* pictures = nullptr);
+bool WriteContactSheet(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& path);
+
+
 
 // Developer tool (--bench-export): when set, sees every frame an export encodes, in order, before encoding.
 extern std::function<void(int index, const Bitmap& frame)> g_exportTap;

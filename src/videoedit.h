@@ -93,6 +93,39 @@ struct Caption {
     bool operator==(const Caption&) const = default;
 };
 
+// A reviewer's note on one frame of a file (or a range of frames), kept next to that file (videoeditor.cpp's sidecar,
+// "<video>.notes.json"). It's tied to the footage, not the edit: it stays put when clips are cut or moved, and shows
+// wherever its frame is on the timeline. Never part of a plain Save.
+enum class NoteKind { Note, Issue, Question, Good };
+constexpr int kNoteKinds = 4;
+const wchar_t* NoteKindLabel(NoteKind k);  // "Note", "Issue", "Question", "Looks good"
+const char* NoteKindKey(NoteKind k);       // as saved: "note", "issue", "question", "good"
+NoteKind NoteKindOf(const std::string& key);  // anything unknown is a Note
+int NoteKindColor(NoteKind k);             // the editor palette (annot): lime, red, blue, green
+
+struct Note {
+    uint64_t id = NewItemId();
+    std::wstring path;              // the file it's on
+    double src = 0;                 // the noted frame's own time in that file
+    std::optional<double> srcEnd;   // a range: its last frame's time
+    std::wstring text, author;
+    NoteKind kind = NoteKind::Note;
+    bool resolved = false;
+    std::optional<VPoint> pin;      // a spot on the picture: fractions of the file's upright frame
+    int64_t created = 0;            // seconds since 1970 (UTC)
+    bool operator==(const Note&) const = default;
+};
+
+// The notes kept with a video: "<video file name>.notes.json" next to it (UTF-8 JSON, one entry per note with its
+// frame number and time in the file, kind, status, author, text, pin and when it was made), for the editor and for
+// other tools. `times`: the file's frame times (FrameTimes), for frame numbers; when empty, a grid at `fps`.
+std::wstring NotesPath(const std::wstring& video);
+std::string NotesJson(const std::wstring& video, std::vector<Note> notes, const std::vector<double>& times, double fps);
+// A sidecar's notes, on `video`; false when the text isn't one (damaged). A note without a time is placed by its frame.
+bool ParseNotes(const std::string& json, const std::wstring& video, const std::vector<double>& times, double fps, std::vector<Note>* out);
+// The order notes are kept and compared in: by frame, then as made.
+void SortNotes(std::vector<Note>& notes);
+
 // One video of the sequence: the stretch [in, out) of a file, in that file's seconds. Clips play back to back;
 // each is fitted into the sequence frame (black bars when the shape differs).
 struct Clip {
@@ -128,6 +161,7 @@ struct VideoEdit {
     CaptionLook captionLook = CaptionLook::Pill;
     AnimStyle captionStyle = AnimStyle::Auto;
     bool highlightWords = true;
+    std::vector<Note> notes;  // of every file the editor has open, also ones whose footage isn't in the clips now
 
     static constexpr double kSpeeds[] = {0.5, 1, 1.5, 2, 4};
     static constexpr double kCaptionScale[] = {0.03, 0.037, 0.045, 0.055, 0.068};
@@ -150,6 +184,40 @@ struct Motion {
     // Entrance and exit of one item at time `t`. Each style has one tuned duration.
     static Motion Between(AnimStyle in, AnimStyle out, double start, double end, double t, int chars, double height);
 };
+
+// ---- frames ----
+
+// Every frame of the timeline in order: where it shows (timeline seconds), its clip, and its time in that clip's file.
+// Made from each file's frame times (FrameTimes in videoio.h), or a grid at the clip's rate for a file whose times
+// aren't known (yet). The frames are the ones SequenceReader gives: for each clip, the frame on screen at its in point
+// (from the clip's start), then the ones before its out point. Frame n counts from the timeline's start.
+struct TimelineFrames {
+    struct Frame {
+        double t = 0, src = 0;
+        uint32_t clip = 0;
+    };
+    std::vector<Frame> frames;
+    std::vector<double> fps;         // each clip's rate (30 when the file doesn't say)
+    std::vector<size_t> clipFirst;   // clip i's frames are [clipFirst[i], clipFirst[i + 1])
+
+    // `times`: a file's frame times, or null when they aren't known.
+    static TimelineFrames Of(const std::vector<Clip>& clips, const std::function<const std::vector<double>*(const Clip&)>& times);
+    bool empty() const { return frames.empty(); }
+    size_t size() const { return frames.size(); }
+    size_t Nearest(double t) const;  // the frame closest to timeline time `t` (what the paused editor shows there)
+    size_t At(double t) const;       // the frame on screen at `t`: the last one starting at or before it
+    double Fps(size_t n) const;      // the rate of frame n's clip
+    std::wstring Timecode(size_t n) const;  // m:ss:ff, frames within the second at the clip's rate
+    std::wstring Readout(size_t n) const;   // "0:12:37 · frame 757 · 60 fps"
+    // Go to: a frame number ("757"), a timecode ("0:12:37", "1:02:03:04" with hours) or a time ("12.6", "0:12.6").
+    std::optional<size_t> Find(const std::wstring& text) const;
+};
+// The timeline frame showing a file's frame at source time `src`: in the first clip of that file whose frames
+// include it (within half a frame). None when that footage isn't on the timeline.
+std::optional<size_t> FrameOfSource(const TimelineFrames& tf, const std::vector<Clip>& clips, const std::wstring& path, double src);
+std::wstring Timecode(double t, double fps);  // m:ss:ff
+std::wstring FpsLabel(double fps);            // "60 fps", "29.97 fps"
+std::vector<double> FrameGrid(double length, double fps);  // k / fps for every frame starting before `length`
 
 // Replaces the clips and moves everything on the timeline with the clip it sits in: marks and captions keep
 // their place in the footage, items in a removed clip (or a cut-off part of one) go, and the trim follows.
@@ -222,6 +290,38 @@ private:
     bool preview_;
     double unit_;
 };
+
+// ---- the review video ----
+
+// A note as the review video shows it.
+struct ReviewNote {
+    double t = 0;       // timeline time of the noted frame (that frame's own time)
+    size_t frame = 0;   // its timeline frame number
+    std::wstring timecode;  // m:ss:ff
+    NoteKind kind = NoteKind::Note;
+    bool resolved = false;
+    std::wstring author, text;
+    std::optional<VPoint> pin;  // in output pixels
+};
+
+// What "Save review video" adds to an edit: a summary card first, a burn-in of the timecode and frame number on every
+// frame, and at each note the noted frame held under its note card (silent), then on.
+struct ReviewPlan {
+    std::vector<ReviewNote> notes;  // in timeline order, within the trim
+    double intro = 3;               // seconds of the summary card
+    double hold = 3;                // seconds each note holds
+    TimelineFrames frames;          // of the edit's clips: for the burn-in's numbers
+    std::wstring title, date;       // the summary card's
+    std::vector<std::wstring> reviewers;
+};
+std::wstring BurnInText(const TimelineFrames& tf, size_t n);  // "0:12:37 · frame 757"
+// Draw onto an opaque output frame (all scaled to its height); each returns where it drew.
+RECT DrawBurnIn(Bitmap& frame, const std::wstring& text);  // top left, on an opaque box
+RECT DrawNoteCard(Bitmap& frame, const ReviewNote& n);      // the card, and the pin
+void DrawNotePin(Bitmap& frame, const ReviewNote& n);       // just the pin
+BitmapPtr SummaryCard(SIZE size, const ReviewPlan& plan);
+// The kind's line on cards and lists: "Issue", "Issue · Resolved".
+std::wstring NoteKindLine(NoteKind k, bool resolved);
 
 // ---- pixel helpers shared with the video window ----
 

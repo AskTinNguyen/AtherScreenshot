@@ -283,6 +283,11 @@ void ShowHotkeyErrors() {
 void ApplyEditorDefaults() {
     SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile});
     SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
+    SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
+        g_settings.noteAuthor = name;
+        g_settings.WriteString(L"VideoEditor", L"NoteAuthor", name);
+    });
+
     SetFileNameTemplate(g_settings.fileNameTemplate);
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);
@@ -1253,7 +1258,11 @@ void ShowTrayMenu() {
 
 LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-        case WM_HOTKEY: Execute((int)w, false); return 0;
+        case WM_HOTKEY:
+            if (VideoEditorHotkey(LOWORD(l), HIWORD(l))) return 0;  // Ctrl+Alt+S in a video editor: Save review video
+            Execute((int)w, false);
+            return 0;
+
         case WM_APP_RUN: {
             auto* fn = reinterpret_cast<std::function<void()>*>(l);
             (*fn)();

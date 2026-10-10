@@ -49,6 +49,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
+| 🔍 **Review video** | Step 60 fps recordings frame by frame, leave notes on exact frames, and save a review video with the notes in it for another team (Windows) |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3) |
@@ -173,13 +174,26 @@ Opening a video (from the gallery, the "Recording saved" notification, Open rece
 - **Captions ▾** sets captions for the whole video: look (pill, outline or bar), animation, size (five steps), text color, box or outline color, and highlighting the spoken word (auto captions). The same style controls show when a caption is selected.
 - **Placing captions:** drag a caption on the video to place it anywhere; Top, Middle and Bottom snap it back to a preset.
 - **Preview:** the preview and the export use the same frame renderer, so what you see is what's saved. While paused, the selected item is shown fully rather than mid-animation, so a new caption is visible at the playhead.
+- **Frame by frame (for reviewing recordings, 60 fps too):**
+  - ←/→ step exactly one frame at the clip's own rate (each frame's own time, read from the file), and show that very frame; Shift+←/→ a second; Home/End the first and last frames of the trim.
+  - The readout under the video shows the frame on screen as `0:12:37 · frame 757 · 60 fps` (minutes, seconds and the frame within the second, then the frame number from the start). Ctrl+G (or a click on the readout) goes to a frame number, a timecode or a time.
+  - J/K/L: L plays, L again cycles the preview speed 0.25× → 0.5× → 1×; J plays backward; K pauses. Slow and backward playback show every frame in turn. The preview speed never changes the edit or what Save writes.
+  - Ctrl+wheel over the timeline (or Ctrl+= and Ctrl+−) zooms in around the playhead, down to a tick per frame with frame numbers; the wheel or dragging an empty lane pans; Ctrl+0 fits the trim.
+  - The wheel over the video magnifies it 1×–8× around the cursor, with sharp pixels from 2×; right-drag pans; F or a double-click fits it again. It's only for looking: crop and export don't change.
+- **Review notes:**
+  - M (or Add ▾ › Review note) adds a note on the frame on screen. Type its text; pick its kind: Note, Issue, Question or Looks good; mark it Resolved; click the video to pin the spot it's about; "Range to here" makes it run to the frame at the playhead.
+  - Notes show as colored flags on the timeline and in a list beside the video (All or only Open notes); click one, or press [ and ], to go to its frame. Undo covers them.
+  - Your name on notes is Windows' display name until you type another in a note's "by" field; it's remembered.
+  - Notes are kept next to the video as you go, in `<video file name>.notes.json` (plain JSON other tools can read), so they're there next time you open it, also when the video is joined with others or trimmed. The video itself is never changed, and notes are never part of Save.
+  - **Copy** in the notes list copies them as text, one line each: `0:12:37 (frame 757), Tin: [Issue] Muzzle flash missing`.
+- **Review video:** Save ▾ › **Save review video** (`Ctrl+Alt+S`) writes `<video> review.mp4` for the other team: a 3-second summary card, then your edit with the timecode and frame number in the corner, and at each note its frame held for 3 seconds (silent) under a card with the note, its kind, author and frame, and its pin. Next to it come `<video> review notes.md` (the same lines as Copy) and `<video> review sheet.png`, a contact sheet with one picture per note to post in a chat.
 - **Saving:**
   - **Save** (`Ctrl+S`) writes a new MP4 (H.264 + AAC).
   - **Save GIF** (`Ctrl+Shift+S`) writes a GIF (12 fps, at most 960 px).
   - Saving is quick: the video is decoded on the graphics card, frames are drawn on all cores (only the parts your edits change), and longer videos are encoded in two or three pieces at once and joined.
   - The original stays untouched, and the result stacks with it in the gallery.
 
-Space plays, ←/→ step a frame (`Shift`: a second), `Del` deletes the selected item, `Ctrl+Z` undoes, `Esc` leaves crop, then deselects, then closes.
+Space plays, ←/→ step a frame (`Shift`: a second), `Home`/`End` go to the trim's ends, `J`/`K`/`L` play backward, pause and play forward (again: 0.25×, 0.5×, 1×), `Ctrl+G` goes to a frame or time, `M` adds a note, `[`/`]` go to the previous and next note, `Ctrl+wheel` or `Ctrl+=`/`Ctrl+−` zoom the timeline (`Ctrl+0` fits the trim), the wheel over the video magnifies it (`F` fits), `Del` deletes the selected item, `Ctrl+Z` undoes, `Ctrl+S` saves, `Ctrl+Shift+S` saves a GIF, `Ctrl+Alt+S` saves a review video (in the editor it wins over the scrolling-capture shortcut), `Esc` leaves crop, then deselects, then closes.
 
 ### Capture gallery
 
@@ -289,6 +303,7 @@ How the Windows app differs from the Mac app:
   - Auto captions use Windows speech recognition (SAPI dictation), on this PC.
   - The emoji field uses Win+. for the full picker.
   - The selected item shows fully while paused (the Mac version shows its first, faded frame).
+  - Frame review (exact frame stepping, the frame readout, J/K/L, timeline zoom, the magnifier, review notes and the review video) is on Windows only for now.
 - **Recording:**
   - System audio and microphone are mixed into one AAC track (two tracks on the Mac).
   - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.

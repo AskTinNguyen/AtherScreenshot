@@ -3,14 +3,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
+
 #include <emmintrin.h>
 #include <format>
 #include <mutex>
 #include <unordered_map>
 
 #include "annot.h"
+#include "json.h"
 #include "selftest.h"
+
 #include "textdraw.h"
 
 namespace ather {
@@ -305,6 +310,278 @@ void ApplyClips(VideoEdit& e, std::vector<Clip> clips) {
     e.trimEnd = wholeEnd || !te.t ? newTotal : std::min(newTotal, *te.t + (te.side ? 0 : 1e-6));  // looked up just before itself
     if (e.trimEnd - e.trimStart < 0.1) e.trimStart = 0, e.trimEnd = newTotal;
     e.clips = std::move(clips);
+}
+
+// ---------- notes ----------
+
+const wchar_t* NoteKindLabel(NoteKind k) {
+    switch (k) {
+        case NoteKind::Issue: return L"Issue";
+        case NoteKind::Question: return L"Question";
+        case NoteKind::Good: return L"Looks good";
+        default: return L"Note";
+    }
+}
+
+const char* NoteKindKey(NoteKind k) {
+    switch (k) {
+        case NoteKind::Issue: return "issue";
+        case NoteKind::Question: return "question";
+        case NoteKind::Good: return "good";
+        default: return "note";
+    }
+}
+
+NoteKind NoteKindOf(const std::string& key) {
+    for (int i = 0; i < kNoteKinds; ++i)
+        if (key == NoteKindKey((NoteKind)i)) return (NoteKind)i;
+    return NoteKind::Note;
+}
+
+std::wstring NotesPath(const std::wstring& video) { return video + L".notes.json"; }
+
+void SortNotes(std::vector<Note>& notes) {
+    std::stable_sort(notes.begin(), notes.end(), [](const Note& a, const Note& b) { return a.src != b.src ? a.src < b.src : a.created < b.created; });
+}
+
+namespace {
+// The frame number in the file of the frame at `src`: the nearest of its frame times, or on a grid at `fps`.
+int64_t FileFrame(double src, const std::vector<double>& times, double fps) {
+    if (times.empty()) return std::llround(src * (fps > 0 ? fps : 30));
+    const auto it = std::lower_bound(times.begin(), times.end(), src);
+    size_t k = (size_t)(it - times.begin());
+    if (k == times.size() || (k > 0 && src - times[k - 1] < times[k] - src)) --k;
+    return (int64_t)k;
+}
+double FileTime(int64_t frame, const std::vector<double>& times, double fps) {
+    if (!times.empty()) return times[(size_t)std::clamp<int64_t>(frame, 0, (int64_t)times.size() - 1)];
+    return frame / (fps > 0 ? fps : 30);
+}
+std::string IsoTime(int64_t t) {
+    tm u{};
+    const time_t tt = (time_t)t;
+    if (gmtime_s(&u, &tt)) return "";
+    return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec);
+}
+int64_t FromIsoTime(const std::string& s) {
+    tm u{};
+    if (sscanf_s(s.c_str(), "%d-%d-%dT%d:%d:%d", &u.tm_year, &u.tm_mon, &u.tm_mday, &u.tm_hour, &u.tm_min, &u.tm_sec) != 6) return 0;
+    u.tm_year -= 1900;
+    u.tm_mon -= 1;
+    const time_t t = _mkgmtime(&u);
+    return t < 0 ? 0 : (int64_t)t;
+}
+}  // namespace
+
+std::string NotesJson(const std::wstring& video, std::vector<Note> notes, const std::vector<double>& times, double fps) {
+    SortNotes(notes);
+    const size_t slash = video.find_last_of(L"\\/");
+    Json head = Json::Object();
+    head.Set("app", "Ather Screenshot");
+    head.Set("format", 1);
+    head.Set("video", slash == std::wstring::npos ? video : video.substr(slash + 1));
+    head.Set("fps", fps);
+    std::string out = head.Dump();
+    out.pop_back();  // the notes go in last, one per line
+    out += ",\"notes\":[";
+    for (size_t i = 0; i < notes.size(); ++i) {
+        const Note& n = notes[i];
+        Json j = Json::Object();
+        j.Set("id", n.id);
+        j.Set("frame", FileFrame(n.src, times, fps));
+        j.Set("time", n.src);
+        if (n.srcEnd) {
+            j.Set("endFrame", FileFrame(*n.srcEnd, times, fps));
+            j.Set("endTime", *n.srcEnd);
+        }
+        j.Set("kind", NoteKindKey(n.kind));
+        j.Set("resolved", n.resolved);
+        j.Set("author", n.author);
+        j.Set("text", n.text);
+        if (n.pin) {
+            Json p = Json::Object();
+            p.Set("x", n.pin->x);
+            p.Set("y", n.pin->y);
+            j.Set("pin", p);
+        }
+        if (n.created) j.Set("created", IsoTime(n.created));
+        out += (i ? ",\n  " : "\n  ") + j.Dump();
+    }
+    out += notes.empty() ? "]}\n" : "\n]}\n";
+    return out;
+}
+
+bool ParseNotes(const std::string& json, const std::wstring& video, const std::vector<double>& times, double fps, std::vector<Note>* out) {
+    bool ok = false;
+    const Json j = Json::Parse(json, &ok);
+    if (!ok || !j.IsObject() || !j["notes"].IsArray()) return false;
+    for (const Json& e : j["notes"].Items()) {
+        if (!e.IsObject() || (!e["time"].IsNumber() && !e["frame"].IsNumber())) continue;
+        Note n;
+        if (const uint64_t id = e["id"].UInt(0)) n.id = id;
+        n.path = video;
+        n.src = e["time"].IsNumber() ? e["time"].Num() : FileTime(e["frame"].Int(), times, fps);
+        if (e["endTime"].IsNumber()) n.srcEnd = e["endTime"].Num();
+        else if (e["endFrame"].IsNumber()) n.srcEnd = FileTime(e["endFrame"].Int(), times, fps);
+        if (n.srcEnd && *n.srcEnd <= n.src) n.srcEnd.reset();
+        n.kind = NoteKindOf(e["kind"].Str());
+        n.resolved = e["resolved"].Bool(false);
+        n.author = e["author"].WStr();
+        n.text = e["text"].WStr();
+        if (e["pin"].IsObject() && e["pin"]["x"].IsNumber() && e["pin"]["y"].IsNumber())
+            n.pin = VPoint{std::clamp(e["pin"]["x"].Num(), 0.0, 1.0), std::clamp(e["pin"]["y"].Num(), 0.0, 1.0)};
+        n.created = FromIsoTime(e["created"].Str());
+        out->push_back(n);
+    }
+    return true;
+}
+
+int NoteKindColor(NoteKind k) {
+    switch (k) {
+        case NoteKind::Issue: return 0;     // red
+        case NoteKind::Question: return 4;  // blue
+        case NoteKind::Good: return 3;      // green
+        default: return 5;                  // Ather lime
+    }
+}
+
+// ---------- frames ----------
+
+
+std::vector<double> FrameGrid(double length, double fps) {
+    std::vector<double> v;
+    if (fps <= 0) return v;
+    for (int64_t k = 0; k / fps < length - 1e-6; ++k) v.push_back(k / fps);
+    return v;
+}
+
+TimelineFrames TimelineFrames::Of(const std::vector<Clip>& clips, const std::function<const std::vector<double>*(const Clip&)>& times) {
+    TimelineFrames tf;
+    double start = 0;
+    for (size_t i = 0; i < clips.size(); ++i) {
+        const Clip& c = clips[i];
+        const double fps = c.fps > 1 ? c.fps : 30;
+        tf.fps.push_back(fps);
+        tf.clipFirst.push_back(tf.frames.size());
+        const std::vector<double>* known = times ? times(c) : nullptr;
+        std::vector<double> grid;
+        if (!known || known->empty()) {
+            grid = FrameGrid(std::max(c.length, c.out), fps);
+            known = &grid;
+        }
+        const std::vector<double>& T = *known;
+        // As SequenceReader: frames up to 0.1 ms before the in point count as in the clip; when none starts right at
+        // it (within 1 ms), the one on screen there shows first, from the clip's start.
+        size_t k = (size_t)(std::lower_bound(T.begin(), T.end(), c.in - 1e-4) - T.begin());
+        if (k > 0 && (k == T.size() || T[k] > c.in + 1e-3)) tf.frames.push_back({start, T[k - 1], (uint32_t)i});
+        for (; k < T.size() && T[k] < c.out - 1e-4; ++k) tf.frames.push_back({start + std::max(0.0, T[k] - c.in), T[k], (uint32_t)i});
+        start += c.Duration();
+    }
+    tf.clipFirst.push_back(tf.frames.size());
+    return tf;
+}
+
+std::optional<size_t> FrameOfSource(const TimelineFrames& tf, const std::vector<Clip>& clips, const std::wstring& path, double src) {
+    for (size_t i = 0; i < clips.size() && i + 1 < tf.clipFirst.size(); ++i) {
+        if (_wcsicmp(clips[i].path.c_str(), path.c_str()) != 0) continue;
+        const auto b = tf.frames.begin() + (ptrdiff_t)tf.clipFirst[i], e = tf.frames.begin() + (ptrdiff_t)tf.clipFirst[i + 1];
+        if (b == e) continue;
+        auto it = std::lower_bound(b, e, src, [](const TimelineFrames::Frame& f, double v) { return f.src < v; });
+        if (it == e || (it != b && src - (it - 1)->src < it->src - src)) --it;  // the nearest
+        if (std::fabs(it->src - src) <= 0.5 / tf.fps[i] + 1e-6) return (size_t)(it - tf.frames.begin());
+    }
+    return std::nullopt;
+}
+
+size_t TimelineFrames::Nearest(double t) const {
+    if (frames.empty()) return 0;
+    const auto it = std::lower_bound(frames.begin(), frames.end(), t, [](const Frame& f, double v) { return f.t < v; });
+    if (it == frames.end()) return frames.size() - 1;
+    if (it == frames.begin()) return 0;
+    const size_t n = (size_t)(it - frames.begin());
+    return t - frames[n - 1].t <= frames[n].t - t ? n - 1 : n;
+}
+
+size_t TimelineFrames::At(double t) const {
+    const auto it = std::upper_bound(frames.begin(), frames.end(), t, [](double v, const Frame& f) { return v < f.t; });
+    return it == frames.begin() ? 0 : (size_t)(it - frames.begin()) - 1;
+}
+
+double TimelineFrames::Fps(size_t n) const { return n < frames.size() && frames[n].clip < fps.size() ? fps[frames[n].clip] : 30; }
+
+namespace {
+// The whole seconds and the frame within that second of time `t` at `fps`, allowing for times stored a hair early.
+std::pair<int64_t, int> SecondAndFrame(double t, double fps) {
+    t = std::max(0.0, t);
+    const int64_t secs = (int64_t)std::floor(t + 0.001 / fps);
+    const int ff = std::clamp((int)std::floor((t - (double)secs) * fps + 0.001), 0, std::max(0, (int)std::ceil(fps) - 1));
+    return {secs, ff};
+}
+}  // namespace
+
+std::wstring Timecode(double t, double fps) {
+    const auto [secs, ff] = SecondAndFrame(t, fps > 0 ? fps : 30);
+    return std::format(L"{}:{:02}:{:02}", secs / 60, secs % 60, ff);
+}
+
+std::wstring FpsLabel(double fps) {
+    if (std::fabs(fps - std::round(fps)) < 0.005) return std::format(L"{} fps", (int)std::lround(fps));
+    std::wstring s = std::format(L"{:.2f}", fps);
+    while (s.back() == L'0') s.pop_back();
+    return s + L" fps";
+}
+
+std::wstring TimelineFrames::Timecode(size_t n) const { return n < frames.size() ? ather::Timecode(frames[n].t, Fps(n)) : L""; }
+
+std::wstring TimelineFrames::Readout(size_t n) const {
+    if (n >= frames.size()) return L"";
+    return Timecode(n) + L" · frame " + std::to_wstring(n) + L" · " + FpsLabel(Fps(n));
+}
+
+std::optional<size_t> TimelineFrames::Find(const std::wstring& text) const {
+    if (frames.empty()) return std::nullopt;
+    std::wstring s;
+    for (wchar_t c : text)
+        if (!iswspace(c)) s += c;
+    if (s.empty()) return std::nullopt;
+    auto number = [](const std::wstring& p, double* v) {  // digits, with an optional fraction
+        if (p.empty() || p.find_first_not_of(L"0123456789.") != std::wstring::npos || std::count(p.begin(), p.end(), L'.') > 1 || p == L".") return false;
+        *v = _wtof(p.c_str());
+        return true;
+    };
+    std::vector<std::wstring> parts;
+    for (size_t at = 0;;) {
+        const size_t c = s.find(L':', at);
+        parts.push_back(s.substr(at, c == std::wstring::npos ? std::wstring::npos : c - at));
+        if (c == std::wstring::npos) break;
+        at = c + 1;
+    }
+    std::vector<double> v(parts.size());
+    for (size_t i = 0; i < parts.size(); ++i)
+        if (!number(parts[i], &v[i])) return std::nullopt;
+    if (parts.size() == 1) {
+        if (s.find(L'.') == std::wstring::npos) {  // a frame number
+            if (v[0] >= (double)frames.size()) return std::nullopt;
+            return (size_t)v[0];
+        }
+        return At(v[0] + 1e-6);  // seconds
+    }
+    if (parts.size() == 2) return At(v[0] * 60 + v[1] + 1e-6);  // m:ss(.s)
+    if (parts.size() > 4) return std::nullopt;
+    // m:ss:ff or h:mm:ss:ff: the frame of that second with that number (or the last one before it).
+    const double secs = parts.size() == 4 ? v[0] * 3600 + v[1] * 60 + v[2] : v[0] * 60 + v[1];
+    const int ff = (int)v.back();
+    std::optional<size_t> best;
+    for (size_t n = At(secs - 1e-3); n < frames.size() && frames[n].t < secs + 1; ++n) {
+        const auto [sec, f] = SecondAndFrame(frames[n].t, Fps(n));
+        if ((double)sec != secs) continue;
+        if (f > ff) break;
+        best = n;
+        if (f == ff) break;
+    }
+    if (best) return best;
+    if (secs > frames.back().t) return std::nullopt;  // past the end
+    return At(secs + 1e-6);
 }
 
 std::vector<Caption> ChunkCaptions(const std::vector<CaptionWord>& words) {
@@ -1242,6 +1519,145 @@ BitmapPtr FrameRenderer::TitleImage(const Mark& m, SIZE size) const {
     });
 }
 
+// ---------- the review video ----------
+
+std::wstring BurnInText(const TimelineFrames& tf, size_t n) { return tf.Timecode(n) + L" · frame " + std::to_wstring(n); }
+
+std::wstring NoteKindLine(NoteKind k, bool resolved) { return std::wstring(NoteKindLabel(k)) + (resolved ? L" · Resolved" : L""); }
+
+namespace {
+void FillOpaque(Bitmap& b, RECT r, COLORREF c) {
+    r.left = std::max(0L, r.left), r.top = std::max(0L, r.top), r.right = std::min((LONG)b.Width(), r.right), r.bottom = std::min((LONG)b.Height(), r.bottom);
+    const uint32_t px = 0xFF000000u | (uint32_t)GetRValue(c) << 16 | (uint32_t)GetGValue(c) << 8 | GetBValue(c);
+    for (LONG y = r.top; y < r.bottom; ++y) std::fill_n(b.Bits() + (size_t)y * b.Width() + r.left, std::max(0L, r.right - r.left), px);
+}
+// `text` cut (with …) to fit on one line `width` wide.
+std::wstring OneLine(std::wstring text, const textdraw::Style& st, float width) {
+    if (const size_t nl = text.find_first_of(L"\r\n"); nl != std::wstring::npos) text = text.substr(0, nl) + L" …";
+    if (textdraw::Measure(text, st, 1e6f).w <= width) return text;
+    while (text.size() > 1 && textdraw::Measure(text + L"…", st, 1e6f).w > width) text.pop_back();
+    return text + L"…";
+}
+}  // namespace
+
+RECT DrawBurnIn(Bitmap& frame, const std::wstring& text) {
+    const double u = std::max(0.4, frame.Height() / 720.0);
+    textdraw::Style st;
+    st.family = L"Consolas";
+    st.weight = 700;
+    st.size = (float)(20 * u);
+    st.center = false;
+    const auto ext = textdraw::Measure(text, st, 1e6f);
+    const int pad = (int)std::lround(8 * u), x = (int)std::lround(12 * u), y = (int)std::lround(12 * u);
+    const RECT r{x, y, x + (int)std::ceil(ext.w) + 2 * pad, y + (int)std::ceil(ext.h) + pad};
+    FillOpaque(frame, r, RGB(12, 12, 12));
+    textdraw::Draw(frame, text, st, (float)(x + pad), (float)(y + pad / 2), ext.w + 2);
+    return r;
+}
+
+void DrawNotePin(Bitmap& frame, const ReviewNote& n) {
+    if (!n.pin) return;
+    const float u = (float)std::max(0.4, frame.Height() / 720.0);
+    const float r = 16 * u, x = (float)n.pin->x, y = (float)n.pin->y;
+    textdraw::FillRounded(frame, x - r - 4 * u, y - r - 4 * u, 2 * (r + 4 * u), 2 * (r + 4 * u), r + 4 * u, RGB(0, 0, 0), 0.45f);
+    textdraw::FillRounded(frame, x - r, y - r, 2 * r, 2 * r, r, annot::Color(NoteKindColor(n.kind)), n.resolved ? 0.6f : 1.f);
+    textdraw::StrokeEllipse(frame, x - r, y - r, 2 * r, 2 * r, 3 * u, RGB(255, 255, 255));
+}
+
+RECT DrawNoteCard(Bitmap& frame, const ReviewNote& n) {
+    const float W = (float)frame.Width(), H = (float)frame.Height(), u = (float)std::max(0.4, frame.Height() / 720.0);
+    const COLORREF kc = annot::Color(NoteKindColor(n.kind));
+    DrawNotePin(frame, n);  // the spot it points at
+    textdraw::Style meta, body, by;
+    meta.size = 17 * u, meta.weight = 700, meta.color = kc, meta.center = false;
+    body.size = 28 * u, body.weight = 600, body.color = RGB(255, 255, 255), body.center = false;
+    by.size = 18 * u, by.weight = 500, by.color = RGB(170, 170, 170), by.center = false;
+    const float cw = std::min(W * 0.7f, 1000 * u), pad = 18 * u, bar = 6 * u, inner = cw - 2 * pad - bar - 8 * u;
+    const std::wstring metaText = Upper(NoteKindLine(n.kind, n.resolved)) + L"   " + n.timecode + L"   FRAME " + std::to_wstring(n.frame);
+    std::wstring text = n.text.empty() ? L"(no text)" : n.text.substr(0, 400);
+    const float maxBody = body.size * 1.35f * 4;  // four lines at most
+    while (text.size() > 8 && textdraw::Measure(text, body, inner).h > maxBody) text = text.substr(0, text.size() * 9 / 10) + L"…";
+    const auto me = textdraw::Measure(metaText, meta, inner), be = textdraw::Measure(text, body, inner);
+    const std::wstring author = L"— " + (n.author.empty() ? std::wstring(L"Reviewer") : n.author);
+    const auto ae = textdraw::Measure(author, by, inner);
+    const float h = pad + me.h + 6 * u + be.h + 8 * u + ae.h + pad;
+    const float x = std::round((W - cw) / 2);
+    const float y = std::round(n.pin && n.pin->y > H * 0.55 ? 60 * u : H - h - 40 * u);  // out of the pin's way
+    textdraw::FillRounded(frame, x, y, cw, h, 14 * u, RGB(26, 26, 26), 1.f);
+    textdraw::FillRounded(frame, x + pad * 0.6f, y + pad, bar, h - 2 * pad, bar / 2, kc, 1.f);
+    const float tx = x + pad + bar + 8 * u;
+    textdraw::Draw(frame, metaText, meta, tx, y + pad, inner);
+    textdraw::Draw(frame, text, body, tx, y + pad + me.h + 6 * u, inner);
+    textdraw::Draw(frame, author, by, tx, y + pad + me.h + 6 * u + be.h + 8 * u, inner);
+    return {(LONG)x, (LONG)y, (LONG)(x + cw), (LONG)std::ceil(y + h)};
+}
+
+BitmapPtr SummaryCard(SIZE size, const ReviewPlan& plan) {
+    auto b = Bitmap::Create(size.cx, size.cy);
+    if (!b) return b;
+    FillOpaque(*b, {0, 0, size.cx, size.cy}, RGB(18, 18, 18));
+    const float W = (float)size.cx, H = (float)size.cy, u = (float)std::max(0.4, size.cy / 720.0);
+    const float x = 70 * u, width = W - 140 * u;
+    float y = 56 * u;
+    textdraw::Style title, sub, chip, tc, kind, line;
+    title.size = 40 * u, title.weight = 700, title.center = false;
+    sub.size = 20 * u, sub.weight = 500, sub.color = RGB(170, 170, 170), sub.center = false;
+    chip.size = 21 * u, chip.weight = 700, chip.center = false;
+    tc.family = L"Consolas", tc.size = 19 * u, tc.weight = 700, tc.color = RGB(200, 200, 200), tc.center = false;
+    kind.size = 18 * u, kind.weight = 700, kind.center = false;
+    line.size = 20 * u, line.weight = 500, line.color = RGB(235, 235, 235), line.center = false;
+    const std::wstring t = OneLine(L"Review · " + plan.title, title, width);
+    textdraw::Draw(*b, t, title, x, y, width);
+    y += textdraw::Measure(t, title, width).h + 8 * u;
+    std::wstring who;
+    for (const auto& r : plan.reviewers) who += (who.empty() ? L"" : L", ") + r;
+    const std::wstring s = OneLine(plan.date + (who.empty() ? L"" : L"   ·   " + who), sub, width);
+    textdraw::Draw(*b, s, sub, x, y, width);
+    y += textdraw::Measure(s, sub, width).h + 26 * u;
+    // Counts by kind, each in its color; then how many are resolved.
+    int counts[kNoteKinds] = {}, resolved = 0;
+    for (const auto& n : plan.notes) ++counts[(int)n.kind], resolved += n.resolved;
+    static const wchar_t* const singular[] = {L"note", L"issue", L"question", L"looks good"};
+    static const wchar_t* const plural[] = {L"notes", L"issues", L"questions", L"looks good"};
+    float cx = x;
+    const float chipH = textdraw::Measure(L"0", chip, 1e6f).h;
+    for (int k : {1, 2, 0, 3}) {  // issues first
+        if (!counts[k]) continue;
+        const std::wstring label = std::to_wstring(counts[k]) + L" " + (counts[k] == 1 ? singular[k] : plural[k]);
+        chip.color = annot::Color(NoteKindColor((NoteKind)k));
+        textdraw::FillRounded(*b, cx, y + chipH / 2 - 6 * u, 12 * u, 12 * u, 6 * u, chip.color, 1.f);
+        textdraw::Draw(*b, label, chip, cx + 20 * u, y, 1e6f);
+        cx += 20 * u + textdraw::Measure(label, chip, 1e6f).w + 34 * u;
+    }
+    if (plan.notes.empty()) {
+        chip.color = RGB(170, 170, 170);
+        textdraw::Draw(*b, L"No notes", chip, cx, y, 1e6f);
+    } else if (resolved) {
+        chip.color = RGB(140, 140, 140);
+        textdraw::Draw(*b, std::to_wstring(resolved) + L" resolved", chip, cx, y, 1e6f);
+    }
+    y += chipH + 30 * u;
+    // The notes, as many as fit, then how many more.
+    const float lh = 36 * u, bottom = H - 50 * u;
+    for (size_t i = 0; i < plan.notes.size(); ++i) {
+        if (y + lh * 2 > bottom && i + 1 < plan.notes.size()) {
+            textdraw::Draw(*b, L"+ " + std::to_wstring(plan.notes.size() - i) + L" more in the video", sub, x, y + 4 * u, width);
+            break;
+        }
+        const ReviewNote& n = plan.notes[i];
+        kind.color = annot::Color(NoteKindColor(n.kind));
+        textdraw::FillRounded(*b, x, y + 4 * u, 5 * u, lh - 12 * u, 2.5f * u, kind.color, n.resolved ? 0.5f : 1.f);
+        textdraw::Draw(*b, n.timecode, tc, x + 16 * u, y + 4 * u, 1e6f);
+        const float kx = x + 16 * u + textdraw::Measure(L"00:00:00", tc, 1e6f).w + 18 * u;
+        textdraw::Draw(*b, NoteKindLabel(n.kind), kind, kx, y + 5 * u, 1e6f);
+        const float lx = kx + textdraw::Measure(L"Looks good", kind, 1e6f).w + 18 * u;
+        line.color = n.resolved ? RGB(140, 140, 140) : RGB(235, 235, 235);
+        textdraw::Draw(*b, OneLine((n.author.empty() ? L"" : n.author + L": ") + n.text, line, x + width - lx), line, lx, y + 3 * u, x + width - lx);
+        y += lh;
+    }
+    return b;
+}
+
 // ---------- tests (MarkupTests.swift, VideoTests.testCaptionChunking) ----------
 
 namespace {
@@ -1606,6 +2022,116 @@ ATHER_TEST(video_clip_changes_move_items_with_their_footage) {
     ApplyClips(kept, {b, a});  // the ends would cross: back to the whole sequence
     CHECK_NEAR(kept.trimStart, 0, 1e-9);
     CHECK_NEAR(kept.trimEnd, 6, 1e-9);
+}
+
+// The sidecar reads back what it wrote (Unicode text, every field), one note per line; other tools' entries with only a
+// frame number are placed by it; junk is refused.
+ATHER_TEST(video_notes_sidecar_format) {
+    std::vector<double> times;
+    for (int i = 0; i < 900; ++i) times.push_back(i / 60.0);
+
+    Note a, b;
+    a.path = b.path = L"C:\\x\\clip.mp4";
+    a.src = 757 / 60.0;
+    a.srcEnd = 800 / 60.0;
+    a.text = L"Flash missing — “quote” \\ / ✅";
+    a.author = L"Tin Nguyễn";
+    a.kind = NoteKind::Issue;
+    a.resolved = true;
+    a.pin = VPoint{0.125, 0.875};
+    a.created = 1791633720;  // 2026-10-10
+    b.src = 0.5;
+    b.text = L"Second";
+    b.kind = NoteKind::Good;
+    const std::string json = NotesJson(L"C:\\x\\clip.mp4", {a, b}, times, 60);
+    test::Note(json);
+    CHECK(json.find("\"video\":\"clip.mp4\"") != std::string::npos);
+    CHECK(json.find("\"frame\":757") != std::string::npos && json.find("\"endFrame\":800") != std::string::npos);
+    CHECK(json.find("\"created\":\"2026-10-10T") != std::string::npos);
+    CHECK_EQ(std::count(json.begin(), json.end(), '\n'), 4);  // head, a note per line, end
+    std::vector<Note> back;
+    CHECK(ParseNotes(json, L"D:\\moved\\clip.mp4", times, 60, &back));
+    CHECK_EQ(back.size(), 2u);
+    if (back.size() == 2) {
+        CHECK(back[0].path == L"D:\\moved\\clip.mp4");
+        Note want = b;  // sorted by frame: b first
+        want.path = back[0].path;
+        CHECK(back[0] == want);
+        want = a;
+        want.path = back[1].path;
+        CHECK(back[1] == want);
+    }
+    std::vector<Note> other;
+    CHECK(ParseNotes("{\"notes\":[{\"frame\":120,\"text\":\"from a script\",\"kind\":\"weird\"},{\"text\":\"no frame\"},3]}", L"v.mp4", times, 60, &other));
+    CHECK(other.size() == 1 && std::fabs(other[0].src - 2) < 1e-9 && other[0].kind == NoteKind::Note && other[0].text == L"from a script");
+    std::vector<Note> none;
+    CHECK(!ParseNotes("{\"notes\": [ {", L"v.mp4", times, 60, &none));
+    CHECK(!ParseNotes("[]", L"v.mp4", times, 60, &none));
+    CHECK(ParseNotes(NotesJson(L"v.mp4", {}, {}, 30), L"v.mp4", {}, 30, &none) && none.empty());
+}
+
+// The readout is m:ss:ff · frame n · fps, at 60, 30 and 29.97 fps, and go to finds every frame by its number, its
+// timecode or a time; frame numbers run on across joined clips of different rates.
+ATHER_TEST(video_frame_readout_and_go_to) {
+    auto clip = [](const wchar_t* path, double fps, double length) {
+        Clip c = TestClip(path, 0, length);
+        c.length = length;
+        c.fps = fps;
+        return c;
+    };
+    const TimelineFrames f60 = TimelineFrames::Of({clip(L"a", 60, 20)}, {});
+    CHECK_EQ(f60.size(), 1200u);
+    CHECK(f60.Readout(757) == L"0:12:37 · frame 757 · 60 fps");
+    CHECK(f60.Readout(0) == L"0:00:00 · frame 0 · 60 fps");
+    CHECK(f60.Timecode(59) == L"0:00:59" && f60.Timecode(60) == L"0:01:00");
+    CHECK(f60.Find(L"757") == std::optional<size_t>(757));
+    CHECK(f60.Find(L"0:12:37") == std::optional<size_t>(757));
+    CHECK(f60.Find(L" 0:12:37 ") == std::optional<size_t>(757));
+    CHECK(f60.Find(L"12.62") == std::optional<size_t>(757));    // the frame on screen at 12.62 s
+    CHECK(f60.Find(L"0:12.62") == std::optional<size_t>(757));
+    CHECK(f60.Find(L"0:00:00:10") == std::optional<size_t>(10));  // with hours
+    CHECK(!f60.Find(L"1200") && !f60.Find(L"abc") && !f60.Find(L"") && !f60.Find(L"1:2:3:4:5") && !f60.Find(L"0:30:00"));
+
+    const TimelineFrames f30 = TimelineFrames::Of({clip(L"a", 30, 10)}, {});
+    CHECK(f30.Readout(100) == L"0:03:10 · frame 100 · 30 fps");
+    CHECK(f30.Find(L"0:03:10") == std::optional<size_t>(100));
+
+    const double ntsc = 30000.0 / 1001;
+    const TimelineFrames f2997 = TimelineFrames::Of({clip(L"a", ntsc, 70)}, {});
+    CHECK(f2997.Readout(1000) == L"0:33:10 · frame 1000 · 29.97 fps");
+    CHECK(Timecode(3725.5, 30) == L"62:05:15");
+    // Every frame, at each rate: its timecode and its number lead back to it, and timecodes never repeat.
+    for (const TimelineFrames* f : {&f60, &f30, &f2997}) {
+        int wrong = 0, repeats = 0;
+        for (size_t n = 0; n < f->size(); ++n) {
+            wrong += f->Find(f->Timecode(n)) != std::optional<size_t>(n);
+            wrong += f->Find(std::to_wstring(n)) != std::optional<size_t>(n);
+            repeats += n > 0 && f->Timecode(n) == f->Timecode(n - 1);
+        }
+        test::Note(ToUtf8(f->Readout(f->size() - 1)) + ": " + std::to_string(wrong) + " wrong, " + std::to_string(repeats) + " repeats");
+        CHECK_EQ(wrong, 0);
+        CHECK_EQ(repeats, 0);
+    }
+
+    // Joined, 60 then 30 fps, the second cut in mid-frame: numbers run on, each clip's frames at its own rate.
+    Clip b = clip(L"b", 30, 10);
+    b.in = 1.01;  // between frames 30 (1.0 s) and 31: frame 30 shows first
+    b.out = 3;
+    const TimelineFrames j = TimelineFrames::Of({clip(L"a", 60, 2), b}, {});
+    CHECK_EQ(j.size(), 120u + 60u);
+    CHECK(j.size() > 121 && std::fabs(j.frames[120].t - 2) < 1e-9 && std::fabs(j.frames[120].src - 1) < 1e-9);
+    CHECK(j.size() > 121 && std::fabs(j.frames[121].src - 31 / 30.0) < 1e-9);
+    CHECK(j.Readout(119) == L"0:01:59 · frame 119 · 60 fps");
+    CHECK(j.Readout(120) == L"0:02:00 · frame 120 · 30 fps");
+    CHECK(j.Readout(121) == L"0:02:00 · frame 121 · 30 fps");  // 2.023 s: still frame 0 of the second at 30 fps
+    CHECK_EQ(j.Nearest(2.0), 120u);
+    CHECK_EQ(j.At(2.03), 121u);
+    // Frame times from the file replace the grid.
+    const std::vector<double> times = {0, 0.5, 0.75, 1.5};
+    const TimelineFrames k = TimelineFrames::Of({clip(L"c", 30, 2)}, [&](const Clip&) { return &times; });
+    CHECK_EQ(k.size(), 4u);
+    CHECK_EQ(k.Nearest(0.6), 1u);
+    CHECK_EQ(k.At(1.4), 2u);
 }
 
 }  // namespace ather

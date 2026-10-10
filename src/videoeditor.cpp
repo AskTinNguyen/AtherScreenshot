@@ -7,14 +7,24 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
+#define SECURITY_WIN32
+#include <security.h>
+#pragma comment(lib, "secur32")
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+
 #include <cmath>
 #include <condition_variable>
+#include <ctime>
+#include <deque>
+
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
+
 #include <thread>
 
 namespace Gdiplus {
@@ -29,6 +39,7 @@ using std::min;
 #include "media.h"
 #include "output.h"
 #include "selftest.h"
+#include "textdraw.h"
 #include "toast.h"
 #include "videoedit.h"
 #include "videoio.h"
@@ -40,7 +51,8 @@ namespace gp = Gdiplus;
 
 constexpr wchar_t kClass[] = L"AtherScreenshotVideoEditor";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
-constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44;
+constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44,
+               WM_FRAMES = WM_APP + 45, WM_STRIP = WM_APP + 46;
 enum : UINT_PTR { kTimerFrame = 1 };
 enum : int { kField1 = 200, kField2 };
 
@@ -51,6 +63,47 @@ const double kAspectValues[] = {0, 16.0 / 9, 4.0 / 3, 1, 9.0 / 16};
 
 std::wstring g_folder;
 HICON g_icon = nullptr;
+std::wstring g_noteAuthor;  // remembered in settings; empty: Windows' display name
+std::function<void(const std::wstring&)> g_rememberAuthor;
+
+// Who you are on this PC: the display name of the Windows account ("Tin Nguyen"), else the user name.
+std::wstring WindowsDisplayName() {
+    wchar_t buf[256];
+    ULONG n = (ULONG)std::size(buf);
+    if (GetUserNameExW(NameDisplay, buf, &n) && n > 0 && buf[0]) return buf;
+    DWORD m = (DWORD)std::size(buf);
+    if (GetUserNameW(buf, &m) && buf[0]) return buf;
+    return L"Reviewer";
+}
+std::wstring NoteAuthor() { return g_noteAuthor.empty() ? WindowsDisplayName() : g_noteAuthor; }
+bool WriteFileUtf8(const std::wstring& path, const std::string& text) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const bool ok = WriteFile(f, text.data(), (DWORD)text.size(), &wrote, nullptr) && wrote == text.size();
+    CloseHandle(f);
+    return ok;
+}
+// A small file's bytes (at most 16 MB).
+bool ReadFileUtf8(const std::wstring& path, std::string* out) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(f, &size) && size.QuadPart <= (16 << 20);
+    if (ok) {
+        out->resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = out->empty() || (ReadFile(f, out->data(), (DWORD)out->size(), &got, nullptr) && got == out->size());
+    }
+    CloseHandle(f);
+    return ok;
+}
+
+// A note's author typed in the editor becomes the name on new notes, kept in settings.
+void RememberAuthor(const std::wstring& name) {
+    g_noteAuthor = name;
+    if (g_rememberAuthor) g_rememberAuthor(name);
+}
 
 gp::Color A(COLORREF c, BYTE a = 255) { return gp::Color(a, GetRValue(c), GetGValue(c), GetBValue(c)); }
 
@@ -192,7 +245,8 @@ void RunMenu(HWND owner, const std::vector<MenuItem>& items, POINT at) {
 
 // ---------- frames for the paused preview ----------
 
-// Decodes the frame at a time on a worker thread (keeps one reader open, so stepping forward is cheap).
+// Decodes the frame at a time on a worker thread. It keeps one reader open, so stepping forward is cheap, and the
+// last frames decoded on the way to an exact request (a step), so stepping back is too.
 class FrameFetcher {
 public:
     FrameFetcher(Sequence seq, HWND hwnd) : seq_(std::move(seq)), hwnd_(hwnd), worker_([this] { Work(); }) {}
@@ -204,10 +258,12 @@ public:
         cv_.notify_one();
         worker_.join();
     }
-    void Request(double t) {
+    // The frame at `t`: the first one from `tol` seconds before it on (by default half a frame, so the nearest one).
+    void Request(double t, double tol = -1) {
         {
             std::lock_guard l(mu_);
             want_ = t;
+            tol_ = tol;
         }
         cv_.notify_one();
     }
@@ -221,33 +277,50 @@ private:
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         SequenceReader r;
         const bool ok = r.Open(seq_);
-        VideoFrame last;
-        double lastT = -1;
+        const double fps = r.Fps() > 1 ? r.Fps() : 30;
+        // Frames read since the last seek, oldest first, with their times. The newest few keep their pictures
+        // (unconverted until shown), within ~150 MB: 25 frames of 1080p.
+        std::deque<std::pair<VideoFrame, double>> got;
+        const size_t keep = std::clamp<size_t>((size_t)(150e6 / std::max(1.0, 5.5 * r.Size().cx * r.Size().cy)), 4, 60);
         for (;;) {
-            double t;
+            double t, tol;
             {
                 std::unique_lock l(mu_);
                 cv_.wait(l, [&] { return quit_ || want_ >= 0; });
                 if (quit_) break;
                 t = want_;
+                tol = tol_;
                 want_ = -1;
             }
             if (!ok) continue;
-            if (!(last && t >= lastT && t - lastT < 1.0)) {  // stepping forward reads on; anything else seeks
-                r.Seek(t);
-                last = {};
-                lastT = -1;
+            const bool exact = tol >= 0;
+            const double from = t - (exact ? tol : 0.5 / fps);  // the frame shown is the first one from here on
+            const std::pair<VideoFrame, double>* hit = nullptr;
+            if (!got.empty() && got.front().second <= from + 1e-9)  // read already, unless it's still to come
+                for (const auto& g : got)
+                    if (g.second >= from) {
+                        hit = &g;
+                        break;
+                    }
+            if (!hit) {
+                if (got.empty() || from < got.front().second || t - got.back().second >= 1.0) {  // stepping forward reads on; anything else seeks
+                    r.Seek(t);
+                    got.clear();
+                }
+                // Only frames that may be shown come with their pictures: the one asked for, and before a step the
+                // ones a step back would show.
+                const double pictures = exact ? from - (double)keep / fps : from;
+                VideoFrame f;
+                double ft = 0;
+                while (!quit_ && (got.empty() || got.back().second < from) && r.ReadFrame(&f, &ft, pictures)) {
+                    got.emplace_back(f, ft);
+                    while (got.size() > keep || (got.size() > 1 && !got.front().first.HasPicture())) got.pop_front();
+                }
+                if (!got.empty()) hit = &got.back();
             }
-            VideoFrame f;
-            double ft = 0;
-            const double frameDur = r.Fps() > 1 ? 1 / r.Fps() : 1 / 30.0;
-            while (!quit_ && !(last && lastT >= t - frameDur * 0.5) && r.ReadFrame(&f, &ft, t - frameDur * 0.5)) {  // only the one shown is converted
-                last = f;
-                lastT = ft;
-            }
-            BitmapPtr fitted = last.Bgra();  // sequence-sized, like the playing frames
+            BitmapPtr fitted = hit ? hit->first.Bgra() : nullptr;  // sequence-sized, like the playing frames
             if (!fitted) continue;
-            auto* res = new Result{fitted, lastT};
+            auto* res = new Result{fitted, hit->second};
             if (!PostMessageW(hwnd_, WM_FETCHED, 0, (LPARAM)res)) delete res;
         }
         CoUninitialize();
@@ -257,8 +330,84 @@ private:
     HWND hwnd_;
     std::mutex mu_;
     std::condition_variable cv_;
-    double want_ = -1;
+    double want_ = -1, tol_ = -1;
     std::atomic<bool> quit_{false};  // also checked mid-decode, so replacing the fetcher never waits long
+    std::thread worker_;
+};
+
+// The zoomed-in filmstrip's pictures: decodes the frames asked for (in timeline order, the newest request replacing the
+// rest) on a worker thread, scales each to `thumb` and posts it back as WM_STRIP. Reads on from one frame to the next,
+// so a view's worth of frames a few apart costs one seek.
+class StripFetcher {
+public:
+    struct Result {
+        uint64_t gen;
+        size_t frame;
+        BitmapPtr thumb;
+    };
+    StripFetcher(Sequence seq, TimelineFrames tf, SIZE thumb, HWND hwnd, uint64_t gen)
+        : seq_(std::move(seq)), tf_(std::move(tf)), thumb_(thumb), hwnd_(hwnd), gen_(gen), worker_([this] { Work(); }) {}
+    ~StripFetcher() {
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_one();
+        worker_.join();
+    }
+    void Want(std::vector<size_t> frames) {  // these, in this order, instead of whatever was asked before
+        {
+            std::lock_guard l(mu_);
+            want_ = std::move(frames);
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void Work() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        SequenceReader r;
+        const bool ok = r.Open(seq_);
+        double lastT = -1e300;
+        for (;;) {
+            size_t n;
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return quit_ || !want_.empty(); });
+                if (quit_) break;
+                n = want_.front();
+                want_.erase(want_.begin());
+            }
+            if (!ok || n >= tf_.size()) continue;
+            const double t = tf_.frames[n].t;
+            if (!(t > lastT && t - lastT < 2.0)) r.Seek(t);  // reading on beats seeking for frames close ahead
+            VideoFrame f, kept;
+            double ft = 0;
+            while (!quit_ && r.ReadFrame(&f, &ft, t - 5e-4)) {  // frames before it come without pictures
+                kept = f;
+                lastT = ft;
+                if (ft >= t - 5e-4) break;
+            }
+            const BitmapPtr full = kept ? kept.Bgra() : nullptr;
+            if (!full) {
+                lastT = -1e300;
+                continue;
+            }
+            auto* res = new Result{gen_, n, Resample(*full, thumb_.cx, thumb_.cy)};
+            if (!res->thumb || !PostMessageW(hwnd_, WM_STRIP, 0, (LPARAM)res)) delete res;
+        }
+        CoUninitialize();
+    }
+
+    Sequence seq_;
+    TimelineFrames tf_;
+    SIZE thumb_;
+    HWND hwnd_;
+    uint64_t gen_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<size_t> want_;
+    std::atomic<bool> quit_{false};
     std::thread worker_;
 };
 
@@ -271,6 +420,12 @@ struct TranscribeResult {
 struct SaveResult {
     bool ok, gif;
     std::wstring out, tmp, err;
+    bool review = false;          // a review video, with its notes list (and sheet) next to it
+    std::wstring md, mdText, sheet;
+};
+struct FrameTimesResult {
+    std::wstring key;
+    std::shared_ptr<const std::vector<double>> times;
 };
 
 // ---------- the window ----------
@@ -295,6 +450,11 @@ public:
 
     std::unique_ptr<SequencePlayer> player;
     std::unique_ptr<FrameFetcher> fetcher;
+    // Every frame of the timeline (for stepping and the frame readout), from each file's frame times, read in the
+    // background (by lowercase path; a grid at the clip's rate until they come).
+    std::map<std::wstring, std::shared_ptr<const std::vector<double>>> frameTimes;
+    std::set<std::wstring> framesPending;
+    TimelineFrames tframes;
     SIZE videoSize{16, 9};  // the sequence frame: the first video's size
     double duration = 0;    // of all clips
     std::vector<Clip> builtClips;  // what the player, fetcher and thumbnails were made for
@@ -327,11 +487,12 @@ public:
     uint64_t fieldsFor = 0;
     int fieldsKind = -1;
 
-    HFONT fUi = nullptr, fSmall = nullptr, fIcon = nullptr, fIconSmall = nullptr, fMono = nullptr, fEmoji = nullptr;
+    HFONT fUi = nullptr, fSmall = nullptr, fIcon = nullptr, fIconSmall = nullptr, fMono = nullptr, fEmoji = nullptr, fMonoBig = nullptr;
+    bool goingTo = false;  // Ctrl+G: the field takes a frame number or a time
     std::vector<Hot> hots;
     RECT hoverRect{};
 
-    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut };
+    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan };
     struct Drag {
         DragKind kind = DragKind::None;
         VPoint from;
@@ -365,6 +526,12 @@ public:
             if (edit.marks[i].id == *selected) return i;
         return std::nullopt;
     }
+    std::optional<size_t> SelNote() const {
+        if (!selected) return std::nullopt;
+        for (size_t i = 0; i < edit.notes.size(); ++i)
+            if (edit.notes[i].id == *selected) return i;
+        return std::nullopt;
+    }
     VRect ViewRect() const {
         const VRect f{0, 0, (double)videoSize.cx, (double)videoSize.cy};
         if (!edit.crop) return f;
@@ -384,13 +551,16 @@ public:
         if (undoStack.empty()) return;
         edit = undoStack.back();
         undoStack.pop_back();
-        if (selected && !SelCaption() && !SelMark()) selected.reset();
+        if (selected && !SelCaption() && !SelMark() && !SelNote()) selected.reset();
         Changed();
     }
 
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
         if (edit.clips != builtClips) RebuildSequence();
+        LoadNotes();
+        PlaceNotes();
+        NotesChanged();
         if (player) player->SetMuted(edit.muted);
         Rerender();
         SyncFields();
@@ -423,9 +593,105 @@ public:
     void Seek(double t) {
         t = std::clamp(t, 0.0, std::max(0.0, duration));
         paused = t;
+        KeepOnView(t);
         if (player) player->Seek(t);
-        if (!playing && fetcher) fetcher->Request(t);
+        if (!playing) Fetch(t);
         Invalidate();
+    }
+
+    // The paused preview decodes the frame nearest `t`, exactly that one (by its own time).
+    void Fetch(double t) {
+        if (!fetcher) return;
+        if (tframes.empty()) return fetcher->Request(t);
+        fetcher->Request(tframes.frames[tframes.Nearest(t)].t, 5e-4);
+    }
+
+    // ---- frames ----
+
+    static std::wstring FileKey(const std::wstring& path) { return Lower(path); }
+    bool FramesKnown() const {
+        for (const auto& c : edit.clips)
+            if (!frameTimes.count(FileKey(c.path))) return false;
+        return true;
+    }
+    // Reads the frame times of files that are new to the editor, each on a thread of its own.
+    void LoadFrameTimes() {
+        for (const auto& c : edit.clips) {
+            const std::wstring key = FileKey(c.path);
+            if (frameTimes.count(key) || framesPending.count(key) || !hwnd) continue;
+            framesPending.insert(key);
+            std::thread([self = hwnd, path = c.path, key] {
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                auto* r = new FrameTimesResult{key, std::make_shared<const std::vector<double>>(FrameTimes(path))};
+                CoUninitialize();
+                if (!PostMessageW(self, WM_FRAMES, 0, (LPARAM)r)) delete r;
+            }).detach();
+        }
+    }
+    // ---- the zoomed-in filmstrip ----
+    // Zoomed in, the strip is tiles at the thumbnails' own shape, each showing a frame from under it (the first frame
+    // starting in it), decoded in the background as the view changes; an empty tile until its picture comes.
+    std::unique_ptr<StripFetcher> stripFetcher;
+    uint64_t stripGen = 0;
+    std::map<size_t, BitmapPtr> stripThumbs;  // by timeline frame
+    std::vector<size_t> stripWanted;          // last asked for
+    struct StripTile {
+        double t0, t1;  // the timeline time it covers
+        size_t frame;   // the frame it shows
+    };
+    SIZE StripThumbSize() const {
+        const int h = S(52);
+        return {std::max(8, (int)std::lround(h * (double)videoSize.cx / std::max(1L, videoSize.cy))), h};
+    }
+    // The tiles on view at this zoom, on a grid from the timeline's start (so they stay put while panning).
+    std::vector<StripTile> StripTiles() const {
+        std::vector<StripTile> v;
+        if (tframes.empty() || tlZoom <= 1.001) return v;
+        const RECT tr = TimelineRect();
+        const double dt = StripThumbSize().cx * TlSpan() / std::max(1, RectW(tr));
+        const double end = std::min(duration, tlStart + TlSpan());
+        for (long long j = (long long)std::floor(tlStart / dt); j * dt < end; ++j) {
+            const double t0 = j * dt, t1 = std::min(duration, (j + 1) * dt);
+            const auto it = std::lower_bound(tframes.frames.begin(), tframes.frames.end(), t0 - 1e-9, [](const TimelineFrames::Frame& f, double x) { return f.t < x; });
+            const size_t n = it != tframes.frames.end() && it->t < t1 ? (size_t)(it - tframes.frames.begin()) : tframes.At(t0);
+            v.push_back({t0, t1, n});
+        }
+        return v;
+    }
+    void ResetStrip() {
+        stripFetcher.reset();
+        stripThumbs.clear();
+        stripWanted.clear();
+        ++stripGen;
+    }
+    // Asks for the pictures of the tiles on view that aren't there yet.
+    void RequestStrip(const std::vector<StripTile>& tiles) {
+        std::vector<size_t> want;
+        for (const auto& t : tiles)
+            if (!stripThumbs.count(t.frame) && std::find(want.begin(), want.end(), t.frame) == want.end()) want.push_back(t.frame);
+        if (want == stripWanted) return;
+        stripWanted = want;
+        if (want.empty() || !hwnd) return;
+        if (!stripFetcher) stripFetcher = std::make_unique<StripFetcher>(Seq(), tframes, StripThumbSize(), hwnd, stripGen);
+        stripFetcher->Want(want);
+    }
+    bool StripComplete() const {  // tests: every tile on view has its picture
+        for (const auto& t : StripTiles())
+            if (!stripThumbs.count(t.frame)) return false;
+        return true;
+    }
+
+    void RebuildFrames() {
+        ResetStrip();
+        tframes = TimelineFrames::Of(edit.clips, [this](const Clip& c) -> const std::vector<double>* {
+            const auto it = frameTimes.find(FileKey(c.path));
+            return it != frameTimes.end() && it->second && !it->second->empty() ? it->second.get() : nullptr;
+        });
+        PlaceNotes();
+    }
+    size_t FrameNow() const { return tframes.Nearest(playing ? rawT : paused); }  // the frame on screen
+    void GoToFrame(size_t n) {
+        if (n < tframes.size()) Seek(tframes.frames[n].t);
     }
 
     void Play() {
@@ -441,20 +707,100 @@ public:
     }
 
     void Pause() {
+        StopReview();
         if (!playing) return;
         paused = player ? player->Now() : paused;
         if (player) player->Pause();
         playing = false;
-        if (fetcher) fetcher->Request(paused);  // the exact frame (and zoom off) for editing
+        Fetch(paused);  // the exact frame (and zoom off) for editing
         Rerender();
         Invalidate();
     }
 
-    void TogglePlay() { playing ? Pause() : Play(); }
+    void TogglePlay() { playing || reviewDir ? Pause() : Play(); }
 
-    void Step(double frames) {
+    // ---- review playback (J/K/L) ----
+    // L plays forward, J backward, K pauses; pressing L (or J) again while it plays that way cycles the preview speed
+    // 0.25× → 0.5× → 1×. Forward at 1× is the usual playback (with sound). Slower, or backward, the paused preview
+    // shows every frame in turn, each decoded exactly, at that pace (or slower when decoding can't keep up: it never
+    // skips one). The speed is the preview's only: the edit, and so what Save writes, stays as it is.
+    static constexpr double kPreviewRates[] = {0.25, 0.5, 1};
+    int reviewDir = 0;          // 1 forward, -1 backward: the exact-frame playback is on
+    double previewRate = 1;     // kept for the next J or L
+    double reviewDue = 0;       // when the next frame is due (seconds on the steady clock)
+    static double Seconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    double NextPreviewRate() const {
+        for (size_t i = 0; i < std::size(kPreviewRates); ++i)
+            if (std::fabs(kPreviewRates[i] - previewRate) < 1e-9) return kPreviewRates[(i + 1) % std::size(kPreviewRates)];
+        return 1;
+    }
+    bool Reviewing(int dir) const { return dir > 0 ? (reviewDir > 0 || playing) : reviewDir < 0; }
+    void Review(int dir) {
+        if (tframes.empty()) return;
+        if (Reviewing(dir)) previewRate = NextPreviewRate();
+        if (dir > 0 && previewRate == 1) {  // the usual playback, with sound
+            StopReview();
+            if (!playing) Play();
+            Invalidate();
+            return;
+        }
+        if (playing) Pause();
+        if (reviewDir != dir) {
+            const size_t n = tframes.Nearest(paused);
+            GoToFrame(n);  // starts from the frame on screen
+            reviewDir = dir;
+            reviewDue = Seconds() + FrameStep(n, dir);
+        }
+        Invalidate();
+    }
+    void StopReview() {
+        if (!reviewDir) return;
+        reviewDir = 0;
+        Invalidate();
+    }
+    // How long frame n shows going `dir` way at the preview speed.
+    double FrameStep(size_t n, int dir) const {
+        const size_t m = dir > 0 ? std::min(n + 1, tframes.size() - 1) : n > 0 ? n - 1 : 0;
+        double d = std::fabs(tframes.frames[m].t - tframes.frames[n].t);
+        if (d <= 0) d = 1 / tframes.Fps(n);
+        return d / (previewRate * edit.speed);
+    }
+    // Each tick: once the frame shown has come and its time is up, on to the next one.
+    void ReviewTick() {
+        if (!reviewDir || tframes.empty()) return;
+        if (!(raw && std::fabs(rawT - paused) < 1e-3)) return;  // still decoding the one asked for
+        const double now = Seconds();
+        if (now < reviewDue) return;
+        const size_t n = tframes.Nearest(paused);
+        const size_t first = tframes.At(edit.trimStart + 1e-3), last = tframes.At(edit.trimEnd - 1e-3);
+        if ((reviewDir > 0 && n >= last) || (reviewDir < 0 && n <= first)) return StopReview();  // at the trim's end
+        const size_t next = reviewDir > 0 ? n + 1 : n - 1;
+        GoToFrame(next);
+        reviewDue = std::max(reviewDue + FrameStep(n, reviewDir), now);  // no catching up by skipping
+        ++reviewFrames;
+    }
+    int reviewFrames = 0;  // tests: frames shown by review playback
+    std::function<void()> onFetched;  // tests: each paused frame as it's shown
+
+
+    // ←/→: `frames` frames at the rate of the clip they're in, landing on each frame's own time.
+    void Step(int frames) {
         Pause();
-        Seek(Now() + frames / 30);
+        if (tframes.empty()) return Seek(Now() + frames / 30.0);
+        const long long n = (long long)tframes.Nearest(paused) + frames;
+        GoToFrame((size_t)std::clamp<long long>(n, 0, (long long)tframes.size() - 1));
+    }
+    // Shift+←/→: the frame nearest a second away.
+    void StepSecond(int dir) {
+        Pause();
+        if (tframes.empty()) return Seek(Now() + dir);
+        GoToFrame(tframes.Nearest(tframes.frames[tframes.Nearest(paused)].t + dir));
+    }
+    // Home/End: the first and last frames of the trim (the saved video's first and last).
+    void GoTrimEnd(bool end) {
+        Pause();
+        if (tframes.empty()) return Seek(end ? edit.trimEnd : edit.trimStart);
+        GoToFrame(tframes.At(end ? edit.trimEnd - 1e-3 : edit.trimStart + 1e-3));
     }
 
     void Replay(const Mark& m) {
@@ -466,12 +812,14 @@ public:
     }
 
     void Tick() {
+        ReviewTick();
         if (!player) return;
         double t = 0;
         if (playing) {
             if (auto f = player->NewFrame(&t)) {
                 raw = f;  // already fitted into the sequence frame
                 rawT = t;
+                KeepOnView(t);
                 Rerender();
                 Invalidate();  // only when there's a new frame (the playhead moves with it)
             }
@@ -512,13 +860,16 @@ public:
             player->SetSequence(Seq());
             player->Seek(paused);
         }
+        RebuildFrames();
         if (hwnd) {
             fetcher = std::make_unique<FrameFetcher>(Seq(), hwnd);
-            fetcher->Request(paused);
+            Fetch(paused);
             thumbs.clear();  // the old ones would be stretched over the wrong clips
             LoadThumbs();
+            LoadFrameTimes();
         }
         if (selClip && !SelClipIndex()) selClip.reset();
+        ClampTimeline();
     }
 
     void LoadThumbs() {
@@ -745,9 +1096,239 @@ public:
         const uint64_t id = *selected;
         std::erase_if(edit.captions, [&](const Caption& c) { return c.id == id; });
         std::erase_if(edit.marks, [&](const Mark& m) { return m.id == id; });
+        std::erase_if(edit.notes, [&](const Note& n) { return n.id == id; });
         selected.reset();
         SetFocus(hwnd);
         Changed();
+    }
+
+    // ---- notes ----
+
+    // The notes whose frames are on the timeline, in timeline order: (frame, index in edit.notes). Kept up to date by
+    // PlaceNotes (after any change to the edit or the frames).
+    std::vector<std::pair<size_t, size_t>> placed;
+    bool notesOpenOnly = false;  // the list shows only notes not resolved
+    int notesScroll = 0;         // the list's scroll, in pixels
+
+    void PlaceNotes() {
+        placed.clear();
+        for (size_t i = 0; i < edit.notes.size(); ++i)
+            if (const auto f = FrameOfSource(tframes, edit.clips, edit.notes[i].path, edit.notes[i].src)) placed.push_back({*f, i});
+        std::stable_sort(placed.begin(), placed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    // The notes the list shows (all, or the open ones).
+    std::vector<std::pair<size_t, size_t>> ListedNotes() const {
+        std::vector<std::pair<size_t, size_t>> v;
+        for (const auto& p : placed)
+            if (!notesOpenOnly || !edit.notes[p.second].resolved) v.push_back(p);
+        return v;
+    }
+    std::optional<size_t> NoteFrame(const Note& n) const { return FrameOfSource(tframes, edit.clips, n.path, n.src); }
+    std::optional<size_t> NoteEndFrame(const Note& n) const {
+        return n.srcEnd ? FrameOfSource(tframes, edit.clips, n.path, *n.srcEnd) : std::nullopt;
+    }
+    // ---- notes kept next to their videos ("<video>.notes.json") ----
+
+    std::map<std::wstring, std::vector<Note>> savedNotes;  // by file: as last read or written
+    std::map<std::wstring, std::wstring> notePaths;        // by file: its path as the clips name it
+    std::set<std::wstring> damagedNotes;                   // files whose sidecar couldn't be read: kept aside on the first write
+    std::set<std::wstring> madeSidecars;                   // sidecars this editor made (gone again once their last note is)
+    std::set<std::wstring> unsaved;                        // files whose sidecar couldn't be written (said once)
+
+    // Reads the notes kept with the clips' files that the editor hasn't seen yet. They join the edit as if they had
+    // always been there: in every undo step too, so undoing never takes away notes that were saved.
+    void LoadNotes() {
+        for (const auto& c : edit.clips) {
+            const std::wstring key = FileKey(c.path);
+            if (savedNotes.count(key)) continue;
+            notePaths[key] = c.path;
+            std::vector<Note> loaded;
+            std::string text;
+            const std::wstring side = NotesPath(c.path);
+            const bool exists = GetFileAttributesW(side.c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (exists && (!ReadFileUtf8(side, &text) || !ParseNotes(text, c.path, FileTimesOf(key), c.fps, &loaded))) {
+                damagedNotes.insert(key);
+                loaded.clear();
+                if (!snapshotMode)
+                    ShowToast(L"Couldn't read the notes kept with this video", FileNameOf(side) + L" stays as it is. New notes are saved next to it.", nullptr,
+                              nullptr, 6000);
+            }
+            if (!exists) madeSidecars.insert(key);
+            SortNotes(loaded);
+            savedNotes[key] = loaded;
+            edit.notes.insert(edit.notes.end(), loaded.begin(), loaded.end());
+            for (auto& u : undoStack) u.notes.insert(u.notes.end(), loaded.begin(), loaded.end());
+        }
+    }
+    const std::vector<double>& FileTimesOf(const std::wstring& key) const {
+        static const std::vector<double> none;
+        const auto it = frameTimes.find(key);
+        return it != frameTimes.end() && it->second ? *it->second : none;
+    }
+    // Writes the sidecar of every file whose notes changed (as they change: typing, undo, everything).
+    void NotesChanged() {
+        std::map<std::wstring, std::vector<Note>> now;
+        for (const auto& n : edit.notes) now[FileKey(n.path)].push_back(n);
+        for (auto& [key, v] : now) SortNotes(v);
+        std::set<std::wstring> keys;
+        for (const auto& [k, v] : now) keys.insert(k);
+        for (const auto& [k, v] : savedNotes) keys.insert(k);
+        for (const auto& key : keys) {
+            const std::vector<Note>& cur = now[key];
+            if (savedNotes.count(key) && savedNotes[key] == cur) continue;
+            if (WriteNotes(key, cur)) savedNotes[key] = cur;
+        }
+    }
+    bool WriteNotes(const std::wstring& key, const std::vector<Note>& notes) {
+        const auto pit = notePaths.find(key);
+        if (pit == notePaths.end()) return false;
+        const std::wstring video = pit->second, side = NotesPath(video);
+        if (damagedNotes.count(key)) {  // kept aside, as it was, before the first write over it
+            std::wstring aside = video + L".notes.damaged.json";
+            for (int i = 2; GetFileAttributesW(aside.c_str()) != INVALID_FILE_ATTRIBUTES; ++i) aside = video + L".notes.damaged-" + std::to_wstring(i) + L".json";
+            MoveFileExW(side.c_str(), aside.c_str(), 0);
+            damagedNotes.erase(key);
+        }
+        if (notes.empty() && madeSidecars.count(key)) {  // a sidecar this editor made, now without notes: gone again
+            DeleteFileW(side.c_str());
+            return true;
+        }
+        double fps = 30;
+        for (const auto& c : edit.clips)
+            if (FileKey(c.path) == key && c.fps > 1) fps = c.fps;
+        const std::string text = NotesJson(video, notes, FileTimesOf(key), fps);
+        const std::wstring tmp = side + L".tmp";
+        bool ok = false;
+        if (HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); f != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+            ok = WriteFile(f, text.data(), (DWORD)text.size(), &wrote, nullptr) && wrote == text.size();
+            CloseHandle(f);
+            ok = ok && MoveFileExW(tmp.c_str(), side.c_str(), MOVEFILE_REPLACE_EXISTING);
+            if (!ok) DeleteFileW(tmp.c_str());
+        }
+        if (!ok && !unsaved.count(key)) {
+            unsaved.insert(key);
+            ShowToast(L"Can't save notes next to this video", FileNameOf(side) + L": the folder may be read-only. They stay while the editor is open.",
+                      nullptr, nullptr, 6000);
+        }
+        return ok;
+    }
+    // The edit as Save sees it (notes are never part of it), to tell whether closing loses anything.
+    static VideoEdit WithoutNotes(VideoEdit e) {
+        e.notes.clear();
+        return e;
+    }
+    VideoEdit savedEdit;  // the picture edit as opened or last saved
+
+    // M: a note on the frame on screen, its text field ready for typing.
+    void AddNote() {
+        if (tframes.empty()) return;
+        Pause();
+        EndGoTo();
+        const size_t n = FrameNow();
+        const TimelineFrames::Frame& f = tframes.frames[n];
+        if (f.clip >= edit.clips.size()) return;
+        PushUndo();
+        Note note;
+        note.path = edit.clips[f.clip].path;
+        note.src = f.src;
+        note.author = NoteAuthor();
+        note.created = (int64_t)time(nullptr);
+        edit.notes.push_back(note);
+        selected = note.id;
+        selClip.reset();
+        GoToFrame(n);
+        Changed();
+        RevealNote(note.id);
+        FocusField();
+    }
+    // "Range to here": the selected note runs on to the frame on screen (a later frame of the same video).
+    void SetNoteRangeToPlayhead() {
+        const auto i = SelNote();
+        if (!i || tframes.empty()) return;
+        const Note& n = edit.notes[*i];
+        const auto f = NoteFrame(n);
+        const size_t now = FrameNow();
+        const TimelineFrames::Frame& fr = tframes.frames[now];
+        if (!f || now <= *f || fr.clip >= edit.clips.size() || _wcsicmp(edit.clips[fr.clip].path.c_str(), n.path.c_str()) != 0 || fr.src <= n.src) {
+            ShowToast(L"Move the playhead to a later frame first", L"The range runs from the note's frame to the frame on screen.", nullptr, nullptr, 3000);
+            return;
+        }
+        const double end = fr.src;
+        UpdateNote([end](Note& x) { x.srcEnd = end; });
+    }
+    void UpdateNote(const std::function<void(Note&)>& f) {
+        if (auto i = SelNote()) {
+            PushUndo();
+            f(edit.notes[*i]);
+            Changed();
+        }
+    }
+    // Selects a note and goes to its frame (from the list, a tick, [ or ]).
+    void SelectNote(uint64_t id) {
+        for (const auto& [frame, i] : placed)
+            if (edit.notes[i].id == id) {
+                EndGoTo();
+                Pause();
+                Select(id);
+                GoToFrame(frame);
+                RevealNote(id);
+                return;
+            }
+    }
+    // [ and ]: the note before or after the frame on screen (of those the list shows).
+    void JumpNote(int dir) {
+        const auto v = ListedNotes();
+        if (v.empty()) return;
+        const size_t now = FrameNow();
+        if (dir > 0) {
+            for (const auto& p : v)
+                if (p.first > now) return SelectNote(edit.notes[p.second].id);
+        } else {
+            for (auto it = v.rbegin(); it != v.rend(); ++it)
+                if (it->first < now) return SelectNote(edit.notes[it->second].id);
+        }
+    }
+    // Scrolls the list so that note's row shows.
+    void RevealNote(uint64_t id) {
+        const auto v = ListedNotes();
+        const RECT list = NotesListRect();
+        for (size_t k = 0; k < v.size(); ++k)
+            if (edit.notes[v[k].second].id == id) {
+                const int top = (int)k * NoteRowH(), bottom = top + NoteRowH();
+                if (top < notesScroll) notesScroll = top;
+                if (bottom > notesScroll + RectH(list)) notesScroll = bottom - RectH(list);
+            }
+        notesScroll = std::max(0, notesScroll);
+    }
+    std::vector<MenuItem> NoteKindMenu(uint64_t id) {
+        std::vector<MenuItem> v;
+        NoteKind cur = NoteKind::Note;
+        for (const auto& n : edit.notes)
+            if (n.id == id) cur = n.kind;
+        for (int k = 0; k < kNoteKinds; ++k) {
+            MenuItem it;
+            it.label = NoteKindLabel((NoteKind)k);
+            it.checked = cur == (NoteKind)k;
+            it.swatch = annot::Color(NoteKindColor((NoteKind)k));
+            it.run = [this, k] { UpdateNote([k](Note& x) { x.kind = (NoteKind)k; }); };
+            v.push_back(it);
+        }
+        return v;
+    }
+    // Where clip `c`'s picture sits in the sequence frame (as FitInto puts it there).
+    VRect ClipFit(const Clip& c) const {
+        const double W = videoSize.cx, H = videoSize.cy, cw = c.w > 0 ? c.w : W, ch = c.h > 0 ? c.h : H;
+        const double k = std::min(W / cw, H / ch);
+        const double fw = std::clamp((double)std::lround(cw * k), 1.0, W), fh = std::clamp((double)std::lround(ch * k), 1.0, H);
+        return {(double)(int)((W - fw) / 2), (double)(int)((H - fh) / 2), fw, fh};
+    }
+    // A note's pin in the sequence frame's pixels.
+    std::optional<VPoint> PinOnVideo(const Note& n) const {
+        const auto f = NoteFrame(n);
+        if (!n.pin || !f || tframes.frames[*f].clip >= edit.clips.size()) return std::nullopt;
+        const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
+        return VPoint{r.x + n.pin->x * r.w, r.y + n.pin->y * r.h};
     }
 
     void SetCrop(std::optional<VRect> r) {
@@ -918,6 +1499,10 @@ public:
         cap.label = L"Caption\tT";
         cap.run = [this] { AddCaption(); };
         v.push_back(cap);
+        MenuItem note;
+        note.label = L"Review note\tM";
+        note.run = [this] { AddNote(); };
+        v.push_back(note);
         v.push_back(MenuItem::Sep());
         for (int k = 0; k < kMarkKinds; ++k) {
             const MarkKind kind = (MarkKind)k;
@@ -969,7 +1554,15 @@ public:
         std::wstring t1, t2;
         int kind = -1;
         uint64_t id = 0;
-        if (auto ci = SelCaption()) {
+        if (goingTo) {
+            kind = 200;
+            id = ~0ull;
+        } else if (auto ni = SelNote()) {
+            t1 = edit.notes[*ni].text;
+            t2 = edit.notes[*ni].author;
+            kind = 300;
+            id = edit.notes[*ni].id;
+        } else if (auto ci = SelCaption()) {
             t1 = edit.captions[*ci].text;
             kind = 100;
             id = edit.captions[*ci].id;
@@ -989,10 +1582,11 @@ public:
             SetWindowTextW(field1, t1.c_str());
             SetWindowTextW(field2, t2.c_str());
             settingText = false;
-            const wchar_t* cue = kind == 100 ? L"Caption text" : kind == (int)MarkKind::Bubble ? L"Bubble text" : kind == (int)MarkKind::Title ? L"Title"
+            const wchar_t* cue = kind == 200 ? L"757, 0:12:37 or 12.6" : kind == 300 ? L"What's on this frame?"
+                                 : kind == 100 ? L"Caption text" : kind == (int)MarkKind::Bubble ? L"Bubble text" : kind == (int)MarkKind::Title ? L"Title"
                                  : kind == (int)MarkKind::Emoji ? L"Emoji (Win+. for more)" : L"Text";
             SendMessageW(field1, EM_SETCUEBANNER, TRUE, (LPARAM)cue);
-            SendMessageW(field2, EM_SETCUEBANNER, TRUE, (LPARAM)L"Subtitle (optional)");
+            SendMessageW(field2, EM_SETCUEBANNER, TRUE, (LPARAM)(kind == 300 ? L"Your name" : L"Subtitle (optional)"));
         }
         if (id == 0) {
             if (GetFocus() == field1 || GetFocus() == field2) SetFocus(hwnd);
@@ -1002,10 +1596,21 @@ public:
     }
 
     void FieldChanged(HWND f) {
-        if (settingText) return;
+        if (settingText || goingTo) return;
         const int n = GetWindowTextLengthW(f);
         std::wstring t(n, L'\0');
         GetWindowTextW(f, t.data(), n + 1);
+        if (auto ni = SelNote()) {
+            if (f == field2) {
+                edit.notes[*ni].author = t;
+                RememberAuthor(t);
+            } else {
+                edit.notes[*ni].text = t;
+            }
+            NotesChanged();
+            Invalidate();
+            return;
+        }
         if (auto ci = SelCaption()) edit.captions[*ci].text = t;
         else if (auto mi = SelMark()) (f == field2 ? edit.marks[*mi].subtitle : edit.marks[*mi].text) = t;
         Rerender();
@@ -1059,10 +1664,33 @@ public:
         const RECT c = Client();
         return {S(14), t.top - S(8) - S(30), c.right - S(14), t.top - S(8)};
     }
-    RECT StageRect() const {
+    // The frame readout under the video.
+    RECT ReadoutRect() const {
         const RECT c = Client();
-        return {S(14), S(50), c.right - S(14), InspectorRect().top - S(8)};
+        const int bottom = InspectorRect().top - S(4);
+        return {S(14), bottom - S(22), c.right - S(14), bottom};
     }
+    // The video and, when there are notes, the notes list at its right.
+    RECT StageArea() const {
+        const RECT c = Client();
+        return {S(14), S(50), c.right - S(14), ReadoutRect().top - S(4)};
+    }
+    bool NotesShown() const { return !placed.empty(); }
+    RECT StageRect() const {
+        RECT r = StageArea();
+        if (NotesShown()) r.right -= S(kNotesW) + S(8);
+        return r;
+    }
+    static constexpr int kNotesW = 290;
+    RECT NotesRect() const {
+        const RECT a = StageArea();
+        return {a.right - S(kNotesW), a.top, a.right, a.bottom};
+    }
+    RECT NotesListRect() const {
+        const RECT r = NotesRect();
+        return {r.left, r.top + S(44), r.right, r.bottom - S(4)};
+    }
+    int NoteRowH() const { return S(52); }
     // Where the video is drawn.
     gp::RectF VideoRect() const {
         const RECT st = StageRect();
@@ -1070,30 +1698,112 @@ public:
         const double w = videoSize.cx * k, h = videoSize.cy * k;
         return gp::RectF((float)(st.left + (RectW(st) - w) / 2), (float)(st.top + (RectH(st) - h) / 2), (float)w, (float)h);
     }
-    double ViewScale() const { return VideoRect().Width / std::max(1L, videoSize.cx); }
+    // Screen pixels per video pixel, with the magnifier's zoom. The video's top-left on view is (magX, magY).
+    double ViewScale() const { return VideoRect().Width / std::max(1L, videoSize.cx) * magZoom; }
     VPoint ToVideo(POINT p) const {
         const auto v = VideoRect();
         const double k = ViewScale();
-        return {(p.x - v.X) / k, (p.y - v.Y) / k};
+        return {magX + (p.x - v.X) / k, magY + (p.y - v.Y) / k};
     }
     gp::PointF ToView(VPoint p) const {
         const auto v = VideoRect();
         const double k = ViewScale();
-        return gp::PointF((float)(v.X + p.x * k), (float)(v.Y + p.y * k));
+        return gp::PointF((float)(v.X + (p.x - magX) * k), (float)(v.Y + (p.y - magY) * k));
     }
     gp::RectF ToView(VRect r) const {
         const auto v = VideoRect();
         const double k = ViewScale();
-        return gp::RectF((float)(v.X + r.x * k), (float)(v.Y + r.y * k), (float)(r.w * k), (float)(r.h * k));
+        return gp::RectF((float)(v.X + (r.x - magX) * k), (float)(v.Y + (r.y - magY) * k), (float)(r.w * k), (float)(r.h * k));
+    }
+
+    // ---- pixel magnifier ----
+    // The wheel over the video zooms 1× to 8× around the cursor, a right-drag pans, F or a double-click fits it again.
+    // From 2× the pixels are drawn sharp. For looking only: the crop and the export never change.
+    double magZoom = 1;
+    double magX = 0, magY = 0;  // the video pixel at the view's top-left
+    std::optional<POINT> magDrag;  // right-drag: where it was last
+    void ClampMagnifier() {
+        magZoom = std::clamp(magZoom, 1.0, 8.0);
+        magX = std::clamp(magX, 0.0, videoSize.cx - videoSize.cx / magZoom);
+        magY = std::clamp(magY, 0.0, videoSize.cy - videoSize.cy / magZoom);
+    }
+    // Zooms by `factor`, keeping the video pixel under screen point `at` there.
+    void Magnify(double factor, POINT at) {
+        const VPoint under = ToVideo(at);
+        magZoom = std::clamp(magZoom * factor, 1.0, 8.0);
+        if (magZoom < 1.0001) magZoom = 1;
+        const auto v = VideoRect();
+        const double k = ViewScale();
+        magX = under.x - (at.x - v.X) / k;
+        magY = under.y - (at.y - v.Y) / k;
+        ClampMagnifier();
+        Invalidate();
+    }
+    void FitMagnifier() {
+        magZoom = 1;
+        magX = magY = 0;
+        Invalidate();
+    }
+    void PanMagnifier(int dx, int dy) {
+        const double k = ViewScale();
+        magX -= dx / k;
+        magY -= dy / k;
+        ClampMagnifier();
+        Invalidate();
     }
 
     double TX(double t) const {  // timeline x for a time
         const RECT r = TimelineRect();
-        return r.left + RectW(r) * (t / std::max(0.001, duration));
+        return r.left + RectW(r) * ((t - tlStart) / TlSpan());
     }
     double TT(int x) const {
         const RECT r = TimelineRect();
-        return std::clamp((double)(x - r.left) / std::max(1, RectW(r)), 0.0, 1.0) * duration;
+        return std::clamp(tlStart + (double)(x - r.left) / std::max(1, RectW(r)) * TlSpan(), 0.0, std::max(0.0, duration));
+    }
+
+    // ---- timeline zoom ----
+    // Ctrl+wheel or Ctrl+= / Ctrl+− zoom in around the playhead, to about 14 px a frame; Ctrl+0 fits the trim. The wheel,
+    // or dragging an empty lane, pans. Everything on the timeline goes through TX and TT, so it stays on its frames.
+    double tlZoom = 1;   // 1: the whole timeline fits
+    double tlStart = 0;  // the time at its left edge
+    double TlSpan() const { return std::max(1e-6, std::max(0.001, duration) / tlZoom); }
+    double PxPerFrame() const { return RectW(TimelineRect()) / TlSpan() / Seq().Fps(); }
+    double MaxTlZoom() const { return std::max(1.0, std::max(0.001, duration) * Seq().Fps() * 14.0 / std::max(1, RectW(TimelineRect()))); }
+    void ClampTimeline() {
+        tlZoom = std::clamp(tlZoom, 1.0, MaxTlZoom());
+        tlStart = std::clamp(tlStart, 0.0, std::max(0.0, duration - TlSpan()));
+    }
+    // Zooms by `factor`, keeping time `at` (the playhead) under the same spot (or centering it, when it was off view).
+    void ZoomTimeline(double factor, std::optional<double> at = std::nullopt) {
+        const double t = at ? *at : (playing ? rawT : paused);
+        const RECT r = TimelineRect();
+        double frac = (TX(t) - r.left) / std::max(1, RectW(r));
+        if (frac < 0 || frac > 1) frac = 0.5;
+        tlZoom *= factor;
+        tlZoom = std::clamp(tlZoom, 1.0, MaxTlZoom());
+        tlStart = t - frac * TlSpan();
+        ClampTimeline();
+        Invalidate();
+    }
+    void FitTrim() {
+        const double span = std::max(0.01, edit.trimEnd - edit.trimStart);
+        tlZoom = std::max(1.0, std::max(0.001, duration) / span);
+        tlStart = edit.trimStart;
+        ClampTimeline();
+        Invalidate();
+    }
+    // Pans so time `t` is on view (stepping or playing past the edge turns the page).
+    void KeepOnView(double t) {
+        if (tlZoom <= 1) return;
+        const double span = TlSpan();
+        if (t < tlStart || t > tlStart + span) tlStart = t - span * 0.15;
+        else if (t > tlStart + span * 0.97) tlStart = t - span * 0.15;
+        ClampTimeline();
+    }
+    // A click on the timeline lands on the nearest frame once frames are a few pixels apart.
+    double SnapToFrame(double t) const {
+        if (tframes.empty() || PxPerFrame() < 3) return t;
+        return tframes.frames[tframes.Nearest(t)].t;
     }
 
     // ---- stage geometry ----
@@ -1221,27 +1931,62 @@ public:
             const RECT cr = r;
             hots.back().click = [this, cr] { Popup(cr, CaptionsMenu()); };
         }
-        // Right side: Save GIF, Save.
-        const int saveW = S(68);
-        RECT save{c.right - S(14) - saveW, y, c.right - S(14), y + h};
+        // Right side: Save GIF, Save and its menu (▾: the review video).
+        const int saveW = S(68), moreW = S(28);
+        const RECT more{c.right - S(14) - moreW, y, c.right - S(14), y + h};
+        RECT save{more.left - S(2) - saveW, y, more.left - S(2), y + h};
         const int gifW = S(9) * 2 + S(22) + Measure(dc, fUi, L"Save GIF").cx;
         Button(dc, g, save.left - S(6) - gifW, y, h, 0xE8B9, L"Save GIF", false, false, [this] { Save(true); }, L"Save as a GIF (Ctrl+Shift+S)");
         Button(dc, g, save.left, y, h, 0, L"Save", false, false, [this] { Save(false); }, L"Save as a new MP4 in your captures (Ctrl+S)", true, saveW);
+        FillRR(g, more, (float)S(7), A(theme::kAccent));
+        Text(dc, fSmall, L"▾", more, theme::kOnAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Hotspot(more, [this, more] { Popup(more, SaveMenu()); }, L"More ways to save: GIF, review video with your notes");
+    }
+    std::vector<MenuItem> SaveMenu() {
+        std::vector<MenuItem> v;
+        MenuItem mp4, gif, review;
+        mp4.label = L"Save video\tCtrl+S";
+        mp4.run = [this] { Save(false); };
+        gif.label = L"Save GIF\tCtrl+Shift+S";
+        gif.run = [this] { Save(true); };
+        review.label = L"Save review video\tCtrl+Alt+S";
+        review.run = [this] { SaveReview(); };
+        review.enabled = !tframes.empty();
+        v.push_back(mp4);
+        v.push_back(gif);
+        v.push_back(MenuItem::Sep());
+        v.push_back(review);
+        return v;
     }
 
     void PaintStage(HDC dc, gp::Graphics& g) {
         const RECT st = StageRect();
         FillRR(g, st, (float)S(8), gp::Color(255, 0, 0, 0));
         const auto v = VideoRect();
-        if (shown) {
+        if (shown && magZoom <= 1) {
             MemDC src(shown->Handle());
             SetStretchBltMode(dc, HALFTONE);
             SetBrushOrgEx(dc, 0, 0, nullptr);
             StretchBlt(dc, (int)std::lround(v.X), (int)std::lround(v.Y), (int)std::lround(v.Width), (int)std::lround(v.Height), src, 0, 0, shown->Width(),
                        shown->Height(), SRCCOPY);
+        } else if (shown) {  // magnified: the whole pixels on view, each drawn as a block (sharp from 2×)
+            const int W = shown->Width(), H = shown->Height();
+            const int x0 = std::clamp((int)std::floor(magX), 0, W - 1), y0 = std::clamp((int)std::floor(magY), 0, H - 1);
+            const int x1 = std::clamp((int)std::ceil(magX + W / magZoom), x0 + 1, W), y1 = std::clamp((int)std::ceil(magY + H / magZoom), y0 + 1, H);
+            const gp::PointF a = ToView(VPoint{(double)x0, (double)y0}), b = ToView(VPoint{(double)x1, (double)y1});
+            HRGN clip = CreateRectRgn((int)std::lround(v.X), (int)std::lround(v.Y), (int)std::lround(v.X + v.Width), (int)std::lround(v.Y + v.Height));
+            SelectClipRgn(dc, clip);
+            MemDC src(shown->Handle());
+            SetStretchBltMode(dc, magZoom >= 2 ? COLORONCOLOR : HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            const int dx0 = (int)std::lround(a.X), dy0 = (int)std::lround(a.Y);
+            StretchBlt(dc, dx0, dy0, (int)std::lround(b.X) - dx0, (int)std::lround(b.Y) - dy0, src, x0, y0, x1 - x0, y1 - y0, SRCCOPY);
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
         }
         // Guides and handles are drawn above the video, so they show while it plays too.
         g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+        if (magZoom > 1) g.SetClip(v);
         const COLORREF accent = theme::kAccent;
         if (edit.crop) {
             const gp::RectF r = ToView(*edit.crop);
@@ -1301,6 +2046,157 @@ public:
             gp::Pen pen(A(accent), 1.5f * s);
             g.DrawPath(&pen, &p);
         }
+        // Pins of the notes on the frame on screen.
+        if (!playing && !tframes.empty()) {
+            const size_t frame = FrameNow();
+            for (const auto& [f, i] : placed) {
+                const Note& n = edit.notes[i];
+                const auto pin = f == frame ? PinOnVideo(n) : std::nullopt;
+                if (!pin) continue;
+                const gp::PointF c = ToView(*pin);
+                const bool sel = selected == n.id;
+                const float rr = (sel ? 9.f : 7.f) * s;
+                gp::SolidBrush fill(A(annot::Color(NoteKindColor(n.kind)), n.resolved ? 150 : 255));
+                gp::Pen ring(gp::Color(255, 255, 255, 255), (sel ? 3.f : 2.f) * s);
+                gp::Pen shadow(gp::Color(120, 0, 0, 0), 5.f * s);
+                g.DrawEllipse(&shadow, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
+                g.FillEllipse(&fill, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
+                g.DrawEllipse(&ring, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
+            }
+        }
+        g.ResetClip();
+        if (magZoom > 1) {  // how far the magnifier is in
+            wchar_t z[16];
+            swprintf_s(z, L"%g×", std::round(magZoom * 10) / 10);
+            const SIZE sz = Measure(dc, fSmall, z);
+            const RECT pill{(LONG)v.X + S(8), (LONG)v.Y + S(8), (LONG)v.X + S(8) + sz.cx + S(14), (LONG)v.Y + S(8) + sz.cy + S(8)};
+            FillRR(g, pill, (float)S(5), gp::Color(190, 0, 0, 0));
+            Text(dc, fSmall, z, pill, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Hotspot(pill, [this] { FitMagnifier(); }, L"Fit the video again (F or double-click)");
+        }
+    }
+
+
+    // The notes list, right of the video: kind, timecode, author and first line of each; All or Open only; Copy.
+    void PaintNotes(HDC dc, gp::Graphics& g) {
+        if (!NotesShown()) return;
+        const RECT r = NotesRect();
+        FillRR(g, r, (float)S(8), A(theme::kSurface));
+        int open = 0;
+        for (const auto& p : placed) open += !edit.notes[p.second].resolved;
+        const int hy = r.top + S(8), hh = S(28);
+        const std::wstring title = L"Notes";
+        const int tw = Measure(dc, fUi, title).cx;
+        Text(dc, fUi, title, {r.left + S(12), hy, r.left + S(12) + tw + S(2), hy + hh}, theme::kText);
+        const std::wstring count = std::to_wstring(open) + L" open";
+        Text(dc, fSmall, count, {r.left + S(18) + tw, hy, r.left + S(18) + tw + Measure(dc, fSmall, count).cx + S(4), hy + hh}, theme::kMuted);
+        // Right to left: Copy, Open, All.
+        const int copyW = S(9) * 2 + S(22) + Measure(dc, fUi, L"Copy").cx;
+        RECT b = Button(dc, g, r.right - S(6) - copyW, hy, hh, 0xE8C8, L"Copy", false, false, [this] { CopyNotes(); },
+                        L"Copy notes: one line each, as in the review notes list");
+        const int openW = S(9) * 2 + Measure(dc, fUi, L"Open").cx, allW = S(9) * 2 + Measure(dc, fUi, L"All").cx;
+        b = Button(dc, g, b.left - S(4) - openW, hy, hh, 0, L"Open", false, notesOpenOnly, [this] { notesOpenOnly = true; notesScroll = 0; Invalidate(); },
+                   L"Only notes not resolved");
+        Button(dc, g, b.left - S(2) - allW, hy, hh, 0, L"All", false, !notesOpenOnly, [this] { notesOpenOnly = false; notesScroll = 0; Invalidate(); },
+               L"Every note, resolved ones too");
+        const RECT list = NotesListRect();
+        const auto v = ListedNotes();
+        const int rowH = NoteRowH();
+        notesScroll = std::clamp(notesScroll, 0, std::max(0, (int)v.size() * rowH - RectH(list)));
+        if (v.empty()) {
+            Text(dc, fSmall, L"No open notes", {list.left + S(12), list.top, list.right, list.top + S(30)}, theme::kMuted);
+            return;
+        }
+        HRGN clip = CreateRectRgn(list.left, list.top, list.right, list.bottom);
+        SelectClipRgn(dc, clip);
+        g.SetClip(gp::Rect(list.left, list.top, RectW(list), RectH(list)));
+        for (size_t k = 0; k < v.size(); ++k) {
+            const int y = list.top + (int)k * rowH - notesScroll;
+            if (y + rowH < list.top || y > list.bottom) continue;
+            const auto [frame, i] = v[k];
+            const Note& n = edit.notes[i];
+            const RECT row{list.left + S(6), y + S(2), list.right - S(6), y + rowH - S(2)};
+            const bool sel = selected == n.id;
+            if (sel) FillRR(g, row, (float)S(6), A(theme::kSelected));
+            else if (EqualRect(&row, &hoverRect)) FillRR(g, row, (float)S(6), A(theme::kBgRaised));
+            const COLORREF kc = annot::Color(NoteKindColor(n.kind));
+            FillRR(g, {row.left + S(6), row.top + S(8), row.left + S(10), row.bottom - S(8)}, (float)S(2), A(kc, n.resolved ? 110 : 255));
+            const int x = row.left + S(18);
+            const std::wstring tc = tframes.Timecode(frame);
+            const int tcw = Measure(dc, fMono, tc).cx;
+            Text(dc, fMono, tc, {x, row.top + S(5), x + tcw + S(2), row.top + S(23)}, theme::kText);
+            const std::wstring kind = n.resolved ? std::wstring(L"✓ Resolved") : std::wstring(NoteKindLabel(n.kind));
+            const int kw = Measure(dc, fSmall, kind).cx;
+            Text(dc, fSmall, kind, {row.right - S(10) - kw, row.top + S(5), row.right - S(8), row.top + S(23)}, n.resolved ? theme::kMuted : kc);
+            Text(dc, fSmall, n.author.empty() ? std::wstring(L"·") : n.author, {x + tcw + S(10), row.top + S(5), row.right - S(16) - kw, row.top + S(23)},
+                 theme::kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            std::wstring first = n.text.substr(0, n.text.find_first_of(L"\r\n"));
+            if (first.empty()) first = L"(no text yet)";
+            Text(dc, fUi, first, {x, row.top + S(25), row.right - S(8), row.bottom - S(4)}, n.resolved || n.text.empty() ? theme::kMuted : theme::kText,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            const uint64_t id = n.id;
+            RECT hot = row;
+            hot.top = std::max(hot.top, list.top);
+            hot.bottom = std::min(hot.bottom, list.bottom);
+            if (hot.bottom > hot.top) Hotspot(hot, [this, id] { SelectNote(id); });
+        }
+        g.ResetClip();
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(clip);
+    }
+
+    // The notes in the review video (those in the trim), in timeline order, as the review video shows them.
+    ReviewPlan MakeReviewPlan() const {
+        ReviewPlan p;
+        p.frames = tframes;
+        if (tframes.empty()) return p;
+        const size_t first = tframes.At(edit.trimStart + 1e-3), last = tframes.At(edit.trimEnd - 1e-3);
+        for (const auto& [f, i] : placed) {
+            if (f < first || f > last) continue;
+            const Note& n = edit.notes[i];
+            ReviewNote r;
+            r.t = tframes.frames[f].t;
+            r.frame = f;
+            r.timecode = tframes.Timecode(f);
+            r.kind = n.kind;
+            r.resolved = n.resolved;
+            r.author = n.author.empty() ? std::wstring(L"Reviewer") : n.author;
+            r.text = n.text;
+            r.pin = PinOnVideo(n);
+            if (std::find(p.reviewers.begin(), p.reviewers.end(), r.author) == p.reviewers.end()) p.reviewers.push_back(r.author);
+            p.notes.push_back(r);
+        }
+        p.title = FileNameOf(path);
+        wchar_t date[128] = L"";
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, nullptr, nullptr, date, (int)std::size(date), nullptr);
+        p.date = date;
+        return p;
+    }
+    // The notes list as text, one line each (the review notes list and Copy): "m:ss:ff (frame n), Author: [Kind] text"
+    // for the notes in the review video, a blank line between them so Markdown shows each on its own line.
+    static std::wstring NoteLine(const ReviewNote& n) {
+        std::wstring text = n.text;
+        for (size_t at = 0; (at = text.find_first_of(L"\r\n", at)) != std::wstring::npos;) {
+            const size_t end = text.find_first_not_of(L"\r\n", at);
+            text.replace(at, (end == std::wstring::npos ? text.size() : end) - at, L" / ");
+            at += 3;
+        }
+        return n.timecode + L" (frame " + std::to_wstring(n.frame) + L"), " + n.author + L": [" + NoteKindLine(n.kind, n.resolved) + L"] " + text;
+    }
+    static std::wstring NotesListText(const ReviewPlan& p) {
+        std::wstring s;
+        for (const auto& n : p.notes) s += (s.empty() ? L"" : L"\r\n\r\n") + NoteLine(n);
+        return s.empty() ? s : s + L"\r\n";
+    }
+    std::wstring NotesText() const { return NotesListText(MakeReviewPlan()); }
+    std::function<void(const std::wstring&)> copyHook;  // tests: instead of the clipboard
+    void CopyNotes() {
+        const std::wstring t = NotesText();
+        if (t.empty()) return;
+        if (copyHook) return copyHook(t);
+        CopyTextToClipboard(hwnd, t);
+
+        ShowToast(L"Notes copied", std::to_wstring(std::count(t.begin(), t.end(), L'\n')) + L" lines", nullptr, nullptr, 2000);
     }
 
     // The per-item settings row, or a hint when nothing is selected.
@@ -1348,9 +2244,27 @@ public:
                 Popup(r, ListMenu(labels, current, [this](int i) { UpdateMark([i](Mark& m) { m.level = i; }); }));
             });
         };
-        const auto ci = SelCaption();
-        const auto mi = SelMark();
-        if (ci) {
+        const auto ci = goingTo ? std::nullopt : SelCaption();
+        const auto mi = goingTo ? std::nullopt : SelMark();
+        const auto ni = goingTo ? std::nullopt : SelNote();
+        if (goingTo) {
+            label(L"Go to");
+            field(1, 200);
+            label(L"a frame number, a timecode (m:ss:ff) or a time in seconds · Enter goes, Esc cancels");
+        } else if (ni) {
+            const Note n = edit.notes[*ni];
+            const uint64_t id = n.id;
+            button(0, NoteKindLabel(n.kind), true, [this, id](RECT r) { Popup(r, NoteKindMenu(id)); }, L"Note, Issue, Question or Looks good");
+            field(1, 250);
+            label(L"by");
+            field(2, 110);
+            button(n.resolved ? 0xE73E : 0, n.resolved ? L"Resolved" : L"Resolve", false, [this](RECT) { UpdateNote([](Note& x) { x.resolved = !x.resolved; }); },
+                   n.resolved ? L"Open it again" : L"Mark as resolved: it stays in the list and the review video, marked Resolved");
+            if (n.pin) button(0, L"Clear pin", false, [this](RECT) { UpdateNote([](Note& x) { x.pin.reset(); }); }, L"Remove the spot it points at");
+            else label(L"Click the video to pin a spot");
+            if (n.srcEnd) button(0, L"No range", false, [this](RECT) { UpdateNote([](Note& x) { x.srcEnd.reset(); }); }, L"Back to a single frame");
+            else button(0, L"Range to here", false, [this](RECT) { SetNoteRangeToPlayhead(); }, L"Make the note run to the frame at the playhead");
+        } else if (ci) {
             const Caption& c = edit.captions[*ci];
             field(1, 300);
             std::vector<std::wstring> pos = {L"Bottom", L"Middle", L"Top"};
@@ -1433,8 +2347,8 @@ public:
                 button(0xE768, L"", false, [this, m](RECT) { Replay(m); }, L"Play this item from just before it appears");
             }
         }
-        if (ci || mi) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
-        if (const auto k = SelClipIndex(); k && !ci && !mi) {
+        if (ci || mi || ni) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
+        if (const auto k = SelClipIndex(); k && !ci && !mi && !ni && !goingTo) {
             const size_t i = *k;
             const Clip& c = edit.clips[i];
             label(L"Clip " + std::to_wstring(i + 1) + L" of " + std::to_wstring(edit.clips.size()) + L":  " + FileNameOf(c.path) + L"  ·  " + Clock(c.Duration()));
@@ -1445,7 +2359,7 @@ public:
         }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · S split · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join them",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -1487,19 +2401,43 @@ public:
         const int stripH = S(52), capY = top + S(62), capH = S(22), markY = top + S(90), rowH = S(18);
         const RECT strip{tr.left, top, tr.right, top + stripH};
         FillRR(g, strip, (float)S(6), A(theme::kSurface));
-        if (!thumbs.empty()) {
-            const double w = RectW(strip) / (double)thumbs.size();
+        // Zoomed in, things off the edges are cut off there.
+        const RECT view{tr.left - S(6), tr.top - S(8), tr.right + S(6), tr.bottom};
+        HRGN viewRgn = CreateRectRgnIndirect(&view);
+        SelectClipRgn(dc, viewRgn);
+        g.SetClip(gp::Rect(view.left, view.top, RectW(view), RectH(view)));
+        if (const auto tiles = StripTiles(); !tiles.empty()) {  // zoomed in: tiles showing their own frames
+            HRGN clip = CreateRectRgn(strip.left, strip.top, strip.right, strip.bottom);
+            SelectClipRgn(dc, clip);
+            SetStretchBltMode(dc, HALFTONE);
+            for (const auto& tile : tiles) {
+                const int x0 = (int)std::lround(TX(tile.t0)), x1 = (int)std::lround(TX(tile.t1));
+                const auto it = stripThumbs.find(tile.frame);
+                if (it == stripThumbs.end() || !it->second) continue;  // still coming: the strip's own color meanwhile
+                MemDC src(it->second->Handle());
+                StretchBlt(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, 0, 0, it->second->Width(), it->second->Height(), SRCCOPY);
+            }
+            for (const auto& tile : tiles) {  // a hairline between tiles
+                const int x = (int)std::lround(TX(tile.t0));
+                FillSolid(dc, {x, strip.top, x + 1, strip.bottom}, RGB(0, 0, 0));
+            }
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
+            RequestStrip(tiles);
+        } else if (!thumbs.empty()) {
+            const double D = std::max(0.001, duration);
             HRGN clip = CreateRectRgn(strip.left, strip.top, strip.right, strip.bottom);
             SelectClipRgn(dc, clip);
             SetStretchBltMode(dc, HALFTONE);
             for (size_t i = 0; i < thumbs.size(); ++i) {
                 const auto& img = thumbs[i];
-                const RECT cell{(LONG)(strip.left + i * w), strip.top, (LONG)std::ceil(strip.left + (i + 1) * w), strip.bottom};
+                const RECT cell{(LONG)TX(D * i / thumbs.size()), strip.top, (LONG)std::ceil(TX(D * (i + 1) / thumbs.size())), strip.bottom};
+                if (cell.right < strip.left || cell.left > strip.right) continue;
                 const double k = std::max(RectW(cell) / (double)img->Width(), RectH(cell) / (double)img->Height());
                 const int dw = (int)std::ceil(img->Width() * k), dh = (int)std::ceil(img->Height() * k);
                 HRGN cr = CreateRectRgnIndirect(&cell);
                 ExtSelectClipRgn(dc, cr, RGN_AND);
-                MemDC src(img->Handle());
+                MemDC src(img->Handle());  // fitted: each of the 16 shows the frame at its middle
                 StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
                 SelectClipRgn(dc, clip);
                 DeleteObject(cr);
@@ -1508,6 +2446,7 @@ public:
             DeleteObject(clip);
         }
         if (edit.clips.size() > 1) PaintClips(dc, g, tr, strip);
+        PaintRuler(dc, g, strip);
         const int xs = (int)TX(edit.trimStart), xe = (int)TX(edit.trimEnd);
         gp::SolidBrush dim(gp::Color(166, 0, 0, 0));
         g.FillRectangle(&dim, (float)strip.left, (float)strip.top, (float)(xs - strip.left), (float)stripH);
@@ -1551,18 +2490,71 @@ public:
             const std::wstring label = KindHasText(m.kind) && !m.text.empty() ? m.text : m.kind == MarkKind::Step ? L"Step " + std::to_wstring(m.step) : KindLabel(m.kind);
             bar(barRect(m.start, m.end, markY + row * rowH + S(1), rowH - S(2)), label, KindGlyph(m.kind), selected == m.id);
         }
+        // Notes: a flag at the top of the strip and a line down it, in the kind's color (faint once resolved); a range
+        // gets a band along the bottom.
+        for (const auto& [f, i] : placed) {
+            const Note& n = edit.notes[i];
+            const float x = (float)TX(tframes.frames[f].t);
+            const BYTE alpha = n.resolved ? 120 : 255;
+            const gp::Color kc = A(annot::Color(NoteKindColor(n.kind)), alpha);
+            if (const auto e = NoteEndFrame(n); e && *e > f) {
+                gp::SolidBrush band(A(annot::Color(NoteKindColor(n.kind)), 150));
+                g.FillRectangle(&band, x, (float)(strip.bottom - S(6)), (float)TX(tframes.frames[*e].t) - x, (float)S(5));
+            }
+            gp::SolidBrush line(kc), edge(gp::Color(n.resolved ? 90 : 170, 0, 0, 0));
+            g.FillRectangle(&edge, x - 2 * s, (float)strip.top, 4 * s, (float)stripH);  // a dark edge, to show on any picture
+            g.FillRectangle(&line, x - 1 * s, (float)strip.top, 2 * s, (float)stripH);
+            gp::PointF flag[] = {{x - 7 * s, (float)strip.top}, {x + 7 * s, (float)strip.top}, {x, (float)strip.top + 11 * s}};
+            g.FillPolygon(&line, flag, 3);
+            gp::Pen outline(selected == n.id ? gp::Color(255, 255, 255, 255) : gp::Color(170, 0, 0, 0), (selected == n.id ? 1.5f : 1.f) * s);
+            g.DrawPolygon(&outline, flag, 3);
+        }
         const float px = (float)TX(Now());
+
         gp::SolidBrush white(gp::Color(255, 255, 255, 255));
         g.FillRectangle(&white, px - s, (float)tr.top - S(2), 2 * s, (float)RectH(tr) + S(2));
         g.FillEllipse(&white, px - 5 * s, (float)tr.top - S(4), 10 * s, 10 * s);
+        g.ResetClip();
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(viewRgn);
 
         // Play button and time, left of the timeline.
         const RECT play{S(14), tr.top + S(6), S(14) + S(34), tr.top + S(40)};
         if (EqualRect(&play, &hoverRect)) FillRR(g, play, (float)S(6), A(theme::kBgRaised));
-        Text(dc, fIcon, playing ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Text(dc, fIcon, playing || reviewDir ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         Hotspot(play, [this] { TogglePlay(); }, L"Play / pause (Space)");
-        Text(dc, fMono, Clock(Now()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)}, theme::kTextDim);
+        Text(dc, fMono, tframes.empty() ? Clock(Now()) : tframes.Timecode(FrameNow()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)},
+             theme::kTextDim);
         Text(dc, fMono, Clock(edit.OutputDuration()) + L" out", {S(12), play.bottom + S(24), tr.left - S(4), play.bottom + S(40)}, theme::kMuted);
+    }
+
+    // Zoomed in: a ruler along the bottom of the strip, a tick per frame once they're 4 px apart, and frame numbers
+    // every so many frames, far enough apart to read.
+    void PaintRuler(HDC dc, gp::Graphics& g, const RECT& strip) {
+        if (tlZoom <= 1.001 || tframes.empty()) return;
+        const int bandH = S(17);
+        const RECT band{strip.left, strip.bottom - bandH, strip.right, strip.bottom};
+        gp::SolidBrush bg(gp::Color(170, 0, 0, 0));
+        g.FillRectangle(&bg, (float)band.left, (float)band.top, (float)RectW(band), (float)bandH);
+        const double pf = PxPerFrame();
+        size_t step = 1;
+        for (size_t k : {1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 3000, 6000, 18000, 36000})
+            if ((step = k) * pf >= S(46)) break;
+        const size_t first = tframes.At(tlStart), last = std::min(tframes.size() - 1, tframes.At(tlStart + TlSpan()) + 1);
+        gp::SolidBrush tick(gp::Color(200, 255, 255, 255)), major(gp::Color(255, 255, 255, 255));
+        const size_t every = pf >= 4 ? 1 : step;
+        for (size_t n = first - first % every; n <= last; n += every) {
+            const float x = (float)TX(tframes.frames[n].t);
+            if (x < strip.left - 1 || x > strip.right + 1) continue;
+            const bool labeled = n % step == 0;
+            g.FillRectangle(labeled ? &major : &tick, x - 0.5f * s, (float)(band.bottom - (labeled ? S(7) : S(4))), 1 * s, (float)(labeled ? S(7) : S(4)));
+            if (labeled) {
+                const std::wstring num = std::to_wstring(n);
+                const int w = Measure(dc, fSmall, num).cx;
+                if (x + S(3) + w <= strip.right)  // whole, or not at all
+                    Text(dc, fSmall, num, {(LONG)x + S(3), band.top, (LONG)x + S(3) + w + S(2), band.bottom - S(4)}, RGB(255, 255, 255));
+            }
+        }
     }
 
     // Clip lane: one bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
@@ -1629,6 +2621,8 @@ public:
             g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
             PaintToolbar(dc, g);
             PaintStage(dc, g);
+            PaintNotes(dc, g);
+            PaintReadout(dc, g);
             PaintInspector(dc, g);
             PaintTimeline(dc, g);
             if (tipShown) PaintTooltip(dc, g);
@@ -1638,6 +2632,60 @@ public:
     }
     bool tipShown = false;
     BitmapPtr backBuffer;
+
+    // m:ss:ff · frame n · fps of the frame on screen.
+    std::wstring ReadoutText() const { return tframes.empty() ? Clock(Now()) : tframes.Readout(FrameNow()); }
+
+    void PaintReadout(HDC dc, gp::Graphics& g) {
+        const RECT r = ReadoutRect();
+        const std::wstring text = ReadoutText();
+        const int w = Measure(dc, fMonoBig, text).cx;
+        Text(dc, fMonoBig, text, {r.left + S(2), r.top, r.left + S(2) + w + S(4), r.bottom}, theme::kText);
+        Hotspot({r.left, r.top, r.left + w + S(8), r.bottom}, [this] { BeginGoTo(); }, L"Go to a frame or time (Ctrl+G)");
+        int x = r.left + w + S(16);
+        if (reviewDir || (playing && previewRate != 1)) {  // the preview's own speed, while it plays that way
+            const std::wstring state = (reviewDir < 0 ? L"◀ Reverse " : L"▶ Preview ") + SpeedLabel(previewRate);
+            const SIZE sz = Measure(dc, fSmall, state);
+            const RECT pill{x, r.top + S(2), x + sz.cx + S(16), r.bottom - S(2)};
+            FillRR(g, pill, (float)S(5), A(theme::kSelected));
+            Text(dc, fSmall, state, pill, theme::kAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            x = pill.right + S(8);
+        }
+        Text(dc, fSmall, L"←/→ frame · Shift+←/→ second · J/K/L review · Home/End trim ends · Ctrl+G go to", {x, r.top, r.right, r.bottom},
+             theme::kMuted, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // ---- go to ----
+
+    void BeginGoTo() {
+        Pause();
+        if (selected) Select(std::nullopt);
+        goingTo = true;
+        fieldsFor = 0;  // the field is emptied for it
+        FocusField();
+        Invalidate();
+    }
+    void EndGoTo() {
+        if (!goingTo) return;
+        goingTo = false;
+        if (field1 && GetFocus() == field1) SetFocus(hwnd);
+        SyncFields();
+        Invalidate();
+    }
+    // Enter in the go-to field: lands on that frame, or says it isn't one.
+    bool CommitGoTo() {
+        const int n = field1 ? GetWindowTextLengthW(field1) : 0;
+        std::wstring t(n, L'\0');
+        if (n) GetWindowTextW(field1, t.data(), n + 1);
+        const auto frame = tframes.Find(t);
+        if (!frame) {
+            ShowToast(L"Not a frame or time in this video", L"Type a frame number (757), a timecode (0:12:37) or seconds (12.6).", nullptr, nullptr, 3000);
+            return false;
+        }
+        EndGoTo();
+        GoToFrame(*frame);
+        return true;
+    }
 
     // ---- mouse ----
 
@@ -1671,6 +2719,17 @@ public:
             drag.kind = DragKind::Crop;
             drag.from = vp;
             return;
+        }
+        if (auto ni = SelNote()) {  // a note selected: the click pins the spot it points at
+            const Note& n = edit.notes[*ni];
+            if (const auto f = NoteFrame(n); f && tframes.frames[*f].clip < edit.clips.size()) {
+                ReleaseCapture();
+                const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
+                const VPoint pin{std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)};
+                UpdateNote([pin](Note& x) { x.pin = pin; });
+                if (FrameNow() != *f) GoToFrame(*f);
+                return;
+            }
         }
         const double t = Now();
         if (auto mi = SelMark(); mi && edit.marks[*mi].Active(t)) {  // handles of the selected mark first
@@ -1717,6 +2776,11 @@ public:
                 return;
             }
         ReleaseCapture();
+        if (magZoom > 1) {  // magnified: a click doesn't play; a double-click fits the video again
+            if (dbl) FitMagnifier();
+            else if (selected) Select(std::nullopt);
+            return;
+        }
         if (selected) Select(std::nullopt);
         else TogglePlay();
     }
@@ -1755,6 +2819,13 @@ public:
             SelectClip(std::nullopt);
             return;
         }
+        if (p.y >= top && p.y <= top + S(14))  // a note's flag at the top of the strip
+            for (auto it = placed.rbegin(); it != placed.rend(); ++it)
+                if (std::abs(p.x - TX(tframes.frames[it->first].t)) <= S(6)) {
+                    ReleaseCapture();
+                    SelectNote(edit.notes[it->second].id);
+                    return;
+                }
         auto grab = [&](uint64_t id, bool isCaption, double s0, double e0) {
             drag = {};
             drag.kind = DragKind::Item;
@@ -1782,8 +2853,7 @@ public:
                 }
             }
             Select(std::nullopt);
-            Seek(TT(p.x));
-            ReleaseCapture();
+            BeginPan(p);
             return;
         }
         if (p.y >= capY) {
@@ -1794,8 +2864,7 @@ public:
                     return;
                 }
             Select(std::nullopt);
-            Seek(TT(p.x));
-            ReleaseCapture();
+            BeginPan(p);
             return;
         }
         drag = {};
@@ -1811,10 +2880,23 @@ public:
         }
         drag.kind = DragKind::Playhead;
         Pause();
-        Seek(TT(p.x));
+        Seek(SnapToFrame(TT(p.x)));
+    }
+    // An empty lane: a drag pans the timeline (zoomed in), a click goes to that time.
+    void BeginPan(POINT p) {
+        drag = {};
+        drag.kind = DragKind::Pan;
+        drag.downX = p.x;
+        drag.grab = tlStart;
+        drag.value = SnapToFrame(TT(p.x));
     }
 
     void OnMouseMove(POINT p, WPARAM keys) {
+        if (magDrag && (keys & MK_RBUTTON)) {
+            PanMagnifier(p.x - magDrag->x, p.y - magDrag->y);
+            magDrag = p;
+            return;
+        }
         if (drag.kind == DragKind::None || !(keys & MK_LBUTTON)) {
             RECT hover{};
             for (auto it = hots.rbegin(); it != hots.rend(); ++it)
@@ -1842,7 +2924,14 @@ public:
                 SetTrim(std::nullopt, now);
                 Seek(edit.trimEnd);
                 break;
-            case DragKind::Playhead: Seek(now); break;
+            case DragKind::Playhead: Seek(SnapToFrame(now)); break;
+            case DragKind::Pan:
+                if (drag.target < 0 && std::abs(p.x - drag.downX) < S(4)) break;
+                drag.target = 1;  // moved: a pan, not a click
+                tlStart = drag.grab - (p.x - drag.downX) * TlSpan() / std::max(1, RectW(TimelineRect()));
+                ClampTimeline();
+                Invalidate();
+                break;
             case DragKind::ClipIn:
             case DragKind::ClipOut: {
                 if (drag.clip >= edit.clips.size()) break;
@@ -1939,8 +3028,42 @@ public:
         }
     }
 
+    // The wheel: scrolls the notes list; over the video it magnifies; over the timeline, Ctrl+wheel zooms it and the
+    // wheel pans it.
+    void OnWheel(POINT p, int delta, WPARAM keys) {
+        const RECT st = StageRect();
+        if (PtInRect(&st, p)) {
+            Magnify(std::pow(1.25, delta / (double)WHEEL_DELTA), p);
+            return;
+        }
+        const RECT nl = NotesListRect();
+        if (NotesShown() && PtInRect(&nl, p)) {
+            notesScroll = std::max(0, notesScroll - delta * NoteRowH() / WHEEL_DELTA);
+            Invalidate();
+            return;
+        }
+        const RECT tr = TimelineRect();
+        if (p.y >= tr.top - S(8) && p.y <= tr.bottom && p.x >= S(14)) {
+            if (keys & MK_CONTROL) ZoomTimeline(std::pow(1.25, delta / (double)WHEEL_DELTA));
+            else if (tlZoom > 1) {
+                tlStart -= delta / (double)WHEEL_DELTA * TlSpan() * 0.15;
+                ClampTimeline();
+                Invalidate();
+            }
+            return;
+        }
+    }
+
     void OnMouseUp() {
+
         const Drag d = drag;
+        if (d.kind == DragKind::Pan) {
+            drag = {};
+            ReleaseCapture();
+            if (d.target < 0) Seek(d.value);  // a click: go there
+            Invalidate();
+            return;
+        }
         if (d.kind == DragKind::ClipIn || d.kind == DragKind::ClipOut || d.kind == DragKind::ClipMove) {
             drag = {};
             ReleaseCapture();
@@ -1968,25 +3091,48 @@ public:
         Invalidate();
     }
 
-    bool OnKey(WPARAM vk) {
+    struct Mods {
+        bool ctrl = false, shift = false, alt = false;
+    };
+    bool OnKey(WPARAM vk) { return Key(vk, {GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0, GetKeyState(VK_MENU) < 0}); }
+
+    bool Key(WPARAM vk, Mods mods) {
         if (drag.kind != DragKind::None) {
             if (vk == VK_ESCAPE) CancelDrag();
             return true;
         }
-        const bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, shift = GetKeyState(VK_SHIFT) < 0;
+        if (mods.ctrl && mods.alt && !mods.shift && vk == 'S') {
+            SaveReview();
+            return true;
+        }
+        const bool ctrl = mods.ctrl && !mods.alt, shift = mods.shift;
         if (ctrl) {
             switch (vk) {
                 case 'S': Save(shift); return true;
                 case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
+                case 'G': BeginGoTo(); return true;
+                case VK_OEM_PLUS:
+                case VK_ADD: ZoomTimeline(1.5); return true;
+                case VK_OEM_MINUS:
+                case VK_SUBTRACT: ZoomTimeline(1 / 1.5); return true;
+                case '0':
+                case VK_NUMPAD0: FitTrim(); return true;
+
                 case 'W': PostMessageW(hwnd, WM_CLOSE, 0, 0); return true;
                 default: return false;
             }
         }
         switch (vk) {
             case VK_SPACE: TogglePlay(); break;
-            case VK_LEFT: Step(shift ? -30 : -1); break;
-            case VK_RIGHT: Step(shift ? 30 : 1); break;
+            case 'J': Review(-1); break;
+            case 'K': Pause(); break;
+            case 'L': Review(1); break;
+
+            case VK_LEFT: shift ? StepSecond(-1) : Step(-1); break;
+            case VK_RIGHT: shift ? StepSecond(1) : Step(1); break;
+            case VK_HOME: GoTrimEnd(false); break;
+            case VK_END: GoTrimEnd(true); break;
             case 'S': SplitAtPlayhead(); break;
             case 'I': PushUndo(); SetTrim(Now(), std::nullopt); break;
             case 'O': PushUndo(); SetTrim(std::nullopt, Now()); break;
@@ -1998,6 +3144,10 @@ public:
             case 'X': AddMark(MarkKind::Blur); break;
             case 'Z': AddMark(MarkKind::Zoom); break;
             case 'C': cropping = !cropping; Invalidate(); break;
+            case 'M': AddNote(); break;
+            case 'F': FitMagnifier(); break;
+            case VK_OEM_4: JumpNote(-1); break;  // [
+            case VK_OEM_6: JumpNote(1); break;   // ]
             case VK_DELETE:
             case VK_BACK:
                 if (SelClipIndex() && !selected) RemoveClip(*SelClipIndex());
@@ -2107,6 +3257,83 @@ public:
         }).detach();
     }
 
+    // Save review video (Ctrl+Alt+S): "<video> review.mp4" in the captures folder (the summary card, the edit with the
+    // timecode and frame number burned in, each note's frame held under its card), with "<video> review notes.md" and
+    // "<video> review sheet.png" next to it.
+    std::wstring lastReviewOut;  // tests
+    void SaveReview() {
+        if (busy || tframes.empty()) return;
+        SetFocus(hwnd);  // commits a field being edited
+        EndGoTo();
+        busy = saving = true;
+        Pause();
+        const ReviewPlan plan = MakeReviewPlan();
+        const std::wstring capture = MakeCapturePath(g_folder, L"mp4", {window, app});
+        const std::wstring folder = capture.substr(0, capture.find_last_of(L'\\'));
+        SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
+        std::wstring stem = FileNameOf(path);
+        if (const size_t dot = stem.find_last_of(L'.'); dot != std::wstring::npos) stem.resize(dot);
+        std::wstring name;
+        for (int k = 1;; ++k) {  // never over an earlier one
+            name = folder + L"\\" + stem + L" review" + (k > 1 ? L" " + std::to_wstring(k) : L"");
+            bool taken = false;
+            for (const wchar_t* ext : {L".mp4", L" notes.md", L" sheet.png"}) taken = taken || GetFileAttributesW((name + ext).c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (!taken) break;
+        }
+        const std::wstring out = name + L".mp4", md = name + L" notes.md", sheet = name + L" sheet.png";
+        wchar_t tdir[MAX_PATH];
+        GetTempPathW(MAX_PATH, tdir);
+        const std::wstring tmp = std::wstring(tdir) + L"ather-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".mp4";
+        const uint64_t toast = ShowToast(L"Saving review video…", std::to_wstring(plan.notes.size()) + (plan.notes.size() == 1 ? L" note" : L" notes"), nullptr,
+                                         nullptr, 600000);
+        const VideoEdit e = edit;
+        const std::wstring src = path, mdText = NotesListText(plan);
+        HWND h = hwnd;
+        std::thread([=] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            std::wstring err;
+            int lastPct = -1;
+            auto progress = [&](double p) {
+                const int pct = (int)(p * 100);
+                if (pct / 5 != lastPct / 5) {
+                    lastPct = pct;
+                    const std::wstring body = std::to_wstring(pct) + L"%";
+                    RunOnUi([toast, body] { UpdateToastBody(toast, body); });
+                }
+                return true;
+            };
+            const bool ok = ExportReviewMp4(src, e, plan, tmp, &err, progress);
+            const bool sheetOk = ok && WriteContactSheet(src, e, plan, sheet);
+            CoUninitialize();
+            auto* r = new SaveResult{ok, false, out, tmp, err, true, md, mdText, sheetOk ? sheet : L""};
+            if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {  // the editor was closed meanwhile
+                delete r;
+                if (!ok) DeleteFileW(tmp.c_str());
+                else RunOnUi([out, tmp, md, mdText] {
+                    MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+                    WriteFileUtf8(md, ToUtf8(mdText));
+                });
+            }
+        }).detach();
+    }
+    void ReviewSaved(const SaveResult& r) {
+        busy = saving = false;
+        lastSaveError = r.ok ? L"" : r.err;
+        Invalidate();
+        if (!r.ok || !MoveFileExW(r.tmp.c_str(), r.out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            DeleteFileW(r.tmp.c_str());
+            ShowToast(L"Saving the review video failed", r.ok ? r.out : r.err, nullptr, nullptr, 8000);
+            return;
+        }
+        lastReviewOut = r.out;
+        Library::Shared().NoteEdit(r.out, path, app, window, true);  // stacks with the original in the gallery
+        WriteFileUtf8(r.md, ToUtf8(r.mdText));
+        std::vector<std::wstring> made = {r.out, r.md};
+        if (!r.sheet.empty()) made.push_back(r.sheet);
+        ShowToast(L"Review video saved", FileNameOf(r.out) + L", its notes list and contact sheet  ·  click to show in Explorer", nullptr,
+                  [made] { RevealInExplorer(made); }, 6000);
+    }
+
     void Saved(bool ok, bool gif, const std::wstring& out, const std::wstring& tmp, const std::wstring& err) {
         busy = saving = false;
         lastSaveError = ok ? L"" : err;
@@ -2124,6 +3351,7 @@ public:
             return;
         }
         dirty = false;
+        savedEdit = WithoutNotes(edit);
         WIN32_FILE_ATTRIBUTE_DATA fa{};
         GetFileAttributesExW(out.c_str(), GetFileExInfoStandard, &fa);
         const double mb = ((uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) / 1048576.0;
@@ -2136,13 +3364,14 @@ public:
     // ---- window ----
 
     void Fonts() {
-        for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji})
+        for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji, fMonoBig})
             if (f) DeleteObject(f);
         fUi = MakeFont(S(13));
         fSmall = MakeFont(S(11));
         fIcon = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, kIconFace);
         fIconSmall = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, kIconFace);
         fMono = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Cascadia Mono");
+        fMonoBig = CreateFontW(-S(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Cascadia Mono");
         fEmoji = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI Emoji");
         for (HWND f : {field1, field2})
             if (f) SendMessageW(f, WM_SETFONT, (WPARAM)fUi, TRUE);
@@ -2162,13 +3391,21 @@ LRESULT CALLBACK FieldProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     VideoEditor* e = FromHwnd(GetParent(h));
     if (!e) return DefWindowProcW(h, m, w, l);
     if (m == WM_KEYDOWN && (w == VK_RETURN || w == VK_ESCAPE)) {
-        SetFocus(e->hwnd);
+        if (e->goingTo && w == VK_RETURN) e->CommitGoTo();
+        else if (e->goingTo) e->EndGoTo();
+        else SetFocus(e->hwnd);
         return 0;
     }
     if (m == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0 && (w == 'S' || w == 'W')) return e->OnKey(w), 0;
     if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE)) return 0;  // no beep
-    if (m == WM_SETFOCUS) e->PushUndo();  // one undo step per editing session
+    if (m == WM_SETFOCUS && !e->goingTo) e->PushUndo();  // one undo step per editing session
+    if (m == WM_KILLFOCUS && e->goingTo) {  // clicked away: going to nowhere
+        const LRESULT r = CallWindowProcW(e->editProc, h, m, w, l);
+        e->EndGoTo();
+        return r;
+    }
     return CallWindowProcW(e->editProc, h, m, w, l);
+
 }
 
 LRESULT CALLBACK VideoProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2219,6 +3456,28 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             if ((HWND)l != hwnd) CancelDrag();  // Alt+Tab, a menu, another window took the mouse mid-drag
             return 0;
         case WM_MOUSELEAVE: hoverRect = {}; tipShown = false; Invalidate(); return 0;
+        case WM_RBUTTONDOWN: {
+            const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            const RECT st = StageRect();
+            if (PtInRect(&st, p) && magZoom > 1) {
+                magDrag = p;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
+        case WM_RBUTTONUP:
+            if (magDrag) {
+                magDrag.reset();
+                ReleaseCapture();
+            }
+            return 0;
+        case WM_MOUSEWHEEL: {
+
+            POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ScreenToClient(hwnd, &p);
+            OnWheel(p, GET_WHEEL_DELTA_WPARAM(w), GET_KEYSTATE_WPARAM(w));
+            return 0;
+        }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (OnKey(w)) return 0;
@@ -2244,7 +3503,30 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
                 rawT = r->t;
                 Rerender();
                 Invalidate();
+                if (onFetched) onFetched();
             }
+            return 0;
+        }
+        case WM_STRIP: {
+            std::unique_ptr<StripFetcher::Result> r(reinterpret_cast<StripFetcher::Result*>(l));
+            if (r->gen != stripGen) return 0;  // for frames since rebuilt
+            stripThumbs[r->frame] = r->thumb;
+            if (stripThumbs.size() > 800) {  // keep the ones on view, drop the rest
+                std::map<size_t, BitmapPtr> keep;
+                for (const auto& t : StripTiles())
+                    if (auto it = stripThumbs.find(t.frame); it != stripThumbs.end()) keep.insert(*it);
+                stripThumbs = std::move(keep);
+            }
+            Invalidate();
+            return 0;
+        }
+        case WM_FRAMES: {
+            std::unique_ptr<FrameTimesResult> r(reinterpret_cast<FrameTimesResult*>(l));
+            framesPending.erase(r->key);
+            frameTimes[r->key] = r->times;
+            RebuildFrames();
+            if (!playing) Fetch(paused);
+            Invalidate();
             return 0;
         }
         case WM_THUMBS: {
@@ -2269,11 +3551,12 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         }
         case WM_SAVED: {
             std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(l));
-            Saved(r->ok, r->gif, r->out, r->tmp, r->err);
+            if (r->review) ReviewSaved(*r);
+            else Saved(r->ok, r->gif, r->out, r->tmp, r->err);
             return 0;
         }
         case WM_CLOSE:
-            if (dirty && !snapshotMode &&
+            if (dirty && !snapshotMode && !(WithoutNotes(edit) == savedEdit) &&
                 MessageBoxW(hwnd, L"Close the video editor and discard your changes?", L"Edit video", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
                 return 0;
             DestroyWindow(hwnd);
@@ -2283,11 +3566,13 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             thumbLatest->store(~0ull);  // stops a thumbnail job still running
             player.reset();
             fetcher.reset();
+            stripFetcher.reset();
             return 0;
+
         case WM_NCDESTROY: {  // after the children: they still need FieldProc to find this editor
             std::erase(g_editors, this);
             if (g_editors.empty()) ClearRenderCache();  // rendered titles and captions can be large
-            for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji})
+            for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji, fMonoBig})
                 if (f) DeleteObject(f);
             delete this;
             return 0;
@@ -2321,6 +3606,9 @@ bool VideoEditor::Create() {
     builtClips = edit.clips;
     duration = ClipsDuration(edit.clips);
     edit.trimEnd = duration;
+    LoadNotes();
+    savedEdit = WithoutNotes(edit);
+
     const ItemMeta& meta = Library::Shared().Meta(path);
     app = meta.app;
     window = meta.window;
@@ -2350,9 +3638,12 @@ bool VideoEditor::Create() {
     std::wstring err;
     player = SequencePlayer::Open(Seq(), hwnd, WM_ENGINE, &err);
     fetcher = std::make_unique<FrameFetcher>(Seq(), hwnd);
+    RebuildFrames();
     Rerender();
     SetTimer(hwnd, kTimerFrame, 15, nullptr);
     LoadThumbs();
+    LoadFrameTimes();
+
     DragAcceptFiles(hwnd, TRUE);
     if (snapshotMode) return true;
     ShowWindow(hwnd, SW_SHOW);
@@ -2369,6 +3660,24 @@ void SetVideoEditorOptions(const std::wstring& capturesFolder, HICON icon) {
     g_folder = capturesFolder;
     g_icon = icon;
 }
+
+bool VideoEditorHotkey(UINT mods, UINT vk) {
+    if ((mods & (MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN)) != (MOD_CONTROL | MOD_ALT) || vk != 'S') return false;
+    const HWND fg = GetForegroundWindow();
+    for (auto* e : g_editors)
+        if (e->hwnd == fg) {
+            e->SaveReview();
+            return true;
+        }
+    return false;
+}
+
+void SetVideoEditorAuthor(const std::wstring& author, std::function<void(const std::wstring&)> remember) {
+
+    g_noteAuthor = author;
+    g_rememberAuthor = std::move(remember);
+}
+
 
 bool IsVideoFile(const std::wstring& path) { return MediaTypeOf(path) == MediaType::Video; }  // one list, in library.cpp
 
@@ -2440,6 +3749,79 @@ VideoEditor* OpenHidden(const std::wstring& clip, int w, int h) {
     AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
     SetWindowPos(e->hwnd, nullptr, 0, 0, RectW(wr), RectH(wr), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
     return e;
+}
+
+// A clip whose every frame has a color of its own: frame i is (16 × (i % 16), 16 × (i / 16), `blue`), which survives
+// compression well enough for NumberOf to read it back.
+// For the snapshots: a recording-like clip whose every frame shows its number in big type (and its timecode), over a
+// fine grid, with a bar that moves 8 px a frame, and a tone. Frame i at i / fps.
+bool WriteFrameNumberClip(const std::wstring& path, int w, int h, int fps, int frames) {
+    Mp4Writer mw;
+    if (FAILED(mw.Begin(path, w, h, fps, 48000, 2))) return false;
+    auto f = Bitmap::Create(w, h);
+    if (!f) return false;
+    textdraw::Style big, sub;
+    big.family = L"Segoe UI";
+    big.size = h * 0.3f;
+    big.weight = 800;
+    sub.family = L"Consolas";
+    sub.size = h * 0.05f;
+    sub.weight = 700;
+    sub.color = RGB(255, 214, 10);
+    int64_t audio = 0;
+    std::vector<int16_t> pcm;
+    for (int i = 0; i < frames; ++i) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const bool grid = x % 40 == 0 || y % 40 == 0;
+                const uint32_t bg = 0xFF000000u | (uint32_t)(20 + 40 * x / w) << 16 | (uint32_t)(30 + 30 * y / h) << 8 | (uint32_t)(70 + 60 * x / w);
+                f->Bits()[(size_t)y * w + x] = grid ? 0xFF5A6A8Au : bg;
+            }
+        const int bx = (i * 8) % w;
+        for (int y = 0; y < h; ++y)
+            for (int x = bx; x < std::min(w, bx + 24); ++x) f->Bits()[(size_t)y * w + x] = 0xFFE5484Du;
+        textdraw::Draw(*f, std::to_wstring(i), big, 0, h * 0.28f, (float)w);
+        textdraw::Draw(*f, L"frame " + std::to_wstring(i) + L" · " + Timecode((double)i / fps, fps), sub, 0, h * 0.68f, (float)w);
+        if (FAILED(mw.WriteFrame(f->Bits(), std::llround(i * 1e7 / fps), std::llround(1e7 / fps)))) return false;
+        const int64_t until = std::llround((i + 1) * 48000.0 / fps);
+        pcm.clear();
+        for (; audio < until; ++audio) {
+            const int16_t v = (int16_t)std::lround(std::sin(2 * 3.14159265358979 * 330 * audio / 48000) * 6000);
+            pcm.push_back(v), pcm.push_back(v);
+        }
+        mw.WriteAudio(pcm.data(), (uint32_t)(pcm.size() / 2), std::llround((audio - (int64_t)pcm.size() / 2) * 1e7 / 48000));
+    }
+    return SUCCEEDED(mw.Finalize());
+}
+
+bool WriteNumberedClip(const std::wstring& path, int w, int h, int fps, int frames, int blue) {
+    Mp4Writer mw;
+    if (FAILED(mw.Begin(path, w, h, fps))) return false;
+    std::vector<uint32_t> px((size_t)w * h);
+    for (int i = 0; i < frames; ++i) {
+        std::fill(px.begin(), px.end(), 0xFF000000u | (uint32_t)(16 * (i % 16)) << 16 | (uint32_t)(16 * (i / 16)) << 8 | (uint32_t)blue);
+        if (FAILED(mw.WriteFrame(px.data(), std::llround(i * 1e7 / fps), std::llround(1e7 / fps)))) return false;
+    }
+    return SUCCEEDED(mw.Finalize());
+}
+int NumberOf(uint32_t c) { return (int)std::lround(((c >> 8) & 255) / 16.0) * 16 + (int)std::lround(((c >> 16) & 255) / 16.0); }
+bool BlueOf(uint32_t c) { return (c & 255) > 128; }
+
+// The frame the paused editor shows once the frame at the playhead has been decoded: its number and whether it has
+// blue (which clip), from the middle pixel. {-1, false} when it doesn't arrive.
+std::pair<int, bool> ShownFrame(VideoEditor* e) {
+    for (const ULONGLONG end = GetTickCount64() + 2000; GetTickCount64() < end;) {
+        if (e->raw && std::fabs(e->rawT - e->paused) < 1e-3) break;
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(1);
+    }
+    if (!e->raw || std::fabs(e->rawT - e->paused) >= 1e-3) return {-1, false};
+    const uint32_t c = e->raw->Bits()[(size_t)(e->raw->Height() / 2) * e->raw->Width() + e->raw->Width() / 2];
+    return {NumberOf(c), BlueOf(c)};
 }
 
 BitmapPtr Snapshot(VideoEditor* e) {
@@ -2514,6 +3896,14 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
     e->Changed();
     Pump(800);
     SavePng(*Snapshot(e), outDir + L"\\video-editor.png");
+    {  // the magnifier at 4×, over the speech bubble's text
+        const gp::PointF at = e->ToView(VPoint{640, 165});
+
+        e->Magnify(4, {(LONG)at.X, (LONG)at.Y});
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-magnifier.png");
+        e->FitMagnifier();
+    }
     ed.captions[0].center = VPoint{0.5, 0.62};
     ed.captionLook = CaptionLook::Pill;
     ed.captionColor = 2;
@@ -2545,6 +3935,96 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
     }
     e->dirty = false;
     DestroyWindow(e->hwnd);
+    // A 60 fps recording on frame 757, as the readout's example.
+    const std::wstring sixty = outDir + L"\\snapshot-60fps.mp4";
+    if (WriteFrameNumberClip(sixty, 1280, 720, 60, 780) && (e = OpenHidden(sixty, 1180, 760))) {
+
+        for (int i = 0; i < 300 && (!e->FramesKnown() || e->thumbs.empty()); ++i) Pump(10);
+        e->GoToFrame(757);
+        Pump(800);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-readout.png");
+        // Notes of every kind, one resolved, the selected one pinned.
+        struct Spec {
+            size_t frame;
+            NoteKind kind;
+            const wchar_t* text;
+            const wchar_t* author;
+            bool resolved;
+        };
+        const Spec specs[] = {{95, NoteKind::Note, L"Intro starts a beat late", L"Tin Nguyen", false},
+                              {260, NoteKind::Issue, L"Health bar flickers for one frame when the shield breaks", L"Tin Nguyen", false},
+                              {410, NoteKind::Question, L"Is this hit-stop intended?", L"Mai", false},
+                              {540, NoteKind::Good, L"Dash trail reads well now", L"Mai", true},
+                              {757, NoteKind::Issue, L"Muzzle flash missing on this frame", L"Tin Nguyen", false}};
+        for (const Spec& sp : specs) {
+            const TimelineFrames::Frame& f = e->tframes.frames[sp.frame];
+            Note n;
+            n.path = e->edit.clips[f.clip].path;
+            n.src = f.src;
+            n.kind = sp.kind;
+            n.text = sp.text;
+            n.author = sp.author;
+            n.resolved = sp.resolved;
+            e->edit.notes.push_back(n);
+        }
+        e->edit.notes.back().pin = VPoint{0.62, 0.38};
+        e->edit.notes[1].srcEnd = e->edit.notes[1].src + 0.5;
+        e->Changed();
+        e->SelectNote(e->edit.notes.back().id);
+        Pump(800);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-notes.png");
+        // Zoomed all the way in around frame 757, with a second note close by: a tick per frame, numbered.
+        {
+            const TimelineFrames::Frame& f = e->tframes.frames[742];
+            Note n;
+            n.path = e->edit.clips[f.clip].path;
+            n.src = f.src;
+            n.kind = NoteKind::Question;
+            n.text = L"Recoil starts here?";
+            n.author = L"Mai";
+            e->edit.notes.push_back(n);
+            e->Changed();
+        }
+        e->ZoomTimeline(1000);
+        e->tlStart = e->tframes.frames[757].t - e->TlSpan() * 0.6;
+        e->ClampTimeline();
+        e->RevealNote(*e->selected);
+        Snapshot(e);  // asks for the strip's pictures
+        for (int i = 0; i < 300 && !e->StripComplete(); ++i) Pump(10);
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-timeline-zoom.png");
+        {  // the magnifier at 4× over the frame number's edge, the grid and the pin
+            const gp::PointF at = e->ToView(VPoint{760, 300});
+            e->Magnify(4, {(LONG)at.X, (LONG)at.Y});
+            Pump(100);
+            SavePng(*Snapshot(e), outDir + L"\\video-editor-magnifier-60fps.png");
+            e->FitMagnifier();
+        }
+
+        // The review video: its summary card, a note card frame (the pinned Issue at frame 757) and the contact sheet.
+        {
+            const ReviewPlan plan = e->MakeReviewPlan();
+            size_t k = 0;
+            while (k + 1 < plan.notes.size() && plan.notes[k].frame != 757) ++k;
+            const int intro = (int)std::lround(plan.intro * 60), hold = (int)std::lround(plan.hold * 60);
+            const int cardAt = intro + (int)plan.notes[k].frame + (int)k * hold + hold / 2;  // trim from 0, 60 fps: output frame = frame number
+            std::mutex mu;
+            g_exportTap = [&](int i, const Bitmap& f) {
+                if (i != 0 && i != cardAt) return;
+                std::lock_guard l(mu);
+                SavePng(f, outDir + (i == 0 ? L"\\review-summary-card.png" : L"\\review-note-card.png"));
+            };
+            std::wstring err;
+            ExportReviewMp4(e->path, e->edit, plan, outDir + L"\\snapshot-review.mp4", &err);
+            g_exportTap = nullptr;
+            WriteContactSheet(e->path, e->edit, plan, outDir + L"\\review-sheet.png");
+        }
+        e->edit.notes.clear();  // its sidecar goes again
+        e->Changed();
+
+        e->dirty = false;
+        DestroyWindow(e->hwnd);
+    }
     return 0;
 }
 
@@ -2684,6 +4164,804 @@ ATHER_TEST(video_editor_trim_keys_and_add_defaults) {
     CHECK(e->edit.captions.empty());
     e->Undo();
     CHECK_EQ(e->edit.captions.size(), 1u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// ←/→ step exactly one frame at the clip's own rate and show that very frame: through a 60 fps clip every frame once,
+// in order, forward and back; then across a joined 30 fps clip. Shift steps a second; Home and End go to the trim's ends.
+ATHER_TEST(video_editor_steps_every_frame_at_60fps) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b30.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));    // 2 s at 60 fps
+    CHECK(WriteNumberedClip(b, 320, 180, 30, 60, 255));   // 2 s at 30 fps, with blue
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->FramesKnown());
+    // Walks `steps` presses of `vk` from where the playhead is, and says what each frame shown was ("a12", "b3").
+    auto walk = [&](WPARAM vk, int steps, bool shift = false) {
+        std::vector<std::string> seen;
+        for (int i = 0; i < steps; ++i) {
+            e->Key(vk, {false, shift, false});
+            const auto [n, blue] = ShownFrame(e);
+            seen.push_back((blue ? "b" : "a") + std::to_string(n));
+            if (n < 0) break;  // the frame at the playhead never came: no use waiting for the rest
+        }
+        return seen;
+    };
+    auto expect = [](const char* clip, int from, int to) {  // from…to inclusive, either way
+        std::vector<std::string> v;
+        for (int i = from;; i += from <= to ? 1 : -1) {
+            v.push_back(clip + std::to_string(i));
+            if (i == to) break;
+        }
+        return v;
+    };
+    auto join = [](std::vector<std::string> x, const std::vector<std::string>& y) {
+        x.insert(x.end(), y.begin(), y.end());
+        return x;
+    };
+    auto show = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (size_t i = 0; i < v.size() && i < 24; ++i) s += v[i] + " ";
+        return s;
+    };
+    e->Key(VK_HOME, {});
+    const auto first = ShownFrame(e);
+    CHECK(first.first == 0 && !first.second);
+    auto fwd = walk(VK_RIGHT, 119);
+    test::Note("60 fps forward: " + show(fwd));
+    CHECK(fwd == expect("a", 1, 119));
+    auto back = walk(VK_LEFT, 119);
+    test::Note("60 fps back: " + show(back));
+    CHECK(back == expect("a", 118, 0));
+    // Shift: a second, which is 60 frames here.
+    auto sec = walk(VK_RIGHT, 1, true);
+    CHECK(sec == std::vector<std::string>{"a60"});
+    walk(VK_LEFT, 1, true);
+    // Joined with a 30 fps clip: 120 + 60 frames, each once, in order, both ways.
+    e->AddClips({b});
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    e->Key(VK_HOME, {});
+    CHECK(ShownFrame(e).first == 0);
+    fwd = walk(VK_RIGHT, 179);
+    test::Note("joined forward: " + show(std::vector<std::string>(fwd.begin() + std::min<size_t>(110, fwd.size()), fwd.end())));
+    CHECK(fwd == join(expect("a", 1, 119), expect("b", 0, 59)));
+    back = walk(VK_LEFT, 179);
+    test::Note("joined back: " + show(back));
+    CHECK(back == join(expect("b", 58, 0), expect("a", 119, 0)));
+    // A second in the 30 fps clip is 30 frames.
+    for (int i = 0; i < 120; ++i) e->Key(VK_RIGHT, {});
+    CHECK(walk(VK_RIGHT, 1, true) == std::vector<std::string>{"b30"});
+    // Home and End: the first and last frames of the trim (0.5 s into a, 0.5 s into b).
+    e->edit.trimStart = 0.5;
+    e->edit.trimEnd = 2.5;
+    e->Key(VK_HOME, {});
+    const auto home = ShownFrame(e);
+    CHECK(home.first == 30 && !home.second);
+    e->Key(VK_END, {});
+    const auto end = ShownFrame(e);
+    test::Note("end: " + std::to_string(end.first) + (end.second ? " b" : " a"));
+    CHECK(end.first == 14 && end.second);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The readout shows m:ss:ff · frame n · fps for the frame on screen; Ctrl+G takes a frame number, a timecode or a time
+// and lands on that frame (nothing to undo); a joined 30 fps clip reads at its own rate.
+ATHER_TEST(video_editor_readout_and_go_to) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b30.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    CHECK(WriteNumberedClip(b, 320, 180, 30, 60, 255));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->ReadoutText() == L"0:00:00 · frame 0 · 60 fps");
+    auto goTo = [&](const wchar_t* text) {
+        e->Key('G', {true, false, false});
+        CHECK(e->goingTo);
+        SetWindowTextW(e->field1, text);
+        return e->CommitGoTo();
+    };
+    CHECK(goTo(L"0:01:30"));
+    CHECK(!e->goingTo);
+    CHECK(ShownFrame(e) == std::make_pair(90, false));
+    CHECK(e->ReadoutText() == L"0:01:30 · frame 90 · 60 fps");
+    CHECK(goTo(L"45"));
+    CHECK(ShownFrame(e) == std::make_pair(45, false));
+    CHECK(e->ReadoutText() == L"0:00:45 · frame 45 · 60 fps");
+    CHECK(goTo(L"1.26"));  // the frame on screen at 1.26 s: 75 (1.25 s)
+    CHECK(ShownFrame(e) == std::make_pair(75, false));
+    e->Key(VK_RIGHT, {});
+    CHECK(e->ReadoutText() == L"0:01:16 · frame 76 · 60 fps");
+    CHECK(!goTo(L"not a time"));  // says so and stays open
+    CHECK(e->goingTo);
+    e->EndGoTo();
+    CHECK(!e->goingTo);
+    CHECK(e->undoStack.empty() && !e->dirty);
+    // Joined with a 30 fps clip: frame numbers run on; that clip's frames read at 30 fps.
+    e->AddClips({b});
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(goTo(L"130"));
+    CHECK(ShownFrame(e) == std::make_pair(10, true));
+    CHECK(e->ReadoutText() == L"0:02:10 · frame 130 · 30 fps");
+    CHECK(goTo(L"0:03:00"));
+    CHECK(ShownFrame(e) == std::make_pair(30, true));
+    CHECK(e->ReadoutText() == L"0:03:00 · frame 150 · 30 fps");
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// J/K/L: L plays, L again cycles the preview speed 0.25× → 0.5× → 1×, J plays backward, K pauses. The preview speed
+// leaves the edit (and so the export) as it was, and slow playback shows every frame in turn, none skipped.
+ATHER_TEST(video_editor_review_playback_jkl) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    const VideoEdit before = e->edit;
+    // Every frame the editor shows during `ms`, by number, as it changes.
+    auto watch = [&](int ms) {
+        std::vector<int> seen;
+        e->onFetched = [&] {
+            const Bitmap& f = *e->raw;
+            const int n = NumberOf(f.Bits()[(size_t)(f.Height() / 2) * f.Width() + f.Width() / 2]);
+            if (seen.empty() || seen.back() != n) seen.push_back(n);
+        };
+        Pump(ms);
+        e->onFetched = nullptr;
+        return seen;
+    };
+    auto steps = [](const std::vector<int>& v, int by) {  // every frame after the first is the one `by` from the one before
+        for (size_t i = 1; i < v.size(); ++i)
+            if (v[i] - v[i - 1] != by) return false;
+        return v.size() > 1;
+    };
+    auto show = [](const std::vector<int>& v) {
+        std::string s;
+        for (int n : v) s += std::to_string(n) + " ";
+        return s;
+    };
+    e->GoToFrame(10);
+    ShownFrame(e);
+    e->Key('L', {});
+    CHECK(e->playing && e->previewRate == 1 && e->reviewDir == 0);  // the usual playback first
+    e->Key('L', {});
+    CHECK(!e->playing && e->reviewDir == 1 && e->previewRate == 0.25);
+    const int from = ShownFrame(e).first;
+    const auto slow = watch(1500);
+    test::Note("0.25x from " + std::to_string(from) + ": " + show(slow));
+    CHECK(steps(slow, 1));
+    CHECK(slow.size() >= 15 && slow.size() <= 26);  // 15 frames a second at 0.25× of 60 fps
+    CHECK(e->edit == before);
+    CHECK(e->edit.speed == 1);
+    e->Key('L', {});
+    CHECK(e->reviewDir == 1 && e->previewRate == 0.5);
+    const auto half = watch(600);
+    test::Note("0.5x: " + show(half));
+    CHECK(steps(half, 1) && half.size() >= 10);
+    e->Key('K', {});
+    CHECK(e->reviewDir == 0 && !e->playing);
+    const auto still = watch(300);
+    CHECK(still.size() <= 1);
+    // Backward at the speed kept (0.5×).
+    e->Key('J', {});
+    CHECK(e->reviewDir == -1 && e->previewRate == 0.5);
+    const auto back = watch(800);
+    test::Note("reverse: " + show(back));
+    CHECK(steps(back, -1) && back.size() >= 15);
+    e->Key('J', {});
+    CHECK(e->reviewDir == -1 && e->previewRate == 1);
+    // Runs into the start of the trim and stops there.
+    e->edit.trimStart = (double)(ShownFrame(e).first - 5) / 60;
+    watch(500);
+    CHECK(e->reviewDir == 0);
+    CHECK(ShownFrame(e).first == (int)std::lround(e->edit.trimStart * 60));
+    e->edit.trimStart = 0;
+    CHECK(e->edit == before);
+    CHECK(e->undoStack.empty() && !e->dirty);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Review notes: M adds one on the frame on screen with its field ready; typing edits it; a click on the video pins a
+// spot; kinds and Resolved; ticks and list rows go to their frames; [ and ] jump; Delete, and undo covers all of it.
+ATHER_TEST(video_editor_notes_add_edit_pin_jump_undo) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(!e->NotesShown());
+    // M on frame 30.
+    e->GoToFrame(30);
+    e->Key('M', {});
+    CHECK_EQ(e->edit.notes.size(), 1u);
+    if (e->edit.notes.size() != 1) return DestroyWindow(e->hwnd), void();
+    const uint64_t first = e->edit.notes[0].id;
+    CHECK(e->selected == first);
+    CHECK_NEAR(e->edit.notes[0].src, 0.5, 1e-3);
+    CHECK(!e->edit.notes[0].author.empty() && e->edit.notes[0].author == NoteAuthor());
+    CHECK(e->fieldsFor == first && e->fieldsKind == 300);  // its text field
+    CHECK(e->NotesShown());
+    CHECK_EQ(e->undoStack.size(), 1u);
+    SetWindowTextW(e->field1, L"Button flickers here");
+    CHECK(e->edit.notes[0].text == L"Button flickers here");
+    // A click in the middle of the video pins the middle of the frame (one undo step).
+    Snapshot(e);  // lays out the video
+    const gp::PointF mid = e->ToView(VPoint{160, 90});
+    e->OnMouseDown({(LONG)std::lround(mid.X), (LONG)std::lround(mid.Y)}, false);
+    e->OnMouseUp();
+    CHECK(e->edit.notes[0].pin && std::fabs(e->edit.notes[0].pin->x - 0.5) < 0.02 && std::fabs(e->edit.notes[0].pin->y - 0.5) < 0.02);
+    CHECK_EQ(e->undoStack.size(), 2u);
+    // Kind and Resolved, each undoable.
+    auto kinds = e->NoteKindMenu(first);
+    CHECK_EQ(kinds.size(), 4u);
+    if (kinds.size() == 4) kinds[1].run();
+    CHECK(e->edit.notes[0].kind == NoteKind::Issue);
+    e->Undo();
+    CHECK(e->edit.notes[0].kind == NoteKind::Note && e->edit.notes[0].pin);
+    if (kinds.size() == 4) kinds[1].run();
+    // Two more: frame 90 (a question), then frame 60 (looks good, resolved).
+    e->Select(std::nullopt);
+    e->GoToFrame(90);
+    e->Key('M', {});
+    e->NoteKindMenu(e->edit.notes.back().id)[2].run();
+    e->GoToFrame(60);
+    e->Key('M', {});
+    e->NoteKindMenu(e->edit.notes.back().id)[3].run();
+    e->UpdateNote([](Note& n) { n.resolved = true; });
+    CHECK_EQ(e->placed.size(), 3u);
+    std::vector<size_t> frames;
+    for (const auto& p : e->placed) frames.push_back(p.first);
+    CHECK(frames == std::vector<size_t>({30, 60, 90}));
+    // ] and [ from the start: 30, 60, 90, (stays), back to 60.
+    e->Select(std::nullopt);
+    e->GoToFrame(0);
+    std::vector<size_t> seen;
+    for (WPARAM k : {VK_OEM_6, VK_OEM_6, VK_OEM_6, VK_OEM_6, VK_OEM_4}) {
+        e->Key(k, {});
+        seen.push_back(e->FrameNow());
+        CHECK(e->SelNote().has_value());
+    }
+    CHECK(seen == std::vector<size_t>({30, 60, 90, 90, 60}));
+    CHECK(ShownFrame(e).first == 60);
+    // Only open notes: the resolved one at 60 is skipped by the list and by ] and [.
+    e->notesOpenOnly = true;
+    CHECK_EQ(e->ListedNotes().size(), 2u);
+    e->GoToFrame(0);
+    e->Key(VK_OEM_6, {});
+    e->Key(VK_OEM_6, {});
+    CHECK_EQ(e->FrameNow(), 90u);
+    e->notesOpenOnly = false;
+    // Clicking a list row, then a tick on the timeline, goes to that note's frame.
+    auto snap = Snapshot(e);  // lays out the list's rows
+    const RECT list = e->NotesListRect();
+    e->OnMouseDown({list.left + e->S(60), list.top + e->NoteRowH() / 2}, false);  // first row: frame 30
+    e->OnMouseUp();
+    CHECK(e->selected == first && e->FrameNow() == 30);
+    const RECT tr = e->TimelineRect();
+    e->OnMouseDown({(LONG)e->TX(e->tframes.frames[90].t), tr.top + e->LaneH() + e->S(4)}, false);
+    e->OnMouseUp();
+    CHECK(e->FrameNow() == 90 && e->SelNote() && e->edit.notes[*e->SelNote()].kind == NoteKind::Question);
+    // Ticks wear their kind's color: the Issue's flag at frame 30 is red.
+    snap = Snapshot(e);
+    const uint32_t flag = snap->Bits()[(size_t)(tr.top + e->LaneH() + e->S(2)) * snap->Width() + (LONG)e->TX(e->tframes.frames[30].t)];
+    test::Note("flag pixel " + std::to_string(flag & 0xFFFFFF));
+    const COLORREF red = annot::Color(0);
+    CHECK(std::abs((int)((flag >> 16) & 255) - GetRValue(red)) < 30 && std::abs((int)((flag >> 8) & 255) - GetGValue(red)) < 30 &&
+          std::abs((int)(flag & 255) - GetBValue(red)) < 30);
+    // Delete, then undo it.
+    e->SelectNote(first);
+    e->Key(VK_DELETE, {});
+    CHECK_EQ(e->edit.notes.size(), 2u);
+    CHECK_EQ(e->placed.size(), 2u);
+    e->Undo();
+    CHECK_EQ(e->edit.notes.size(), 3u);
+    CHECK(e->edit.notes[0].text == L"Button flickers here" && e->edit.notes[0].kind == NoteKind::Issue);
+    // None of this touched the picture's edit.
+    VideoEdit plain = e->edit;
+    plain.notes.clear();
+    CHECK(plain.marks.empty() && plain.captions.empty());
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Notes are kept next to their video as they change, and come back at the same frames: after reopening, in a joined
+// clip (each in its own file's sidecar), with a clip trimmed. A damaged sidecar never stops the video opening, and is
+// kept aside rather than written over.
+ATHER_TEST(video_editor_notes_kept_next_to_the_video) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b30.mp4", c = dir + L"\\c60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    CHECK(WriteNumberedClip(b, 320, 180, 30, 60, 255));
+    CHECK(WriteNumberedClip(c, 320, 180, 60, 60, 0));
+    auto open = [&](const std::wstring& path) {
+        VideoEditor* e = OpenHidden(path, 1180, 760);
+        for (int i = 0; e && i < 300 && !e->FramesKnown(); ++i) Pump(10);
+        return e;
+    };
+    auto sidecar = [](const std::wstring& video) {  // the sidecar's notes, read as another tool would
+        std::string text;
+        bool ok = false;
+        const Json j = ReadFileUtf8(NotesPath(video), &text) ? Json::Parse(text, &ok) : Json();
+        return ok ? j["notes"] : Json();
+    };
+    auto exists = [](const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    auto noteAt = [](VideoEditor* e, size_t frame, NoteKind kind, const wchar_t* text) {
+        e->Select(std::nullopt);
+        e->GoToFrame(frame);
+        e->Key('M', {});
+        e->UpdateNote([&](Note& n) {
+            n.kind = kind;
+            n.text = text;
+        });
+        e->Select(std::nullopt);
+    };
+    // Round trip: two notes on a, then reopen.
+    VideoEditor* e = open(a);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK(!exists(NotesPath(a)));  // opening alone writes nothing
+    noteAt(e, 30, NoteKind::Issue, L"Flicker");
+    noteAt(e, 90, NoteKind::Question, L"Intended?");
+    e->SelectNote(e->edit.notes[0].id);
+    e->UpdateNote([](Note& n) {
+        n.pin = VPoint{0.25, 0.75};
+        n.resolved = true;
+    });
+    e->SetNoteRangeToPlayhead();  // the playhead is on the note: not a range
+    e->GoToFrame(40);
+    e->SetNoteRangeToPlayhead();
+    const std::vector<Note> before = [&] {
+        auto v = e->edit.notes;
+        SortNotes(v);
+        return v;
+    }();
+    Json kept = sidecar(a);
+    CHECK_EQ(kept.size(), 2u);
+    CHECK(kept[0]["frame"].Int() == 30 && kept[0]["kind"].Str() == "issue" && kept[0]["resolved"].Bool() && kept[0]["endFrame"].Int() == 40);
+    CHECK(kept[1]["frame"].Int() == 90 && kept[1]["text"].Str() == "Intended?" && kept[0]["pin"]["x"].Num() == 0.25);
+    // Undo takes a change back out of the sidecar too.
+    noteAt(e, 100, NoteKind::Note, L"Gone again");
+    CHECK_EQ(sidecar(a).size(), 3u);
+    e->Undo();  // the text and kind
+    e->Undo();  // the note
+    CHECK_EQ(sidecar(a).size(), 2u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    e = open(a);
+    CHECK(e != nullptr);
+    if (!e) return;
+    auto after = e->edit.notes;
+    SortNotes(after);
+    CHECK_EQ(after.size(), 2u);
+    for (size_t i = 0; i < after.size() && i < before.size(); ++i) {
+        CHECK(after[i].text == before[i].text && after[i].kind == before[i].kind && after[i].resolved == before[i].resolved && after[i].pin == before[i].pin &&
+              after[i].author == before[i].author && after[i].srcEnd == before[i].srcEnd && after[i].src == before[i].src && after[i].id == before[i].id);
+    }
+    std::vector<size_t> at;
+    for (const auto& p : e->placed) at.push_back(p.first);
+    CHECK(at == std::vector<size_t>({30, 90}));
+    CHECK(!e->dirty && e->undoStack.empty());
+    // Joined: b's own note (made on b alone) shows at b's frame 10, frame 130 of a + b; a new note on b's footage
+    // goes into b's sidecar, not a's.
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    e = open(b);
+    CHECK(e != nullptr);
+    if (!e) return;
+    noteAt(e, 10, NoteKind::Good, L"b ten");
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    e = open(a);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->AddClips({b});
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    at.clear();
+    for (const auto& p : e->placed) at.push_back(p.first);
+    CHECK(at == std::vector<size_t>({30, 90, 130}));
+    e->SelectNote(e->edit.notes[e->placed[2].second].id);
+    CHECK(ShownFrame(e) == std::make_pair(10, true));
+    noteAt(e, 140, NoteKind::Note, L"b twenty");
+    CHECK_EQ(sidecar(a).size(), 2u);
+    CHECK_EQ(sidecar(b).size(), 2u);
+    CHECK(sidecar(b)[1]["frame"].Int() == 20 && sidecar(b)[1]["text"].Str() == "b twenty");
+    // b trimmed to start at its frame 15: the note at b's 10 isn't on the timeline (still kept), the one at 20 moves
+    // to 120 + 5; undo brings the trim back.
+    e->TrimClip(1, 0.5, std::nullopt);
+    at.clear();
+    for (const auto& p : e->placed) at.push_back(p.first);
+    CHECK(at == std::vector<size_t>({30, 90, 125}));
+    CHECK_EQ(sidecar(b).size(), 2u);
+    e->SelectNote(e->edit.notes[e->placed[2].second].id);
+    CHECK(ShownFrame(e) == std::make_pair(20, true));
+    e->Undo();
+    CHECK_EQ(e->placed.size(), 4u);
+    // Undoing the note on b takes it out of b's sidecar; undoing the joining of b leaves b's own note there.
+    e->Undo();
+    e->Undo();
+    CHECK_EQ(sidecar(b).size(), 1u);
+    e->Undo();
+    CHECK_EQ(e->edit.clips.size(), 1u);
+    CHECK(sidecar(b).size() == 1 && sidecar(b)[0]["text"].Str() == "b ten");
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    // Damaged: the video still opens, without notes; the first new note keeps the damaged file aside, as it was.
+    {
+        HANDLE f = CreateFileW(NotesPath(c).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD w = 0;
+        const char damaged[] = "{\"notes\": [ {\"frame\": 3,";
+        WriteFile(f, damaged, (DWORD)strlen(damaged), &w, nullptr);
+
+        CloseHandle(f);
+    }
+    e = open(c);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK(e->edit.notes.empty());
+    CHECK(e->raw != nullptr);
+    noteAt(e, 5, NoteKind::Note, L"After the damage");
+    std::string aside;
+    CHECK(ReadFileUtf8(c + L".notes.damaged.json", &aside) && aside == "{\"notes\": [ {\"frame\": 3,");
+    CHECK(sidecar(c).size() == 1 && sidecar(c)[0]["frame"].Int() == 5);
+    // A sidecar this editor made goes again with its last note.
+    e->Undo();
+    e->Undo();
+    CHECK(e->edit.notes.empty());
+    CHECK(exists(NotesPath(c)));  // it wasn't made here: written empty, not deleted
+    CHECK_EQ(sidecar(c).size(), 0u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+    const std::wstring d = dir + L"\\d60.mp4";
+    CHECK(WriteNumberedClip(d, 320, 180, 60, 30, 0));
+    e = open(d);
+    CHECK(e != nullptr);
+    if (!e) return;
+    noteAt(e, 3, NoteKind::Note, L"Short-lived");
+    CHECK(exists(NotesPath(d)));
+    e->Select(e->edit.notes[0].id);
+    e->Key(VK_DELETE, {});
+    CHECK(!exists(NotesPath(d)));
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Timeline zoom: Ctrl+= zooms around the playhead (its frame stays put) down to about 14 px a frame; pixels and frames
+// map both ways at every zoom and pan; at full zoom a click on a frame's tick lands on that frame; Ctrl+0 fits the
+// trim; notes and caption bars stay on their frames.
+ATHER_TEST(video_editor_timeline_zoom) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    const RECT tr = e->TimelineRect();
+    CHECK_NEAR(e->TX(0), tr.left, 1e-9);
+    CHECK_NEAR(e->TX(e->duration), tr.right, 1e-6);
+    e->GoToFrame(50);
+    const double t50 = e->tframes.frames[50].t;
+    // Every frame's x leads back to that frame, and every pixel to the frame nearest it.
+    auto roundTrip = [&] {
+        int wrong = 0;
+        for (size_t n = 0; n < e->tframes.size(); ++n) {
+            const double x = e->TX(e->tframes.frames[n].t);
+            if (x < tr.left || x > tr.right) continue;
+            wrong += e->tframes.Nearest(e->TT((int)std::lround(x))) != n;
+        }
+        for (int x = tr.left; x <= tr.right; x += 7) {
+            const size_t n = e->tframes.Nearest(e->TT(x));
+            const double half = (double)RectW(tr) / e->TlSpan() / 120.0;  // half a frame in pixels
+            const bool pastLast = n + 1 == e->tframes.size() && x >= e->TX(e->tframes.frames[n].t);  // the last frame shows to the end
+            wrong += !pastLast && std::fabs(e->TX(e->tframes.frames[n].t) - x) > half + 1;
+        }
+        return wrong;
+    };
+    CHECK_EQ(roundTrip(), 0);
+    double x50 = e->TX(t50);
+    int presses = 0;
+    while (e->tlZoom < e->MaxTlZoom() - 1e-9 && presses < 40) {
+        e->Key(VK_OEM_PLUS, {true, false, false});
+        ++presses;
+        test::Note("zoom " + std::to_string(e->tlZoom) + ", frame 50 at " + std::to_string(e->TX(t50)) + " (was " + std::to_string(x50) + ")");
+        CHECK(std::fabs(e->TX(t50) - x50) <= 1);  // the playhead's frame stays under the same spot
+        CHECK_EQ(roundTrip(), 0);
+    }
+    const double pf = e->PxPerFrame();
+    test::Note("full zoom: " + std::to_string(pf) + " px a frame after " + std::to_string(presses) + " presses");
+    CHECK(pf >= 13.5 && pf <= 14.5);
+    // At full zoom, a click on a frame's tick lands on that frame (and shows it).
+    const int stripY = tr.top + e->LaneH() + e->S(30);
+    for (size_t n : {48, 53, 57}) {
+        e->OnMouseDown({(LONG)std::lround(e->TX(e->tframes.frames[n].t)), stripY}, false);
+        e->OnMouseUp();
+        CHECK_EQ(e->FrameNow(), n);
+        CHECK(ShownFrame(e).first == (int)n);
+    }
+    // Panning with the wheel moves everything together; the mapping still holds.
+    const double before = e->tlStart;
+    e->OnWheel({tr.left + 100, stripY}, -WHEEL_DELTA, 0);
+    CHECK(e->tlStart > before);
+    CHECK_EQ(roundTrip(), 0);
+    // Dragging an empty lane pans; a click there (no drag) goes to that time.
+    const int laneY = tr.top + e->LaneH() + e->S(70);
+    const double s0 = e->tlStart;
+    e->OnMouseDown({tr.left + 300, laneY}, false);
+    e->OnMouseMove({tr.left + 200, laneY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(e->tlStart > s0);
+    const size_t clickAt = e->tframes.Nearest(e->TT(tr.left + 400));
+    e->OnMouseDown({tr.left + 400, laneY}, false);
+    e->OnMouseUp();
+    CHECK_EQ(e->FrameNow(), clickAt);
+    // A note and a caption bar sit on their frames, zoomed in: the note's flag shows its color at its frame's x.
+    e->GoToFrame(60);
+    e->Key('M', {});
+    e->UpdateNote([](Note& n) { n.kind = NoteKind::Question; });
+    e->Select(std::nullopt);
+    e->Seek(e->tframes.frames[62].t);
+    e->AddCaption();
+    e->edit.captions.back().start = e->tframes.frames[62].t;
+    e->edit.captions.back().text = L"Here";
+    e->Select(std::nullopt);
+    e->Changed();
+    auto snap = Snapshot(e);
+    auto px = [&](double x, int y) { return snap->Bits()[(size_t)y * snap->Width() + (int)std::lround(x)] & 0xFFFFFF; };
+    const COLORREF blue = annot::Color(4);
+    const uint32_t flag = px(e->TX(e->tframes.frames[60].t), tr.top + e->LaneH() + e->S(2));
+    test::Note("flag " + std::to_string(flag));
+    CHECK(std::abs((int)(flag & 255) - GetBValue(blue)) < 40 && std::abs((int)((flag >> 16) & 255) - GetRValue(blue)) < 40);
+    const int capMid = tr.top + e->LaneH() + e->S(62) + e->S(11);
+    const uint32_t onBar = px(e->TX(e->tframes.frames[62].t) + e->S(3), capMid), before62 = px(e->TX(e->tframes.frames[62].t) - e->S(3), capMid);
+    test::Note("caption bar " + std::to_string(onBar) + " before it " + std::to_string(before62));
+    CHECK(onBar != before62);
+    // Ctrl+0 fits the trim.
+    e->edit.trimStart = 0.2;  // 1.6 s: within the 1.58x a 2 s clip zooms to
+    e->edit.trimEnd = 1.8;
+    e->Key('0', {true, false, false});
+    test::Note("fit: zoom " + std::to_string(e->tlZoom) + " start " + std::to_string(e->tlStart) + " x " + std::to_string(e->TX(0.2)) + ".." +
+               std::to_string(e->TX(1.8)) + " of " + std::to_string(tr.left) + ".." + std::to_string(tr.right));
+    CHECK(std::fabs(e->TX(0.2) - tr.left) <= 1 && std::fabs(e->TX(1.8) - tr.right) <= 1);
+    e->edit.trimStart = 0;
+    e->edit.trimEnd = e->duration;
+    e->Key('0', {true, false, false});
+    CHECK_NEAR(e->tlZoom, 1, 1e-9);
+    // Zooming never touches the edit.
+    CHECK(e->edit.speed == 1 && !e->edit.crop);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Zoomed in, every filmstrip tile shows a frame from the frames it covers (the first one starting in it), read from the
+// painted strip itself, at several zooms and pans; the pictures come in the background, painting never waits for them.
+ATHER_TEST(video_editor_filmstrip_shows_frames_under_each_tile) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 240, 0));  // 4 s
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    const RECT tr = e->TimelineRect();
+    const int stripTop = tr.top + e->LaneH(), y = stripTop + e->S(22);  // under the flags, above the ruler
+    int tilesChecked = 0, wrong = 0, maxPaint = 0;
+    std::string first;
+    for (double zoom : {2.0, 5.0, 1000.0}) {
+        e->FitTrim();
+        e->GoToFrame(100);
+        e->ZoomTimeline(zoom);
+        for (double at : {0.0, 0.5, 1.0}) {  // panned to the start, the middle and the end
+            e->tlStart = at * std::max(0.0, e->duration - e->TlSpan());
+            e->ClampTimeline();
+            const ULONGLONG t0 = GetTickCount64();
+            Snapshot(e);  // asks for the tiles' pictures
+            maxPaint = std::max(maxPaint, (int)(GetTickCount64() - t0));
+            for (int i = 0; i < 300 && !e->StripComplete(); ++i) Pump(10);
+            CHECK(e->StripComplete());
+            const auto snap = Snapshot(e);
+            const double px = e->TX(e->Now());
+            for (const auto& tile : e->StripTiles()) {
+                const double xa = std::max(e->TX(tile.t0), (double)tr.left) + 3, xb = std::min(e->TX(tile.t1), (double)tr.right) - 3;
+                if (xb - xa < 4) continue;  // hardly on view
+                double x = (xa + xb) / 2;
+                if (std::fabs(x - px) < 4) x = x < px ? px - 5 : px + 5;  // not on the playhead's line
+                if (x < xa || x > xb) continue;
+                const int n = NumberOf(snap->Bits()[(size_t)y * snap->Width() + (int)x]);
+                const bool inside = n >= 0 && n < (int)e->tframes.size() && e->tframes.frames[(size_t)n].t >= tile.t0 - 1e-6 &&
+                                    (e->tframes.frames[(size_t)n].t < tile.t1 || tile.t1 - tile.t0 < 1 / 60.0);
+                if (!inside || n != (int)tile.frame) {
+                    if (!wrong)
+                        first = "zoom " + std::to_string(zoom) + " at " + std::to_string(at) + ": tile " + std::to_string(tile.t0) + "–" + std::to_string(tile.t1) +
+                                " shows frame " + std::to_string(n) + " (wanted " + std::to_string(tile.frame) + ")";
+                    ++wrong;
+                }
+                ++tilesChecked;
+            }
+        }
+    }
+    test::Note(std::to_string(tilesChecked) + " tiles, " + std::to_string(wrong) + " wrong; " + first + "; slowest paint " + std::to_string(maxPaint) + " ms");
+    CHECK(tilesChecked >= 60);
+    CHECK_EQ(wrong, 0);
+    CHECK(maxPaint < 250);  // painting never waits for pictures
+    // At full zoom each tile covers whole frames of its own: about 6 at 14 px a frame.
+    e->ZoomTimeline(1000);
+    const auto tiles = e->StripTiles();
+    CHECK(!tiles.empty() && (tiles[0].t1 - tiles[0].t0) * 60 > 3 && (tiles[0].t1 - tiles[0].t0) * 60 < 12);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The pixel magnifier: the wheel over the video zooms 1×–8× keeping the pixel under the cursor there; from 2× a 1-pixel
+// checkerboard shows as hard-edged blocks (only black and white); a right-drag pans; F fits again; the edit (crop and
+// all) never changes.
+ATHER_TEST(video_editor_pixel_magnifier) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 60, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    Pump(300);
+    e->edit.crop = VRect{40, 20, 200, 120};  // the magnifier works on top of a crop and leaves it be
+    const VideoEdit before = e->edit;
+    // The frame shown: a 1-pixel checkerboard (exact pixels, as no video codec keeps them).
+    auto checker = Bitmap::Create(320, 180);
+    for (int y = 0; y < 180; ++y)
+        for (int x = 0; x < 320; ++x) checker->Bits()[(size_t)y * 320 + x] = (x + y) % 2 ? 0xFFFFFFFFu : 0xFF000000u;
+    auto showChecker = [&] {
+        e->raw = checker;
+        e->shown = checker;
+    };
+    const auto v = e->VideoRect();
+    const POINT at{(LONG)(v.X + v.Width * 0.3), (LONG)(v.Y + v.Height * 0.6)};
+    const VPoint under = e->ToVideo(at);
+    for (int i = 0; i < 6; ++i) {
+        e->OnWheel(at, WHEEL_DELTA, 0);
+        const VPoint now = e->ToVideo(at);
+        CHECK(std::fabs(now.x - under.x) < 0.01 && std::fabs(now.y - under.y) < 0.01);  // stays under the cursor
+    }
+    test::Note("zoom after 6 notches: " + std::to_string(e->magZoom));
+    CHECK_NEAR(e->magZoom, std::pow(1.25, 6), 1e-9);
+    for (int i = 0; i < 20; ++i) e->OnWheel(at, WHEEL_DELTA, 0);
+    CHECK_NEAR(e->magZoom, 8, 1e-9);
+    // At 4×: sharp blocks only.
+    e->FitMagnifier();
+    e->Magnify(4, at);
+    CHECK_NEAR(e->magZoom, 4, 1e-9);
+    showChecker();
+    auto snap = Snapshot(e);
+    auto stageColors = [&](const Bitmap& b, int* grays) {
+        int bw = 0;
+        *grays = 0;
+        for (int y = (int)v.Y + 40; y < (int)(v.Y + v.Height) - 40; y += 3)  // inside the video, away from the label and the edges
+            for (int x = (int)v.X + 60; x < (int)(v.X + v.Width) - 10; x += 3) {
+                const uint32_t c = b.Bits()[(size_t)y * b.Width() + x] & 0xFFFFFF;
+                if (c == 0 || c == 0xFFFFFF) ++bw;
+                else ++*grays;
+            }
+        return bw;
+    };
+    int grays = 0;
+    const int bw = stageColors(*snap, &grays);
+    test::Note("4x: " + std::to_string(bw) + " black or white, " + std::to_string(grays) + " other");
+    CHECK(bw > 1000);
+    CHECK_EQ(grays, 0);
+    // Each video pixel is a block about 4 × the fitted scale wide: count a row's runs.
+    {
+        const int y = (int)(v.Y + v.Height / 2);
+        int runs = 0, longest = 0, run = 0;
+        uint32_t last = 1;
+        for (int x = (int)v.X + 60; x < (int)(v.X + v.Width) - 10; ++x) {
+            const uint32_t c = snap->Bits()[(size_t)y * snap->Width() + x] & 0xFFFFFF;
+            if (c == last) ++run;
+            else {
+                ++runs;
+                run = 1;
+                last = c;
+            }
+            longest = std::max(longest, run);
+        }
+        const double k = e->ViewScale();
+        test::Note("block " + std::to_string(longest) + " px, scale " + std::to_string(k));
+        CHECK(longest >= (int)std::floor(k) && longest <= (int)std::ceil(k));
+    }
+    // Fitted (1×), the same frame is drawn smoothed: other shades appear, as they should.
+    e->FitMagnifier();
+    showChecker();
+    snap = Snapshot(e);
+    stageColors(*snap, &grays);
+    CHECK(grays > 0);
+    // A right-drag pans by the video pixels dragged; F fits again.
+    e->Magnify(4, at);
+    const VPoint p0 = e->ToVideo(at);
+    e->Proc(WM_RBUTTONDOWN, MK_RBUTTON, MAKELPARAM(at.x, at.y));
+    e->OnMouseMove({at.x - 40, at.y - 20}, MK_RBUTTON);
+    e->Proc(WM_RBUTTONUP, 0, MAKELPARAM(at.x - 40, at.y - 20));
+    const VPoint p1 = e->ToVideo(at);
+    CHECK_NEAR(p1.x - p0.x, 40 / e->ViewScale(), 0.01);
+    CHECK_NEAR(p1.y - p0.y, 20 / e->ViewScale(), 0.01);
+    e->Key('F', {});
+    CHECK(e->magZoom == 1 && e->magX == 0 && e->magY == 0);
+    // Wheel out never goes below 1×.
+    e->OnWheel(at, -WHEEL_DELTA * 3, 0);
+    CHECK(e->magZoom == 1);
+    CHECK(e->edit == before);
+    CHECK(e->undoStack.empty());
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Save review video (Ctrl+Alt+S, or Save ▾): "<video> review.mp4" with "… review notes.md" and "… review sheet.png"
+// next to it in the captures; the notes list has one line per note in the trim, "m:ss:ff (frame n), Author: [Kind] text",
+// and Copy puts the same text on the clipboard. The edit and the original are untouched; a second save never
+// overwrites the first.
+ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\shot 60.mp4", caps = dir + L"\\caps";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    const CapturesFolderForTest folder(caps);
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    auto noteAt = [&](size_t frame, NoteKind kind, const wchar_t* text, const wchar_t* author, bool resolved) {
+        e->Select(std::nullopt);
+        e->GoToFrame(frame);
+        e->Key('M', {});
+        e->UpdateNote([&](Note& n) {
+            n.kind = kind;
+            n.text = text;
+            n.author = author;
+            n.resolved = resolved;
+        });
+    };
+    noteAt(90, NoteKind::Question, L"Intended?", L"Mai", false);
+    noteAt(30, NoteKind::Issue, L"Flicker\nsecond line", L"Tin", false);
+    noteAt(5, NoteKind::Good, L"Cut before the trim", L"Tin", true);  // outside the trim below: not in the review
+    e->edit.trimStart = 0.25;
+    e->Changed();
+    const std::wstring want = L"0:00:30 (frame 30), Tin: [Issue] Flicker / second line\r\n\r\n0:01:30 (frame 90), Mai: [Question] Intended?\r\n";
+    test::Note("notes text: " + ToUtf8(e->NotesText()));
+    CHECK(e->NotesText() == want);
+    std::wstring copied;
+    e->copyHook = [&](const std::wstring& t) { copied = t; };
+    e->CopyNotes();
+    CHECK(copied == want);
+    const VideoEdit before = e->edit;
+    e->Key('S', {true, false, true});  // Ctrl+Alt+S
+    CHECK(e->busy);
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    test::Note("review save: " + ToUtf8(e->lastSaveError) + " → " + ToUtf8(e->lastReviewOut));
+    CHECK(!e->busy && e->lastSaveError.empty());
+    const std::wstring out = e->lastReviewOut;
+    CHECK(FileNameOf(out) == L"shot 60 review.mp4");
+    const std::wstring base = out.substr(0, out.size() - 4);
+    std::string md;
+    CHECK(ReadFileUtf8(base + L" notes.md", &md));
+    CHECK(FromUtf8(md) == want);
+    int sw = 0, sh = 0;
+    CHECK(ImageSize(base + L" sheet.png", &sw, &sh) && sw == 1600 && sh > 300);
+    VideoInfo vi;
+    CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - (1.75 + 3 + 2 * 3)) < 0.1);  // 1.75 s edit, card, two holds
+    CHECK(e->edit == before);
+    // Again: new names, the first files kept.
+    e->SaveReview();
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    CHECK(FileNameOf(e->lastReviewOut) == L"shot 60 review 2.mp4");
+    CHECK(GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
