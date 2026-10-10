@@ -4,7 +4,7 @@ import ImageIO
 import XCTest
 @testable import AtherScreenshot
 
-// The faster export: GIF chunks joined, MP4 pieces joined, frames without edits passed through.
+// The faster export: GIF parts joined, MP4 pieces joined, cancelling.
 final class ExportSpeedTests: XCTestCase {
     private func tmp(_ ext: String) -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("ather-speed-\(UUID().uuidString).\(ext)") }
 
@@ -17,13 +17,13 @@ final class ExportSpeedTests: XCTestCase {
     }
 
     // A GIF written in parts at once has the same frames, timing and colors as one written in one go.
-    func testGifInChunksMatchesOnePass() async throws {
+    func testGifInPartsMatchesOnePass() async throws {
         var e = TestMedia.edit([try await VideoSource.probe(try await TestMedia.colors())])
         e.captions = [Caption(start: 0.5, end: 2.5, text: "Chunks")]
         let one = tmp("gif"), three = tmp("gif")
         defer { try? FileManager.default.removeItem(at: one); try? FileManager.default.removeItem(at: three) }
-        try await VideoExport.gif(e, to: one, fps: 10, chunks: 1)
-        try await VideoExport.gif(e, to: three, fps: 10, chunks: 3)
+        try await VideoExport.gif(e, to: one, fps: 10, parts: 1)
+        try await VideoExport.gif(e, to: three, fps: 10, parts: 3)
         let a = gifFrames(one), b = gifFrames(three)
         XCTAssertEqual(a.count, 30)
         XCTAssertEqual(b.count, a.count)
@@ -78,10 +78,8 @@ final class ExportSpeedTests: XCTestCase {
         let one = tmp("mp4"), three = tmp("mp4")
         defer { try? FileManager.default.removeItem(at: one); try? FileManager.default.removeItem(at: three) }
         let probe = VideoExport.Probe()
-        VideoExport.probe = probe
-        defer { VideoExport.probe = nil }
-        try await VideoExport.mp4(e, to: one, encoders: 1)
-        try await VideoExport.mp4(e, to: three, encoders: 3)
+        try await VideoExport.mp4(e, to: one, encoders: 1, probe: probe)
+        try await VideoExport.mp4(e, to: three, encoders: 3, probe: probe)
         XCTAssertEqual(probe.notes, ["writer 1 piece", "writer 3 pieces"])
         XCTAssertEqual(probe.frames, 2 * 156)
         let v1 = try await times(one, .video), v3 = try await times(three, .video)
@@ -110,9 +108,7 @@ final class ExportSpeedTests: XCTestCase {
         let out = tmp("mp4")
         defer { try? FileManager.default.removeItem(at: out) }
         let probe = VideoExport.Probe()
-        VideoExport.probe = probe
-        defer { VideoExport.probe = nil }
-        try await VideoExport.mp4(e, to: out)
+        try await VideoExport.mp4(e, to: out, probe: probe)
         XCTAssertEqual(probe.notes, ["writer 2 pieces"])
         let frames = try await times(out, .video).count
         XCTAssertEqual(frames, 180)
@@ -129,9 +125,7 @@ final class ExportSpeedTests: XCTestCase {
         }
         let before = pieceDirs()
         let probe = VideoExport.Probe()
-        VideoExport.probe = probe
-        defer { VideoExport.probe = nil }
-        let task = Task { try await VideoExport.mp4(e, to: out, encoders: 2) }
+        let task = Task { try await VideoExport.mp4(e, to: out, encoders: 2, probe: probe) }
         while probe.frames < 20 { try await Task.sleep(nanoseconds: 5_000_000) }
         task.cancel()
         do {

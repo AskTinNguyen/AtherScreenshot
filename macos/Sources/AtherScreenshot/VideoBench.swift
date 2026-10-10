@@ -11,7 +11,8 @@ import Foundation
 //     <outDir>, for --bench-compare.
 //   AtherScreenshot --bench-compare <dirA> <dirB>
 //     Compares two tapped runs: identical frames, and the PSNR of the kept frames that differ.
-// Reads the clips only; everything it writes goes to <outDir>. ATHER_BENCH_ONLY=<scenario> runs one scenario.
+// Reads the clips only; everything it writes goes to <outDir>. ATHER_BENCH_ONLY=<scenario> runs one scenario;
+// ATHER_ENCODERS=n and ATHER_GIF_PARTS=n try another number of MP4 encoders or GIF parts.
 enum VideoBench {
     struct Scenario {
         let name: String
@@ -103,35 +104,22 @@ enum VideoBench {
 
     // A rendered frame as tightly packed BGRA (premultiplied, sRGB), whatever it came as.
     private static let tapContext = CIContext(options: [.workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, .cacheIntermediates: false])
-    static func bgra(_ img: AnyObject) -> (w: Int, h: Int, bytes: [UInt8])? {
-        if CFGetTypeID(img) == CVPixelBufferGetTypeID() {
-            let pb = img as! CVPixelBuffer
-            let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
-            var bytes = [UInt8](repeating: 0, count: w * h * 4)
-            if CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA {
-                CVPixelBufferLockBaseAddress(pb, .readOnly)
-                defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-                guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
-                let row = CVPixelBufferGetBytesPerRow(pb)
-                bytes.withUnsafeMutableBytes { d in
-                    for y in 0..<h { memcpy(d.baseAddress! + y * w * 4, base + y * row, w * 4) }
-                }
-            } else {
-                tapContext.render(CIImage(cvPixelBuffer: pb), toBitmap: &bytes, rowBytes: w * 4, bounds: CGRect(x: 0, y: 0, width: w, height: h),
-                                  format: .BGRA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
-            }
-            return (w, h, bytes)
-        }
-        let cg = img as! CGImage
-        let w = cg.width, h = cg.height
+    static func bgra(_ pb: CVPixelBuffer) -> (w: Int, h: Int, bytes: [UInt8])? {
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
         var bytes = [UInt8](repeating: 0, count: w * h * 4)
-        let ok = bytes.withUnsafeMutableBytes { d -> Bool in
-            guard let ctx = CGContext(data: d.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return false }
-            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-            return true
+        if CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA {
+            CVPixelBufferLockBaseAddress(pb, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+            guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+            let row = CVPixelBufferGetBytesPerRow(pb)
+            bytes.withUnsafeMutableBytes { d in
+                for y in 0..<h { memcpy(d.baseAddress! + y * w * 4, base + y * row, w * 4) }
+            }
+        } else {
+            tapContext.render(CIImage(cvPixelBuffer: pb), toBitmap: &bytes, rowBytes: w * 4, bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                              format: .BGRA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
         }
-        return ok ? (w, h, bytes) : nil
+        return (w, h, bytes)
     }
 
     static func hash(_ b: [UInt8]) -> UInt64 {
@@ -142,6 +130,9 @@ enum VideoBench {
         }
         return h
     }
+
+    // A number from the environment, to try another setting.
+    static func knob(_ name: String) -> Int? { ProcessInfo.processInfo.environment[name].flatMap { Int($0) }.map { max(1, $0) } }
 
     static func say(_ s: String) {
         FileHandle.standardOutput.write(s.data(using: .utf8)!)
@@ -181,15 +172,14 @@ enum VideoBench {
                         }
                     }
                 }
-                VideoExport.probe = probe
                 let cpu0 = cpuSeconds()
                 let t0 = Date()
                 var err: String?
                 do {
-                    if s.gif { try await VideoExport.gif(s.edit, to: out) } else { try await VideoExport.mp4(s.edit, to: out) }
+                    if s.gif { try await VideoExport.gif(s.edit, to: out, parts: knob("ATHER_GIF_PARTS"), probe: probe) }
+                    else { try await VideoExport.mp4(s.edit, to: out, encoders: knob("ATHER_ENCODERS"), probe: probe) }
                 } catch { err = error.localizedDescription }
                 let secs = Date().timeIntervalSince(t0), cpu = cpuSeconds() - cpu0
-                VideoExport.probe = nil
                 total += secs
                 say(String(format: "  %@ %7.2f s  %5d frames  %7.1f fps  cpu %6.2f s  [%@]%@\n", s.name.padding(toLength: 8, withPad: " ", startingAt: 0) as NSString, secs, probe.frames,
                            Double(probe.frames) / max(1e-9, secs), cpu, probe.notes.joined(separator: "; ") as NSString, err.map { "  FAILED: \($0)" } ?? ""))

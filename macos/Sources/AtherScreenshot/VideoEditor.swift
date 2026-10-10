@@ -1,9 +1,7 @@
 import AVFoundation
 import AppKit
 import Carbon.HIToolbox
-import ImageIO
 import Speech
-import UniformTypeIdentifiers
 
 // A small video editor for screen recordings: trim, crop, speed, mute, captions (typed or
 // transcribed on device) and markup (text, emoji, callouts, blur, zoom, title cards),
@@ -67,37 +65,20 @@ enum VideoExport {
         }
     }
 
-    // Developer hooks for the bench (VideoBench.swift): sees every frame an export renders, and notes how it ran.
-    final class Probe {
-        private let lock = NSLock()
-        private(set) var frames = 0
-        private(set) var notes: [String] = []
-        // Output frame index and the rendered frame (a CVPixelBuffer or a CGImage). Called from any thread.
-        var tap: ((Int, AnyObject) -> Void)?
-        func frame(_ index: Int, _ img: @autoclosure () -> AnyObject) {
-            lock.lock(); frames += 1; lock.unlock()
-            tap?(index, img())
-        }
-        func note(_ s: String) { lock.lock(); notes.append(s); lock.unlock() }
-    }
-    nonisolated(unsafe) static var probe: Probe?
-
     struct Prepared {
         let composition: AVMutableComposition
         let video: AVMutableVideoComposition
         let size: CGSize
+
+        func time(ofFrame i: Int) -> CMTime { CMTimeMultiply(video.frameDuration, multiplier: Int32(i)) }
     }
 
-    static func prepare(_ e: VideoEdit) async throws -> Prepared {
+    // `probe`: the bench's (it sees every frame the compositor renders, through the renderer box).
+    static func prepare(_ e: VideoEdit, probe: Probe? = nil) async throws -> Prepared {
         // Every frame goes through the same renderer the preview uses.
         let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
         let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), speed: e.speed, muted: e.muted,
-                                              box: RendererBox(renderer))
-        // The frame rates the HighestQuality preset saved at: at most H.264 level 5.1's macroblock rate, so 3K at 60 fps
-        // saves at 30 (1440p60 stays 60). Smoother would mean twice the frames to encode and much bigger files.
-        let blocks = ceil(renderer.out.width / 16) * ceil(renderer.out.height / 16)
-        let k = Int32(max(1, ceil(blocks / b.video.frameDuration.seconds / 983_040 - 1e-9)))
-        if k > 1 { b.video.frameDuration = CMTimeMultiply(b.video.frameDuration, multiplier: k) }
+                                              box: RendererBox(renderer, probe: probe))
         return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
 
@@ -122,11 +103,6 @@ enum VideoExport {
     static func run(_ s: AVAssetExportSession) async throws {
         await withCheckedContinuation { (k: CheckedContinuation<Void, Never>) in s.exportAsynchronously { k.resume() } }
         if s.status != .completed { throw Failure.failed(s.error?.localizedDescription ?? "Export failed.") }
-    }
-
-    static func mp4(_ e: VideoEdit, to url: URL, encoders: Int? = nil) async throws {
-        let p = try await prepare(e)
-        try await write(p, speed: e.speed, encoders: encoders, to: url)
     }
 
     // Speech in the trimmed range, as caption-sized chunks. On device when the Mac supports it.

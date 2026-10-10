@@ -3,13 +3,92 @@ import ImageIO
 import UniformTypeIdentifiers
 import VideoToolbox
 
-// Saving an MP4: the composition is read back through the frame renderer (AVAssetReaderVideoCompositionOutput) and
-// written with AVAssetWriter, so the encoder settings, the sound and the pieces are ours to choose.
+// Saving: the timeline is cut into a few back-to-back parts on frame boundaries, each part is read back through
+// the frame renderer (AVAssetReaderVideoCompositionOutput) and written on its own at the same time, and the parts
+// are joined. An MP4's parts are HEVC files whose samples are copied into one without encoding again; a GIF's are
+// ImageIO GIFs whose frames are copied into one.
 extension VideoExport {
-    // HEVC at a constant quality, encoder told to favour speed: on Apple silicon it encodes ~1.6x faster than H.264
-    // did, the frames are as close to what was rendered as the old HighestQuality H.264 files, and the files are
-    // ~25% smaller. (H.264 tops out at ~190 fps at 3K on an M4 Max's media engine.)
-    // No B-frames, so every frame decodes in order and pieces join without edits between them.
+    // Developer hook for the bench (VideoBench.swift): every frame the compositor renders for an export (it gets
+    // it from the renderer box), and notes on how the export ran.
+    final class Probe {
+        private let lock = NSLock()
+        private(set) var frames = 0
+        private(set) var notes: [String] = []
+        var tap: ((Int, CVPixelBuffer) -> Void)?   // output frame index, the rendered frame; from any thread
+
+        func frame(_ index: Int, _ buffer: CVPixelBuffer) {
+            lock.lock(); frames += 1; lock.unlock()
+            tap?(index, buffer)
+        }
+        func note(_ s: String) { lock.lock(); notes.append(s); lock.unlock() }
+    }
+
+    // `count` back-to-back runs of `frames` frames.
+    static func split(_ frames: Int, into count: Int) -> [Range<Int>] {
+        let count = max(1, min(count, frames))
+        return (0..<count).map { k in k * frames / count ..< (k + 1) * frames / count }
+    }
+
+    // `body` for parts 0..<count at once; the results in order. The first error cancels the others.
+    private static func inParallel<T: Sendable>(_ count: Int, _ body: @escaping @Sendable (Int) async throws -> T) async throws -> [T] {
+        try await withThrowingTaskGroup(of: (Int, T).self) { g in
+            for k in 0..<count { g.addTask { (k, try await body(k)) } }
+            var out = [T?](repeating: nil, count: count)
+            for try await (k, v) in g { out[k] = v }
+            return out.map { $0! }
+        }
+    }
+
+    // The composition's frames from `start` to `end` (nil: to the very end, which can include a frame right at it).
+    private static func frameReader(_ comp: AVComposition, _ vc: AVVideoComposition, from start: CMTime, to end: CMTime?) throws
+        -> (AVAssetReader, AVAssetReaderVideoCompositionOutput) {
+        let reader = try AVAssetReader(asset: comp)
+        if start != .zero || end != nil { reader.timeRange = CMTimeRange(start: start, end: end ?? .positiveInfinity) }
+        let vo = AVAssetReaderVideoCompositionOutput(videoTracks: comp.tracks(withMediaType: .video), videoSettings: nil)
+        vo.videoComposition = vc
+        vo.alwaysCopiesSampleData = false
+        reader.add(vo)
+        return (reader, vo)
+    }
+}
+
+// MARK: - MP4
+
+extension VideoExport {
+    static func mp4(_ e: VideoEdit, to url: URL, encoders: Int? = nil, probe: Probe? = nil) async throws {
+        let p = try await prepare(e, probe: probe)
+        p.video.frameDuration = mp4FrameDuration(p.video.frameDuration, size: p.size)
+        let frames = Int((p.composition.duration.seconds / p.video.frameDuration.seconds).rounded(.up))
+        let parts = split(frames, into: encoders ?? self.encoders(for: p.composition.duration.seconds))
+        let sound = await audio(p, speed: e.speed)
+        probe?.note(parts.count == 1 ? "writer 1 piece" : "writer \(parts.count) pieces")
+        if parts.count == 1 { return try await encode(p, parts[0], of: frames, to: url, final: true, sound: sound) }
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ather-pieces-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let files = parts.indices.map { dir.appendingPathComponent("\($0).mp4") }
+        _ = try await inParallel(parts.count) { k in try await encode(p, parts[k], of: frames, to: files[k], final: false, sound: nil) }
+        try await join(files, at: parts.map { p.time(ofFrame: $0.lowerBound) }, sound: sound, from: p.composition, end: p.composition.duration, to: url)
+    }
+
+    // The frame rates the HighestQuality preset saved at: at most H.264 level 5.1's macroblock rate (983,040 a
+    // second), so 3K at 60 fps saves at 30 while 1440p60 stays 60. Smoother would mean twice the frames to encode.
+    static func mp4FrameDuration(_ fd: CMTime, size: CGSize) -> CMTime {
+        let blocks = ceil(size.width / 16) * ceil(size.height / 16)
+        let k = Int32(max(1, ceil(blocks / fd.seconds / 983_040 - 1e-9)))
+        return k > 1 ? CMTimeMultiply(fd, multiplier: k) : fd
+    }
+
+    // How many encoders work on one MP4 at once: two HEVC sessions beat one on Apple silicon, a third doesn't.
+    // Under ~5 s, splitting and joining cost what they save.
+    static func encoders(for seconds: Double) -> Int { seconds >= 5 ? 2 : 1 }
+
+    // HEVC at a constant quality with the encoder told to favour speed (without that, HEVC is no faster than H.264,
+    // which the media engine can't run much faster than the old export did). Quality 0.85 keeps the frames at least
+    // as close to what was rendered as the old HighestQuality H.264 files; the size follows the content.
+    // No B-frames: with them each part starts with its own decode delay, and the joined file gets an empty edit at
+    // every cut.
     static func videoSettings(_ size: CGSize, fps: Double) -> [String: Any] {
         [AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: Int(size.width), AVVideoHeightKey: Int(size.height),
          AVVideoColorPropertiesKey: [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
@@ -17,37 +96,198 @@ extension VideoExport {
          AVVideoCompressionPropertiesKey: [AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel as String,
                                            kVTCompressionPropertyKey_Quality as String: 0.85,
                                            kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String: true,
-                                           AVVideoAllowFrameReorderingKey: false,   // see writePieces
+                                           AVVideoAllowFrameReorderingKey: false,
                                            AVVideoExpectedSourceFrameRateKey: fps] as [String: Any]]
     }
 
-    // How many encoders work on one MP4 at once: two HEVC sessions beat one (M4 Max: 1.25x over all the bench's
-    // exports); a third is slower. Under ~5 s, splitting and joining cost what it saves.
-    static func encoders(for seconds: Double) -> Int {
-        if let v = ProcessInfo.processInfo.environment["ATHER_ENCODERS"], let n = Int(v) { return max(1, n) }   // the bench
-        return seconds >= 5 ? 2 : 1
+    // One part of the picture rendered and encoded into `url`, starting at 0; with `sound`, the sound too (then the
+    // part is the whole video: one pass).
+    private static func encode(_ p: Prepared, _ part: Range<Int>, of frames: Int, to url: URL, final: Bool, sound: Sound?) async throws {
+        let last = part.upperBound == frames
+        let start = p.time(ofFrame: part.lowerBound), end = last ? p.composition.duration : p.time(ofFrame: part.upperBound)
+        precondition(sound == nil || (part.lowerBound == 0 && last), "sound goes with the whole video only")
+        let (reader, vo) = try frameReader(p.composition, p.video, from: start, to: last ? nil : end)
+        let writer = try makeWriter(url, final: final)
+        let vi = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings(p.size, fps: 1 / p.video.frameDuration.seconds))
+        vi.expectsMediaDataInRealTime = false
+        vi.mediaTimeScale = VideoSequence.timeScale
+        writer.add(vi)
+        let back = CMTimeSubtract(.zero, start)
+        var streams = [Stream(vi) { try vo.copyNextSampleBuffer().map { try shifted($0, by: back) } }]
+        if let sound {
+            reader.add(sound.output)
+            writer.add(sound.input)
+            streams.append(Stream(sound.input) { sound.output.copyNextSampleBuffer() })
+        }
+        try await run([reader], writer, end: CMTimeSubtract(end, start), streams)
     }
 
-    // Copies samples from `next` to `input` until it runs out (true), or the input stops taking them or it's
-    // stopped (false). A cancelled writer stops asking for data, so `stop` is what ends the wait then.
+    // The parts' samples one after another, each moved to where its part starts, copied into one MP4 with the
+    // sound. The sound is read from the composition here, not written as a part: copied from a file of its own,
+    // AAC loses its priming trim and plays ~44 ms late.
+    private static func join(_ files: [URL], at starts: [CMTime], sound: Sound?, from comp: AVComposition, end: CMTime, to url: URL) async throws {
+        var readers: [AVAssetReader] = [], outputs: [AVAssetReaderTrackOutput] = []
+        var format: CMFormatDescription?
+        for f in files {
+            let asset = AVURLAsset(url: f)
+            guard let t = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.failed("A piece of the export is missing.") }
+            if format == nil { format = try await t.load(.formatDescriptions).first }
+            let r = try AVAssetReader(asset: asset)
+            let o = AVAssetReaderTrackOutput(track: t, outputSettings: nil)
+            o.alwaysCopiesSampleData = false
+            r.add(o)
+            readers.append(r)
+            outputs.append(o)
+        }
+        let writer = try makeWriter(url, final: true)
+        let vi = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+        vi.expectsMediaDataInRealTime = false
+        vi.mediaTimeScale = VideoSequence.timeScale
+        writer.add(vi)
+        var k = 0
+        var streams = [Stream(vi) {
+            while k < outputs.count {
+                if let s = outputs[k].copyNextSampleBuffer() { return try shifted(s, by: starts[k]) }
+                k += 1
+            }
+            return nil
+        }]
+        if let sound {
+            let r = try AVAssetReader(asset: comp)
+            r.add(sound.output)
+            readers.append(r)
+            writer.add(sound.input)
+            streams.append(Stream(sound.input) { sound.output.copyNextSampleBuffer() })
+        }
+        try await run(readers, writer, end: end, streams)
+    }
+
+    // `final`: the file people get, with its index at the front; parts are copied again anyway. Times are kept at
+    // the composition's timescale (edit lists too), so a part ends exactly where the next starts and frames land
+    // where one pass puts them.
+    private static func makeWriter(_ url: URL, final: Bool) throws -> AVAssetWriter {
+        let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        w.movieTimeScale = VideoSequence.timeScale
+        w.shouldOptimizeForNetworkUse = final
+        return w
+    }
+
+    private struct Sound {
+        let output: AVAssetReaderOutput
+        let input: AVAssetWriterInput
+    }
+
+    // The composition's sound as written to the MP4: copied as it is when nothing changes it (one AAC source at
+    // normal speed, like the export session did), otherwise mixed, sped up keeping its pitch, and encoded as AAC.
+    private static func audio(_ p: Prepared, speed: Double) async -> Sound? {
+        let tracks = p.composition.tracks(withMediaType: .audio)
+        guard !tracks.isEmpty else { return nil }
+        if speed == 1, tracks.count == 1, let t = tracks.first {
+            let descs = (try? await t.load(.formatDescriptions)) ?? []
+            if descs.count == 1, CMFormatDescriptionGetMediaSubType(descs[0]) == kAudioFormatMPEG4AAC {
+                let o = AVAssetReaderTrackOutput(track: t, outputSettings: nil)
+                o.alwaysCopiesSampleData = false
+                let i = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: descs[0])
+                i.expectsMediaDataInRealTime = false
+                return Sound(output: o, input: i)
+            }
+        }
+        let o = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+        o.audioTimePitchAlgorithm = .spectral   // sped-up audio keeps its pitch
+        o.alwaysCopiesSampleData = false
+        var rate = 48000.0, channels = 2
+        if let d = ((try? await tracks[0].load(.formatDescriptions)) ?? []).first, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(d)?.pointee {
+            rate = asbd.mSampleRate > 0 ? asbd.mSampleRate : rate
+            channels = Int(min(2, max(1, asbd.mChannelsPerFrame)))
+        }
+        let i = AVAssetWriterInput(mediaType: .audio, outputSettings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate, AVNumberOfChannelsKey: channels,
+                                                                       AVEncoderBitRateKey: channels * 96000])
+        i.expectsMediaDataInRealTime = false
+        return Sound(output: o, input: i)
+    }
+
+    // The same sample, `by` later (picture and decode times).
+    static func shifted(_ s: CMSampleBuffer, by t: CMTime) throws -> CMSampleBuffer {
+        guard t != .zero else { return s }
+        var n: CMItemCount = 0
+        CMSampleBufferGetSampleTimingInfoArray(s, entryCount: 0, arrayToFill: nil, entriesNeededOut: &n)
+        var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: n)
+        CMSampleBufferGetSampleTimingInfoArray(s, entryCount: n, arrayToFill: &timing, entriesNeededOut: &n)
+        for i in timing.indices {
+            if timing[i].presentationTimeStamp.isValid { timing[i].presentationTimeStamp = CMTimeAdd(timing[i].presentationTimeStamp, t) }
+            if timing[i].decodeTimeStamp.isValid { timing[i].decodeTimeStamp = CMTimeAdd(timing[i].decodeTimeStamp, t) }
+        }
+        var out: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: s, sampleTimingEntryCount: n, sampleTimingArray: &timing,
+                                                    sampleBufferOut: &out) == noErr, let out else { throw Failure.failed("Can't move a frame of the export.") }
+        return out
+    }
+
+    // What goes into one writer input: the next sample, or nil when there are no more.
+    private struct Stream {
+        let input: AVAssetWriterInput
+        let next: () throws -> CMSampleBuffer?
+        init(_ input: AVAssetWriterInput, _ next: @escaping () throws -> CMSampleBuffer?) { self.input = input; self.next = next }
+    }
+
+    // Runs readers into a writer: every stream is pumped on its own queue, then the file is closed at `end`.
+    // Cancelling stops the reading and the pumps; the file is thrown away.
+    private static func run(_ readers: [AVAssetReader], _ writer: AVAssetWriter, end: CMTime, _ streams: [Stream]) async throws {
+        for r in readers {
+            guard r.startReading() else { throw Failure.failed(r.error?.localizedDescription ?? "Can't read this video.") }
+        }
+        guard writer.startWriting() else { throw Failure.failed(writer.error?.localizedDescription ?? "Can't write the video.") }
+        writer.startSession(atSourceTime: .zero)
+        let pumps = streams.map { _ in Pump() }
+        let ok = await withTaskCancellationHandler {
+            await withTaskGroup(of: Bool.self) { g in
+                for (n, s) in streams.enumerated() { g.addTask { await pumps[n].run(s, on: DispatchQueue(label: "ather.export.\(n)")) } }
+                return await g.reduce(true) { $0 && $1 }
+            }
+        } onCancel: {
+            for p in pumps { p.finish(false) }
+            for r in readers { r.cancelReading() }
+        }
+        let failed = readers.first { $0.status == .failed }
+        if !ok || failed != nil || writer.status == .failed || Task.isCancelled {
+            for r in readers { r.cancelReading() }
+            writer.cancelWriting()
+            try Task.checkCancellation()
+            if let e = pumps.lazy.compactMap(\.error).first { throw e }
+            throw Failure.failed((writer.error ?? failed?.error)?.localizedDescription ?? "Export failed.")
+        }
+        writer.endSession(atSourceTime: end)
+        await writer.finishWriting()
+        if writer.status != .completed { throw Failure.failed(writer.error?.localizedDescription ?? "Export failed.") }
+    }
+
+    // Copies a stream's samples into its input until they run out (true), or the input stops taking them, the
+    // stream fails or it's stopped (false). A cancelled writer stops asking for data, so `finish` is what ends the
+    // wait then.
     private final class Pump {
         private let lock = NSLock()
         private var k: CheckedContinuation<Bool, Never>?
         private var result: Bool?
+        private(set) var error: Error?
 
-        func run(_ input: AVAssetWriterInput, on queue: DispatchQueue, _ next: @escaping () -> CMSampleBuffer?) async -> Bool {
+        func run(_ s: Stream, on queue: DispatchQueue) async -> Bool {
             await withCheckedContinuation { (k: CheckedContinuation<Bool, Never>) in
                 lock.lock()
                 if let r = result { lock.unlock(); return k.resume(returning: r) }   // stopped before it started
                 self.k = k
                 lock.unlock()
-                input.requestMediaDataWhenReady(on: queue) { [self] in
-                    while input.isReadyForMoreMediaData, !done {
-                        guard let s = next() else {
-                            input.markAsFinished()
-                            return finish(true)
+                s.input.requestMediaDataWhenReady(on: queue) { [self] in
+                    while s.input.isReadyForMoreMediaData, !done {
+                        do {
+                            guard let b = try s.next() else {
+                                s.input.markAsFinished()
+                                return finish(true)
+                            }
+                            if !s.input.append(b) { return finish(false) }
+                        } catch {
+                            self.error = error
+                            return finish(false)
                         }
-                        if !input.append(s) { return finish(false) }
                     }
                 }
             }
@@ -65,300 +305,69 @@ extension VideoExport {
             k?.resume(returning: ok)
         }
     }
-
-    // The same sample, `by` later (picture and decode times).
-    static func shifted(_ s: CMSampleBuffer, by t: CMTime) -> CMSampleBuffer? {
-        guard t != .zero else { return s }
-        var n: CMItemCount = 0
-        CMSampleBufferGetSampleTimingInfoArray(s, entryCount: 0, arrayToFill: nil, entriesNeededOut: &n)
-        var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: n)
-        CMSampleBufferGetSampleTimingInfoArray(s, entryCount: n, arrayToFill: &timing, entriesNeededOut: &n)
-        for i in timing.indices {
-            if timing[i].presentationTimeStamp.isValid { timing[i].presentationTimeStamp = CMTimeAdd(timing[i].presentationTimeStamp, t) }
-            if timing[i].decodeTimeStamp.isValid { timing[i].decodeTimeStamp = CMTimeAdd(timing[i].decodeTimeStamp, t) }
-        }
-        var out: CMSampleBuffer?
-        CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: s, sampleTimingEntryCount: n, sampleTimingArray: &timing, sampleBufferOut: &out)
-        return out
-    }
-
-    // The composition's sound as written to the MP4: copied as it is when nothing changes it (one AAC source at
-    // normal speed, like the export session did), otherwise mixed, sped up keeping its pitch, and encoded as AAC.
-    private static func audioIO(_ p: Prepared, speed: Double) async -> (AVAssetReaderOutput, AVAssetWriterInput)? {
-        let tracks = p.composition.tracks(withMediaType: .audio)
-        guard !tracks.isEmpty else { return nil }
-        if speed == 1, tracks.count == 1, let t = tracks.first {
-            let descs = (try? await t.load(.formatDescriptions)) ?? []
-            if descs.count == 1, CMFormatDescriptionGetMediaSubType(descs[0]) == kAudioFormatMPEG4AAC {
-                let o = AVAssetReaderTrackOutput(track: t, outputSettings: nil)
-                o.alwaysCopiesSampleData = false
-                let i = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: descs[0])
-                i.expectsMediaDataInRealTime = false
-                return (o, i)
-            }
-        }
-        let o = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
-        o.audioTimePitchAlgorithm = .spectral   // sped-up audio keeps its pitch
-        o.alwaysCopiesSampleData = false
-        var rate = 48000.0, channels = 2
-        if let d = ((try? await tracks[0].load(.formatDescriptions)) ?? []).first, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(d)?.pointee {
-            rate = asbd.mSampleRate > 0 ? asbd.mSampleRate : rate
-            channels = Int(min(2, max(1, asbd.mChannelsPerFrame)))
-        }
-        let i = AVAssetWriterInput(mediaType: .audio, outputSettings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate, AVNumberOfChannelsKey: channels,
-                                                                       AVEncoderBitRateKey: channels * 96000])
-        i.expectsMediaDataInRealTime = false
-        return (o, i)
-    }
-
-    // The composition's timescale: frame times are kept exactly, so pieces moved back to where they start land
-    // where one pass puts them (at 600 they'd round differently).
-    static let timeScale: CMTimeScale = 60000
-
-    private static func videoOutput(_ p: Prepared) -> AVAssetReaderVideoCompositionOutput {
-        let vo = AVAssetReaderVideoCompositionOutput(videoTracks: p.composition.tracks(withMediaType: .video), videoSettings: nil)
-        vo.videoComposition = p.video
-        vo.alwaysCopiesSampleData = false
-        return vo
-    }
-
-    private static func videoInput(_ p: Prepared) -> AVAssetWriterInput {
-        let vi = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings(p.size, fps: 1 / p.video.frameDuration.seconds))
-        vi.expectsMediaDataInRealTime = false
-        vi.mediaTimeScale = timeScale
-        return vi
-    }
-
-    // Runs a reader into a writer: each (input, next) pair is pumped on its own queue, then the file is closed at `end`.
-    private static func run(_ reader: AVAssetReader?, _ writer: AVAssetWriter, end: CMTime, _ streams: [(AVAssetWriterInput, () -> CMSampleBuffer?)]) async throws {
-        writer.movieTimeScale = timeScale   // the edit lists too, so a piece ends exactly where the next starts
-        if let reader, !reader.startReading() { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
-        guard writer.startWriting() else { throw Failure.failed(writer.error?.localizedDescription ?? "Can't write the video.") }
-        writer.startSession(atSourceTime: .zero)
-        // Cancelling stops the reading and the writing; the pumps then run out and the file is thrown away below.
-        let pumps = streams.map { _ in Pump() }
-        let ok = await withTaskCancellationHandler {
-            await withTaskGroup(of: Bool.self) { g in
-                for (n, (input, next)) in streams.enumerated() { g.addTask { await pumps[n].run(input, on: DispatchQueue(label: "ather.export.\(n)"), next) } }
-                return await g.reduce(true) { $0 && $1 }
-            }
-        } onCancel: {
-            for p in pumps { p.finish(false) }
-            reader?.cancelReading()
-        }
-        if !ok || reader?.status == .failed || writer.status == .failed || Task.isCancelled {
-            reader?.cancelReading()
-            writer.cancelWriting()
-            try Task.checkCancellation()
-            throw Failure.failed((writer.error ?? reader?.error)?.localizedDescription ?? "Export failed.")
-        }
-        writer.endSession(atSourceTime: end)
-        await writer.finishWriting()
-        if writer.status != .completed { throw Failure.failed(writer.error?.localizedDescription ?? "Export failed.") }
-    }
-
-    // `encoders`: how many at once (nil: by length).
-    static func write(_ p: Prepared, speed: Double, encoders count: Int? = nil, to url: URL) async throws {
-        let n = count ?? encoders(for: p.composition.duration.seconds)
-        if n > 1 { return try await writePieces(p, speed: speed, count: n, to: url) }
-        // One pass: the whole composition, picture and sound, into one MP4.
-        let reader = try AVAssetReader(asset: p.composition)
-        let vo = videoOutput(p)
-        reader.add(vo)
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        writer.shouldOptimizeForNetworkUse = true
-        let vi = videoInput(p)
-        writer.add(vi)
-        var streams: [(AVAssetWriterInput, () -> CMSampleBuffer?)] = [(vi, { vo.copyNextSampleBuffer() })]
-        if let (ao, ai) = await audioIO(p, speed: speed) {
-            reader.add(ao)
-            writer.add(ai)
-            streams.append((ai, { ao.copyNextSampleBuffer() }))
-        }
-        probe?.note("writer 1 piece")
-        try await run(reader, writer, end: p.composition.duration, streams)
-    }
-
-    // Pieces: the picture is cut into `count` back-to-back parts on frame boundaries, each read through the
-    // compositor and encoded by its own writer at the same time, the sound is written on its own alongside, and
-    // then everything is copied into one MP4 without encoding again (each piece starts on a key frame). With B-frames
-    // each piece would start with its own decode delay, and the joined file gets an empty edit at every cut.
-    static func writePieces(_ p: Prepared, speed: Double, count: Int, to url: URL) async throws {
-        let fd = p.video.frameDuration, total = p.composition.duration
-        let frames = Int((total.seconds / fd.seconds).rounded(.up))
-        let cuts: [CMTime] = (0...count).map { k in k == count ? total : CMTimeMultiply(fd, multiplier: Int32(frames * k / count)) }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ather-pieces-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let pieces = (0..<count).map { dir.appendingPathComponent("\($0).mp4") }
-        probe?.note("writer \(count) pieces")
-        try await withThrowingTaskGroup(of: Void.self) { g in
-            for k in 0..<count {
-                g.addTask {
-                    let reader = try AVAssetReader(asset: p.composition)
-                    // The last piece reads to the end, like one pass (which can include a frame right at the end).
-                    reader.timeRange = CMTimeRange(start: cuts[k], end: k == count - 1 ? .positiveInfinity : cuts[k + 1])
-                    let vo = videoOutput(p)
-                    reader.add(vo)
-                    let writer = try AVAssetWriter(outputURL: pieces[k], fileType: .mp4)
-                    let vi = videoInput(p)
-                    writer.add(vi)
-                    let back = CMTimeSubtract(.zero, cuts[k])   // each piece starts at 0
-                    try await run(reader, writer, end: CMTimeSubtract(cuts[k + 1], cuts[k]), [(vi, { vo.copyNextSampleBuffer().flatMap { shifted($0, by: back) } })])
-                }
-            }
-            try await g.waitForAll()
-        }
-        try await join(pieces, at: cuts, sound: await audioIO(p, speed: speed), from: p.composition, end: total, to: url)
-    }
-
-    // The pieces' samples one after another (each moved to where it starts) copied into one MP4, with the sound.
-    // The sound comes straight from the composition: written to a file of its own and copied, AAC loses its
-    // priming trim and plays ~44 ms late.
-    static func join(_ pieces: [URL], at cuts: [CMTime], sound: (AVAssetReaderOutput, AVAssetWriterInput)?, from comp: AVComposition,
-                     end: CMTime, to url: URL) async throws {
-        func track(_ u: URL, _ type: AVMediaType) async throws -> (AVAssetReader, AVAssetReaderTrackOutput, CMFormatDescription?) {
-            let asset = AVURLAsset(url: u)
-            guard let t = try await asset.loadTracks(withMediaType: type).first else { throw Failure.failed("A piece of the export is missing.") }
-            let r = try AVAssetReader(asset: asset)
-            let o = AVAssetReaderTrackOutput(track: t, outputSettings: nil)
-            o.alwaysCopiesSampleData = false
-            r.add(o)
-            return (r, o, try await t.load(.formatDescriptions).first)
-        }
-        var video: [(AVAssetReader, AVAssetReaderTrackOutput, CMFormatDescription?)] = []
-        for u in pieces { video.append(try await track(u, .video)) }
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        writer.shouldOptimizeForNetworkUse = true
-        let vi = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: video[0].2)
-        vi.expectsMediaDataInRealTime = false
-        vi.mediaTimeScale = timeScale
-        writer.add(vi)
-        for v in video where !v.0.startReading() { throw Failure.failed(v.0.error?.localizedDescription ?? "Can't read a piece of the export.") }
-        var k = 0
-        var streams: [(AVAssetWriterInput, () -> CMSampleBuffer?)] = [(vi, {
-            while k < video.count {
-                if let s = video[k].1.copyNextSampleBuffer() { return shifted(s, by: cuts[k]) }
-                k += 1
-            }
-            return nil
-        })]
-        var reader: AVAssetReader?
-        if let (ao, ai) = sound {
-            let r = try AVAssetReader(asset: comp)
-            r.add(ao)
-            writer.add(ai)
-            streams.append((ai, { ao.copyNextSampleBuffer() }))
-            reader = r
-        }
-        try await run(reader, writer, end: end, streams)
-    }
 }
 
-// Saving a GIF: the composition renders straight at the GIF's rate and size (≤ 960 px), one pass, no MP4 in between.
+// MARK: - GIF
+
 extension VideoExport {
+    // `parts`: how many ImageIO encodes at once (nil: by length and cores).
+    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12, parts count: Int? = nil, probe: Probe? = nil) async throws {
+        let p = try await prepare(e, probe: probe)
+        let vc = p.video.mutableCopy() as! AVMutableVideoComposition
+        vc.frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 600)
+        vc.renderSize = gifSize(p.size)
+        // As many frames as the saved MP4 is long (whole frames of it), like before.
+        let fd = mp4FrameDuration(p.video.frameDuration, size: p.size).seconds
+        let n = max(1, Int((p.composition.duration.seconds / fd).rounded(.up) * fd * fps + 1e-6))
+        let parts = split(n, into: count ?? gifParts(n))
+        probe?.note("gif \(parts.count) parts")
+        let gifs = try await inParallel(parts.count) { k in try await gifPart(p.composition, vc, parts[k], last: k == parts.count - 1, fps: fps) }
+        if gifs.count == 1 { return try gifs[0].write(to: url) }
+        guard let gif = joinGIFs(gifs) else {   // not what ImageIO usually writes: one part after all
+            probe?.note("join failed, 1 part")
+            return try await self.gif(e, to: url, fps: fps, parts: 1, probe: probe)
+        }
+        try gif.write(to: url)
+    }
+
+    // ImageIO picks a GIF's palette and compresses it at finalize, on one thread (~5.6 ms a frame at 960 px), and
+    // the source decodes faster split up too: one part per 24 frames, at most half the cores.
+    static func gifParts(_ frames: Int) -> Int { max(1, min(ProcessInfo.processInfo.activeProcessorCount / 2, frames / 24)) }
+
     static func gifSize(_ s: CGSize, max m: CGFloat = 960) -> CGSize {
         let k = min(1, m / s.width, m / s.height)
         return CGSize(width: max(1, (s.width * k).rounded(.down)), height: max(1, (s.height * k).rounded(.down)))
     }
 
-    // `chunks`: how many parts ImageIO encodes at once (nil: by length and cores).
-    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12, chunks: Int? = nil) async throws {
-        let p = try await prepare(e)
-        let probe = VideoExport.probe
-        VideoExport.probe = nil   // the bench taps the GIF's frames, not the compositor's
-        defer { VideoExport.probe = probe }
-        let vc = p.video.mutableCopy() as! AVMutableVideoComposition
-        vc.frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 600)
-        vc.renderSize = gifSize(p.size)
-        // As many frames as the saved MP4 is long (whole frames of the sequence), like before.
-        let fd = p.video.frameDuration.seconds
-        let n = max(1, Int((p.composition.duration.seconds / fd).rounded(.up) * fd * fps + 1e-6))
-        // ImageIO picks the palette and compresses at finalize, on one thread. So the frames go out in a few chunks,
-        // each finalized on its own as soon as its frames are in, and the chunks are joined (joinGIFs). And they're
-        // read in two halves at once, which mostly means decoding the source twice as fast.
-        let k = max(1, min(chunks ?? gifChunks(n), n))
-        let halves = n >= 24 && k >= 2 ? 2 : 1
-        probe?.note(k == 1 ? "gif 1 pass" : "gif 1 pass, \(k) chunks, \(halves) readers")
-        let edges = (0...halves).map { $0 * n / halves }
-        let reads = (0..<halves).map { h in
-            Task { () throws -> [Task<Data?, Never>] in
-                let reader = try AVAssetReader(asset: p.composition)
-                reader.timeRange = CMTimeRange(start: CMTimeMultiply(vc.frameDuration, multiplier: Int32(edges[h])),
-                                               end: h == halves - 1 ? .positiveInfinity : CMTimeMultiply(vc.frameDuration, multiplier: Int32(edges[h + 1])))
-                let vo = AVAssetReaderVideoCompositionOutput(videoTracks: p.composition.tracks(withMediaType: .video), videoSettings: nil)
-                vo.videoComposition = vc
-                vo.alwaysCopiesSampleData = false
-                reader.add(vo)
-                defer { reader.cancelReading() }
-                guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
-                var parts: [Task<Data?, Never>] = []
-                var dest: CGImageDestination?, data: CFMutableData?, chunk = -1
-                func close() {
-                    guard let d = dest, let m = data else { return }
-                    parts.append(Task.detached { CGImageDestinationFinalize(d) ? m as Data : nil })
-                    dest = nil
-                }
-                func add(_ j: Int, _ img: CGImage, frames: Int) throws {
-                    let c = j * k / n
-                    if c != chunk || dest == nil {
-                        close()
-                        chunk = c
-                        let m = CFDataCreateMutable(nil, 0)!
-                        // At most the frames j with j * k / n == c, in this half.
-                        let count = min((c + 1) * n + k - 1, edges[h + 1] * k + k - 1) / k - max(c * n + k - 1, edges[h] * k + k - 1) / k
-                        guard let d = CGImageDestinationCreateWithData(m, UTType.gif.identifier as CFString, max(1, count), nil) else { throw Failure.failed("Can't write the GIF.") }
-                        CGImageDestinationSetProperties(d, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-                        (dest, data) = (d, m)
-                    }
-                    CGImageDestinationAddImage(dest!, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
-                }
-                // Each frame shows until the next one; a frame the compositor skipped (nothing new) lengthens the one
-                // before, and the first one of a half covers its start.
-                var pending: (Int, CGImage)?
-                while let s = vo.copyNextSampleBuffer() {
-                    try Task.checkCancellation()
-                    guard let pb = CMSampleBufferGetImageBuffer(s), let img = cgImage(pb) else { continue }
-                    let i = max(edges[h], Int((CMSampleBufferGetPresentationTimeStamp(s).seconds * fps).rounded()))
-                    guard i < edges[h + 1] else { break }
-                    if let (j, prev) = pending {
-                        guard i > j else { pending = (j, img); continue }
-                        try add(j, prev, frames: i - j)
-                    }
-                    probe?.frame(i, img)
-                    pending = (pending == nil ? edges[h] : i, img)
-                }
-                if reader.status == .failed { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
-                if let (j, prev) = pending { try add(j, prev, frames: max(1, edges[h + 1] - j)) }
-                close()
-                return parts
+    // One part of a GIF: its frames rendered and handed to ImageIO in order. Each frame shows until the next one; a
+    // frame the compositor skipped (nothing new) lengthens the one before, and the first covers the part's start.
+    private static func gifPart(_ comp: AVComposition, _ vc: AVVideoComposition, _ part: Range<Int>, last: Bool, fps: Double) async throws -> Data {
+        let at = { (i: Int) in CMTimeMultiply(vc.frameDuration, multiplier: Int32(i)) }
+        let (reader, vo) = try frameReader(comp, vc, from: at(part.lowerBound), to: last ? nil : at(part.upperBound))
+        let data = CFDataCreateMutable(nil, 0)!
+        guard let dest = CGImageDestinationCreateWithData(data, UTType.gif.identifier as CFString, part.count, nil) else { throw Failure.failed("Can't write the GIF.") }
+        CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        func add(_ img: CGImage, frames: Int) {
+            CGImageDestinationAddImage(dest, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
+        }
+        guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+        defer { reader.cancelReading() }
+        var pending: (Int, CGImage)?
+        while let s = vo.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            guard let pb = CMSampleBufferGetImageBuffer(s), let img = cgImage(pb) else { continue }
+            let i = Int((CMSampleBufferGetPresentationTimeStamp(s).seconds * fps).rounded())
+            guard i < part.upperBound else { break }
+            if let (j, prev) = pending {
+                guard i > j else { pending = (j, img); continue }
+                add(prev, frames: i - j)
             }
+            pending = (pending == nil ? part.lowerBound : i, img)
         }
-        var parts: [Task<Data?, Never>] = []
-        do {
-            for r in reads { parts += try await r.value }
-        } catch {
-            for r in reads { r.cancel() }
-            throw error
-        }
-        let t0 = Date()
-        var done: [Data] = []
-        for t in parts {
-            guard let d = await t.value else { throw Failure.failed("Can't write the GIF.") }
-            done.append(d)
-        }
-        probe?.note(String(format: "waited %.2f s for the last chunks", Date().timeIntervalSince(t0)))
-        if k == 1 { return try done[0].write(to: url) }
-        guard let gif = joinGIFs(done) else {   // not what ImageIO usually writes: one part after all
-            probe?.note("join failed, 1 chunk")
-            return try await self.gif(e, to: url, fps: fps, chunks: 1)
-        }
-        try gif.write(to: url)
-    }
-
-    static func gifChunks(_ frames: Int) -> Int {
-        if let v = ProcessInfo.processInfo.environment["ATHER_GIF_CHUNKS"], let k = Int(v) { return max(1, k) }   // the bench
-        return max(1, min(ProcessInfo.processInfo.activeProcessorCount / 2, frames / 24))
+        if reader.status == .failed { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+        if let (j, prev) = pending { add(prev, frames: max(1, part.upperBound - j)) }
+        guard CGImageDestinationFinalize(dest) else { throw Failure.failed("Can't write the GIF.") }
+        return data as Data
     }
 
     // GIFs from ImageIO joined into one: the first as it is, the frames of the others after it, each with its GIF's
