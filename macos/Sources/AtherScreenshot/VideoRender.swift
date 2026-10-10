@@ -592,7 +592,11 @@ extension Caption {
 final class RendererBox {
     private let lock = NSLock()
     private var r: FrameRenderer
-    init(_ r: FrameRenderer) { self.r = r }
+    let probe: VideoExport.Probe?   // an export's, for the bench
+    init(_ r: FrameRenderer, probe: VideoExport.Probe? = nil) {
+        self.r = r
+        self.probe = probe
+    }
     var renderer: FrameRenderer {
         get { lock.lock(); defer { lock.unlock() }; return r }
         set { lock.lock(); r = newValue; lock.unlock() }

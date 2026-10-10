@@ -1,9 +1,7 @@
 import AVFoundation
 import AppKit
 import Carbon.HIToolbox
-import ImageIO
 import Speech
-import UniformTypeIdentifiers
 
 // A small video editor for screen recordings: trim, crop, speed, mute, captions (typed or
 // transcribed on device) and markup (text, emoji, callouts, blur, zoom, title cards),
@@ -71,13 +69,16 @@ enum VideoExport {
         let composition: AVMutableComposition
         let video: AVMutableVideoComposition
         let size: CGSize
+
+        func time(ofFrame i: Int) -> CMTime { CMTimeMultiply(video.frameDuration, multiplier: Int32(i)) }
     }
 
-    static func prepare(_ e: VideoEdit) async throws -> Prepared {
+    // `probe`: the bench's (it sees every frame the compositor renders, through the renderer box).
+    static func prepare(_ e: VideoEdit, probe: Probe? = nil) async throws -> Prepared {
         // Every frame goes through the same renderer the preview uses.
         let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
         let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), speed: e.speed, muted: e.muted,
-                                              box: RendererBox(renderer))
+                                              box: RendererBox(renderer, probe: probe))
         return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
 
@@ -102,40 +103,6 @@ enum VideoExport {
     static func run(_ s: AVAssetExportSession) async throws {
         await withCheckedContinuation { (k: CheckedContinuation<Void, Never>) in s.exportAsynchronously { k.resume() } }
         if s.status != .completed { throw Failure.failed(s.error?.localizedDescription ?? "Export failed.") }
-    }
-
-    static func mp4(_ e: VideoEdit, to url: URL) async throws {
-        let p = try await prepare(e)
-        guard let s = AVAssetExportSession(asset: p.composition, presetName: AVAssetExportPresetHighestQuality) else { throw Failure.failed("Can't export this video.") }
-        s.videoComposition = p.video
-        s.audioTimePitchAlgorithm = .spectral   // sped-up audio keeps its pitch
-        s.outputURL = url
-        s.outputFileType = .mp4
-        s.shouldOptimizeForNetworkUse = true
-        try await run(s)
-    }
-
-    // Renders the edit to MP4 first, then samples it into a GIF (≤ 960 px wide).
-    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).mp4")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        try await mp4(e, to: tmp)
-        let src = AVURLAsset(url: tmp)
-        let duration = try await src.load(.duration).seconds
-        let gen = AVAssetImageGenerator(asset: src)
-        gen.appliesPreferredTrackTransform = true
-        gen.maximumSize = CGSize(width: 960, height: 960)
-        gen.requestedTimeToleranceBefore = .zero
-        gen.requestedTimeToleranceAfter = CMTime(seconds: 0.5 / fps, preferredTimescale: 600)
-        let n = max(1, Int(duration * fps))
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.gif.identifier as CFString, n, nil) else { throw Failure.failed("Can't write the GIF.") }
-        CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-        let frame = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 1 / fps]] as CFDictionary
-        for i in 0..<n {
-            let img = try await gen.image(at: CMTime(seconds: Double(i) / fps, preferredTimescale: 600)).image
-            CGImageDestinationAddImage(dest, img, frame)
-        }
-        guard CGImageDestinationFinalize(dest) else { throw Failure.failed("Can't write the GIF.") }
     }
 
     // Speech in the trimmed range, as caption-sized chunks. On device when the Mac supports it.

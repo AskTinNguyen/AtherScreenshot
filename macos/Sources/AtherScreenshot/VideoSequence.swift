@@ -186,7 +186,8 @@ enum VideoSequence {
         let unplayable: Set<UUID>  // clips whose file couldn't be read: black in the composition, skipped while playing
     }
 
-    private static let scale: CMTimeScale = 60000
+    // Clip times are kept at this scale, and so are the saved MP4's frame times (VideoEncode.swift).
+    static let timeScale: CMTimeScale = 60000
 
     // `range`: the part of the timeline to include (nil: all). `speed` scales it. `box` draws the markup.
     static func build(_ clips: [Clip], frame: CGSize, range: ClosedRange<Double>? = nil, speed: Double = 1, muted: Bool = false,
@@ -204,8 +205,8 @@ enum VideoSequence {
             defer { timeline += c.duration }
             let from = max(a, timeline), to = min(b, timeline + c.duration)
             guard to - from > 0.0005 else { continue }
-            let src = CMTimeRange(start: CMTime(seconds: c.inPoint + from - timeline, preferredTimescale: scale),
-                                  duration: CMTime(seconds: to - from, preferredTimescale: scale))
+            let src = CMTimeRange(start: CMTime(seconds: c.inPoint + from - timeline, preferredTimescale: timeScale),
+                                  duration: CMTime(seconds: to - from, preferredTimescale: timeScale))
             let asset = AVURLAsset(url: c.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
             do {
                 guard let vt = try await asset.loadTracks(withMediaType: .video).first else { throw VideoSource.Failure.noVideo }
@@ -330,8 +331,13 @@ final class SequenceCompositor: NSObject, AVVideoCompositing {
         let size = req.renderContext.size
         let src = req.sourceFrame(byTrackID: ins.track).map { VideoSequence.place(CIImage(cvPixelBuffer: $0), clip: ins.clip(for: $0), frame: ins.frame) }
             ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: ins.frame))
-        let img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
+        var img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
+        let full = ins.box.renderer.out
+        if abs(size.width - full.width) > 0.5 || abs(size.height - full.height) > 0.5 {   // rendered smaller (a GIF): scaled to fit
+            img = img.transformed(by: CGAffineTransform(scaleX: size.width / full.width, y: size.height / full.height))
+        }
         SequenceCompositor.context.render(img, to: out, bounds: CGRect(origin: .zero, size: size), colorSpace: space)
+        ins.box.probe?.frame(Int((req.compositionTime.seconds / req.renderContext.videoComposition.frameDuration.seconds).rounded()), out)
         req.finish(withComposedVideoFrame: out)
     }
 }
