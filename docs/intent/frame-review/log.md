@@ -48,3 +48,9 @@ The owner is away (L-2), so this review stands in for the owner's calls.
 - Notes, the playhead and the readout (0:12:37 · frame 757) are still right.
 
 **A13 passes review:** all seven images, at R-1 and R-2. With A1–A12 met in `progress.md`, the intent is complete pending the owner's merge of #1 and #2.
+
+## L-3 (2026-10-10 14:20) | class: decision | -> completed
+
+> Merge them all
+
+The orchestrator squash-merged #1 (cbc32a6), then #2 (1a7a107). `main` now matches the feature branch, and on `main` `test.bat` gives `97 tests, 1463 checks, 0 failed`. The contract's On close steps (README, RELEASE_NOTES) landed in #2. Status is completed.

@@ -1,7 +1,7 @@
 # Frame Review: Step 60 fps Video Frame by Frame, Leave Notes, Export a Review Video
 
 - Rev: 3
-- Status: active
+- Status: completed
 - Area: Video
 - Owner: Tin Nguyen
 - Skill: `none`
@@ -160,6 +160,7 @@ These are the orchestrator's proposed defaults for rev 1. They are calls the con
 ## Changelog
 
 - rev 1 (2026-10-10): created from L-1, with the orchestrator's proposed feature set (D1–D6, A1–A8) for the owner to review.
+- completed (2026-10-10): A1–A13 met; #1 (cbc32a6) and #2 (1a7a107) squash-merged by the orchestrator on the owner's word (L-3); `main` passes `test.bat`: 97 tests, 1463 checks, 0 failed.
 - rev 3 (2026-10-10): from R-1. F-1 accepted (D13). A9 now requires the filmstrip to show frames from under each tile at every zoom, and A13 image 3 must be redone. A8 passed review.
 - rev 2 (2026-10-10): from L-2 (owner away 8 h, full autonomy):
   - D1–D6 accepted.
