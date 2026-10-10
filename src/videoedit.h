@@ -170,6 +170,18 @@ public:
 
     // `src`: the source frame (full size, opaque). `t`: source time in seconds. Returns a frame of `Out()` size.
     BitmapPtr Render(const Bitmap& src, double t) const;
+    // The same, but when nothing changes the frame (an export without edits at `t`) it can be `src` itself.
+    // `owned`: nothing else will look at `src` again, so it can be drawn on instead of a copy of it.
+    BitmapPtr Render(const BitmapPtr& src, double t, bool owned = false) const;
+
+    // An export frame at `t` is the source frame as it is: no edit shows, and nothing is cropped or zoomed.
+    bool Untouched(double t) const;
+    // An export frame at `t` whose edits change only parts of the source frame (nothing zooming, no title card, and
+    // a crop that starts on even pixels): those parts, apart from each other, in source pixels on even coordinates
+    // (none when nothing shows), else nothing. DrawEdits draws what falls on one (`area`, whose top-left is `at`)
+    // exactly as Render does on the whole frame.
+    std::optional<std::vector<RECT>> EditAreas(double t) const;
+    void DrawEdits(Bitmap& area, POINT at, double t) const;
 
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
@@ -188,6 +200,18 @@ public:
     uint64_t settled = 0;        // preview while paused: the selected item shows fully, not mid-animation
 
 private:
+    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;
+    // Draw's steps, on `img` holding the part of the frame from `at` on (source pixels for 1–2, output for 4).
+    struct Effect {
+        RECT rc{};  // the pixels a blur or pixelate changes
+        Motion mo;
+        double sigma = 0;  // blur
+        int block = 0;     // pixelate
+    };
+    std::optional<Effect> EffectOf(const Mark& m, double t) const;
+    void DrawRegions(Bitmap& img, POINT at, double t) const;  // 1. blur and pixelate
+    void DrawMarks(Bitmap& img, POINT at, double t) const;    // 2. markup on the video
+    void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4. captions, title cards
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;
     std::optional<Placed> RingImage(VRect r) const;
 
@@ -203,7 +227,8 @@ private:
 
 // Draws `img` stretched into `r` (destination pixels, fractional) on premultiplied `dst` with motion applied:
 // scale about the center, offset, wipe, blur and alpha.
-void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo);
+// `at`: where `dst`'s top-left is, when it holds just a part of the frame (`r` stays in frame pixels).
+void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo, POINT at = {});
 // Frees the rendered marks, captions and title cards kept between frames.
 void ClearRenderCache();
 

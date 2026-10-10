@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <memory>
 
 #include "common.h"
@@ -6,22 +7,46 @@
 
 namespace ather {
 
-// Video in and out for the video editor: Media Foundation decoding (Source Reader), export through the frame
-// renderer to H.264/AAC MP4 or GIF, a pitch-keeping speed change for the audio, preview playback
-// (IMFMediaEngine in frame-server mode) and on-device speech-to-text (SAPI dictation).
+// Video in and out for the video editor: Media Foundation decoding (Source Reader, on the GPU where it can), export
+// through the frame renderer to H.264/AAC MP4 or GIF (frames made on worker threads; long MP4s in two pieces on two
+// encoders at once), a pitch-keeping speed change for the audio, preview playback (IMFMediaEngine in frame-server
+// mode) and on-device speech-to-text (SAPI dictation).
+
+// A decoded frame that turns into opaque top-down BGRA only when asked: an export skips the frames it doesn't
+// use and converts the others on its worker threads. Copies share one conversion; Bgra is thread-safe.
+class VideoFrame {
+public:
+    VideoFrame() = default;
+    explicit VideoFrame(BitmapPtr bgra);
+    BitmapPtr Bgra() const;  // null when out of memory
+    explicit operator bool() const { return s_ != nullptr; }
+    bool operator==(const VideoFrame& o) const { return s_ == o.s_; }
+
+    struct State;
+    explicit VideoFrame(std::shared_ptr<State> s) : s_(std::move(s)) {}
+    State* state() const { return s_.get(); }
+
+private:
+    std::shared_ptr<State> s_;
+};
 
 // Decodes video frames in order, as opaque top-down BGRA.
 class VideoReader {
 public:
     VideoReader();
     ~VideoReader();
-    bool Open(const std::wstring& path);
+    // `convert`: false keeps Media Foundation's own color conversion (slow; for tests comparing against it).
+    bool Open(const std::wstring& path, bool convert = true);
     SIZE Size() const;
     double Duration() const;
     double Fps() const;
     bool HasAudio() const;
     bool Seek(double t);  // lands on the key frame before `t`; Read on to reach it
     bool Read(BitmapPtr* frame, double* t);  // false at the end
+    // Like Read, without converting yet. With `fit`, Bgra() comes fitted into that size (black bars). With `skipTo`:
+    // a frame followed by one at or before that time (so not the newest up to it) comes without its picture (Bgra()
+    // is null), which saves copying it off the GPU — for callers after the newest frame up to a time.
+    bool ReadFrame(VideoFrame* frame, double* t, SIZE fit = {}, double skipTo = -1e300);
 
 private:
     struct Impl;
@@ -53,10 +78,11 @@ public:
     double Fps() const;  // the highest of the clips (≤ 60)
     bool HasAudio() const;
     bool Seek(double t);
-    // Frames come at their clip's own size (letterboxing every frame read would waste time on the ones a caller
-    // skips); Fit makes the one it keeps sequence-sized.
+    // Sequence-sized frames. ReadFrame doesn't convert them yet (Bgra() does), so frames a caller skips cost
+    // little; Read converts each.
+    bool ReadFrame(VideoFrame* frame, double* t, double skipTo = -1e300);  // `skipTo` in timeline time, as for VideoReader
     bool Read(BitmapPtr* frame, double* t);
-    BitmapPtr Fit(const BitmapPtr& frame) const;
+    BitmapPtr Fit(const BitmapPtr& frame) const;  // any frame into the sequence frame
 
 private:
     struct Impl;
@@ -76,7 +102,7 @@ private:
     void Run(bool final, std::vector<float>& out);
     int ch_, n_, hop_, delta_;
     double speed_;
-    std::vector<float> in_, win_, tail_;
+    std::vector<float> in_, win_, tail_, mono_;
     int64_t base_ = 0;  // absolute frame index of in_[0]
     int64_t k_ = 0, prev_ = 0;
     bool started_ = false;
@@ -88,6 +114,15 @@ using ExportProgress = std::function<bool(double)>;
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress = {});
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps = 12,
                ExportProgress progress = {});
+
+// Developer tool (--bench-export): when set, sees every frame an export encodes, in order, before encoding.
+extern std::function<void(int index, const Bitmap& frame)> g_exportTap;
+// Developer switches (--bench-export, tests): encoders an MP4 export uses at once (0: as many as suits its length), and
+// Media Foundation's software decoder instead of the GPU (set before any video is read).
+extern std::atomic<int> g_exportEncoders;
+extern bool g_noGpuDecode;
+// `--bench-export <outDir> [tap] <clip>...` and `--bench-compare <dirA> <dirB>`: see videobench.cpp.
+int VideoBench(const std::vector<std::wstring>& args);
 
 // `count` frames spread over the sequence, each at most `maxSide` pixels. `cancelled` is asked between frames.
 std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide, const std::function<bool()>& cancelled = {});

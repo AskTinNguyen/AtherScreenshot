@@ -1,5 +1,6 @@
 #include "videoio.h"
 
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
@@ -13,14 +14,19 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <condition_variable>
 #include <deque>
+#include <emmintrin.h>
+#include <future>
 #include <mutex>
+#include <thread>
 
 #include "json.h"
 #include "library.h"
 #include "media.h"
 #include "selftest.h"
 
+#pragma comment(lib, "d3d11")
 #pragma comment(lib, "mfplat")
 #pragma comment(lib, "mfreadwrite")
 #pragma comment(lib, "mfuuid")
@@ -52,7 +58,240 @@ std::wstring HrText(const wchar_t* what, HRESULT hr) {
 
 }  // namespace
 
+// ---------- frames ----------
+
+// YUV → RGB for 8-bit 4:2:0 video, bit for bit the way Media Foundation's own converter does it (which is ~15×
+// slower): 8-bit fixed point; the file's matrix, else BT.709 above 576 rows and BT.601 up to that; studio range
+// unless the file says full; each chroma sample used as is for its 2 × 2 pixels.
+struct YuvMatrix {
+    int y = 0, rv = 0, gu = 0, gv = 0, bu = 0, yOff = 16;
+};
+
+namespace {
+
+YuvMatrix MatrixFor(IMFMediaType* native, UINT32 height) {
+    UINT32 m = MFGetAttributeUINT32(native, MF_MT_YUV_MATRIX, MFVideoTransferMatrix_Unknown);
+    if (m != MFVideoTransferMatrix_BT709 && m != MFVideoTransferMatrix_BT601 && m != MFVideoTransferMatrix_SMPTE240M &&
+        m != MFVideoTransferMatrix_BT2020_10 && m != MFVideoTransferMatrix_BT2020_12)
+        m = height > 576 ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601;
+    double kr = 0.2126, kb = 0.0722;
+    if (m == MFVideoTransferMatrix_BT601) kr = 0.299, kb = 0.114;
+    else if (m == MFVideoTransferMatrix_SMPTE240M) kr = 0.212, kb = 0.087;
+    else if (m != MFVideoTransferMatrix_BT709) kr = 0.2627, kb = 0.0593;
+    const bool full = MFGetAttributeUINT32(native, MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_Unknown) == MFNominalRange_0_255;
+    const double ys = full ? 1 : 255.0 / 219, cs = full ? 1 : 255.0 / 224, kg = 1 - kr - kb;
+    auto fx = [](double v) { return (int)std::lround(v * 256); };
+    YuvMatrix x;
+    x.y = fx(ys);
+    x.rv = fx(2 * (1 - kr) * cs);
+    x.bu = fx(2 * (1 - kb) * cs);
+    x.gu = fx(2 * kb * (1 - kb) / kg * cs);
+    x.gv = fx(2 * kr * (1 - kr) / kg * cs);
+    x.yOff = full ? 0 : 16;
+    return x;
+}
+
+// Whether the file's video is stored as 8-bit 4:2:0, so its NV12 is the decoder's own pictures. Others (MJPEG's
+// 4:2:2, raw RGB, 10-bit HEVC) keep Media Foundation's RGB, as before.
+bool Is420(IMFMediaType* native) {
+    GUID sub{};
+    if (FAILED(native->GetGUID(MF_MT_SUBTYPE, &sub))) return false;
+    if (sub == MFVideoFormat_HEVC || sub == MFVideoFormat_HEVC_ES)
+        return MFGetAttributeUINT32(native, MF_MT_MPEG2_PROFILE, 1) == 1;  // Main (eAVEncH265VProfile_Main_420_8)
+    return sub == MFVideoFormat_H264 || sub == MFVideoFormat_H264_ES || sub == MFVideoFormat_VP80 ||
+           sub == MFVideoFormat_VP90 || sub == MFVideoFormat_AV1;
+}
+
+bool operator==(const YuvMatrix& a, const YuvMatrix& b) {
+    return a.y == b.y && a.rv == b.rv && a.gu == b.gu && a.gv == b.gv && a.bu == b.bu && a.yOff == b.yOff;
+}
+
+// The coefficients for unmarked studio-range video: BT.709 (hd) or BT.601.
+YuvMatrix StudioMatrix(bool hd) {
+    ComPtr<IMFMediaType> t;
+    MFCreateMediaType(&t);
+    t->SetUINT32(MF_MT_YUV_MATRIX, hd ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601);
+    t->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    return MatrixFor(t.Get(), hd ? 720 : 480);
+}
+
+inline uint32_t Clamp8(int v) { return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+// NV12 (`w` × `h`, rows `pitch` bytes apart, chroma plane at `uv`) → opaque BGRA.
+void Nv12ToBgra(const uint8_t* yp, const uint8_t* uvp, int pitch, int w, int h, uint32_t* dst, const YuvMatrix& m) {
+    // Eight pixels at a time, each with exactly the integer arithmetic of the scalar tail below.
+    const __m128i zero = _mm_setzero_si128(), c128 = _mm_set1_epi16(128), y16 = _mm_set1_epi16((short)m.yOff), r128 = _mm_set1_epi32(128);
+    const __m128i kR = _mm_setr_epi16((short)m.y, (short)m.rv, (short)m.y, (short)m.rv, (short)m.y, (short)m.rv, (short)m.y, (short)m.rv);
+    const __m128i kB = _mm_setr_epi16((short)m.y, (short)m.bu, (short)m.y, (short)m.bu, (short)m.y, (short)m.bu, (short)m.y, (short)m.bu);
+    const __m128i kG = _mm_setr_epi16((short)m.y, (short)-m.gu, (short)m.y, (short)-m.gu, (short)m.y, (short)-m.gu, (short)m.y, (short)-m.gu);
+    const __m128i kGv = _mm_setr_epi16((short)-m.gv, 0, (short)-m.gv, 0, (short)-m.gv, 0, (short)-m.gv, 0);
+    const __m128i alpha = _mm_set1_epi8(-1);
+    // (pairs · k + 128) >> 8 for the four (luma, chroma) pairs in each half of a and b.
+    auto ch = [&](__m128i yy, __m128i cc, __m128i k) {
+        const __m128i lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(yy, cc), k), r128), 8);
+        const __m128i hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(yy, cc), k), r128), 8);
+        return _mm_packs_epi32(lo, hi);
+    };
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* yr = yp + (size_t)pitch * y;
+        const uint8_t* cr = uvp + (size_t)pitch * (y / 2);
+        uint32_t* d = dst + (size_t)w * y;
+        int x0 = 0;
+        for (; x0 + 8 <= w; x0 += 8) {
+            const __m128i yy = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(yr + x0)), zero), y16);
+            const __m128i c = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(cr + x0)), zero), c128);  // u0 v0 u1 v1 …
+            // Each chroma sample twice, for its two pixels: uu = u0 u0 u1 u1 …, vv = v0 v0 v1 v1 …
+            const __m128i u = _mm_shufflehi_epi16(_mm_shufflelo_epi16(c, _MM_SHUFFLE(2, 2, 0, 0)), _MM_SHUFFLE(2, 2, 0, 0));
+            const __m128i v = _mm_shufflehi_epi16(_mm_shufflelo_epi16(c, _MM_SHUFFLE(3, 3, 1, 1)), _MM_SHUFFLE(3, 3, 1, 1));
+            const __m128i R = ch(yy, v, kR), B = ch(yy, u, kB);
+            // G = (y·Y − gu·u + 128 − gv·v) >> 8: the two products of the pair, then the third.
+            const __m128i glo = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(yy, u), kG), _mm_madd_epi16(_mm_unpacklo_epi16(v, zero), kGv));
+            const __m128i ghi = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(yy, u), kG), _mm_madd_epi16(_mm_unpackhi_epi16(v, zero), kGv));
+            const __m128i G = _mm_packs_epi32(_mm_srai_epi32(_mm_add_epi32(glo, r128), 8), _mm_srai_epi32(_mm_add_epi32(ghi, r128), 8));
+            const __m128i b8 = _mm_packus_epi16(B, B), g8 = _mm_packus_epi16(G, G), r8 = _mm_packus_epi16(R, R);
+            const __m128i bg = _mm_unpacklo_epi8(b8, g8), ra = _mm_unpacklo_epi8(r8, alpha);
+            _mm_storeu_si128((__m128i*)(d + x0), _mm_unpacklo_epi16(bg, ra));
+            _mm_storeu_si128((__m128i*)(d + x0 + 4), _mm_unpackhi_epi16(bg, ra));
+        }
+        for (int x = x0; x < w; x += 2) {
+            const int u = cr[x] - 128, v = cr[x + 1] - 128;
+            const int r = m.rv * v + 128, g = 128 - m.gu * u - m.gv * v, b = m.bu * u + 128;
+            for (int k = x; k < x + 2 && k < w; ++k) {
+                const int c = (yr[k] - m.yOff) * m.y;
+                d[k] = 0xFF000000u | Clamp8((c + r) >> 8) << 16 | Clamp8((c + g) >> 8) << 8 | Clamp8((c + b) >> 8);
+            }
+        }
+    }
+}
+
+// Frame-sized byte buffers (NV12) for an export's threads, reused like Bitmap::CreateRecycled's memory.
+using Bytes = std::shared_ptr<std::vector<uint8_t>>;
+struct BytePool {
+    std::mutex mu;
+    std::vector<std::pair<std::vector<uint8_t>*, ULONGLONG>> free;  // and when it was dropped
+    size_t bytes = 0;
+    static constexpr size_t kMaxBytes = 128u << 20;
+    std::vector<std::vector<uint8_t>*> Expire(size_t keep) {
+        std::vector<std::vector<uint8_t>*> out;
+        const ULONGLONG now = GetTickCount64();
+        while (!free.empty() && (bytes > keep || now - free.front().second > 3000)) {
+            bytes -= free.front().first->capacity();
+            out.push_back(free.front().first);
+            free.erase(free.begin());
+        }
+        return out;
+    }
+};
+BytePool& ThePool() {
+    static BytePool* p = new BytePool();  // never destroyed: buffers may come back during shutdown
+    return *p;
+}
+
+// `n` bytes, their values left as they were.
+Bytes RecycledBytes(size_t n) {
+    BytePool& p = ThePool();
+    std::vector<uint8_t>* v = nullptr;
+    std::vector<std::vector<uint8_t>*> old;
+    {
+        std::lock_guard l(p.mu);
+        for (size_t i = p.free.size(); i-- > 0;)
+            if (p.free[i].first->capacity() >= n && p.free[i].first->capacity() <= n + n / 4) {
+                v = p.free[i].first;
+                p.bytes -= v->capacity();
+                p.free.erase(p.free.begin() + (ptrdiff_t)i);
+                break;
+            }
+        old = p.Expire(BytePool::kMaxBytes);
+    }
+    for (auto* o : old) delete o;
+    if (!v) v = new std::vector<uint8_t>();
+    v->resize(n);
+    return Bytes(v, [](std::vector<uint8_t>* d) {
+        BytePool& p = ThePool();
+        std::vector<std::vector<uint8_t>*> old;
+        {
+            std::lock_guard l(p.mu);
+            p.free.push_back({d, GetTickCount64()});
+            p.bytes += d->capacity();
+            old = p.Expire(BytePool::kMaxBytes);
+        }
+        for (auto* o : old) delete o;
+    });
+}
+
+void ReleaseRecycledBytes() {
+    BytePool& p = ThePool();
+    std::vector<std::vector<uint8_t>*> old;
+    {
+        std::lock_guard l(p.mu);
+        old = p.Expire(0);
+    }
+    for (auto* o : old) delete o;
+}
+
+}  // namespace
+
+struct VideoFrame::State {
+    std::once_flag once;
+    BitmapPtr bgra;  // the picture, once converted (or as decoded, when the decoder made BGRA)
+    Bytes yuv;       // NV12 as decoded: w × h luma, then the chroma rows, `pitch` bytes each (kept once converted:
+                     // other output frames may pass it on to the encoder meanwhile, so it never changes)
+    int pitch = 0, w = 0, h = 0;
+    YuvMatrix matrix;
+    int rotation = 0;  // applied on conversion
+    SIZE fit{};        // fitted into this size on conversion, when set
+};
+
+VideoFrame::VideoFrame(BitmapPtr bgra) : s_(std::make_shared<State>()) { s_->bgra = std::move(bgra); }
+
+BitmapPtr VideoFrame::Bgra() const {
+    if (!s_) return nullptr;
+    State& s = *s_;
+    std::call_once(s.once, [&s] {
+        BitmapPtr out = s.bgra;
+        if (!out && s.yuv && (out = Bitmap::CreateRecycled(s.w, s.h)))
+            Nv12ToBgra(s.yuv->data(), s.yuv->data() + (size_t)s.pitch * s.h, s.pitch, s.w, s.h, out->Bits(), s.matrix);
+        if (out && s.rotation) out = RotateBitmap(*out, s.rotation);
+        if (out && s.fit.cx > 0 && (out->Width() != s.fit.cx || out->Height() != s.fit.cy)) out = FitInto(*out, s.fit.cx, s.fit.cy);
+        s.bgra = out;
+    });
+    return s.bgra;
+}
+
 // ---------- VideoReader ----------
+
+namespace {
+
+// The GPU every reader decodes on: hardware decoding takes a fraction of the CPU Media Foundation's software
+// decoder does (~1.5 vs ~10 ms a frame at 1080p), which leaves the cores to an export's renderers. H.264 decoding
+// is exact, so the frames are the same. Null when there is no hardware device (or g_noGpuDecode was set first).
+struct Gpu {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<IMFDXGIDeviceManager> mgr;
+};
+
+Gpu* SharedGpu() {
+    static Gpu* const gpu = []() -> Gpu* {
+        if (g_noGpuDecode) return nullptr;
+        EnsureMediaFoundation();
+        auto g = std::make_unique<Gpu>();
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+        ComPtr<ID3D10Multithread> mt;
+        UINT token = 0;
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, (UINT)std::size(levels),
+                                     D3D11_SDK_VERSION, &g->dev, nullptr, &g->ctx)) ||
+            FAILED(g->dev.As(&mt)) || FAILED(MFCreateDXGIDeviceManager(&token, &g->mgr)) || FAILED(g->mgr->ResetDevice(g->dev.Get(), token)))
+            return nullptr;
+        mt->SetMultithreadProtected(TRUE);  // Media Foundation's threads and the readers share it
+        return g.release();
+    }();
+    return gpu && gpu->dev->GetDeviceRemovedReason() == S_OK ? gpu : nullptr;
+}
+
+constexpr size_t kGpuAhead = 4;  // frames copied off the GPU ahead of the one read back, so reading never waits
+
+}  // namespace
 
 struct VideoReader::Impl {
     ComPtr<IMFSourceReader> reader;
@@ -60,6 +299,33 @@ struct VideoReader::Impl {
     UINT32 rotation = 0;                  // clockwise degrees to show it upright (phone videos)
     double duration = 0, fps = 0;
     bool audio = false;
+    bool nv12 = false;  // decoded to NV12 and converted here; else Media Foundation converts to RGB32
+    YuvMatrix matrix;
+    // Hardware decoding: decoded surfaces are copied into a ring of staging textures and read back a few frames
+    // later, by then without waiting on the GPU.
+    Gpu* gpu = nullptr;
+    struct Slot {
+        ComPtr<ID3D11Texture2D> tex;
+        bool busy = false;
+    };
+    std::vector<Slot> slots;
+    struct Pending {
+        int slot = -1;              // still on its way off the GPU
+        ComPtr<IMFSample> decoded;  // or decoded into memory
+        double t = 0;
+    };
+    std::deque<Pending> pending;
+    bool eof = false;
+    std::wstring file;
+    double from = -1e300, last = -1e300;  // where it was last sought, the last frame given since
+    bool lost = false;                    // a frame couldn't be read back off the GPU
+    bool decoded = false;                 // a frame decoded since it was opened or sought
+
+    bool Open(const std::wstring& path, bool convert, Gpu* gpu);
+    bool Read(VideoFrame* frame, double* t, SIZE fit, double skipTo);  // as ReadFrame
+    bool Next();  // decodes one more frame into `pending`; false at the end
+    VideoFrame FromBuffer(IMFMediaBuffer* buf);
+    VideoFrame Download(int slot);
 };
 
 VideoReader::VideoReader() : p_(std::make_unique<Impl>()) {}
@@ -71,89 +337,276 @@ double VideoReader::Duration() const { return p_->duration; }
 double VideoReader::Fps() const { return p_->fps; }
 bool VideoReader::HasAudio() const { return p_->audio; }
 
-bool VideoReader::Open(const std::wstring& path) {
+bool VideoReader::Open(const std::wstring& path, bool convert) {
     EnsureMediaFoundation();
-    ComPtr<IMFAttributes> attr;
-    HRESULT hr = MFCreateAttributes(&attr, 1);
-    if (SUCCEEDED(hr)) hr = attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &p_->reader);
-    if (FAILED(hr)) return false;
-    IMFSourceReader* r = p_->reader.Get();
-    PROPVARIANT var;
-    PropVariantInit(&var);
-    if (SUCCEEDED(r->GetPresentationAttribute((DWORD)MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var))) p_->duration = var.uhVal.QuadPart / kTicks;
-    PropVariantClear(&var);
-    ComPtr<IMFMediaType> native, audio, rgb, cur;
-    if (FAILED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native))) return false;
-    p_->audio = SUCCEEDED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &audio));
-    UINT32 num = 0, den = 0;
-    MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &p_->w, &p_->h);
-    MFVideoArea area{};
-    if (SUCCEEDED(native->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8*)&area, sizeof(area), nullptr)) && area.Area.cx > 0) {
-        p_->w = (UINT32)area.Area.cx;  // 1920x1088 coded, 1920x1080 shown
-        p_->h = (UINT32)area.Area.cy;
+    if (Gpu* gpu = convert ? SharedGpu() : nullptr) {
+        if (p_->Open(path, convert, gpu)) return true;
+        p_ = std::make_unique<Impl>();  // no hardware decoding for this one: the software decoder, as before
     }
-    if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && den) p_->fps = (double)num / den;
-    // Turned like the preview player turns it (IMFMediaEngine applies this itself).
-    p_->rotation = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, 0) % 360;
-    if (p_->rotation % 90) p_->rotation = 0;
-    r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
-    r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-    hr = MFCreateMediaType(&rgb);
-    if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-    if (SUCCEEDED(hr)) hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, rgb.Get());
-    if (SUCCEEDED(hr)) hr = r->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur);
-    if (SUCCEEDED(hr)) hr = MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &p_->cw, &p_->ch);
-    return SUCCEEDED(hr) && p_->w > 0 && p_->h > 0;
+    return p_->Open(path, convert, nullptr);
 }
 
-bool VideoReader::Seek(double t) { return p_->reader && SetPosition(p_->reader.Get(), t); }
+bool VideoReader::Impl::Open(const std::wstring& path, bool convert, Gpu* withGpu) {
+    ComPtr<IMFAttributes> attr;
+    HRESULT hr = MFCreateAttributes(&attr, 1);
+    if (SUCCEEDED(hr)) hr = withGpu ? attr->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, withGpu->mgr.Get()) : attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &reader);
+    if (FAILED(hr)) return false;
+    gpu = withGpu;
+    file = path;
+    IMFSourceReader* r = reader.Get();
+    PROPVARIANT var;
+    PropVariantInit(&var);
+    if (SUCCEEDED(r->GetPresentationAttribute((DWORD)MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var))) duration = var.uhVal.QuadPart / kTicks;
+    PropVariantClear(&var);
+    ComPtr<IMFMediaType> native, audioType, rgb, cur;
+    if (FAILED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native))) return false;
+    audio = SUCCEEDED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &audioType));
+    UINT32 num = 0, den = 0;
+    MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &w, &h);
+    MFVideoArea area{};
+    if (SUCCEEDED(native->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8*)&area, sizeof(area), nullptr)) && area.Area.cx > 0) {
+        w = (UINT32)area.Area.cx;  // 1920x1088 coded, 1920x1080 shown
+        h = (UINT32)area.Area.cy;
+    }
+    if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && den) fps = (double)num / den;
+    // Turned like the preview player turns it (IMFMediaEngine applies this itself).
+    rotation = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_ROTATION, 0) % 360;
+    if (rotation % 90) rotation = 0;
+    r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+    r->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+    // NV12 straight from the decoder when it can (4:2:0 video; interlaced video keeps Media Foundation's deinterlacing).
+    const UINT32 interlace = MFGetAttributeUINT32(native.Get(), MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    if (convert && Is420(native.Get()) && (interlace == MFVideoInterlace_Progressive || interlace == MFVideoInterlace_MixedInterlaceOrProgressive)) {
+        ComPtr<IMFMediaType> type;
+        nv12 = SUCCEEDED(MFCreateMediaType(&type)) && SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
+               SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) &&
+               SUCCEEDED(r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, type.Get()));
+        matrix = MatrixFor(native.Get(), h);
+    }
+    if (gpu && !nv12) return false;  // only NV12 comes off the GPU here
+    hr = S_OK;
+    if (!nv12) {
+        hr = MFCreateMediaType(&rgb);
+        if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (SUCCEEDED(hr)) hr = rgb->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (SUCCEEDED(hr)) hr = r->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, rgb.Get());
+    }
+    if (SUCCEEDED(hr)) hr = r->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur);
+    if (SUCCEEDED(hr)) hr = MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &cw, &ch);
+    if (gpu) slots.resize(kGpuAhead + 1);
+    return SUCCEEDED(hr) && w > 0 && h > 0;
+}
+
+bool VideoReader::Seek(double t) {
+    if (!p_->reader) return false;
+    // A hardware decoder sought before it has decoded anything can end the stream at once (now and then, with other
+    // decoders busy): one frame decoded first keeps it going.
+    if (p_->gpu && !p_->decoded)
+        for (int tries = 0; tries < 16; ++tries) {
+            DWORD flags = 0;
+            LONGLONG ts = 0;
+            ComPtr<IMFSample> s;
+            if (FAILED(p_->reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s)) || s ||
+                (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)))
+                break;
+        }
+    p_->pending.clear();  // decoded ahead of the old position
+    for (auto& s : p_->slots) s.busy = false;
+    p_->eof = false;
+    p_->from = t;
+    p_->last = -1e300;
+    p_->decoded = false;
+    return SetPosition(p_->reader.Get(), t);
+}
 
 bool VideoReader::Read(BitmapPtr* frame, double* t) {
+    VideoFrame f;
+    if (!ReadFrame(&f, t)) return false;
+    *frame = f.Bgra();
+    return *frame != nullptr;
+}
+
+bool VideoReader::ReadFrame(VideoFrame* frame, double* t, SIZE fit, double skipTo) {
     if (!p_->reader) return false;
+    if (p_->Read(frame, t, fit, skipTo)) return true;
+    const bool stalled = !p_->decoded && p_->from < p_->duration - 1;  // ended right after a seek inside the video
+    if (!p_->gpu || (!p_->lost && !stalled && p_->gpu->dev->GetDeviceRemovedReason() == S_OK)) return false;  // the end
+    // The GPU stopped giving frames (its driver restarted, say): on from the last one given, decoded without it.
+    auto fresh = std::make_unique<Impl>();
+    if (!fresh->Open(p_->file, true, nullptr)) return false;
+    const double from = p_->from, after = p_->last;
+    p_ = std::move(fresh);
+    if (from > -1e300) Seek(from);
+    double ts = 0;
+    while (p_->Read(frame, &ts, fit, std::max(skipTo, after + 1e-4)))
+        if (ts > after + 1e-4) {
+            *t = p_->last = ts;
+            return true;
+        }
+    return false;
+}
+
+bool VideoReader::Impl::Read(VideoFrame* frame, double* t, SIZE fit, double skipTo) {
+    Impl& p = *this;
+    // A frame or more ahead, so it's known whether the next one supersedes this one.
+    while (!p.eof && p.pending.size() < (p.gpu ? kGpuAhead : 2))
+        if (!p.Next()) p.eof = true;
+    if (p.pending.empty()) return false;
+    Impl::Pending next = std::move(p.pending.front());
+    p.pending.pop_front();
+    VideoFrame f;
+    if (!p.pending.empty() && p.pending.front().t <= skipTo) {
+        f = VideoFrame(std::make_shared<VideoFrame::State>());  // superseded: no picture
+    } else if (next.slot >= 0) {
+        f = p.Download(next.slot);
+        p.lost = !f;
+    } else {
+        ComPtr<IMFMediaBuffer> buf;
+        if (SUCCEEDED(next.decoded->ConvertToContiguousBuffer(&buf))) f = p.FromBuffer(buf.Get());
+    }
+    if (next.slot >= 0) p.slots[next.slot].busy = false;
+    if (!f) return false;
+    f.state()->fit = fit;  // nobody else has the frame yet
+    *frame = f;
+    *t = p.last = next.t;
+    return true;
+}
+
+bool VideoReader::Impl::Next() {
     for (;;) {
         DWORD flags = 0;
         LONGLONG ts = 0;
         ComPtr<IMFSample> s;
-        if (FAILED(p_->reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) return false;
+        if (FAILED(reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &s))) return false;
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
             ComPtr<IMFMediaType> cur;
-            if (SUCCEEDED(p_->reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)))
-                MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &p_->cw, &p_->ch);
+            if (SUCCEEDED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)))
+                MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &cw, &ch);
         }
         if (!s) {
             if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) return false;
             continue;
         }
+        decoded = true;
+        Pending out;
+        out.t = ts / kTicks;
         ComPtr<IMFMediaBuffer> buf;
-        if (FAILED(s->ConvertToContiguousBuffer(&buf))) return false;
-        auto out = Bitmap::Create((int)p_->w, (int)p_->h);
-        if (!out) return false;
-        ComPtr<IMF2DBuffer> b2;
-        BYTE* scan0 = nullptr;
-        LONG pitch = 0;
-        BYTE* data = nullptr;
-        DWORD len = 0;
-        const bool twoD = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&scan0, &pitch));
-        if (!twoD) {
-            if (FAILED(buf->Lock(&data, nullptr, &len))) return false;
-            scan0 = data;
-            pitch = (LONG)p_->cw * 4;
+        ComPtr<IMFDXGIBuffer> dx;
+        ComPtr<ID3D11Texture2D> tex;
+        UINT sub = 0;
+        D3D11_TEXTURE2D_DESC d{};
+        if (gpu && SUCCEEDED(s->GetBufferByIndex(0, &buf)) && SUCCEEDED(buf.As(&dx)) && SUCCEEDED(dx->GetResource(IID_PPV_ARGS(&tex))) &&
+            SUCCEEDED(dx->GetSubresourceIndex(&sub)) && (tex->GetDesc(&d), d.Format == DXGI_FORMAT_NV12) && d.Width >= w && d.Height >= h) {
+            // On the GPU: copied into a free staging texture now, read back once a few more are under way.
+            int slot = 0;
+            while (slot < (int)slots.size() && slots[slot].busy) ++slot;
+            if (slot == (int)slots.size()) return false;  // can't happen: one more slot than frames ahead
+            Slot& sl = slots[slot];
+            D3D11_TEXTURE2D_DESC have{};
+            if (sl.tex) sl.tex->GetDesc(&have);
+            if (!sl.tex || have.Width != d.Width || have.Height != d.Height) {
+                D3D11_TEXTURE2D_DESC sd{};
+                sd.Width = d.Width;
+                sd.Height = d.Height;
+                sd.MipLevels = 1;
+                sd.ArraySize = 1;
+                sd.Format = DXGI_FORMAT_NV12;
+                sd.SampleDesc.Count = 1;
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                sl.tex.Reset();
+                if (FAILED(gpu->dev->CreateTexture2D(&sd, nullptr, &sl.tex))) return false;
+            }
+            gpu->ctx->CopySubresourceRegion(sl.tex.Get(), 0, 0, 0, 0, tex.Get(), sub, nullptr);
+            sl.busy = true;
+            out.slot = slot;
+        } else {
+            out.decoded = s;  // copied out when read (unless superseded by then)
         }
-        const UINT32 rows = std::min(p_->h, p_->ch), cols = std::min(p_->w, p_->cw);
-        for (UINT32 y = 0; y < rows; ++y) {
-            const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
-            uint32_t* dst = out->Bits() + (size_t)y * p_->w;
-            for (UINT32 x = 0; x < cols; ++x) dst[x] = row[x] | 0xFF000000u;
-        }
-        if (twoD) b2->Unlock2D();
-        else buf->Unlock();
-        if (p_->rotation && !(out = RotateBitmap(*out, (int)p_->rotation))) return false;
-        *frame = out;
-        *t = ts / kTicks;
+        pending.push_back(std::move(out));
         return true;
     }
+}
+
+VideoFrame VideoReader::Impl::Download(int slot) {
+    ID3D11Texture2D* tex = slots[slot].tex.Get();
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(gpu->ctx->Map(tex, 0, D3D11_MAP_READ, 0, &m))) return {};
+    // Kept compact until converted: w × h luma, then the chroma rows (after all the texture's luma rows).
+    auto st = std::make_shared<VideoFrame::State>();
+    const int fw = (int)w, fh = (int)h, cp = (fw + 1) & ~1;
+    st->w = fw;
+    st->h = fh;
+    st->pitch = cp;
+    st->matrix = matrix;
+    st->rotation = (int)rotation;
+    st->yuv = RecycledBytes((size_t)cp * (fh + (fh + 1) / 2));
+    uint8_t* dst = st->yuv->data();
+    const uint8_t* src = static_cast<const uint8_t*>(m.pData);
+    for (int y = 0; y < fh; ++y) memcpy(dst + (size_t)y * cp, src + (size_t)m.RowPitch * y, (size_t)fw);
+    const uint8_t* uv = src + (size_t)m.RowPitch * d.Height;
+    for (int y = 0; y < (fh + 1) / 2; ++y) memcpy(dst + (size_t)(fh + y) * cp, uv + (size_t)m.RowPitch * y, (size_t)cp);
+    gpu->ctx->Unmap(tex, 0);
+    return VideoFrame(std::move(st));
+}
+
+VideoFrame VideoReader::Impl::FromBuffer(IMFMediaBuffer* buffer) {
+    ComPtr<IMFMediaBuffer> buf(buffer);
+    ComPtr<IMF2DBuffer> b2;
+    BYTE* scan0 = nullptr;
+    LONG pitch = 0;
+    DWORD len = 0;
+    const bool twoD = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&scan0, &pitch));
+    if (!twoD) {
+        if (FAILED(buf->Lock(&scan0, nullptr, &len))) return {};
+        pitch = (LONG)cw * (nv12 ? 1 : 4);
+    } else {
+        buf->GetCurrentLength(&len);
+    }
+    auto st = std::make_shared<VideoFrame::State>();
+    st->rotation = (int)rotation;
+    const int fw = (int)w, fh = (int)h;
+    bool ok = false;
+    if (nv12) {
+        // Kept compact until converted. The chroma plane follows the decoded rows, which can be more than
+        // the shown ones (1088 for 1080).
+        const size_t rows = pitch > 0 ? (size_t)len / (size_t)pitch * 2 / 3 : 0;
+        ok = pitch >= ((fw + 1) & ~1) && rows >= (size_t)fh && (size_t)pitch * rows * 3 / 2 <= len;
+        if (ok) {
+            const int cp = (fw + 1) & ~1;
+            st->w = fw;
+            st->h = fh;
+            st->pitch = cp;
+            st->matrix = matrix;
+            st->yuv = RecycledBytes((size_t)cp * (fh + (fh + 1) / 2));
+            uint8_t* d = st->yuv->data();
+            if (pitch == cp) {
+                memcpy(d, scan0, (size_t)cp * fh);
+            } else {
+                for (int y = 0; y < fh; ++y) memcpy(d + (size_t)y * cp, scan0 + (size_t)pitch * y, (size_t)fw);
+            }
+            const BYTE* uv = scan0 + (size_t)pitch * rows;
+            if (pitch == cp) {
+                memcpy(d + (size_t)cp * fh, uv, (size_t)cp * ((fh + 1) / 2));
+            } else {
+                for (int y = 0; y < (fh + 1) / 2; ++y) memcpy(d + (size_t)(fh + y) * cp, uv + (size_t)pitch * y, (size_t)cp);
+            }
+        }
+    } else if ((st->bgra = Bitmap::Create(fw, fh))) {
+        ok = true;
+        const UINT32 rows = std::min(h, ch), cols = std::min(w, cw);
+        for (UINT32 y = 0; y < rows; ++y) {
+            const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
+            uint32_t* dst = st->bgra->Bits() + (size_t)y * w;
+            for (UINT32 x = 0; x < cols; ++x) dst[x] = row[x] | 0xFF000000u;
+        }
+    }
+    if (twoD) b2->Unlock2D();
+    else buf->Unlock();
+    return ok ? VideoFrame(std::move(st)) : VideoFrame();
 }
 
 // ---------- sequences ----------
@@ -165,9 +618,9 @@ std::optional<Clip> ClipOf(const std::wstring& path) {
     if (!ProbeVideo(path, &vi) || vi.w <= 0 || vi.h <= 0 || vi.duration <= 0) return std::nullopt;
     {
         VideoReader r;
-        BitmapPtr f;
+        VideoFrame f;
         double t = 0;
-        if (!r.Open(path) || !r.Read(&f, &t)) return std::nullopt;
+        if (!r.Open(path) || !r.ReadFrame(&f, &t)) return std::nullopt;
     }
     Clip c;
     c.source = c.id;  // pieces split from it share this
@@ -195,12 +648,12 @@ struct SequenceReader::Impl {
     std::vector<double> starts;
     size_t cur = 0;
     std::unique_ptr<VideoReader> reader;
-    BitmapPtr pre;  // the last frame before the clip's in point: shown until the first frame inside it
-    std::deque<std::pair<BitmapPtr, double>> queue;
+    VideoFrame pre;  // the last frame before the clip's in point: shown until the first frame inside it
+    std::deque<std::pair<VideoFrame, double>> queue;
 
     void Enter(size_t i, double src) {
         cur = i;
-        pre = nullptr;
+        pre = {};
         reader = std::make_unique<VideoReader>();
         if (!reader->Open(seq.clips[i].path)) reader.reset();  // unreadable: the clip is skipped
         else reader->Seek(src);
@@ -248,7 +701,7 @@ bool SequenceReader::Seek(double t) {
     if (!spot) return false;
     p_->queue.clear();
     if (p_->reader && spot->first == p_->cur) {  // same file still open: just seek it
-        p_->pre = nullptr;
+        p_->pre = {};
         return p_->reader->Seek(spot->second);
     }
     p_->Enter(spot->first, spot->second);
@@ -256,6 +709,13 @@ bool SequenceReader::Seek(double t) {
 }
 
 bool SequenceReader::Read(BitmapPtr* frame, double* t) {
+    VideoFrame f;
+    if (!ReadFrame(&f, t)) return false;
+    *frame = f.Bgra();
+    return *frame != nullptr;
+}
+
+bool SequenceReader::ReadFrame(VideoFrame* frame, double* t, double skipTo) {
     Impl& p = *p_;
     const size_t n = p.seq.clips.size();
     for (;;) {
@@ -263,15 +723,17 @@ bool SequenceReader::Read(BitmapPtr* frame, double* t) {
             *frame = p.queue.front().first;
             *t = p.queue.front().second;
             p.queue.pop_front();
-            return *frame != nullptr;
+            return true;
         }
         if (p.cur >= n) return false;
         const Clip& c = p.seq.clips[p.cur];
-        BitmapPtr f;
+        VideoFrame f;
         double ts = 0;
-        if (!p.reader || !p.reader->Read(&f, &ts) || ts >= c.out - 1e-4) {  // this clip is done
+        // Only frames of this clip can supersede one (the clip's last frame stays, whatever comes after it in the file).
+        const double limit = std::min(c.in + (skipTo - p.starts[p.cur]), c.out - 2e-4);
+        if (!p.reader || !p.reader->ReadFrame(&f, &ts, p.seq.size, limit) || ts >= c.out - 1e-4) {  // this clip is done
             if (p.pre) p.queue.push_back({p.pre, p.starts[p.cur]});
-            p.pre = nullptr;
+            p.pre = {};
             if (p.cur + 1 < n) p.Enter(p.cur + 1, p.seq.clips[p.cur + 1].in);
             else p.cur = n, p.reader.reset();
             continue;
@@ -281,7 +743,7 @@ bool SequenceReader::Read(BitmapPtr* frame, double* t) {
             continue;
         }
         if (p.pre && ts > c.in + 1e-3) p.queue.push_back({p.pre, p.starts[p.cur]});
-        p.pre = nullptr;
+        p.pre = {};
         p.queue.push_back({f, p.starts[p.cur] + (ts - c.in)});
     }
 }
@@ -462,26 +924,49 @@ private:
     std::unique_ptr<Resampler> rs_;
 };
 
-// The edit's audio: the trimmed range, as 48 kHz stereo, at the edit's speed.
+// The edit's audio: the trimmed range, as 48 kHz stereo, at the edit's speed. Decoded, resampled and stretched
+// on a thread of its own, a little ahead of where the video is written.
 class AudioPipe {
 public:
+    ~AudioPipe() {
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
     bool Open(const Sequence& s, double from, double to, double speed) {
         audio_ = std::make_unique<SequenceAudio>(s, from, to, kRate, 2);
         if (!audio_->AnyAudio()) return false;
         if (std::fabs(speed - 1) > 1e-6) ts_ = std::make_unique<TimeStretch>(2, kRate, speed);
+        thread_ = std::thread([this] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            Produce();
+            CoUninitialize();
+        });
         return true;
     }
 
     // Writes audio up to `target` output frames, padding with silence when the source runs out.
     HRESULT WriteUntil(Mp4Writer& w, int64_t target) {
-        while ((int64_t)ready_.size() / 2 < target - written_ && !eof_) Fill();
         std::vector<int16_t> pcm;
         while (written_ < target) {
-            const int64_t n = std::min<int64_t>(1024, target - written_);
+            const int64_t n = std::min<int64_t>(kRate, target - written_);  // in big writes: the encoder takes small ones slowly
             pcm.assign((size_t)n * 2, 0);
-            const size_t have = std::min(ready_.size(), (size_t)n * 2);
-            for (size_t i = 0; i < have; ++i) pcm[i] = (int16_t)std::lround(std::clamp(ready_[i], -1.f, 1.f) * 32767);
-            ready_.erase(ready_.begin(), ready_.begin() + have);
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return eof_ || ready_.size() - at_ >= (size_t)n * 2; });
+                const size_t have = std::min(ready_.size() - at_, (size_t)n * 2);
+                for (size_t i = 0; i < have; ++i) pcm[i] = (int16_t)std::lround(std::clamp(ready_[at_ + i], -1.f, 1.f) * 32767);
+                at_ += have;
+                if (at_ > (1u << 16)) {  // drop what was used now and then
+                    ready_.erase(ready_.begin(), ready_.begin() + (ptrdiff_t)at_);
+                    at_ = 0;
+                }
+            }
+            cv_.notify_all();
             const HRESULT hr = w.WriteAudio(pcm.data(), (uint32_t)n, (int64_t)std::llround(written_ * kTicks / kRate));
             if (FAILED(hr)) return hr;
             written_ += n;
@@ -490,26 +975,43 @@ public:
     }
 
 private:
-    void Fill() {
-        std::vector<float> chunk;
-        if (!audio_->Read(chunk)) {
-            eof_ = true;
-            if (ts_) ts_->Finish(ready_);
-            return;
-        }
-        if (ts_) {
-            ts_->Push(chunk.data(), chunk.size() / 2);
-            ts_->Pull(ready_);
-        } else {
-            ready_.insert(ready_.end(), chunk.begin(), chunk.end());
+    void Produce() {
+        constexpr size_t kAhead = kRate * 2 * 2;  // two seconds of samples
+        for (;;) {
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return quit_ || ready_.size() - at_ < kAhead; });
+                if (quit_) return;
+            }
+            std::vector<float> chunk, out;
+            const bool more = audio_->Read(chunk);
+            if (!more) {
+                if (ts_) ts_->Finish(out);
+            } else if (ts_) {
+                ts_->Push(chunk.data(), chunk.size() / 2);
+                ts_->Pull(out);
+            } else {
+                out = std::move(chunk);
+            }
+            {
+                std::lock_guard l(mu_);
+                ready_.insert(ready_.end(), out.begin(), out.end());
+                eof_ = !more;
+            }
+            cv_.notify_all();
+            if (!more) return;
         }
     }
 
     std::unique_ptr<SequenceAudio> audio_;
     std::unique_ptr<TimeStretch> ts_;
-    std::vector<float> ready_;
+    std::thread thread_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<float> ready_;  // made and not yet written from `at_` on
+    size_t at_ = 0;
+    bool eof_ = false, quit_ = false;
     int64_t written_ = 0;
-    bool eof_ = false;
 };
 
 }  // namespace
@@ -560,21 +1062,37 @@ void TimeStretch::Run(bool final, std::vector<float>& out) {
         } else {
             const int64_t lo = std::max(base_, nominal - delta_), hi = nominal + delta_, target = prev_ + hop_;
             if (!final && (hi + n_ > avail || target + hop_ > avail)) break;
-            // The window that best continues what the previous one left off (step 2 keeps this cheap).
+            // The window that best continues what the previous one left off (step 2 keeps this cheap). The mono
+            // signal of the stretch searched is worked out once; two candidates go side by side.
+            const int64_t m0 = std::min(lo, target), m1 = std::max(hi, target) + hop_;
+            mono_.resize((size_t)(m1 - m0));
+            for (int64_t i = m0; i < m1; ++i) mono_[(size_t)(i - m0)] = mono(i);
+            const float* a = mono_.data() + (target - m0);
+            auto score = [&](double num, double den) { return num / std::sqrt(den); };
             double best = -1e300;
             pos = std::max(lo, nominal);
-            for (int64_t p = lo; p <= hi; p += 2) {
-                double num = 0, den = 1e-9;
+            for (int64_t p = lo; p <= hi; p += 4) {
+                const float* b0 = mono_.data() + (p - m0);
+                const float* b1 = b0 + 2;
+                const bool two = p + 2 <= hi;
+                double num0 = 0, den0 = 1e-9, num1 = 0, den1 = 1e-9;
                 for (int j = 0; j < hop_; j += 2) {
-                    const float a = mono(target + j), b = mono(p + j);
-                    num += (double)a * b;
-                    den += (double)b * b;
+                    num0 += (double)a[j] * b0[j];
+                    den0 += (double)b0[j] * b0[j];
+                    if (two) {
+                        num1 += (double)a[j] * b1[j];
+                        den1 += (double)b1[j] * b1[j];
+                    }
                 }
-                const double score = num / std::sqrt(den);
-                if (score > best) {
-                    best = score;
+                if (const double s = score(num0, den0); s > best) {
+                    best = s;
                     pos = p;
                 }
+                if (two)
+                    if (const double s = score(num1, den1); s > best) {
+                        best = s;
+                        pos = p + 2;
+                    }
             }
         }
         for (int j = 0; j < n_; ++j)
@@ -600,10 +1118,13 @@ void TimeStretch::Run(bool final, std::vector<float>& out) {
 namespace {
 
 // The edited video's frames in output order: output time i/fps shows the source frame at
-// trimStart + i/fps × speed, run through the frame renderer.
+// trimStart + i/fps × speed, run through the frame renderer. Next picks each frame's source in order (decoding
+// as it goes, converting nothing); Render makes the frame, on any thread.
 class EditFrames {
 public:
-    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error) {
+    // From output frame `first` on (asked in order): reading from a second before it (for an export in pieces), from
+    // where Next picks the same source frames as when reading from the start.
+    bool Open(const Sequence& seq, const VideoEdit& e, double fps, std::wstring* error, int first = 0) {
         if (!reader_.Open(seq)) {
             if (error) *error = L"Can't read this video.";
             return false;
@@ -611,99 +1132,552 @@ public:
         e_ = e;
         fps_ = fps;
         renderer_ = std::make_unique<FrameRenderer>(e, reader_.Size(), false);
-        reader_.Seek(e.trimStart);
+        reader_.Seek(std::max(e.trimStart, e.trimStart + first / fps * e.speed - 1.0));
         Advance();
         return true;
     }
     SIZE Out() const { return renderer_->Out(); }
-    double SourceFps() const { return reader_.Fps(); }
-    bool HasAudio() const { return reader_.HasAudio(); }
+    SIZE Full() const { return renderer_->Full(); }
+    const FrameRenderer& Renderer() const { return *renderer_; }
     int Count(bool roundUp) const {
         const double n = e_.OutputDuration() * fps_;
         return std::max(1, roundUp ? (int)std::ceil(n - 1e-6) : (int)std::floor(n + 1e-6));
     }
 
-    BitmapPtr Frame(int i) {
-        const double st = e_.trimStart + i / fps_ * e_.speed;
-        while (next_ && nextT_ <= st + 1e-3) {
+    // The source frame of output frame `i` (asked in order) and its source time.
+    // `alone`: no other output frame shows that source frame, so its rendering can draw on it.
+    bool Next(int i, VideoFrame* src, double* st, bool* alone) {
+        *st = e_.trimStart + i / fps_ * e_.speed;
+        while (next_ && nextT_ <= *st + 1e-3) {
             cur_ = next_;
-            curT_ = nextT_;
-            Advance();
+            Advance(*st + 1e-3);  // frames that a later one up to here replaces needn't be copied off the GPU
         }
-        const BitmapPtr& src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
-        if (!src) return nullptr;
-        if (src != fitFor_) {  // fitted once per source frame, and only for frames that are used
-            fitFor_ = src;
-            fit_ = reader_.Fit(src);
+        *src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
+        // Not the previous output frame's, and the next output frame shows a later one.
+        *alone = *src != shown_ && next_ && *src != next_ && nextT_ <= e_.trimStart + (i + 1) / fps_ * e_.speed + 1e-3;
+        shown_ = *src;
+        return (bool)*src;
+    }
+    // The source frame as the encoder's NV12 when the export shows it as it is (no edit at `st`), else null. Then
+    // nothing is converted, and the frame keeps its colors exactly instead of going through RGB and back.
+    Bytes Passthrough(const VideoFrame& src, double st) const {
+        return Nv12Ready(src.state(), renderer_->Out().cy) && renderer_->Untouched(st) ? src.state()->yuv : nullptr;
+    }
+    // The encoder's NV12 for a frame whose edits at `st` change only parts of it, else null: the frame (its crop) as
+    // decoded, with just those parts converted, drawn on and converted back (each pixel there as Render and
+    // BgraToNv12 make it).
+    Bytes WithEdits(const VideoFrame& src, double st) const {
+        const VideoFrame::State* s = src.state();
+        const SIZE out = renderer_->Out();
+        const auto areas = Nv12Ready(s, out.cy) ? renderer_->EditAreas(st) : std::nullopt;
+        if (!areas) return nullptr;
+        const VRect view = renderer_->View();
+        const int w = s->w, vx = (int)view.x, vy = (int)view.y, ow = out.cx, oh = out.cy;
+        const uint8_t* y = s->yuv->data();
+        const uint8_t* uv = y + (size_t)w * s->h;
+        Bytes o = RecycledBytes((size_t)ow * oh * 3 / 2);
+        uint8_t* oy = o->data();
+        uint8_t* ouv = oy + (size_t)ow * oh;
+        for (int r = 0; r < oh; ++r) memcpy(oy + (size_t)r * ow, y + (size_t)(vy + r) * w + vx, (size_t)ow);
+        for (int r = 0; r < oh / 2; ++r) memcpy(ouv + (size_t)r * ow, uv + (size_t)(vy / 2 + r) * w + vx, (size_t)ow);
+        for (const RECT& area : *areas) {  // each part the edits change, where the crop shows it (all on even pixels)
+            const int x0 = std::max<int>(area.left, vx), x1 = std::min<int>(area.right, vx + ow);
+            const int y0 = std::max<int>(area.top, vy), y1 = std::min<int>(area.bottom, vy + oh);
+            if (x1 <= x0 || y1 <= y0) continue;
+            const int aw = area.right - area.left, ah = area.bottom - area.top;
+            const BitmapPtr part = Bitmap::CreateRecycled(aw, ah);
+            if (!part) return nullptr;
+            Nv12ToBgra(y + (size_t)area.top * w + area.left, uv + (size_t)(area.top / 2) * w + area.left, w, aw, ah, part->Bits(), s->matrix);
+            renderer_->DrawEdits(*part, {area.left, area.top}, st);
+            thread_local std::vector<uint8_t> nv;
+            nv.resize((size_t)aw * ah * 3 / 2);
+            BgraToNv12(part->Bits(), aw, ah, nv.data(), oh);
+            const uint8_t* ny = nv.data() + (x0 - area.left);
+            const uint8_t* nuv = nv.data() + (size_t)aw * ah + (x0 - area.left);
+            for (int r = y0; r < y1; ++r) memcpy(oy + (size_t)(r - vy) * ow + (x0 - vx), ny + (size_t)(r - area.top) * aw, (size_t)(x1 - x0));
+            for (int r = y0 / 2; r < y1 / 2; ++r) memcpy(ouv + (size_t)(r - vy / 2) * ow + (x0 - vx), nuv + (size_t)(r - area.top / 2) * aw, (size_t)(x1 - x0));
         }
-        return fit_ ? renderer_->Render(*fit_, st) : nullptr;
+        return o;
+    }
+    BitmapPtr Render(const VideoFrame& src, double st, bool alone) const {
+        const BitmapPtr f = src.Bgra();  // converted (and fitted) once, however many output frames show it
+        return renderer_->Render(f, st, alone);
     }
 
 private:
-    void Advance() {
-        BitmapPtr f;
+    // The decoded NV12 can be the encoder's: upright and sequence-sized, and with colors the encoder side reads the
+    // same way (studio range and the matrix BgraToNv12 picks for an output that high).
+    static bool Nv12Ready(const VideoFrame::State* s, int outHeight) {
+        if (!s || !s->yuv || s->rotation || s->w != s->fit.cx || s->h != s->fit.cy || (s->w & 1) || (s->h & 1) || s->pitch != s->w) return false;
+        static const YuvMatrix hd = StudioMatrix(true), sd = StudioMatrix(false);
+        return s->matrix == (outHeight > 576 ? hd : sd);
+    }
+
+    void Advance(double skipTo = -1e300) {
         double t = 0;
-        if (reader_.Read(&f, &t)) {
-            next_ = f;
-            nextT_ = t;
-        } else {
-            next_ = nullptr;
-        }
+        if (!reader_.ReadFrame(&next_, &t, skipTo)) next_ = {};
+        nextT_ = t;
     }
 
     SequenceReader reader_;
-    BitmapPtr fitFor_, fit_;
     VideoEdit e_;
     double fps_ = 30;
     std::unique_ptr<FrameRenderer> renderer_;
-    BitmapPtr cur_, next_;
-    double curT_ = 0, nextT_ = 0;
+    VideoFrame cur_, next_, shown_;
+    double nextT_ = 0;
+};
+
+// Worker threads (COM initialized) running tasks in the order they come.
+class WorkerPool {
+public:
+    explicit WorkerPool(int workers) {
+        for (int i = 0; i < workers; ++i)
+            threads_.emplace_back([this] {
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                Work();
+                CoUninitialize();
+            });
+    }
+    ~WorkerPool() {  // drops what hasn't started, waits for what has
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : threads_) t.join();
+    }
+    void Run(std::function<void()> task) {
+        {
+            std::lock_guard l(mu_);
+            todo_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void Work() {
+        std::unique_lock l(mu_);
+        for (;;) {
+            cv_.wait(l, [&] { return quit_ || !todo_.empty(); });
+            if (quit_) return;
+            auto task = std::move(todo_.front());
+            todo_.pop_front();
+            l.unlock();
+            task();
+            l.lock();
+        }
+    }
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> todo_;
+    std::vector<std::thread> threads_;
+    bool quit_ = false;
+};
+
+// Jobs run on a pool, their results handed back in the order they were pushed, with at most `depth` pushed and not
+// yet taken. Several of these can share a pool.
+template <class T>
+class OrderedWork {
+public:
+    OrderedWork(WorkerPool& pool, size_t depth) : pool_(pool), s_(std::make_shared<Shared>()) { s_->depth = depth; }
+    ~OrderedWork() {  // jobs not started are dropped; waits for the running ones (they use the caller's things)
+        Stop();
+        std::unique_lock l(s_->mu);
+        s_->idle.wait(l, [&] { return s_->running == 0; });
+    }
+    // Waits for room; false once stopped.
+    bool Push(std::function<T()> job) {
+        auto slot = std::make_shared<Slot>();
+        {
+            std::unique_lock l(s_->mu);
+            s_->room.wait(l, [&] { return s_->stop || s_->order.size() < s_->depth; });
+            if (s_->stop) return false;
+            s_->order.push_back(slot);
+        }
+        pool_.Run([s = s_, slot, job = std::move(job)] {
+            {
+                std::lock_guard l(s->mu);
+                if (s->stop) return;
+                ++s->running;
+            }
+            T r = job();
+            std::lock_guard l(s->mu);
+            slot->result = std::move(r);
+            slot->done = true;
+            if (!--s->running) s->idle.notify_all();
+            s->done.notify_all();
+        });
+        return true;
+    }
+    void Close() {  // nothing more comes: Pop says so once the rest are out
+        std::lock_guard l(s_->mu);
+        s_->closed = true;
+        s_->done.notify_all();
+    }
+    void Stop() {  // refuses everything from now on
+        std::lock_guard l(s_->mu);
+        s_->stop = true;
+        s_->room.notify_all();
+        s_->done.notify_all();
+    }
+    // The oldest result, once it is ready; false when there is none left (closed) or after Stop.
+    bool Pop(T* out) {
+        std::unique_lock l(s_->mu);
+        s_->done.wait(l, [&] { return s_->stop || (!s_->order.empty() && s_->order.front()->done) || (s_->closed && s_->order.empty()); });
+        if (s_->stop || s_->order.empty()) return false;
+        *out = std::move(s_->order.front()->result);
+        s_->order.pop_front();
+        s_->room.notify_one();
+        return true;
+    }
+
+private:
+    struct Slot {
+        T result{};
+        bool done = false;
+    };
+    struct Shared {  // outlives this when a job is still queued on the pool
+        std::mutex mu;
+        std::condition_variable done, room, idle;
+        std::deque<std::shared_ptr<Slot>> order;
+        size_t depth = 2;
+        int running = 0;
+        bool closed = false, stop = false;
+    };
+    WorkerPool& pool_;
+    std::shared_ptr<Shared> s_;
+};
+
+// Workers and frames in flight for an export of `px`-pixel frames: enough to keep the cores busy, few enough that
+// the frames in flight stay within ~600 MB (less on a PC with under 10 GB).
+std::pair<int, size_t> ExportWorkers(SIZE px) {
+    const int cores = (int)std::max(1u, std::thread::hardware_concurrency());
+    const int workers = std::clamp(cores - 2, 1, 16);
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    const double budget = std::min(600e6, GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys / 16.0 : 300e6);
+    const double perFrame = std::max(1.0, (double)px.cx * px.cy * 14);  // NV12 source, its BGRA, the render, NV12 out
+    const size_t depth = (size_t)std::clamp((int)(budget / perFrame), 2, workers * 2);
+    return {workers, depth};
+}
+
+// Makes output frames first…end−1 on worker threads (`make` turns a source frame, its time and whether it's shown
+// alone into one) and hands them to `use` in order, on this thread, while another thread decodes ahead. Stops when
+// `use` returns false or a frame can't be made. With `shared`, on that pool, alongside `share` − 1 others (they split the frames in flight).
+// Decoding and handing over are one thread each, so they go before the renderers: above normal priority.
+template <class T>
+void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(const VideoFrame&, double, bool)>& make,
+                  const std::function<bool(int, T&)>& use, WorkerPool* shared = nullptr, int share = 1) {
+    const SIZE full = frames.Full(), out = frames.Out();
+    const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
+    std::unique_ptr<WorkerPool> own(shared ? nullptr : new WorkerPool(workers));
+    OrderedWork<T> work(shared ? *shared : *own, std::max<size_t>(2, depth / std::max(1, share)));
+    const int oldPrio = GetThreadPriority(GetCurrentThread());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    std::thread reader([&] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        for (int i = first; i < end; ++i) {
+            VideoFrame src;
+            double st = 0;
+            bool alone = false;
+            if (!frames.Next(i, &src, &st, &alone) || !work.Push([&make, src, st, alone] { return make(src, st, alone); })) break;
+        }
+        work.Close();
+        CoUninitialize();
+    });
+    T f{};
+    for (int i = first; work.Pop(&f); ++i) {
+        if (!f || !use(i, f)) break;
+    }
+    work.Stop();
+    reader.join();
+    SetThreadPriority(GetCurrentThread(), oldPrio);
+}
+
+// An output frame ready for the encoder (and, for --bench-export's tap, as rendered).
+struct EncoderFrame {
+    Bytes nv12;
+    BitmapPtr bgra;
+    explicit operator bool() const { return nv12 != nullptr; }
 };
 
 }  // namespace
 
-bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
-    const Sequence seq = SequenceOf(source, e);
+std::function<void(int, const Bitmap&)> g_exportTap;
+std::atomic<int> g_exportEncoders{0};
+bool g_noGpuDecode = false;
+
+namespace {
+
+// Makes the MP4's frames: the rendered frame as NV12 for the encoder.
+auto Mp4Frames(EditFrames& frames, SIZE sz) {
+    return [&frames, sz](const VideoFrame& src, double st, bool alone) {
+        EncoderFrame ef;
+        if ((ef.nv12 = frames.Passthrough(src, st))) {  // shown as decoded: straight to the encoder
+            if (g_exportTap) ef.bgra = src.Bgra();
+            return ef;
+        }
+        if ((ef.nv12 = frames.WithEdits(src, st))) {  // edits on parts of it: just those converted
+            if (g_exportTap) ef.bgra = frames.Render(src, st, false);
+            return ef;
+        }
+        const BitmapPtr f = frames.Render(src, st, alone);
+        if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
+        ef.nv12 = RecycledBytes((size_t)sz.cx * sz.cy * 3 / 2);
+        BgraToNv12(f->Bits(), sz.cx, sz.cy, ef.nv12->data());
+        if (g_exportTap) ef.bgra = f;
+        return ef;
+    };
+}
+
+bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress) {
     const int fps = (int)std::lround(seq.Fps());
-    EditFrames frames;
-    if (!frames.Open(seq, e, fps, error)) return false;  // "Can't read this video."
-    const SIZE sz = frames.Out();
+    const SIZE sz = FrameRenderer(e, seq.size, false).Out();
     std::unique_ptr<AudioPipe> audio;
     if (!e.muted && seq.HasAudio()) {
         audio = std::make_unique<AudioPipe>();
         if (!audio->Open(seq, e.trimStart, e.trimEnd, e.speed)) audio.reset();
     }
+    // The encoder takes a moment to start: meanwhile the video opens and the first frames are made.
     Mp4Writer w;
-    HRESULT hr = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2);
-    if (FAILED(hr)) {
-        if (error) *error = HrText(L"Can't start the MP4 encoder", hr);
+    auto begun = std::async(std::launch::async, [&] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const HRESULT r = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2, 0, true);
+        CoUninitialize();
+        return r;
+    });
+    EditFrames frames;
+    if (!frames.Open(seq, e, fps, error)) {  // "Can't read this video."
+        if (SUCCEEDED(begun.get())) w.Finalize();
         return false;
     }
+    HRESULT hr = S_OK;
+    bool started = false;
+    auto start = [&] {
+        if (started) return SUCCEEDED(hr);
+        started = true;
+        if (FAILED(hr = begun.get()) && error) *error = HrText(L"Can't start the MP4 encoder", hr);
+        return SUCCEEDED(hr);
+    };
     const int n = frames.Count(true);
     const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
-    for (int i = 0; i < n; ++i) {
-        BitmapPtr f = frames.Frame(i);
-        if (!f) break;
-        hr = w.WriteFrame(f->Bits(), std::llround(i * kTicks / fps), std::llround(kTicks / fps));
+    bool cancelled = false;
+    ExportFrames<EncoderFrame>(frames, 0, n, Mp4Frames(frames, sz), [&](int i, EncoderFrame& f) {
+        if (!start()) return false;
+        if (g_exportTap) g_exportTap(i, *f.bgra);
+        hr = w.WriteNv12(std::shared_ptr<const uint8_t>(f.nv12, f.nv12->data()), std::llround(i * kTicks / fps), std::llround(kTicks / fps));
+        f = {};
         if (SUCCEEDED(hr) && audio) hr = audio->WriteUntil(w, std::min(audioTotal, std::llround((i + 1) * (double)kRate / fps)));
-        if (FAILED(hr)) {
-            if (error) *error = HrText(L"Encoding failed", hr);
-            w.Finalize();
-            return false;
-        }
-        if (progress && !progress((i + 1.0) / n)) {
-            w.Finalize();
-            if (error) *error = L"Cancelled.";
-            return false;
-        }
+        if (FAILED(hr)) return false;
+        cancelled = progress && !progress((i + 1.0) / n);
+        return !cancelled;
+    });
+    if (!start()) return false;  // "Can't start the MP4 encoder"
+    if (FAILED(hr) || cancelled) {
+        if (error) *error = cancelled ? L"Cancelled." : HrText(L"Encoding failed", hr);
+        w.Finalize();
+        return false;
     }
-    if (audio) audio->WriteUntil(w, audioTotal);
-    hr = w.Finalize();
+    if (audio) hr = audio->WriteUntil(w, audioTotal);
+    const HRESULT fin = w.Finalize();
+    if (SUCCEEDED(hr)) hr = fin;
     if (FAILED(hr) && error) *error = HrText(L"Couldn't finish the MP4", hr);
     return SUCCEEDED(hr);
 }
 
+// Whether this PC encodes H.264 on a GPU (else several encoders at once only share the cores the renderers use).
+bool HardwareH264Encoder() {
+    static const bool has = [] {
+        EnsureMediaFoundation();
+        const MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, MFVideoFormat_NV12}, out{MFMediaType_Video, MFVideoFormat_H264};
+        IMFActivate** found = nullptr;
+        UINT32 n = 0;
+        if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out, &found, &n))) return false;
+        for (UINT32 i = 0; i < n; ++i) found[i]->Release();
+        CoTaskMemFree(found);
+        return n > 0;
+    }();
+    return has;
+}
+
+enum class Outcome { Done, Failed, Retry };  // Retry: this way doesn't work here, export the usual way
+
+std::atomic<int> g_joined{0};  // encoders the last export's video was joined from (0: one encoder), for the tests
+
+// Encoders for an export of `n` frames at `fps`: two from three seconds on (shorter, starting the second one costs
+// what it saves), three from fifteen, four from forty (measured on an RTX 5090 with --bench-export: at 10 s two beat
+// three, at 20 s three beat two, at 74 s four beat three by 13%; a GPU's sessions share its encoders, but each
+// session also waits on its own frames).
+int EncodersFor(int n, int fps) {
+    if (g_exportEncoders > 0) return g_exportEncoders;
+    return n >= 40 * fps ? 4 : n >= 15 * fps ? 3 : n >= 3 * fps ? 2 : 1;
+}
+
+// Encoding is what holds a plain export back: a hardware encoder does ~300–450 frames a second, and a GPU often
+// has more than one. The video is made in `k` pieces at once, each with its own reader and encoder (and so
+// starting on a key frame), then joined without re-encoding. Each piece reads on from a second before its first
+// frame, so it shows the same source frames as one pass would.
+// `most`: at most so many encoders (0: as many as suit the length). When fewer could start (the GPU allows only so many
+// sessions), Retry says how many in `started`.
+Outcome ExportMp4Parallel(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress,
+                          int most, int* started) {
+    const int fps = (int)std::lround(seq.Fps());
+    const SIZE sz = FrameRenderer(e, seq.size, false).Out();
+    const int n = std::max(1, (int)std::ceil(e.OutputDuration() * fps - 1e-6));  // as EditFrames::Count(true)
+    const int k = most > 0 ? std::min(most, EncodersFor(n, fps)) : EncodersFor(n, fps);
+    if (k < 2 || seq.clips.empty() || !HardwareH264Encoder()) return Outcome::Retry;
+    // The encoders start side by side (each takes a moment) while the pieces get their first frames ready.
+    std::vector<std::unique_ptr<Mp4Writer>> writers;
+    std::vector<std::wstring> parts;
+    std::vector<std::future<HRESULT>> begun;
+    for (int s = 0; s < k; ++s) {
+        writers.push_back(std::make_unique<Mp4Writer>());
+        parts.push_back(out + L".part" + std::to_wstring(s) + L".mp4");
+        begun.push_back(std::async(std::launch::async, [&, s] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            HRESULT r = writers[s]->Begin(parts[s], sz.cx, sz.cy, fps, 0, 2, 0, true);
+            if (SUCCEEDED(r) && !writers[s]->HardwareEncoder()) r = E_FAIL;  // no GPU session left for it
+            CoUninitialize();
+            return r;
+        }));
+    }
+    std::unique_ptr<AudioPipe> audio;
+    if (!e.muted && seq.HasAudio()) {
+        audio = std::make_unique<AudioPipe>();
+        if (!audio->Open(seq, e.trimStart, e.trimEnd, e.speed)) audio.reset();
+    }
+    std::atomic<bool> stop{false};
+    // The sound, made and encoded meanwhile on a thread of its own into a file next to `out` (then copied in).
+    const std::wstring soundPart = out + L".sound.mp4";
+    const int64_t audioTotal = std::llround(e.OutputDuration() * kRate);
+    HRESULT soundHr = S_OK;
+    std::thread sound;
+    if (audio)
+        sound = std::thread([&] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            Mp4Writer aw;
+            soundHr = aw.Begin(soundPart, 0, 0, fps, kRate, 2);
+            for (int64_t at = 0; SUCCEEDED(soundHr) && at < audioTotal && !stop;) {
+                at = std::min(audioTotal, at + kRate);
+                soundHr = audio->WriteUntil(aw, at);
+            }
+            const HRESULT fin = aw.Finalize();
+            if (SUCCEEDED(soundHr)) soundHr = stop ? E_ABORT : fin;
+            CoUninitialize();
+        });
+    std::vector<int> from((size_t)k + 1);
+    for (int s = 0; s <= k; ++s) from[s] = (int)((int64_t)n * s / k);
+    std::vector<int> made((size_t)k, 0);
+    std::vector<HRESULT> result((size_t)k, S_OK), began((size_t)k, E_PENDING);
+    std::atomic<int> done{0};
+    std::mutex progressMu;  // progress hears from one piece at a time
+    std::atomic<bool> cancelled{false};
+    WorkerPool pool(ExportWorkers({std::max(sz.cx, seq.size.cx), std::max(sz.cy, seq.size.cy)}).first);  // the renderers, for all the pieces
+    std::vector<std::thread> pieces;
+    for (int s = 0; s < k; ++s)
+        pieces.emplace_back([&, s] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            EditFrames frames;
+            HRESULT hr = frames.Open(seq, e, fps, nullptr, from[s]) ? S_OK : E_FAIL;
+            Mp4Writer& w = *writers[s];
+            auto start = [&] {  // the encoder, once the first frame is ready
+                if (began[s] == E_PENDING && FAILED(began[s] = begun[s].get())) stop = true;
+                return SUCCEEDED(began[s]);
+            };
+            if (SUCCEEDED(hr))
+                ExportFrames<EncoderFrame>(frames, from[s], from[s + 1], Mp4Frames(frames, sz), [&](int i, EncoderFrame& ef) {
+                    if (stop || !start()) return false;
+                    if (g_exportTap) g_exportTap(i, *ef.bgra);
+                    hr = w.WriteNv12(std::shared_ptr<const uint8_t>(ef.nv12, ef.nv12->data()), std::llround((i - from[s]) * kTicks / fps), std::llround(kTicks / fps));
+                    ef = {};
+                    if (FAILED(hr)) {
+                        stop = true;
+                        return false;
+                    }
+                    made[s] = i - from[s] + 1;
+                    const int d = ++done;
+                    if (progress) {
+                        std::lock_guard l(progressMu);
+                        if (!cancelled && !progress(0.97 * d / n)) cancelled = true;
+                    }
+                    if (cancelled) stop = true;
+                    return !stop.load();
+                }, &pool, k);
+            start();
+            const HRESULT fin = SUCCEEDED(began[s]) ? w.Finalize() : began[s];
+            result[s] = FAILED(hr) ? hr : fin;
+            CoUninitialize();
+        });
+    for (auto& t : pieces) t.join();
+    if (cancelled) stop = true;
+    if (sound.joinable()) sound.join();
+    writers.clear();  // finalized by their threads
+    auto removeFiles = [&] {
+        for (const auto& p : parts) DeleteFileW(p.c_str());
+        DeleteFileW(soundPart.c_str());
+    };
+    if (cancelled) {
+        removeFiles();
+        if (error) *error = L"Cancelled.";
+        return Outcome::Failed;
+    }
+    bool whole = true;  // every piece made all its frames (else the usual way, which stops where the frames do)
+    for (int s = 0; s < k; ++s) whole = whole && SUCCEEDED(result[s]) && made[s] == from[s + 1] - from[s];
+    whole = whole && SUCCEEDED(soundHr);
+    if (!whole) {
+        removeFiles();
+        const int ok = (int)std::count_if(began.begin(), began.end(), [](HRESULT b) { return SUCCEEDED(b); });
+        if (started && ok < k) *started = ok;
+        return Outcome::Retry;
+    }
+    std::vector<int> counts((size_t)k);
+    for (int s = 0; s < k; ++s) counts[s] = from[s + 1] - from[s];
+    const HRESULT hr = JoinMp4(out, parts, counts, fps, audio ? soundPart : std::wstring());
+    removeFiles();
+    if (FAILED(hr)) {
+        DeleteFileW(out.c_str());
+        return Outcome::Retry;
+    }
+    if (progress) progress(1.0);
+    g_joined = k;
+    return Outcome::Done;
+}
+
+// Frees the memory kept for the next frames once an export is over.
+struct ReleaseFrameMemory {
+    ~ReleaseFrameMemory() {
+        Bitmap::ReleaseRecycled();
+        ReleaseRecycledBytes();
+    }
+};
+
+}  // namespace
+
+bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress) {
+    ReleaseFrameMemory release;
+    const Sequence seq = SequenceOf(source, e);
+    g_joined = 0;
+    double shown = 0;  // by the try in pieces: the usual way carries on from there rather than going back
+    const ExportProgress tracked = progress ? ExportProgress([&](double p) { return progress(shown = std::max(shown, p)); }) : ExportProgress();
+    int started = 0;
+    switch (ExportMp4Parallel(seq, e, out, error, tracked, 0, &started)) {
+        case Outcome::Done: return true;
+        case Outcome::Failed: return false;
+        case Outcome::Retry: break;
+    }
+    if (started >= 2) {  // fewer encoders could start: in as many pieces as did
+        switch (ExportMp4Parallel(seq, e, out, error, tracked, started, nullptr)) {
+            case Outcome::Done: return true;
+            case Outcome::Failed: return false;
+            case Outcome::Retry: break;
+        }
+    }
+    if (shown <= 0) return ExportMp4Single(seq, e, out, error, progress);
+    return ExportMp4Single(seq, e, out, error, [&](double p) { return progress(shown + (1 - shown) * p); });
+}
+
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps, ExportProgress progress) {
+    ReleaseFrameMemory release;
     EditFrames frames;
     if (!frames.Open(SequenceOf(source, e), e, fps, error)) return false;
     const SIZE sz = frames.Out();
@@ -712,17 +1686,33 @@ bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstrin
     GifWriter g;
     HRESULT hr = g.Begin(out, gw, gh);
     const int n = frames.Count(false);
-    for (int i = 0; i < n && SUCCEEDED(hr); ++i) {
-        BitmapPtr f = frames.Frame(i);
-        if (!f) break;
-        if (f->Width() != gw || f->Height() != gh) f = Resample(*f, gw, gh);
-        const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
-        hr = f ? g.Add(f->Bits(), delay) : E_OUTOFMEMORY;
-        if (progress && !progress((i + 1.0) / n)) {
-            g.Finish();
-            if (error) *error = L"Cancelled.";
-            return false;
-        }
+    bool cancelled = false;
+    struct GifFrame {
+        std::shared_ptr<GifWriter::Quantized> q;
+        BitmapPtr bgra;  // for --bench-export's tap
+        explicit operator bool() const { return q != nullptr; }
+    };
+    auto make = [&](const VideoFrame& src, double st, bool alone) {
+        GifFrame gf;
+        BitmapPtr f = frames.Render(src, st, alone);
+        if (f && (f->Width() != gw || f->Height() != gh)) f = Resample(*f, gw, gh);
+        if (!f) return gf;
+        gf.q = GifWriter::Quantize(f->Bits(), gw, gh);  // the slow part of a GIF frame, on the workers
+        if (g_exportTap) gf.bgra = f;
+        return gf;
+    };
+    if (SUCCEEDED(hr))
+        ExportFrames<GifFrame>(frames, 0, n, make, [&](int i, GifFrame& f) {
+            if (g_exportTap) g_exportTap(i, *f.bgra);
+            const int delay = (int)std::lround((i + 1) * 100 / fps) - (int)std::lround(i * 100 / fps);  // 1/100 s, drift-free
+            hr = g.AddQuantized(*f.q, delay);
+            cancelled = SUCCEEDED(hr) && progress && !progress((i + 1.0) / n);
+            return SUCCEEDED(hr) && !cancelled;
+        });
+    if (cancelled) {
+        g.Finish();
+        if (error) *error = L"Cancelled.";
+        return false;
     }
     const HRESULT fin = g.Finish();
     if (SUCCEEDED(hr)) hr = fin;
@@ -738,13 +1728,14 @@ std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide
         if (cancelled && cancelled()) return {};
         const double t = r.Duration() * (i + 0.5) / count;
         r.Seek(t);
-        BitmapPtr f, last;
+        VideoFrame f, kept;
         double ft = 0;
-        while (r.Read(&f, &ft)) {
-            last = f;
+        while (r.ReadFrame(&f, &ft, t - 0.04)) {  // only the frame kept is converted (or copied off the GPU)
+            kept = f;
             if (ft >= t - 0.04) break;
         }
-        if (!last || !(last = r.Fit(last))) continue;
+        BitmapPtr last = kept.Bgra();
+        if (!last) continue;
         const double k = std::min(1.0, (double)maxSide / std::max(last->Width(), last->Height()));
         out.push_back(k < 1 ? Resample(*last, std::max(1, (int)std::lround(last->Width() * k)), std::max(1, (int)std::lround(last->Height() * k))) : last);
     }
@@ -1249,6 +2240,42 @@ ATHER_TEST(video_sequence_joins_clips_into_one_video) {
     CHECK(prev > 2.9 && prev < 3.0);
 }
 
+// Frames converted here come out exactly as Media Foundation's own (much slower) converter makes them, for SD
+// (BT.601) and HD (BT.709) sizes alike.
+ATHER_TEST(video_decoding_matches_media_foundation_colors) {
+    for (SIZE sz : {SIZE{640, 360}, SIZE{1024, 576}, SIZE{720, 580}, SIZE{800, 600}, SIZE{1280, 720}, SIZE{1920, 1080}}) {
+        const std::wstring path = test::TempDir() + L"/colors.mp4";
+        Mp4Writer mw;
+        CHECK(SUCCEEDED(mw.Begin(path, sz.cx, sz.cy, 10)));
+        std::vector<uint32_t> px((size_t)sz.cx * sz.cy);
+        for (int i = 0; i < 3; ++i) {
+            uint32_t seed = 7 + i;
+            for (int y = 0; y < sz.cy; ++y)
+                for (int x = 0; x < sz.cx; ++x) {
+                    seed = seed * 1664525u + 1013904223u;
+                    const uint32_t r = (uint32_t)(x * 255 / sz.cx), g = (uint32_t)(y * 255 / sz.cy), b = (seed >> 24) & 255;
+                    px[(size_t)y * sz.cx + x] = 0xFF000000u | r << 16 | g << 8 | ((x / 16 + y / 16 + i) % 2 ? b : 255 - r);
+                }
+            mw.WriteFrame(px.data(), i * 1'000'000, 1'000'000);
+        }
+        CHECK(SUCCEEDED(mw.Finalize()));
+        VideoReader ours, theirs;
+        CHECK(ours.Open(path) && theirs.Open(path, false));
+        BitmapPtr a, b;
+        double ta = 0, tb = 0;
+        int frames = 0, maxDiff = 0;
+        while (ours.Read(&a, &ta) && theirs.Read(&b, &tb)) {
+            ++frames;
+            CHECK(a->Width() == b->Width() && a->Height() == b->Height());
+            for (size_t k = 0, n = (size_t)a->Width() * a->Height(); k < n; ++k)
+                for (int s = 0; s < 24; s += 8) maxDiff = std::max(maxDiff, std::abs((int)((a->Bits()[k] >> s) & 255) - (int)((b->Bits()[k] >> s) & 255)));
+        }
+        test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + ": max diff " + std::to_string(maxDiff));
+        CHECK_EQ(frames, 3);
+        CHECK_EQ(maxDiff, 0);
+    }
+}
+
 ATHER_TEST(video_rotated_phone_clip_reads_upright_like_the_preview) {
     for (int rot : {90, 270}) {
         const std::wstring path = test::TempDir() + L"/rot" + std::to_wstring(rot) + L".mp4";
@@ -1348,6 +2375,240 @@ ATHER_TEST(video_export_trim_speed_crop_captions) {
     CHECK_NEAR(GifDuration(gif), 1.0, 0.02);
     int gw = 0, gh = 0;
     CHECK(ImageSize(gif, &gw, &gh) && gw == 320 && gh == 200);
+}
+
+// A longer export is made in pieces on several encoders at once (where the GPU has them) and comes out joined in
+// order: every second in its place, all the frames and sound, nothing left behind. The single encoder too.
+ATHER_TEST(video_export_joins_pieces_from_several_encoders) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"\\clip.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));  // red, green, blue, red… a second each
+    for (const wchar_t* encoders : {L"3", L"1"}) {
+        g_exportEncoders = _wtoi(encoders);
+        const std::wstring out = dir + L"\\out" + encoders + L".mp4";
+        VideoEdit e;
+        e.trimEnd = 9;
+        std::wstring err;
+        const bool ok = ExportMp4(clip, e, out, &err);
+        test::Note("encoders " + ToUtf8(encoders) + ": " + ToUtf8(err));
+        CHECK(ok);
+        test::Out("  (" + ToUtf8(encoders) + " encoders wanted, " + std::to_string(std::max(1, g_joined.load())) + " used)\n");
+        CHECK(wcscmp(encoders, L"1") != 0 || g_joined == 0);
+        CHECK(wcscmp(encoders, L"3") != 0 || !HardwareH264Encoder() || g_joined >= 2);  // joined, not made again in one
+        VideoInfo vi;
+        CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 9) < 0.1 && vi.w == 640 && vi.h == 360 && vi.hasAudio);
+        VideoReader r;
+        CHECK(r.Open(out));
+        BitmapPtr f;
+        double t = 0;
+        int frames = 0, wrong = 0;
+        while (r.Read(&f, &t)) {
+            const uint32_t c = f->Bits()[(size_t)180 * 640 + 320];
+            const int want = (int)(t + 0.01) % 3;  // 0 red, 1 green, 2 blue
+            wrong += ((c >> (16 - 8 * want)) & 255) < 180;
+            ++frames;
+        }
+        CHECK_EQ(frames, 270);
+        CHECK_EQ(wrong, 0);
+        for (int i = 0; i < 3; ++i) CHECK(GetFileAttributesW((out + L".part" + std::to_wstring(i) + L".mp4").c_str()) == INVALID_FILE_ATTRIBUTES);
+    }
+    g_exportEncoders = 0;
+}
+
+// An export in pieces shows exactly the frames one pass does, also where a piece starts inside a later clip of a
+// joined video (of other sizes and frame rates, turned, silent) and with the speed changed.
+ATHER_TEST(video_export_in_pieces_renders_the_same_frames) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a.mp4", b = dir + L"\\b.mp4", c = dir + L"\\c.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 5, true));
+    CHECK(WriteTestClip(b, 320, 320, 30, 4, false));       // square, silent
+    CHECK(WriteTestClip(c, 640, 360, 25, 4, true, 90));    // a phone clip: upright 360 × 640, 25 fps
+    auto ca = ClipOf(a), cb = ClipOf(b), cc = ClipOf(c);
+    CHECK(ca && cb && cc);
+    if (!ca || !cb || !cc) return;
+    ca->in = 0.5, ca->out = 4.5;
+    cc->in = 1;
+    for (double speed : {1.0, 1.5}) {
+        VideoEdit e;
+        e.clips = {*ca, *cb, *cc};
+        e.frameW = 640;
+        e.frameH = 360;
+        e.speed = speed;
+        e.trimStart = 0.2;
+        e.trimEnd = ClipsDuration(e.clips);
+        Caption cap;
+        cap.start = 3, cap.end = 6, cap.text = L"Across the cut";
+        e.captions = {cap};
+        std::vector<uint64_t> first;
+        for (const wchar_t* encoders : {L"1", L"2", L"3"}) {
+            std::vector<uint64_t> hashes;
+            std::mutex mu;
+            g_exportTap = [&](int i, const Bitmap& f) {
+                uint64_t h = 1469598103934665603ull;
+                for (size_t k = 0, n = (size_t)f.Width() * f.Height(); k < n; ++k) h = (h ^ f.Bits()[k]) * 1099511628211ull;
+                std::lock_guard l(mu);
+                if (hashes.size() <= (size_t)i) hashes.resize((size_t)i + 1);
+                hashes[i] = h;
+            };
+            g_exportEncoders = _wtoi(encoders);
+            std::wstring err;
+            const std::wstring out = dir + L"\\out" + encoders + L".mp4";
+            CHECK(ExportMp4(L"", e, out, &err));
+            g_exportTap = nullptr;
+            VideoInfo vi;
+            CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - e.OutputDuration()) < 0.1 && vi.hasAudio);
+            if (first.empty()) first = hashes;
+            test::Note("speed " + std::to_string(speed) + ", encoders " + ToUtf8(encoders) + ": " + std::to_string(hashes.size()) + " frames");
+            CHECK_EQ(hashes.size(), first.size());
+            CHECK(hashes == first);
+        }
+    }
+    g_exportEncoders = 0;
+}
+
+// A frame whose edits change only parts of it gets just those converted and drawn on: there it is byte for byte the
+// whole frame rendered and converted, and elsewhere the frame (its crop) as decoded. Every kind of markup, with
+// their animations, and captions; in SD and HD, cropped (on odd pixels too) and not.
+ATHER_TEST(video_edits_drawn_on_their_part_match_the_whole_frame) {
+    struct Case {
+        SIZE sz;
+        std::optional<VRect> crop;
+    };
+    for (const Case& k : {Case{{640, 360}, std::nullopt}, Case{{1280, 720}, VRect{64, 32, 1100, 600}},
+                         Case{{1280, 720}, VRect{75, 41, 1013, 611}}, Case{{1280, 720}, std::nullopt}}) {
+        const SIZE sz = k.sz;
+        const std::wstring clip = test::TempDir() + L"\\noise.mp4";
+        Mp4Writer mw;
+        CHECK(SUCCEEDED(mw.Begin(clip, sz.cx, sz.cy, 10)));
+        std::vector<uint32_t> px((size_t)sz.cx * sz.cy);
+        uint32_t seed = 3;
+        for (int i = 0; i < 30; ++i) {
+            for (size_t j = 0; j < px.size(); ++j) px[j] = 0xFF000000u | ((seed = seed * 1664525u + 1013904223u) >> 8);
+            mw.WriteFrame(px.data(), i * 1'000'000, 1'000'000);
+        }
+        CHECK(SUCCEEDED(mw.Finalize()));
+        const double W = sz.cx, H = sz.cy;
+        VideoEdit e;
+        e.trimEnd = 3;
+        e.crop = k.crop;
+        e.captionStyle = AnimStyle::Pop;
+        e.captionLook = sz.cx > 640 ? CaptionLook::Outline : CaptionLook::Pill;
+        auto mark = [&](MarkKind kind, double x0, double y0, double x1, double y1, double start, double end, AnimStyle st, std::wstring text = L"") {
+            Mark m;
+            m.kind = kind;
+            m.a = {W * x0, H * y0};
+            m.b = {W * x1, H * y1};
+            m.start = start;
+            m.end = end;
+            m.style = st;
+            m.text = std::move(text);
+            e.marks.push_back(m);
+            return &e.marks.back();
+        };
+        mark(MarkKind::Blur, 0.55, 0.55, 0.8, 0.75, 0, 3, AnimStyle::BlurIn);
+        mark(MarkKind::Pixelate, 0.05, 0.7, 0.3, 0.9, 0.5, 2.5, AnimStyle::Fade);
+        mark(MarkKind::Box, 0.1, 0.2, 0.4, 0.45, 0, 2, AnimStyle::DrawOn);
+        mark(MarkKind::Arrow, 0.7, 0.8, 0.45, 0.5, 0.3, 2.2, AnimStyle::DrawOn);
+        mark(MarkKind::Text, 0.5, 0.1, 0.9, 0.2, 0.2, 2.8, AnimStyle::Typewriter, L"Click Deploy");
+        mark(MarkKind::Emoji, 0.8, 0.3, 0.8 + 0.1 * H / W, 0.4, 0.4, 2.6, AnimStyle::Pop, L"✅")->emphasis = Emphasis::Ping;
+        mark(MarkKind::Bubble, 0.2, 0.55, 0.45, 0.65, 1, 2.9, AnimStyle::Pop, L"Saved!")->emphasis = Emphasis::Pulse;
+        Caption a, b;
+        a.start = 0, a.end = 3, a.text = L"Popping in at the bottom";
+        b.start = 0.5, b.end = 1.6, b.text = L"Dragged", b.center = VPoint{0.31, 0.27};
+        e.captions = {a, b};
+        EditFrames frames;
+        CHECK(frames.Open(SequenceOf(clip, e), e, 10, nullptr));
+        const SIZE out = frames.Out();
+        const int vx = e.crop ? (int)frames.Renderer().View().x : 0, vy = e.crop ? (int)frames.Renderer().View().y : 0;
+        int checked = 0, insideWrong = 0, outsideWrong = 0, parts = 0;
+        for (int i = 0; i < 30; ++i) {
+            VideoFrame src;
+            double st = 0;
+            bool alone = false;
+            if (!frames.Next(i, &src, &st, &alone)) break;
+            const auto areas = frames.Renderer().EditAreas(st);
+            const Bytes got = frames.WithEdits(src, st);
+            CHECK(areas && got);
+            if (!areas || !got) continue;
+            const std::vector<uint8_t> decoded = *src.state()->yuv;
+            const BitmapPtr whole = frames.Render(src, st, false);
+            std::vector<uint8_t> ref((size_t)out.cx * out.cy * 3 / 2);
+            BgraToNv12(whole->Bits(), out.cx, out.cy, ref.data());
+            for (int y = 0; y < out.cy; ++y)
+                for (int x = 0; x < out.cx; ++x) {
+                    const int sx = x + vx, sy = y + vy;  // source pixels
+                    bool in = false;
+                    for (const RECT& ar : *areas) in = in || (sx >= ar.left && sx < ar.right && sy >= ar.top && sy < ar.bottom);
+                    const size_t lk = (size_t)y * out.cx + x, ck = (size_t)out.cx * out.cy + (size_t)(y / 2) * out.cx + x;
+                    const size_t sl = (size_t)sy * sz.cx + sx, sc = (size_t)sz.cx * sz.cy + (size_t)(sy / 2) * sz.cx + sx;
+                    if (in) insideWrong += (*got)[lk] != ref[lk] || (*got)[ck] != ref[ck];
+                    else outsideWrong += (*got)[lk] != decoded[sl] || (*got)[ck] != decoded[sc];
+                }
+            checked += !areas->empty();
+            parts = std::max(parts, (int)areas->size());
+        }
+        test::Note(std::to_string(sz.cx) + "x" + std::to_string(sz.cy) + (e.crop ? " cropped" : "") + ": " + std::to_string(checked) + " frames with edits");
+        CHECK(checked >= 25);
+        CHECK(parts >= 2);  // some apart from others
+        CHECK_EQ(insideWrong, 0);
+        CHECK_EQ(outsideWrong, 0);
+    }
+}
+
+// In slow motion every source frame is shown twice; here once with a mark on it (converted and drawn on) and once
+// with just a caption (its NV12 copied, only the caption's part converted), by different workers at the same time.
+ATHER_TEST(video_export_frame_shown_twice_both_ways) {
+    const std::wstring clip = test::TempDir() + L"\\clip.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 3, false));
+    VideoEdit e;
+    e.trimEnd = 3;
+    e.speed = 0.5;
+    for (int k = 0; k < 90; ++k) {  // the mark on each source frame's first showing, the caption on its second
+        Mark m;
+        m.kind = MarkKind::Box;
+        m.a = {100, 100}, m.b = {300, 200};
+        m.style = AnimStyle::None;
+        m.start = k / 30.0;
+        m.end = k / 30.0 + 1 / 120.0;
+        e.marks.push_back(m);
+        Caption c;
+        c.start = k / 30.0 + 1 / 60.0;
+        c.end = c.start + 1 / 120.0;
+        c.text = L"Second showing";
+        e.captions.push_back(c);
+    }
+    for (int round = 0; round < 5; ++round) {
+        const std::wstring out = test::TempDir() + L"\\slow.mp4";
+        std::wstring err;
+        CHECK(ExportMp4(clip, e, out, &err));
+        VideoInfo vi;
+        CHECK(ProbeVideo(out, &vi) && std::fabs(vi.duration - 6) < 0.1);
+    }
+}
+
+// Cancelling halfway stops the export (one encoder or several) and leaves no pieces behind.
+ATHER_TEST(video_export_cancels_cleanly) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"\\clip.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 9, true));
+    for (const wchar_t* encoders : {L"2", L"1"}) {
+        g_exportEncoders = _wtoi(encoders);
+        const std::wstring out = dir + L"\\out" + encoders + L".mp4";
+        VideoEdit e;
+        e.trimEnd = 9;
+        std::wstring err;
+        double last = 0;
+        const bool ok = ExportMp4(clip, e, out, &err, [&](double p) {
+            last = p;
+            return p < 0.5;
+        });
+        CHECK(!ok);
+        CHECK(err == L"Cancelled.");
+        CHECK(last >= 0.5 && last < 0.6);
+        for (const wchar_t* part : {L".part0.mp4", L".part1.mp4", L".sound.mp4"})
+            CHECK(GetFileAttributesW((out + part).c_str()) == INVALID_FILE_ATTRIBUTES);
+    }
+    g_exportEncoders = 0;
 }
 
 // Speech made by Windows text-to-speech, transcribed by Windows dictation. Skipped where no recognizer is installed.

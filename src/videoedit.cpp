@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <emmintrin.h>
 #include <format>
 #include <mutex>
 #include <unordered_map>
@@ -354,13 +355,36 @@ inline void Over(uint32_t& d, uint32_t s) {  // premultiplied source over
     d = s + Scale(d, 255 - sa);
 }
 
+// Scale and Over for four pixels at once, with the same integer results: x / 255 for x ≤ 255 × 255 + 127 is
+// (x + 1 + (x >> 8)) >> 8, and the final add is on whole pixels, as Over's is.
+inline __m128i Div255(__m128i v) { return _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(v, _mm_set1_epi16(1)), _mm_srli_epi16(v, 8)), 8); }
+
+inline __m128i ScaleFour(__m128i p, __m128i klo, __m128i khi) {  // channels × k / 255; k per channel, 16-bit
+    const __m128i zero = _mm_setzero_si128(), r = _mm_set1_epi16(127);
+    const __m128i lo = Div255(_mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(p, zero), klo), r));
+    const __m128i hi = Div255(_mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(p, zero), khi), r));
+    return _mm_packus_epi16(lo, hi);
+}
+
+inline void OverFour(uint32_t* d, const uint32_t* s, uint32_t a) {  // Over(d[i], Scale(s[i], a)) for i < 4
+    __m128i p = _mm_loadu_si128((const __m128i*)s);
+    if (a < 255) p = ScaleFour(p, _mm_set1_epi16((short)a), _mm_set1_epi16((short)a));
+    const __m128i dd = _mm_loadu_si128((const __m128i*)d);
+    const __m128i sa = _mm_srli_epi32(p, 24);
+    const __m128i k16 = _mm_packs_epi32(_mm_sub_epi32(_mm_set1_epi32(255), sa), _mm_setzero_si128());  // 255 − sa, per pixel
+    const __m128i kk = _mm_unpacklo_epi16(k16, k16);  // k0 k0 k1 k1 k2 k2 k3 k3
+    const __m128i res = _mm_add_epi32(p, ScaleFour(dd, _mm_unpacklo_epi32(kk, kk), _mm_unpackhi_epi32(kk, kk)));
+    const __m128i none = _mm_cmpeq_epi32(sa, _mm_setzero_si128());  // fully transparent: left as it was
+    _mm_storeu_si128((__m128i*)d, _mm_or_si128(_mm_and_si128(none, dd), _mm_andnot_si128(none, res)));
+}
+
 inline uint32_t Mix(uint32_t a, uint32_t b, double t) {  // a·(1−t) + b·t
     const uint32_t k = (uint32_t)std::clamp(std::lround(t * 255), 0L, 255L);
     return Scale(a, 255 - k) + Scale(b, k);
 }
 
 BitmapPtr Copy(const Bitmap& src) {
-    auto b = Bitmap::Create(src.Width(), src.Height());
+    auto b = Bitmap::CreateRecycled(src.Width(), src.Height());
     if (b) memcpy(b->Bits(), src.Bits(), (size_t)src.Width() * src.Height() * 4);
     return b;
 }
@@ -373,6 +397,9 @@ BitmapPtr Blank(int w, int h) {
 
 // Gaussian-like blur (three box passes) of `inner`, sampling up to 3 radii around it so the edges blend with
 // the surroundings (like Core Image's clamped blur). Returns the blurred pixels of `inner`.
+// Each pass is a box along the rows, then one down the columns. The four channels go side by side (an SSE lane
+// each, each lane doing exactly the float arithmetic of that channel alone). Rows stream through the six passes,
+// each column pass keeping just the rows its window spans, so the work stays in the cache.
 std::vector<uint32_t> BlurArea(const Bitmap& img, const RECT& inner, double sigma) {
     const int r = std::max(1, (int)std::lround(sigma));
     const int W = img.Width(), H = img.Height();
@@ -380,36 +407,100 @@ std::vector<uint32_t> BlurArea(const Bitmap& img, const RECT& inner, double sigm
                  std::min((LONG)H, inner.bottom + 3 * r)};
     const int pw = RectW(P), ph = RectH(P), iw = RectW(inner), ih = RectH(inner);
     std::vector<uint32_t> out((size_t)iw * ih, 0);
-    std::vector<float> plane((size_t)pw * ph), tmp((size_t)std::max(pw, ph));
-    auto pass = [&](float* data, int n, int stride) {
-        const int rr = std::min(r, n - 1);
-        const float inv = 1.f / (2 * rr + 1);
-        float sum = data[0] * (rr + 1);
-        for (int i = 1; i <= rr; ++i) sum += data[(size_t)i * stride];
-        for (int i = 0; i < n; ++i) {
-            tmp[i] = sum * inv;
-            sum += data[(size_t)std::min(i + rr + 1, n - 1) * stride] - data[(size_t)std::max(i - rr, 0) * stride];
-        }
-        for (int i = 0; i < n; ++i) data[(size_t)i * stride] = tmp[i];
+    const __m128i zero = _mm_setzero_si128();
+    const bool pass = pw > 1 && ph > 1;
+    const int rh = std::min(r, pw - 1), rv = std::min(r, ph - 1), R = 2 * rv + 2;  // R: rows a column window spans
+    // Kept per thread between calls (fresh memory costs a page fault per 4 KB), unless it grew big.
+    thread_local std::vector<__m128> mem;
+    mem.resize((size_t)pw * (3 * (R + 2) + 1));
+    __m128* scratch = mem.data();
+    struct Stage {
+        __m128 *ring, *sum, *out;
+        int fetched = -1;
+    } stages[3];
+    for (int s = 0; s < 3; ++s) {
+        __m128* base = mem.data() + (size_t)pw * (1 + s * (R + 2));
+        stages[s] = {base, base + (size_t)pw * R, base + (size_t)pw * (R + 1)};
+    }
+    auto load = [&](int y, __m128* d) {  // row y of the area, as floats
+        const uint32_t* row = img.Bits() + (size_t)(P.top + y) * W + P.left;
+        for (int x = 0; x < pw; ++x) d[x] = _mm_cvtepi32_ps(_mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)row[x]), zero), zero));
     };
-    for (int ch = 0; ch < 4; ++ch) {
-        const int sh = ch * 8;
-        for (int y = 0; y < ph; ++y) {
-            const uint32_t* row = img.Bits() + (size_t)(P.top + y) * W + P.left;
-            float* dst = plane.data() + (size_t)y * pw;
-            for (int x = 0; x < pw; ++x) dst[x] = (float)((row[x] >> sh) & 255);
+    const __m128 invH = _mm_set1_ps(1.f / (2 * rh + 1)), firstH = _mm_set1_ps((float)(rh + 1));
+    const __m128 invV = _mm_set1_ps(1.f / (2 * rv + 1)), firstV = _mm_set1_ps((float)(rv + 1));
+    auto along = [&](const __m128* d, __m128* o) {  // a box along one row (the clamps only near its ends)
+        __m128 sum = _mm_mul_ps(d[0], firstH);
+        for (int i = 1; i <= rh; ++i) sum = _mm_add_ps(sum, d[i]);
+        const int mid0 = std::min(rh, pw), mid1 = std::max(mid0, pw - rh - 1);  // i − rh ≥ 0 and i + rh + 1 ≤ pw − 1 in between
+        int i = 0;
+        for (; i < mid0; ++i) {
+            o[i] = _mm_mul_ps(sum, invH);
+            sum = _mm_add_ps(sum, _mm_sub_ps(d[std::min(i + rh + 1, pw - 1)], d[std::max(i - rh, 0)]));
         }
-        if (pw > 1 && ph > 1)
-            for (int k = 0; k < 3; ++k) {
-                for (int y = 0; y < ph; ++y) pass(plane.data() + (size_t)y * pw, pw, 1);
-                for (int x = 0; x < pw; ++x) pass(plane.data() + x, ph, pw);
+        for (; i < mid1; ++i) {
+            o[i] = _mm_mul_ps(sum, invH);
+            sum = _mm_add_ps(sum, _mm_sub_ps(d[i + rh + 1], d[i - rh]));
+        }
+        for (; i < pw; ++i) {
+            o[i] = _mm_mul_ps(sum, invH);
+            sum = _mm_add_ps(sum, _mm_sub_ps(d[std::min(i + rh + 1, pw - 1)], d[std::max(i - rh, 0)]));
+        }
+    };
+    // Row i (asked for in order from 0) after pass s: the box down the columns over rows that had the box along
+    // them, fed by pass s − 1 (or the image).
+    auto passRow = [&](auto& self, int s, int i) -> const __m128* {
+        Stage& st = stages[s];
+        auto in = [&](int j) { return st.ring + (size_t)(j % R) * pw; };
+        auto fetch = [&](int j) {
+            while (st.fetched < j) {
+                const int y = ++st.fetched;
+                if (s == 0) {
+                    load(y, scratch);
+                    along(scratch, in(y));
+                } else {
+                    along(self(self, s - 1, y), in(y));
+                }
             }
-        for (int y = 0; y < ih; ++y) {
-            const float* src = plane.data() + (size_t)(inner.top - P.top + y) * pw + (inner.left - P.left);
-            uint32_t* dst = out.data() + (size_t)y * iw;
-            for (int x = 0; x < iw; ++x) dst[x] |= (uint32_t)std::clamp((int)std::lround(src[x]), 0, 255) << sh;
+        };
+        if (i == 0) {
+            fetch(rv);
+            const __m128* r0 = in(0);
+            for (int x = 0; x < pw; ++x) st.sum[x] = _mm_mul_ps(r0[x], firstV);
+            for (int k = 1; k <= rv; ++k) {
+                const __m128* rk = in(k);
+                for (int x = 0; x < pw; ++x) st.sum[x] = _mm_add_ps(st.sum[x], rk[x]);
+            }
+        }
+        for (int x = 0; x < pw; ++x) st.out[x] = _mm_mul_ps(st.sum[x], invV);
+        const int a = std::min(i + rv + 1, ph - 1), b = std::max(i - rv, 0);
+        fetch(a);
+        const __m128 *add = in(a), *sub = in(b);
+        for (int x = 0; x < pw; ++x) st.sum[x] = _mm_add_ps(st.sum[x], _mm_sub_ps(add[x], sub[x]));
+        return st.out;
+    };
+    // Rounded like lround (halves up; anything below zero is 0 after the clamp), clamped to 0…255.
+    const __m128 half = _mm_set1_ps(0.5f), one = _mm_set1_ps(1.f), fzero = _mm_setzero_ps();
+    const int top = inner.top - P.top, left = inner.left - P.left;
+    for (int y = 0; y < top + ih; ++y) {
+        const __m128* row;
+        if (pass) {
+            row = passRow(passRow, 2, y);
+        } else {
+            load(y, scratch);
+            row = scratch;
+        }
+        if (y < top) continue;
+        const __m128* src = row + left;
+        uint32_t* dst = out.data() + (size_t)(y - top) * iw;
+        for (int x = 0; x < iw; ++x) {
+            const __m128 v = _mm_max_ps(src[x], fzero);
+            const __m128 tr = _mm_cvtepi32_ps(_mm_cvttps_epi32(v));
+            const __m128 rounded = _mm_add_ps(tr, _mm_and_ps(_mm_cmpge_ps(_mm_sub_ps(v, tr), half), one));
+            const __m128i q = _mm_cvttps_epi32(rounded);
+            dst[x] = (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(_mm_packs_epi32(q, zero), zero));
         }
     }
+    if (mem.capacity() > (1u << 19)) std::vector<__m128>().swap(mem);  // 8 MB
     return out;
 }
 
@@ -432,22 +523,69 @@ inline uint32_t Sample(const Bitmap& b, double sx, double sy) {
 
 // The part `r` of `src` (fractional, source pixels) scaled to w × h. Opaque frames, so edges clamp.
 BitmapPtr SampleRect(const Bitmap& src, VRect r, int w, int h) {
-    auto out = Bitmap::Create(w, h);
+    auto out = Bitmap::CreateRecycled(w, h);
     if (!out) return nullptr;
     const int W = src.Width(), H = src.Height();
     if (std::fabs(r.w - w) <= 1.01 && std::fabs(r.h - h) <= 1.01 && r.x == std::floor(r.x) && r.y == std::floor(r.y)) {  // a plain crop
+        const int x0 = (int)r.x;
         for (int y = 0; y < h; ++y) {
             const int sy = std::clamp((int)r.y + y, 0, H - 1);
-            for (int x = 0; x < w; ++x) out->Bits()[(size_t)y * w + x] = src.Bits()[(size_t)sy * W + std::clamp((int)r.x + x, 0, W - 1)];
+            uint32_t* d = out->Bits() + (size_t)y * w;
+            const uint32_t* s = src.Bits() + (size_t)sy * W;
+            if (x0 >= 0 && x0 + w <= W) memcpy(d, s + x0, (size_t)w * 4);
+            else
+                for (int x = 0; x < w; ++x) d[x] = s[std::clamp(x0 + x, 0, W - 1)];
         }
         return out;
     }
+    // Bilinear, pixel for pixel as Sample does it (the same double arithmetic, so the same result), with the
+    // source positions worked out once per column and row and two channels at a time.
     const double kx = r.w / w, ky = r.h / h;
+    std::vector<int> xs((size_t)w);
+    std::vector<double> fxs((size_t)w), gxs((size_t)w);
+    for (int x = 0; x < w; ++x) {
+        const double sx = std::min(std::clamp(r.x + (x + 0.5) * kx - 0.5, 0.0, W - 1.0), W - 1.001);
+        xs[x] = (int)std::floor(sx);
+        fxs[x] = sx - xs[x];
+        gxs[x] = 1 - fxs[x];
+    }
+    const __m128i zero = _mm_setzero_si128();
+    const __m128d half = _mm_set1_pd(0.5), one = _mm_set1_pd(1);
+    auto lanes = [&](uint32_t q, __m128d* bg, __m128d* ra) {
+        const __m128i c = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)q), zero), zero);
+        *bg = _mm_cvtepi32_pd(c);
+        *ra = _mm_cvtepi32_pd(_mm_srli_si128(c, 8));
+    };
+    auto round = [&](__m128d v) {  // lround for v ≥ 0
+        const __m128d tr = _mm_cvtepi32_pd(_mm_cvttpd_epi32(v));
+        return _mm_cvttpd_epi32(_mm_add_pd(tr, _mm_and_pd(_mm_cmpge_pd(_mm_sub_pd(v, tr), half), one)));
+    };
     for (int y = 0; y < h; ++y) {
-        const double sy = std::clamp(r.y + (y + 0.5) * ky - 0.5, 0.0, H - 1.0);
+        const double sy = std::min(std::clamp(r.y + (y + 0.5) * ky - 0.5, 0.0, H - 1.0), H - 1.001);
+        const int y0 = (int)std::floor(sy);
+        const double fy = sy - y0, gy = 1 - fy;
+        const uint32_t* r0 = src.Bits() + (size_t)y0 * W;
+        const uint32_t* r1 = r0 + W;
+        uint32_t* d = out->Bits() + (size_t)y * w;
+        __m128d bg0{}, ra0{}, bg1{}, ra1{}, bg2{}, ra2{}, bg3{}, ra3{};
+        int have = -1;  // the source column whose pixels are in those (zoomed in, neighbors share them)
         for (int x = 0; x < w; ++x) {
-            const double sx = std::clamp(r.x + (x + 0.5) * kx - 0.5, 0.0, W - 1.0);
-            out->Bits()[(size_t)y * w + x] = Sample(src, std::min(sx, W - 1.001), std::min(sy, H - 1.001));
+            const int x0 = xs[x];
+            const double fx = fxs[x], gx = gxs[x];
+            const __m128d w0 = _mm_set1_pd(gx * gy), w1 = _mm_set1_pd(fx * gy), w2 = _mm_set1_pd(gx * fy), w3 = _mm_set1_pd(fx * fy);
+            if (x0 != have) {
+                have = x0;
+                lanes(r0[x0], &bg0, &ra0);
+                lanes(r0[x0 + 1], &bg1, &ra1);
+                lanes(r1[x0], &bg2, &ra2);
+                lanes(r1[x0 + 1], &bg3, &ra3);
+            }
+            __m128d bg = _mm_mul_pd(bg0, w0), ra = _mm_mul_pd(ra0, w0);
+            bg = _mm_add_pd(bg, _mm_mul_pd(bg1, w1)), ra = _mm_add_pd(ra, _mm_mul_pd(ra1, w1));
+            bg = _mm_add_pd(bg, _mm_mul_pd(bg2, w2)), ra = _mm_add_pd(ra, _mm_mul_pd(ra2, w2));
+            bg = _mm_add_pd(bg, _mm_mul_pd(bg3, w3)), ra = _mm_add_pd(ra, _mm_mul_pd(ra3, w3));
+            const __m128i q = _mm_unpacklo_epi64(round(bg), round(ra));  // B, G, R, A
+            d[x] = (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(_mm_packs_epi32(q, zero), zero));
         }
     }
     return out;
@@ -479,6 +617,22 @@ BitmapPtr Cached(const std::wstring& key, F make) {
     return img;
 }
 
+// textdraw::Measure, remembered: a caption is laid out for every frame it shows on (and asked for twice on some).
+textdraw::Extent Measured(const std::wstring& text, const textdraw::Style& st, float maxWidth) {
+    static std::mutex mu;
+    static std::unordered_map<std::wstring, textdraw::Extent> known;
+    const std::wstring key = std::format(L"{}|{}|{}|{}|{}|{}", st.family, st.weight, st.size, st.center, maxWidth, text);
+    {
+        std::lock_guard lock(mu);
+        if (auto it = known.find(key); it != known.end()) return it->second;
+    }
+    const textdraw::Extent e = textdraw::Measure(text, st, maxWidth);
+    std::lock_guard lock(mu);
+    if (known.size() >= 1000) known.clear();
+    known.emplace(key, e);
+    return e;
+}
+
 std::wstring Typed(const std::wstring& s, double reveal) {
     if (reveal >= 1) return s;
     size_t n = std::min(s.size(), (size_t)std::ceil(s.size() * reveal));
@@ -501,7 +655,28 @@ void ClearRenderCache() {
     g_cacheBytes = 0;
 }
 
-void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
+// A ping's ring at `phase` (0…1 of a beat): spreading and fading.
+static Motion RingMotion(double phase) {
+    Motion ring;
+    ring.alpha = (1 - phase) * 0.8;
+    ring.scale = 1 + phase * 0.5;
+    return ring;
+}
+
+// Where PlaceImage puts `img` before clipping it to the destination: `r` widened for a blur-in, scaled, moved.
+static std::optional<VRect> PlacedRect(const Bitmap& img, VRect r, const Motion& mo) {
+    if (r.w <= 0 || r.h <= 0 || mo.alpha <= 0.001) return std::nullopt;
+    if (mo.blur > 0.3) {
+        const double k = img.Width() / r.w;
+        const int pad = (int)std::ceil(mo.blur * 3 * k);
+        r = r.Inset(-pad / k, -pad / k);
+    }
+    const VRect c{r.MidX() - r.w * mo.scale / 2 + mo.dx, r.MidY() - r.h * mo.scale / 2 + mo.dy, r.w * mo.scale, r.h * mo.scale};
+    if (c.w < 0.5 || c.h < 0.5) return std::nullopt;
+    return c;
+}
+
+void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo, POINT at) {
     if (r.w <= 0 || r.h <= 0 || mo.alpha <= 0.001) return;
     const Bitmap* src = &img;
     BitmapPtr blurred;
@@ -525,14 +700,23 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
     VRect c{r.MidX() - r.w * mo.scale / 2 + mo.dx, r.MidY() - r.h * mo.scale / 2 + mo.dy, r.w * mo.scale, r.h * mo.scale};
     if (c.w < 0.5 || c.h < 0.5) return;
     const uint32_t a = (uint32_t)std::clamp(std::lround(mo.alpha * 255), 0L, 255L);
+    // `dst` covers [at.x, at.x + W) × [at.y, at.y + H) of the frame; everything is worked out in frame pixels.
     const int W = dst.Width(), H = dst.Height();
-    const int x0 = std::max(0, (int)std::floor(c.x)), y0 = std::max(0, (int)std::floor(c.y));
-    const int x1 = std::min(W, (int)std::ceil(c.MaxX())), y1 = std::min(H, (int)std::ceil(c.MaxY()));
+    const int x0 = std::max((int)at.x, (int)std::floor(c.x)), y0 = std::max((int)at.y, (int)std::floor(c.y));
+    const int x1 = std::min((int)at.x + W, (int)std::ceil(c.MaxX())), y1 = std::min((int)at.y + H, (int)std::ceil(c.MaxY()));
     const int sw = src->Width(), sh = src->Height();
     const bool exact = c.x == std::floor(c.x) && c.y == std::floor(c.y) && std::fabs(c.w - sw) < 1e-6 && std::fabs(c.h - sh) < 1e-6;
     for (int y = y0; y < y1; ++y) {
-        uint32_t* row = dst.Bits() + (size_t)y * W;
-        for (int x = x0; x < x1; ++x) {
+        uint32_t* const line = dst.Bits() + (size_t)(y - at.y) * W;
+        auto row = [&](int x) -> uint32_t& { return line[x - at.x]; };
+        int xs = x0;
+        if (exact && y - (int)c.y < sh) {  // four at a time while the source row lasts, then one by one
+            const int cx = (int)c.x;
+            const int end = (int)std::min({(double)x1, (double)cx + sw, cx + std::ceil(clipX)});
+            const uint32_t* s = src->Bits() + (size_t)(y - (int)c.y) * sw;
+            for (; xs + 4 <= end; xs += 4) OverFour(&row(xs), s + (xs - cx), a);
+        }
+        for (int x = xs; x < x1; ++x) {
             uint32_t p;
             if (exact) {
                 const int sx = x - (int)c.x, sy = y - (int)c.y;
@@ -544,7 +728,7 @@ void PlaceImage(Bitmap& dst, const Bitmap& img, VRect r, const Motion& mo) {
                 p = Sample(*src, sx, sy);
             }
             if (a < 255) p = Scale(p, a);
-            Over(row[x], p);
+            Over(row(x), p);
         }
     }
 }
@@ -557,47 +741,111 @@ FrameRenderer::FrameRenderer(const VideoEdit& edit, SIZE full, bool preview) : e
     if (edit.crop)
         if (auto i = Intersect(*edit.crop, f)) v = i->Integral();
     if (v.w < 16 || v.h < 16) v = f;
+    // An export shows whole 2 × 2 pixel blocks (H.264 wants even sizes), so the crop's color samples go out as decoded
+    // (moving its corner up to a pixel up and left).
+    if (!preview) v = {std::floor(v.x / 2) * 2, std::floor(v.y / 2) * 2, std::floor(v.w / 2) * 2, std::floor(v.h / 2) * 2};
     view_ = v;
-    out_ = preview ? full : SIZE{(LONG)(std::floor(v.w / 2) * 2), (LONG)(std::floor(v.h / 2) * 2)};  // H.264 wants even sizes
+    out_ = preview ? full : SIZE{(LONG)v.w, (LONG)v.h};
     unit_ = std::max(1.0, full.cy / 720.0);
 }
 
-BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const {
-    BitmapPtr img = Copy(src);
-    if (!img) return nullptr;
-    const VRect extent{0, 0, (double)img->Width(), (double)img->Height()};
-    // 1. Blur and pixelate, in the order they were added.
+BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw(src, nullptr, t, false); }
+
+BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t, bool owned) const { return src ? Draw(*src, &src, t, owned) : nullptr; }
+
+BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
+    if (!preview_) {  // an export frame under a title card that is fully shown and still: just the card (it's opaque)
+        const Mark* top = nullptr;
+        for (const auto& m : edit_.marks)
+            if (m.kind == MarkKind::Title && m.Active(t)) top = &m;
+        if (top) {
+            const Motion mo = MotionOf(*top, t);
+            if (mo.alpha >= 1 && mo.scale == 1 && mo.dx == 0 && mo.dy == 0 && mo.reveal >= 1 && !mo.wipe && mo.blur == 0 && !mo.ring)
+                if (const BitmapPtr card = TitleImage(*top, out_)) return Copy(*card);
+        }
+    }
+    // Steps 1–2 change the video itself, on a copy of it (or on it, when it's `owned`). An export frame without
+    // them reads the source as is.
+    bool onVideo = false;
+    for (const auto& m : edit_.marks) onVideo = onVideo || (m.kind != MarkKind::Title && m.kind != MarkKind::Zoom && m.Active(t));
+    const BitmapPtr img = preview_ || onVideo ? (owned && shared && !preview_ ? *shared : Copy(src)) : nullptr;
+    if ((preview_ || onVideo) && !img) return nullptr;
+    const VRect extent{0, 0, (double)src.Width(), (double)src.Height()};
+    if (img) {
+        DrawRegions(*img, {}, t);  // 1. Blur and pixelate, in the order they were added.
+        DrawMarks(*img, {}, t);    // 2. Markup that sits on the video (moves with zoom).
+    }
+    // 3. The visible area: the crop, or a zoom into it.
+    const VRect r = ViewRect(t);
+    const SIZE tsize = preview_ ? SIZE{(LONG)view_.w, (LONG)view_.h} : out_;
+    const Bitmap& video = img ? *img : src;
+    bool overlays = false;  // anything for step 4 to draw
+    for (const auto& c : edit_.captions) overlays = overlays || (c.Active(t) && (preview_ || !Trimmed(c.text).empty()));
+    for (const auto& m : edit_.marks) overlays = overlays || (m.kind == MarkKind::Title && m.Active(t));
+    BitmapPtr framed;
+    if (preview_ && r == view_) framed = nullptr;  // drawn in place
+    else if (!preview_ && r == extent && tsize.cx == src.Width() && tsize.cy == src.Height())  // the whole frame, unscaled
+        framed = img ? img : shared && (!overlays || owned) ? *shared : Copy(src);
+    else framed = SampleRect(video, r, tsize.cx, tsize.cy);
+    if (!framed && !(preview_ && r == view_)) return nullptr;
+    // 4. Captions and title cards stay put on screen.
+    Bitmap& target = framed ? *framed : *img;
+    DrawOverlays(target, framed ? 0 : view_.x, framed ? 0 : view_.y, {}, tsize, t);
+    if (!framed) return img;
+    if (!preview_) return framed;
+    for (int y = 0; y < tsize.cy; ++y)  // preview: the framed output sits in place inside the full frame
+        memcpy(img->Bits() + (size_t)(y + (int)view_.y) * img->Width() + (int)view_.x, framed->Bits() + (size_t)y * tsize.cx, (size_t)tsize.cx * 4);
+    return img;
+}
+
+std::optional<FrameRenderer::Effect> FrameRenderer::EffectOf(const Mark& m, double t) const {
+    auto ri = Intersect(m.Rect(), VRect{0, 0, (double)full_.cx, (double)full_.cy});
+    if (!ri) return std::nullopt;
+    const VRect q = ri->Integral();
+    Effect fx;
+    fx.rc = {(LONG)q.x, (LONG)q.y, (LONG)q.MaxX(), (LONG)q.MaxY()};
+    if (RectW(fx.rc) < 1 || RectH(fx.rc) < 1) return std::nullopt;
+    fx.mo = MotionOf(m, t);
+    const double k = fx.mo.blur > 0 ? std::max(0.15, 1 - fx.mo.blur / (12 * unit_)) : 1;  // blur in: the effect strengthens
+    const double side = std::min(ri->w, ri->h);
+    const int lv = std::clamp(m.level, 0, 4);
+    if (m.kind == MarkKind::Blur) {
+        static const double pct[] = {0.03, 0.05, 0.08, 0.12, 0.18};
+        fx.sigma = k * std::max(4.0, side * pct[lv]);
+    } else {
+        static const double pct[] = {0.04, 0.07, 0.1, 0.14, 0.2};
+        fx.block = (int)std::lround(std::max(6.0, k * side * pct[lv]));
+    }
+    return fx;
+}
+
+void FrameRenderer::DrawRegions(Bitmap& img, POINT at, double t) const {
     for (const auto& m : edit_.marks) {
         if ((m.kind != MarkKind::Blur && m.kind != MarkKind::Pixelate) || !m.Active(t)) continue;
-        auto ri = Intersect(m.Rect(), extent);
-        if (!ri) continue;
-        const VRect q = ri->Integral();
-        const RECT rc{(LONG)q.x, (LONG)q.y, (LONG)q.MaxX(), (LONG)q.MaxY()};
-        if (RectW(rc) < 1 || RectH(rc) < 1) continue;
-        const Motion mo = MotionOf(m, t);
-        const double k = mo.blur > 0 ? std::max(0.15, 1 - mo.blur / (12 * unit_)) : 1;  // blur in: the effect strengthens
-        const double side = std::min(ri->w, ri->h);
-        const int lv = std::clamp(m.level, 0, 4);
-        std::vector<uint32_t> fx;
+        const auto fx = EffectOf(m, t);
+        if (!fx) continue;
+        const RECT rc{fx->rc.left - at.x, fx->rc.top - at.y, fx->rc.right - at.x, fx->rc.bottom - at.y};
+        if (rc.right <= 0 || rc.bottom <= 0 || rc.left >= img.Width() || rc.top >= img.Height()) continue;  // on another part
+        std::vector<uint32_t> px;
         if (m.kind == MarkKind::Blur) {
-            static const double pct[] = {0.03, 0.05, 0.08, 0.12, 0.18};
-            fx = BlurArea(*img, rc, k * std::max(4.0, side * pct[lv]));
+            px = BlurArea(img, rc, fx->sigma);
         } else {
-            static const double pct[] = {0.04, 0.07, 0.1, 0.14, 0.2};
-            const int block = (int)std::lround(std::max(6.0, k * side * pct[lv]));
-            auto copy = img->Crop(rc);
+            auto copy = img.Crop(rc);
             if (!copy) continue;
-            copy->Pixelate({0, 0, copy->Width(), copy->Height()}, block);
-            fx.assign(copy->Bits(), copy->Bits() + (size_t)copy->Width() * copy->Height());
+            copy->Pixelate({0, 0, copy->Width(), copy->Height()}, fx->block);
+            px.assign(copy->Bits(), copy->Bits() + (size_t)copy->Width() * copy->Height());
         }
         const int w = RectW(rc);
+        const Motion& mo = fx->mo;
         for (int y = rc.top; y < rc.bottom; ++y) {
-            uint32_t* row = img->Bits() + (size_t)y * img->Width();
-            const uint32_t* f = fx.data() + (size_t)(y - rc.top) * w;
+            uint32_t* row = img.Bits() + (size_t)y * img.Width();
+            const uint32_t* f = px.data() + (size_t)(y - rc.top) * w;
             for (int x = rc.left; x < rc.right; ++x) row[x] = mo.alpha < 1 ? Mix(row[x], f[x - rc.left], std::max(0.0, mo.alpha)) : f[x - rc.left];
         }
     }
-    // 2. Markup that sits on the video (moves with zoom).
+}
+
+void FrameRenderer::DrawMarks(Bitmap& img, POINT at, double t) const {
     for (const auto& m : edit_.marks) {
         if (KindIsRegion(m.kind) || m.kind == MarkKind::Title || !m.Active(t)) continue;
         const Motion mo = MotionOf(m, t);
@@ -605,39 +853,91 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const {
         auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
         if (!pl) continue;
         if (mo.ring)
-            if (auto ring = RingImage(pl->rect)) {
-                Motion rm;
-                rm.alpha = (1 - *mo.ring) * 0.8;
-                rm.scale = 1 + *mo.ring * 0.5;
-                PlaceImage(*img, *ring->image, ring->rect, rm);
-            }
-        PlaceImage(*img, *pl->image, pl->rect, mo);
+            if (auto ring = RingImage(pl->rect)) PlaceImage(img, *ring->image, ring->rect, RingMotion(*mo.ring), at);
+        PlaceImage(img, *pl->image, pl->rect, mo, at);
     }
-    // 3. The visible area: the crop, or a zoom into it.
-    const VRect r = ViewRect(t);
-    const SIZE tsize = preview_ ? SIZE{(LONG)view_.w, (LONG)view_.h} : out_;
-    BitmapPtr framed;
-    if (preview_ && r == view_) framed = nullptr;  // drawn in place
-    else framed = SampleRect(*img, r, tsize.cx, tsize.cy);
-    // 4. Captions and title cards stay put on screen.
-    Bitmap& target = framed ? *framed : *img;
-    const double ox = framed ? 0 : view_.x, oy = framed ? 0 : view_.y;
+}
+
+void FrameRenderer::DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const {
     for (const auto& c : edit_.captions) {
         if (!c.Active(t) || (!preview_ && Trimmed(c.text).empty())) continue;
         const Motion mo = CaptionMotion(c, t);
         if (mo.alpha <= 0.001) continue;
-        if (auto pl = CaptionImage(c, tsize, t, mo.reveal)) PlaceImage(target, *pl->image, pl->rect.Offset(ox, oy), mo);
+        if (auto pl = CaptionImage(c, tsize, t, mo.reveal)) PlaceImage(target, *pl->image, pl->rect.Offset(ox, oy), mo, at);
     }
     for (const auto& m : edit_.marks) {
         if (m.kind != MarkKind::Title || !m.Active(t)) continue;
         const Motion mo = MotionOf(m, t);
-        if (auto card = TitleImage(m, tsize)) PlaceImage(target, *card, {ox, oy, (double)tsize.cx, (double)tsize.cy}, mo);
+        if (auto card = TitleImage(m, tsize)) PlaceImage(target, *card, {ox, oy, (double)tsize.cx, (double)tsize.cy}, mo, at);
     }
-    if (!framed) return img;
-    if (!preview_) return framed;
-    for (int y = 0; y < tsize.cy; ++y)  // preview: the framed output sits in place inside the full frame
-        memcpy(img->Bits() + (size_t)(y + (int)view_.y) * img->Width() + (int)view_.x, framed->Bits() + (size_t)y * tsize.cx, (size_t)tsize.cx * 4);
-    return img;
+}
+
+bool FrameRenderer::Untouched(double t) const {
+    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy) return false;
+    for (const auto& m : edit_.marks)
+        if (m.Active(t) && m.kind != MarkKind::Zoom) return false;
+    for (const auto& c : edit_.captions)
+        if (c.Active(t) && !Trimmed(c.text).empty()) return false;
+    return ViewRect(t) == VRect{0, 0, (double)full_.cx, (double)full_.cy};
+}
+
+std::optional<std::vector<RECT>> FrameRenderer::EditAreas(double t) const {
+    const int vx = (int)view_.x, vy = (int)view_.y;
+    if (preview_ || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_)) return std::nullopt;
+    std::vector<RECT> areas;
+    auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels: whole 2 × 2 blocks, in the frame
+        const RECT r{(LONG)std::max(0.0, std::floor(x0)) & ~1L, (LONG)std::max(0.0, std::floor(y0)) & ~1L,
+                     std::min((LONG)full_.cx, ((LONG)std::ceil(x1) + 1) & ~1L), std::min((LONG)full_.cy, ((LONG)std::ceil(y1) + 1) & ~1L)};
+        if (r.left < r.right && r.top < r.bottom) areas.push_back(r);
+    };
+    auto addPlaced = [&](const Bitmap& img, VRect r, const Motion& mo, double dx, double dy) {
+        if (auto c = PlacedRect(img, r, mo)) add(c->x + dx, c->y + dy, c->MaxX() + dx, c->MaxY() + dy);
+    };
+    for (const auto& m : edit_.marks) {
+        if (!m.Active(t) || m.kind == MarkKind::Zoom) continue;
+        if (m.kind == MarkKind::Title) return std::nullopt;  // the whole frame
+        if (KindIsRegion(m.kind)) {
+            const auto fx = EffectOf(m, t);
+            if (!fx) continue;
+            const double reach = m.kind == MarkKind::Blur ? 3.0 * std::max(1, (int)std::lround(fx->sigma)) : 0;  // what BlurArea reads
+            add(fx->rc.left - reach, fx->rc.top - reach, fx->rc.right + reach, fx->rc.bottom + reach);
+            continue;
+        }
+        const Motion mo = MotionOf(m, t);
+        if (mo.alpha <= 0.001) continue;
+        const auto pl = MarkImage(m, mo.wipe ? 1 : mo.reveal);
+        if (!pl) continue;
+        if (mo.ring)
+            if (auto ring = RingImage(pl->rect)) addPlaced(*ring->image, ring->rect, RingMotion(*mo.ring), 0, 0);
+        addPlaced(*pl->image, pl->rect, mo, 0, 0);
+    }
+    for (const auto& c : edit_.captions) {  // in output pixels: the crop starts at (vx, vy)
+        if (!c.Active(t) || Trimmed(c.text).empty()) continue;
+        const Motion mo = CaptionMotion(c, t);
+        if (mo.alpha <= 0.001) continue;
+        if (const auto pl = CaptionImage(c, out_, t, mo.reveal)) addPlaced(*pl->image, pl->rect, mo, vx, vy);
+    }
+    // Ones that touch are drawn as one (in order; and a blur reads around it), until none touch.
+    for (bool merged = true; merged;) {
+        merged = false;
+        for (size_t i = 0; i < areas.size() && !merged; ++i)
+            for (size_t j = i + 1; j < areas.size() && !merged; ++j) {
+                RECT& a = areas[i];
+                const RECT& b = areas[j];
+                if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+                    a = {std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right), std::max(a.bottom, b.bottom)};
+                    areas.erase(areas.begin() + (ptrdiff_t)j);
+                    merged = true;
+                }
+            }
+    }
+    return areas;
+}
+
+void FrameRenderer::DrawEdits(Bitmap& area, POINT at, double t) const {
+    DrawRegions(area, at, t);
+    DrawMarks(area, at, t);
+    DrawOverlays(area, 0, 0, {at.x - (LONG)view_.x, at.y - (LONG)view_.y}, out_, t);
 }
 
 VRect FrameRenderer::ViewRect(double t) const {
@@ -885,9 +1185,7 @@ std::optional<Placed> FrameRenderer::CaptionImage(const Caption& c, SIZE size, s
         st.edgeWidth = (float)std::max(1.0, fontSize * 0.03);
     }
     if (hot && hot->first + hot->second <= shown.size()) st.ranges.push_back({hot->first, hot->second, highlight});
-    textdraw::Style measure = st;
-    measure.ranges.clear();
-    const auto tb = textdraw::Measure(whole, measure, (float)maxW);
+    const auto tb = Measured(whole, st, (float)maxW);
     const double tbw = std::ceil(tb.w), tbh = std::ceil(tb.h);
     const double pad = fontSize * 0.45;
     double w = tbw + pad * 2, h = tbh + pad * 1.2;

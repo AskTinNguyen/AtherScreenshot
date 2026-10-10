@@ -20,6 +20,7 @@ using std::min;
 #include "capture.h"
 #include "editor.h"
 #include "videoeditor.h"
+#include "videoio.h"
 #include "gallery.h"
 #include "installer.h"
 #include "library.h"
@@ -1340,7 +1341,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool videoSnaps = n >= 3 && _wcsicmp(av[1], L"--video-snapshots") == 0;
         const bool editVideo = n >= 3 && _wcsicmp(av[1], L"--edit-video") == 0;
         const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps || videoSnaps || editVideo) && n >= 3 ? av[2] : L"";
+        std::vector<std::wstring> bench;
+        if (n >= 3 && (_wcsicmp(av[1], L"--bench-export") == 0 || _wcsicmp(av[1], L"--bench-compare") == 0)) bench.assign(av + 1, av + n);
         LocalFree(av);
+        if (!bench.empty()) return VideoBench(bench);  // developer tool, see videobench.cpp
         if (writeIcon) return ok ? 0 : 1;
         if (featureStats) return FeatureStats(filter);  // developer tool, see library_tests.cpp
         if (gallerySnaps) return GallerySnapshots(filter);  // developer tool, see gallery.cpp

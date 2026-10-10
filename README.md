@@ -176,6 +176,7 @@ Opening a video (from the gallery, the "Recording saved" notification, Open rece
 - **Saving:**
   - **Save** (`Ctrl+S`) writes a new MP4 (H.264 + AAC).
   - **Save GIF** (`Ctrl+Shift+S`) writes a GIF (12 fps, at most 960 px).
+  - Saving is quick: the video is decoded on the graphics card, frames are drawn on all cores (only the parts your edits change), and longer videos are encoded in two or three pieces at once and joined.
   - The original stays untouched, and the result stacks with it in the gallery.
 
 Space plays, ←/→ step a frame (`Shift`: a second), `Del` deletes the selected item, `Ctrl+Z` undoes, `Esc` leaves crop, then deselects, then closes.
