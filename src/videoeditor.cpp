@@ -39,6 +39,7 @@ using std::min;
 #include "media.h"
 #include "output.h"
 #include "selftest.h"
+#include "textdraw.h"
 #include "toast.h"
 #include "videoedit.h"
 #include "videoio.h"
@@ -2289,7 +2290,14 @@ public:
                 HRGN cr = CreateRectRgnIndirect(&cell);
                 ExtSelectClipRgn(dc, cr, RGN_AND);
                 MemDC src(img->Handle());
-                StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
+                const int tw = (int)std::ceil(img->Width() * RectH(cell) / (double)img->Height());  // its own width at the strip's height
+                if (RectW(cell) > tw * 3 / 2) {  // zoomed in: side by side at their own shape, not stretched
+                    const int skip = cell.left < strip.left - tw ? (strip.left - tw - cell.left) / tw * tw : 0;  // off view on the left
+                    for (int x = cell.left + skip; x < std::min((int)cell.right, (int)strip.right); x += tw)
+                        StretchBlt(dc, x, cell.top, tw, RectH(cell), src, 0, 0, img->Width(), img->Height(), SRCCOPY);
+                } else {
+                    StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
+                }
                 SelectClipRgn(dc, clip);
                 DeleteObject(cr);
             }
@@ -2402,7 +2410,8 @@ public:
             if (labeled) {
                 const std::wstring num = std::to_wstring(n);
                 const int w = Measure(dc, fSmall, num).cx;
-                Text(dc, fSmall, num, {(LONG)x + S(3), band.top, (LONG)x + S(3) + w + S(2), band.bottom - S(4)}, RGB(255, 255, 255));
+                if (x + S(3) + w <= strip.right)  // whole, or not at all
+                    Text(dc, fSmall, num, {(LONG)x + S(3), band.top, (LONG)x + S(3) + w + S(2), band.bottom - S(4)}, RGB(255, 255, 255));
             }
         }
     }
@@ -3588,6 +3597,47 @@ VideoEditor* OpenHidden(const std::wstring& clip, int w, int h) {
 
 // A clip whose every frame has a color of its own: frame i is (16 × (i % 16), 16 × (i / 16), `blue`), which survives
 // compression well enough for NumberOf to read it back.
+// For the snapshots: a recording-like clip whose every frame shows its number in big type (and its timecode), over a
+// fine grid, with a bar that moves 8 px a frame, and a tone. Frame i at i / fps.
+bool WriteFrameNumberClip(const std::wstring& path, int w, int h, int fps, int frames) {
+    Mp4Writer mw;
+    if (FAILED(mw.Begin(path, w, h, fps, 48000, 2))) return false;
+    auto f = Bitmap::Create(w, h);
+    if (!f) return false;
+    textdraw::Style big, sub;
+    big.family = L"Segoe UI";
+    big.size = h * 0.3f;
+    big.weight = 800;
+    sub.family = L"Consolas";
+    sub.size = h * 0.05f;
+    sub.weight = 700;
+    sub.color = RGB(255, 214, 10);
+    int64_t audio = 0;
+    std::vector<int16_t> pcm;
+    for (int i = 0; i < frames; ++i) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const bool grid = x % 40 == 0 || y % 40 == 0;
+                const uint32_t bg = 0xFF000000u | (uint32_t)(20 + 40 * x / w) << 16 | (uint32_t)(30 + 30 * y / h) << 8 | (uint32_t)(70 + 60 * x / w);
+                f->Bits()[(size_t)y * w + x] = grid ? 0xFF5A6A8Au : bg;
+            }
+        const int bx = (i * 8) % w;
+        for (int y = 0; y < h; ++y)
+            for (int x = bx; x < std::min(w, bx + 24); ++x) f->Bits()[(size_t)y * w + x] = 0xFFE5484Du;
+        textdraw::Draw(*f, std::to_wstring(i), big, 0, h * 0.28f, (float)w);
+        textdraw::Draw(*f, L"frame " + std::to_wstring(i) + L" · " + Timecode((double)i / fps, fps), sub, 0, h * 0.68f, (float)w);
+        if (FAILED(mw.WriteFrame(f->Bits(), std::llround(i * 1e7 / fps), std::llround(1e7 / fps)))) return false;
+        const int64_t until = std::llround((i + 1) * 48000.0 / fps);
+        pcm.clear();
+        for (; audio < until; ++audio) {
+            const int16_t v = (int16_t)std::lround(std::sin(2 * 3.14159265358979 * 330 * audio / 48000) * 6000);
+            pcm.push_back(v), pcm.push_back(v);
+        }
+        mw.WriteAudio(pcm.data(), (uint32_t)(pcm.size() / 2), std::llround((audio - (int64_t)pcm.size() / 2) * 1e7 / 48000));
+    }
+    return SUCCEEDED(mw.Finalize());
+}
+
 bool WriteNumberedClip(const std::wstring& path, int w, int h, int fps, int frames, int blue) {
     Mp4Writer mw;
     if (FAILED(mw.Begin(path, w, h, fps))) return false;
@@ -3731,7 +3781,8 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
     DestroyWindow(e->hwnd);
     // A 60 fps recording on frame 757, as the readout's example.
     const std::wstring sixty = outDir + L"\\snapshot-60fps.mp4";
-    if (WriteTestClip(sixty, 1280, 720, 60, 13, false) && (e = OpenHidden(sixty, 1180, 760))) {
+    if (WriteFrameNumberClip(sixty, 1280, 720, 60, 780) && (e = OpenHidden(sixty, 1180, 760))) {
+
         for (int i = 0; i < 300 && (!e->FramesKnown() || e->thumbs.empty()); ++i) Pump(10);
         e->GoToFrame(757);
         Pump(800);
@@ -3784,6 +3835,14 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->RevealNote(*e->selected);
         Pump(300);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-timeline-zoom.png");
+        {  // the magnifier at 4× over the frame number's edge, the grid and the pin
+            const gp::PointF at = e->ToView(VPoint{760, 300});
+            e->Magnify(4, {(LONG)at.X, (LONG)at.Y});
+            Pump(100);
+            SavePng(*Snapshot(e), outDir + L"\\video-editor-magnifier-60fps.png");
+            e->FitMagnifier();
+        }
+
         // The review video: its summary card, a note card frame (the pinned Issue at frame 757) and the contact sheet.
         {
             const ReviewPlan plan = e->MakeReviewPlan();
