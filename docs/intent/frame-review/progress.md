@@ -2,8 +2,8 @@
 
 - Working under rev: 2
 - Worker: `frame-review-worker`
-- Current step: S12 (A8), README's Video editor guide and shortcuts, and RELEASE_NOTES.
-- Next step: the final full gate, then the orchestrator's review of A13 and A8.
+- Current step: none: every row is met except A13 and A8, whose proof is `review` (the orchestrator's verdict).
+- Next step: the orchestrator reviews A13's images and A8's docs (and F-1); the owner merges. Afterwards, the Mac handoff (a Non-Goal here).
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/2
 
 ## Acceptance
@@ -22,7 +22,7 @@
 | A11 | met | S5 (kinds, Resolved, Open filter, colored ticks and list), S6 (sidecar), S9 (card, `.md`, sheet, summary); gate `96 tests, 1448 checks, 0 failed`; snapshot `docs/intent/frame-review/proof/a4-a11-notes.png` (all four kinds and a resolved note), plus the S9 images |
 | A12 | met | S9: gate `96 tests, 1448 checks, 0 failed` with the review export test (180 summary-card frames equal `SummaryCard`, length 10.5 s, sheet tiles in order matching the decoded review video within 6/255); snapshots `docs/intent/frame-review/proof/a12-summary-card.png`, `a12-contact-sheet.png` (opened, checked) |
 | A13 | ready for review | S11: seven images in `docs/intent/frame-review/proof/a13/` (list in S11), each opened and checked; waits for the orchestrator's verdict in `log.md` |
-| A8 | open | |
+| A8 | ready for review | S12: README (Features row, Video editor guide: frame by frame, review notes, review video; the editor's shortcut line; Platform differences) and RELEASE_NOTES ("Coming in the next update (Windows)"); final gate `96 tests, 1448 checks, 0 failed` |
 
 ## Steps
 
@@ -53,6 +53,7 @@ Engineering decisions (S2):
   - `proof/a13/a13-6-review-note-card-from-mp4.png`: the held frame 757 under its card, burn-in `0:12:37 · frame 757`, the pin.
   - `proof/a13/a13-7-contact-sheet.png`: six tiles in timeline order, each showing its own frame number (95, 260, 410, 540, 742, 757), kinds in color, the resolved one dimmed.
   Fixed on the way (found in these images): zoomed-in thumbnails were stretched to the whole cell (now tiled at their own shape); the last ruler number was cut at the right edge (now drawn whole or not at all); the first capture attempts were scaled by Windows (the script now sets per-thread DPI awareness and leaves the window on its monitor). Evidence: the script re-run into a fresh folder produced the same four window images (same sizes); `video_editor` tests → pass (see the S12 gate). Acceptance: A13 ready for the orchestrator's review.
+- S12 (rev 2, 2026-10-10): docs (A8). README: a "Review video" row in Features; in the Video editor guide, "Frame by frame" (exact steps, Shift, Home/End, the readout, Ctrl+G, J/K/L and preview speeds, timeline zoom, the magnifier), "Review notes" (M, kinds, Resolved, pin, range, flags and list, [ and ], the author name, the sidecar, Copy) and "Review video" (Save ▾ › Save review video, Ctrl+Alt+S, what's in it, the notes list and contact sheet); the editor's shortcut line now lists Home/End, J/K/L, Ctrl+G, M, [ ], timeline zoom, the magnifier, the save shortcuts and Ctrl+Alt+S winning over scrolling capture in the editor; Platform differences says frame review is Windows only for now. RELEASE_NOTES: a "Coming in the next update (Windows)" section above build 0.0.2.2 (no build number: that's the owner's call at release). Evidence: final full `test.bat` → `96 tests, 1448 checks, 0 failed`, exit 0, at this commit's code (the S11 code; S12 changed docs only). Acceptance: A8 ready for review.
 
 ## Reconciliations
 
