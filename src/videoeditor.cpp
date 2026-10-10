@@ -452,6 +452,8 @@ public:
 
     void TogglePlay() { playing ? Pause() : Play(); }
 
+    bool FramesKnown() const { return true; }
+
     void Step(double frames) {
         Pause();
         Seek(Now() + frames / 30);
@@ -1968,12 +1970,17 @@ public:
         Invalidate();
     }
 
-    bool OnKey(WPARAM vk) {
+    struct Mods {
+        bool ctrl = false, shift = false, alt = false;
+    };
+    bool OnKey(WPARAM vk) { return Key(vk, {GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0, GetKeyState(VK_MENU) < 0}); }
+
+    bool Key(WPARAM vk, Mods mods) {
         if (drag.kind != DragKind::None) {
             if (vk == VK_ESCAPE) CancelDrag();
             return true;
         }
-        const bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, shift = GetKeyState(VK_SHIFT) < 0;
+        const bool ctrl = mods.ctrl && !mods.alt, shift = mods.shift;
         if (ctrl) {
             switch (vk) {
                 case 'S': Save(shift); return true;
@@ -2442,6 +2449,33 @@ VideoEditor* OpenHidden(const std::wstring& clip, int w, int h) {
     return e;
 }
 
+// A clip whose every frame has a color of its own: frame i is (16 × (i % 16), 16 × (i / 16), `blue`), which survives
+// compression well enough for NumberOf to read it back.
+bool WriteNumberedClip(const std::wstring& path, int w, int h, int fps, int frames, int blue) {
+    Mp4Writer mw;
+    if (FAILED(mw.Begin(path, w, h, fps))) return false;
+    std::vector<uint32_t> px((size_t)w * h);
+    for (int i = 0; i < frames; ++i) {
+        std::fill(px.begin(), px.end(), 0xFF000000u | (uint32_t)(16 * (i % 16)) << 16 | (uint32_t)(16 * (i / 16)) << 8 | (uint32_t)blue);
+        if (FAILED(mw.WriteFrame(px.data(), std::llround(i * 1e7 / fps), std::llround(1e7 / fps)))) return false;
+    }
+    return SUCCEEDED(mw.Finalize());
+}
+int NumberOf(uint32_t c) { return (int)std::lround(((c >> 8) & 255) / 16.0) * 16 + (int)std::lround(((c >> 16) & 255) / 16.0); }
+bool BlueOf(uint32_t c) { return (c & 255) > 128; }
+
+// The frame the paused editor shows once the frame at the playhead has been decoded: its number and whether it has
+// blue (which clip), from the middle pixel. {-1, false} when it doesn't arrive.
+std::pair<int, bool> ShownFrame(VideoEditor* e) {
+    for (int i = 0; i < 150; ++i) {
+        if (e->raw && std::fabs(e->rawT - e->paused) < 1e-3) break;
+        Pump(5);
+    }
+    if (!e->raw || std::fabs(e->rawT - e->paused) >= 1e-3) return {-1, false};
+    const uint32_t c = e->raw->Bits()[(size_t)(e->raw->Height() / 2) * e->raw->Width() + e->raw->Width() / 2];
+    return {NumberOf(c), BlueOf(c)};
+}
+
 BitmapPtr Snapshot(VideoEditor* e) {
     RECT rc;
     GetClientRect(e->hwnd, &rc);
@@ -2684,6 +2718,87 @@ ATHER_TEST(video_editor_trim_keys_and_add_defaults) {
     CHECK(e->edit.captions.empty());
     e->Undo();
     CHECK_EQ(e->edit.captions.size(), 1u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// ←/→ step exactly one frame at the clip's own rate and show that very frame: through a 60 fps clip every frame once,
+// in order, forward and back; then across a joined 30 fps clip. Shift steps a second; Home and End go to the trim's ends.
+ATHER_TEST(video_editor_steps_every_frame_at_60fps) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b30.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));    // 2 s at 60 fps
+    CHECK(WriteNumberedClip(b, 320, 180, 30, 60, 255));   // 2 s at 30 fps, with blue
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->FramesKnown());
+    // Walks `steps` presses of `vk` from where the playhead is, and says what each frame shown was ("a12", "b3").
+    auto walk = [&](WPARAM vk, int steps, bool shift = false) {
+        std::vector<std::string> seen;
+        for (int i = 0; i < steps; ++i) {
+            e->Key(vk, {false, shift, false});
+            const auto [n, blue] = ShownFrame(e);
+            seen.push_back((blue ? "b" : "a") + std::to_string(n));
+            if (n < 0) break;  // the frame at the playhead never came: no use waiting for the rest
+        }
+        return seen;
+    };
+    auto expect = [](const char* clip, int from, int to) {  // from…to inclusive, either way
+        std::vector<std::string> v;
+        for (int i = from;; i += from <= to ? 1 : -1) {
+            v.push_back(clip + std::to_string(i));
+            if (i == to) break;
+        }
+        return v;
+    };
+    auto join = [](std::vector<std::string> x, const std::vector<std::string>& y) {
+        x.insert(x.end(), y.begin(), y.end());
+        return x;
+    };
+    auto show = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (size_t i = 0; i < v.size() && i < 24; ++i) s += v[i] + " ";
+        return s;
+    };
+    e->Key(VK_HOME, {});
+    const auto first = ShownFrame(e);
+    CHECK(first.first == 0 && !first.second);
+    auto fwd = walk(VK_RIGHT, 119);
+    test::Note("60 fps forward: " + show(fwd));
+    CHECK(fwd == expect("a", 1, 119));
+    auto back = walk(VK_LEFT, 119);
+    test::Note("60 fps back: " + show(back));
+    CHECK(back == expect("a", 118, 0));
+    // Shift: a second, which is 60 frames here.
+    auto sec = walk(VK_RIGHT, 1, true);
+    CHECK(sec == std::vector<std::string>{"a60"});
+    walk(VK_LEFT, 1, true);
+    // Joined with a 30 fps clip: 120 + 60 frames, each once, in order, both ways.
+    e->AddClips({b});
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    e->Key(VK_HOME, {});
+    CHECK(ShownFrame(e).first == 0);
+    fwd = walk(VK_RIGHT, 179);
+    test::Note("joined forward: " + show(std::vector<std::string>(fwd.begin() + std::min<size_t>(110, fwd.size()), fwd.end())));
+    CHECK(fwd == join(expect("a", 1, 119), expect("b", 0, 59)));
+    back = walk(VK_LEFT, 179);
+    test::Note("joined back: " + show(back));
+    CHECK(back == join(expect("b", 58, 0), expect("a", 119, 0)));
+    // A second in the 30 fps clip is 30 frames.
+    for (int i = 0; i < 120; ++i) e->Key(VK_RIGHT, {});
+    CHECK(walk(VK_RIGHT, 1, true) == std::vector<std::string>{"b30"});
+    // Home and End: the first and last frames of the trim (0.5 s into a, 0.5 s into b).
+    e->edit.trimStart = 0.5;
+    e->edit.trimEnd = 2.5;
+    e->Key(VK_HOME, {});
+    const auto home = ShownFrame(e);
+    CHECK(home.first == 30 && !home.second);
+    e->Key(VK_END, {});
+    const auto end = ShownFrame(e);
+    test::Note("end: " + std::to_string(end.first) + (end.second ? " b" : " a"));
+    CHECK(end.first == 14 && end.second);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
