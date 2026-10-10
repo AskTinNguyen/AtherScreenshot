@@ -2,8 +2,8 @@
 
 - Working under rev: 3
 - Worker: `frame-review-worker`
-- Current step: none: every row is met except A13, which waits for the orchestrator's re-review of the redone image 3.
-- Next step: the orchestrator re-reviews `proof/a13/a13-3-timeline-zoomed.png`; the owner merges. Afterwards, the Mac handoff (a Non-Goal here).
+- Current step: none
+- Next step: owner merges #1 then #2
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/2
 
 ## Acceptance
@@ -21,7 +21,7 @@
 | A10 | met | S8; S9 gate `96 tests, 1448 checks, 0 failed` with `video_editor_pixel_magnifier`; snapshot `docs/intent/frame-review/proof/a10-magnifier-4x.png` (opened, checked) |
 | A11 | met | S5 (kinds, Resolved, Open filter, colored ticks and list), S6 (sidecar), S9 (card, `.md`, sheet, summary); gate `96 tests, 1448 checks, 0 failed`; snapshot `docs/intent/frame-review/proof/a4-a11-notes.png` (all four kinds and a resolved note), plus the S9 images |
 | A12 | met | S9: gate `96 tests, 1448 checks, 0 failed` with the review export test (180 summary-card frames equal `SummaryCard`, length 10.5 s, sheet tiles in order matching the decoded review video within 6/255); snapshots `docs/intent/frame-review/proof/a12-summary-card.png`, `a12-contact-sheet.png` (opened, checked) |
-| A13 | ready for re-review | R-1 (log.md): images 1, 2, 4, 5, 6, 7 pass; image 3 failed (stale filmstrip). S13: `proof/a13/a13-3-timeline-zoomed.png` redone (thumbnails 663, 672, 680 … 755, each the first frame at its tile's left edge, agreeing with the ticks under them; opened, checked), and image 4, which also shows the zoomed strip, redone the same way. Waits for the orchestrator's re-review of image 3 |
+| A13 | met | review R-2 in log.md: all seven images in `docs/intent/frame-review/proof/a13/` pass (R-1 passed 1, 2, 4–7; R-2 passed the redone image 3, `proof/a13/a13-3-timeline-zoomed.png`); orchestrator re-ran `test.bat`: `97 tests, 1463 checks, 0 failed` |
 | A8 | met | review R-1 in log.md (passes). S12: README (Features row, Video editor guide: frame by frame, review notes, review video; the editor's shortcut line; Platform differences) and RELEASE_NOTES ("Coming in the next update (Windows)"); final gate `96 tests, 1448 checks, 0 failed` |
 
 ## Steps
