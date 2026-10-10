@@ -1557,21 +1557,58 @@ public:
         const double w = videoSize.cx * k, h = videoSize.cy * k;
         return gp::RectF((float)(st.left + (RectW(st) - w) / 2), (float)(st.top + (RectH(st) - h) / 2), (float)w, (float)h);
     }
-    double ViewScale() const { return VideoRect().Width / std::max(1L, videoSize.cx); }
+    // Screen pixels per video pixel, with the magnifier's zoom. The video's top-left on view is (magX, magY).
+    double ViewScale() const { return VideoRect().Width / std::max(1L, videoSize.cx) * magZoom; }
     VPoint ToVideo(POINT p) const {
         const auto v = VideoRect();
         const double k = ViewScale();
-        return {(p.x - v.X) / k, (p.y - v.Y) / k};
+        return {magX + (p.x - v.X) / k, magY + (p.y - v.Y) / k};
     }
     gp::PointF ToView(VPoint p) const {
         const auto v = VideoRect();
         const double k = ViewScale();
-        return gp::PointF((float)(v.X + p.x * k), (float)(v.Y + p.y * k));
+        return gp::PointF((float)(v.X + (p.x - magX) * k), (float)(v.Y + (p.y - magY) * k));
     }
     gp::RectF ToView(VRect r) const {
         const auto v = VideoRect();
         const double k = ViewScale();
-        return gp::RectF((float)(v.X + r.x * k), (float)(v.Y + r.y * k), (float)(r.w * k), (float)(r.h * k));
+        return gp::RectF((float)(v.X + (r.x - magX) * k), (float)(v.Y + (r.y - magY) * k), (float)(r.w * k), (float)(r.h * k));
+    }
+
+    // ---- pixel magnifier ----
+    // The wheel over the video zooms 1× to 8× around the cursor, a right-drag pans, F or a double-click fits it again.
+    // From 2× the pixels are drawn sharp. For looking only: the crop and the export never change.
+    double magZoom = 1;
+    double magX = 0, magY = 0;  // the video pixel at the view's top-left
+    std::optional<POINT> magDrag;  // right-drag: where it was last
+    void ClampMagnifier() {
+        magZoom = std::clamp(magZoom, 1.0, 8.0);
+        magX = std::clamp(magX, 0.0, videoSize.cx - videoSize.cx / magZoom);
+        magY = std::clamp(magY, 0.0, videoSize.cy - videoSize.cy / magZoom);
+    }
+    // Zooms by `factor`, keeping the video pixel under screen point `at` there.
+    void Magnify(double factor, POINT at) {
+        const VPoint under = ToVideo(at);
+        magZoom = std::clamp(magZoom * factor, 1.0, 8.0);
+        if (magZoom < 1.0001) magZoom = 1;
+        const auto v = VideoRect();
+        const double k = ViewScale();
+        magX = under.x - (at.x - v.X) / k;
+        magY = under.y - (at.y - v.Y) / k;
+        ClampMagnifier();
+        Invalidate();
+    }
+    void FitMagnifier() {
+        magZoom = 1;
+        magX = magY = 0;
+        Invalidate();
+    }
+    void PanMagnifier(int dx, int dy) {
+        const double k = ViewScale();
+        magX -= dx / k;
+        magY -= dy / k;
+        ClampMagnifier();
+        Invalidate();
     }
 
     double TX(double t) const {  // timeline x for a time
@@ -1765,15 +1802,30 @@ public:
         const RECT st = StageRect();
         FillRR(g, st, (float)S(8), gp::Color(255, 0, 0, 0));
         const auto v = VideoRect();
-        if (shown) {
+        if (shown && magZoom <= 1) {
             MemDC src(shown->Handle());
             SetStretchBltMode(dc, HALFTONE);
             SetBrushOrgEx(dc, 0, 0, nullptr);
             StretchBlt(dc, (int)std::lround(v.X), (int)std::lround(v.Y), (int)std::lround(v.Width), (int)std::lround(v.Height), src, 0, 0, shown->Width(),
                        shown->Height(), SRCCOPY);
+        } else if (shown) {  // magnified: the whole pixels on view, each drawn as a block (sharp from 2×)
+            const int W = shown->Width(), H = shown->Height();
+            const int x0 = std::clamp((int)std::floor(magX), 0, W - 1), y0 = std::clamp((int)std::floor(magY), 0, H - 1);
+            const int x1 = std::clamp((int)std::ceil(magX + W / magZoom), x0 + 1, W), y1 = std::clamp((int)std::ceil(magY + H / magZoom), y0 + 1, H);
+            const gp::PointF a = ToView(VPoint{(double)x0, (double)y0}), b = ToView(VPoint{(double)x1, (double)y1});
+            HRGN clip = CreateRectRgn((int)std::lround(v.X), (int)std::lround(v.Y), (int)std::lround(v.X + v.Width), (int)std::lround(v.Y + v.Height));
+            SelectClipRgn(dc, clip);
+            MemDC src(shown->Handle());
+            SetStretchBltMode(dc, magZoom >= 2 ? COLORONCOLOR : HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            const int dx0 = (int)std::lround(a.X), dy0 = (int)std::lround(a.Y);
+            StretchBlt(dc, dx0, dy0, (int)std::lround(b.X) - dx0, (int)std::lround(b.Y) - dy0, src, x0, y0, x1 - x0, y1 - y0, SRCCOPY);
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
         }
         // Guides and handles are drawn above the video, so they show while it plays too.
         g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+        if (magZoom > 1) g.SetClip(v);
         const COLORREF accent = theme::kAccent;
         if (edit.crop) {
             const gp::RectF r = ToView(*edit.crop);
@@ -1851,7 +1903,18 @@ public:
                 g.DrawEllipse(&ring, c.X - rr, c.Y - rr, 2 * rr, 2 * rr);
             }
         }
+        g.ResetClip();
+        if (magZoom > 1) {  // how far the magnifier is in
+            wchar_t z[16];
+            swprintf_s(z, L"%g×", std::round(magZoom * 10) / 10);
+            const SIZE sz = Measure(dc, fSmall, z);
+            const RECT pill{(LONG)v.X + S(8), (LONG)v.Y + S(8), (LONG)v.X + S(8) + sz.cx + S(14), (LONG)v.Y + S(8) + sz.cy + S(8)};
+            FillRR(g, pill, (float)S(5), gp::Color(190, 0, 0, 0));
+            Text(dc, fSmall, z, pill, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Hotspot(pill, [this] { FitMagnifier(); }, L"Fit the video again (F or double-click)");
+        }
     }
+
 
     // The notes list, right of the video: kind, timecode, author and first line of each; All or Open only; Copy.
     void PaintNotes(HDC dc, gp::Graphics& g) {
@@ -2488,6 +2551,11 @@ public:
                 return;
             }
         ReleaseCapture();
+        if (magZoom > 1) {  // magnified: a click doesn't play; a double-click fits the video again
+            if (dbl) FitMagnifier();
+            else if (selected) Select(std::nullopt);
+            return;
+        }
         if (selected) Select(std::nullopt);
         else TogglePlay();
     }
@@ -2599,6 +2667,11 @@ public:
     }
 
     void OnMouseMove(POINT p, WPARAM keys) {
+        if (magDrag && (keys & MK_RBUTTON)) {
+            PanMagnifier(p.x - magDrag->x, p.y - magDrag->y);
+            magDrag = p;
+            return;
+        }
         if (drag.kind == DragKind::None || !(keys & MK_LBUTTON)) {
             RECT hover{};
             for (auto it = hots.rbegin(); it != hots.rend(); ++it)
@@ -2730,8 +2803,14 @@ public:
         }
     }
 
-    // The wheel: scrolls the notes list; over the timeline, Ctrl+wheel zooms it and the wheel pans it.
+    // The wheel: scrolls the notes list; over the video it magnifies; over the timeline, Ctrl+wheel zooms it and the
+    // wheel pans it.
     void OnWheel(POINT p, int delta, WPARAM keys) {
+        const RECT st = StageRect();
+        if (PtInRect(&st, p)) {
+            Magnify(std::pow(1.25, delta / (double)WHEEL_DELTA), p);
+            return;
+        }
         const RECT nl = NotesListRect();
         if (NotesShown() && PtInRect(&nl, p)) {
             notesScroll = std::max(0, notesScroll - delta * NoteRowH() / WHEEL_DELTA);
@@ -2837,6 +2916,7 @@ public:
             case 'Z': AddMark(MarkKind::Zoom); break;
             case 'C': cropping = !cropping; Invalidate(); break;
             case 'M': AddNote(); break;
+            case 'F': FitMagnifier(); break;
             case VK_OEM_4: JumpNote(-1); break;  // [
             case VK_OEM_6: JumpNote(1); break;   // ]
             case VK_DELETE:
@@ -3070,7 +3150,23 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             if ((HWND)l != hwnd) CancelDrag();  // Alt+Tab, a menu, another window took the mouse mid-drag
             return 0;
         case WM_MOUSELEAVE: hoverRect = {}; tipShown = false; Invalidate(); return 0;
+        case WM_RBUTTONDOWN: {
+            const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            const RECT st = StageRect();
+            if (PtInRect(&st, p) && magZoom > 1) {
+                magDrag = p;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
+        case WM_RBUTTONUP:
+            if (magDrag) {
+                magDrag.reset();
+                ReleaseCapture();
+            }
+            return 0;
         case WM_MOUSEWHEEL: {
+
             POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             ScreenToClient(hwnd, &p);
             OnWheel(p, GET_WHEEL_DELTA_WPARAM(w), GET_KEYSTATE_WPARAM(w));
@@ -3425,6 +3521,14 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
     e->Changed();
     Pump(800);
     SavePng(*Snapshot(e), outDir + L"\\video-editor.png");
+    {  // the magnifier at 4×, over the speech bubble's text
+        const gp::PointF at = e->ToView(VPoint{640, 165});
+
+        e->Magnify(4, {(LONG)at.X, (LONG)at.Y});
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-magnifier.png");
+        e->FitMagnifier();
+    }
     ed.captions[0].center = VPoint{0.5, 0.62};
     ed.captionLook = CaptionLook::Pill;
     ed.captionColor = 2;
@@ -4232,6 +4336,107 @@ ATHER_TEST(video_editor_timeline_zoom) {
     CHECK_NEAR(e->tlZoom, 1, 1e-9);
     // Zooming never touches the edit.
     CHECK(e->edit.speed == 1 && !e->edit.crop);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The pixel magnifier: the wheel over the video zooms 1×–8× keeping the pixel under the cursor there; from 2× a 1-pixel
+// checkerboard shows as hard-edged blocks (only black and white); a right-drag pans; F fits again; the edit (crop and
+// all) never changes.
+ATHER_TEST(video_editor_pixel_magnifier) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 60, 0));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    Pump(300);
+    e->edit.crop = VRect{40, 20, 200, 120};  // the magnifier works on top of a crop and leaves it be
+    const VideoEdit before = e->edit;
+    // The frame shown: a 1-pixel checkerboard (exact pixels, as no video codec keeps them).
+    auto checker = Bitmap::Create(320, 180);
+    for (int y = 0; y < 180; ++y)
+        for (int x = 0; x < 320; ++x) checker->Bits()[(size_t)y * 320 + x] = (x + y) % 2 ? 0xFFFFFFFFu : 0xFF000000u;
+    auto showChecker = [&] {
+        e->raw = checker;
+        e->shown = checker;
+    };
+    const auto v = e->VideoRect();
+    const POINT at{(LONG)(v.X + v.Width * 0.3), (LONG)(v.Y + v.Height * 0.6)};
+    const VPoint under = e->ToVideo(at);
+    for (int i = 0; i < 6; ++i) {
+        e->OnWheel(at, WHEEL_DELTA, 0);
+        const VPoint now = e->ToVideo(at);
+        CHECK(std::fabs(now.x - under.x) < 0.01 && std::fabs(now.y - under.y) < 0.01);  // stays under the cursor
+    }
+    test::Note("zoom after 6 notches: " + std::to_string(e->magZoom));
+    CHECK_NEAR(e->magZoom, std::pow(1.25, 6), 1e-9);
+    for (int i = 0; i < 20; ++i) e->OnWheel(at, WHEEL_DELTA, 0);
+    CHECK_NEAR(e->magZoom, 8, 1e-9);
+    // At 4×: sharp blocks only.
+    e->FitMagnifier();
+    e->Magnify(4, at);
+    CHECK_NEAR(e->magZoom, 4, 1e-9);
+    showChecker();
+    auto snap = Snapshot(e);
+    auto stageColors = [&](const Bitmap& b, int* grays) {
+        int bw = 0;
+        *grays = 0;
+        for (int y = (int)v.Y + 40; y < (int)(v.Y + v.Height) - 40; y += 3)  // inside the video, away from the label and the edges
+            for (int x = (int)v.X + 60; x < (int)(v.X + v.Width) - 10; x += 3) {
+                const uint32_t c = b.Bits()[(size_t)y * b.Width() + x] & 0xFFFFFF;
+                if (c == 0 || c == 0xFFFFFF) ++bw;
+                else ++*grays;
+            }
+        return bw;
+    };
+    int grays = 0;
+    const int bw = stageColors(*snap, &grays);
+    test::Note("4x: " + std::to_string(bw) + " black or white, " + std::to_string(grays) + " other");
+    CHECK(bw > 1000);
+    CHECK_EQ(grays, 0);
+    // Each video pixel is a block about 4 × the fitted scale wide: count a row's runs.
+    {
+        const int y = (int)(v.Y + v.Height / 2);
+        int runs = 0, longest = 0, run = 0;
+        uint32_t last = 1;
+        for (int x = (int)v.X + 60; x < (int)(v.X + v.Width) - 10; ++x) {
+            const uint32_t c = snap->Bits()[(size_t)y * snap->Width() + x] & 0xFFFFFF;
+            if (c == last) ++run;
+            else {
+                ++runs;
+                run = 1;
+                last = c;
+            }
+            longest = std::max(longest, run);
+        }
+        const double k = e->ViewScale();
+        test::Note("block " + std::to_string(longest) + " px, scale " + std::to_string(k));
+        CHECK(longest >= (int)std::floor(k) && longest <= (int)std::ceil(k));
+    }
+    // Fitted (1×), the same frame is drawn smoothed: other shades appear, as they should.
+    e->FitMagnifier();
+    showChecker();
+    snap = Snapshot(e);
+    stageColors(*snap, &grays);
+    CHECK(grays > 0);
+    // A right-drag pans by the video pixels dragged; F fits again.
+    e->Magnify(4, at);
+    const VPoint p0 = e->ToVideo(at);
+    e->Proc(WM_RBUTTONDOWN, MK_RBUTTON, MAKELPARAM(at.x, at.y));
+    e->OnMouseMove({at.x - 40, at.y - 20}, MK_RBUTTON);
+    e->Proc(WM_RBUTTONUP, 0, MAKELPARAM(at.x - 40, at.y - 20));
+    const VPoint p1 = e->ToVideo(at);
+    CHECK_NEAR(p1.x - p0.x, 40 / e->ViewScale(), 0.01);
+    CHECK_NEAR(p1.y - p0.y, 20 / e->ViewScale(), 0.01);
+    e->Key('F', {});
+    CHECK(e->magZoom == 1 && e->magX == 0 && e->magY == 0);
+    // Wheel out never goes below 1×.
+    e->OnWheel(at, -WHEEL_DELTA * 3, 0);
+    CHECK(e->magZoom == 1);
+    CHECK(e->edit == before);
+    CHECK(e->undoStack.empty());
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
