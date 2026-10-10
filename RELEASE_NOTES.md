@@ -10,7 +10,7 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## Coming in the next update (Windows)
+## What's new in this update (Windows, build 0.0.2.3)
 
 ### Review recordings frame by frame, with notes
 - **Every frame:** ←/→ now step exactly one frame of the video, also in 60 fps recordings (before, a step skipped every other frame). The readout under the video shows `0:12:37 · frame 757 · 60 fps`; Ctrl+G goes to a frame or a time; J/K/L play backward and forward at 0.25×, 0.5× or 1× without skipping frames; zoom the timeline down to single frames and the video up to 8× to see every pixel.
@@ -18,7 +18,7 @@
 - **Review video:** Save ▾ › Save review video (Ctrl+Alt+S) makes an MP4 for the other team: a summary card, the timecode and frame number in the corner, and each note's frame held for 3 seconds under its note. A notes list and a contact sheet picture are saved next to it.
 - **Saving is unchanged:** Save and Save GIF make exactly the same videos as before.
 
-## What's new in this update (Windows, build 0.0.2.2)
+## Earlier update (Windows, build 0.0.2.2)
 
 ### Saving videos is much faster
 - **How much:** saving from the video editor is about 36 times faster than before. A 20-second 1440p recording saves in about a second instead of half a minute; with captions, callouts, blur and zoom, in about 1.5 s instead of more than a minute. A 5-minute 1080p recording saves in about 7 s.
