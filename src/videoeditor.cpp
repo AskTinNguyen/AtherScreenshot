@@ -361,7 +361,8 @@ public:
     uint64_t fieldsFor = 0;
     int fieldsKind = -1;
 
-    HFONT fUi = nullptr, fSmall = nullptr, fIcon = nullptr, fIconSmall = nullptr, fMono = nullptr, fEmoji = nullptr;
+    HFONT fUi = nullptr, fSmall = nullptr, fIcon = nullptr, fIconSmall = nullptr, fMono = nullptr, fEmoji = nullptr, fMonoBig = nullptr;
+    bool goingTo = false;  // Ctrl+G: the field takes a frame number or a time
     std::vector<Hot> hots;
     RECT hoverRect{};
 
@@ -1060,7 +1061,10 @@ public:
         std::wstring t1, t2;
         int kind = -1;
         uint64_t id = 0;
-        if (auto ci = SelCaption()) {
+        if (goingTo) {
+            kind = 200;
+            id = ~0ull;
+        } else if (auto ci = SelCaption()) {
             t1 = edit.captions[*ci].text;
             kind = 100;
             id = edit.captions[*ci].id;
@@ -1080,7 +1084,8 @@ public:
             SetWindowTextW(field1, t1.c_str());
             SetWindowTextW(field2, t2.c_str());
             settingText = false;
-            const wchar_t* cue = kind == 100 ? L"Caption text" : kind == (int)MarkKind::Bubble ? L"Bubble text" : kind == (int)MarkKind::Title ? L"Title"
+            const wchar_t* cue = kind == 200 ? L"757, 0:12:37 or 12.6"
+                                 : kind == 100 ? L"Caption text" : kind == (int)MarkKind::Bubble ? L"Bubble text" : kind == (int)MarkKind::Title ? L"Title"
                                  : kind == (int)MarkKind::Emoji ? L"Emoji (Win+. for more)" : L"Text";
             SendMessageW(field1, EM_SETCUEBANNER, TRUE, (LPARAM)cue);
             SendMessageW(field2, EM_SETCUEBANNER, TRUE, (LPARAM)L"Subtitle (optional)");
@@ -1093,7 +1098,7 @@ public:
     }
 
     void FieldChanged(HWND f) {
-        if (settingText) return;
+        if (settingText || goingTo) return;
         const int n = GetWindowTextLengthW(f);
         std::wstring t(n, L'\0');
         GetWindowTextW(f, t.data(), n + 1);
@@ -1150,9 +1155,15 @@ public:
         const RECT c = Client();
         return {S(14), t.top - S(8) - S(30), c.right - S(14), t.top - S(8)};
     }
+    // The frame readout under the video.
+    RECT ReadoutRect() const {
+        const RECT c = Client();
+        const int bottom = InspectorRect().top - S(4);
+        return {S(14), bottom - S(22), c.right - S(14), bottom};
+    }
     RECT StageRect() const {
         const RECT c = Client();
-        return {S(14), S(50), c.right - S(14), InspectorRect().top - S(8)};
+        return {S(14), S(50), c.right - S(14), ReadoutRect().top - S(4)};
     }
     // Where the video is drawn.
     gp::RectF VideoRect() const {
@@ -1439,9 +1450,13 @@ public:
                 Popup(r, ListMenu(labels, current, [this](int i) { UpdateMark([i](Mark& m) { m.level = i; }); }));
             });
         };
-        const auto ci = SelCaption();
-        const auto mi = SelMark();
-        if (ci) {
+        const auto ci = goingTo ? std::nullopt : SelCaption();
+        const auto mi = goingTo ? std::nullopt : SelMark();
+        if (goingTo) {
+            label(L"Go to");
+            field(1, 200);
+            label(L"a frame number, a timecode (m:ss:ff) or a time in seconds · Enter goes, Esc cancels");
+        } else if (ci) {
             const Caption& c = edit.captions[*ci];
             field(1, 300);
             std::vector<std::wstring> pos = {L"Bottom", L"Middle", L"Top"};
@@ -1525,7 +1540,7 @@ public:
             }
         }
         if (ci || mi) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
-        if (const auto k = SelClipIndex(); k && !ci && !mi) {
+        if (const auto k = SelClipIndex(); k && !ci && !mi && !goingTo) {
             const size_t i = *k;
             const Clip& c = edit.clips[i];
             label(L"Clip " + std::to_wstring(i + 1) + L" of " + std::to_wstring(edit.clips.size()) + L":  " + FileNameOf(c.path) + L"  ·  " + Clock(c.Duration()));
@@ -1652,7 +1667,8 @@ public:
         if (EqualRect(&play, &hoverRect)) FillRR(g, play, (float)S(6), A(theme::kBgRaised));
         Text(dc, fIcon, playing ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         Hotspot(play, [this] { TogglePlay(); }, L"Play / pause (Space)");
-        Text(dc, fMono, Clock(Now()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)}, theme::kTextDim);
+        Text(dc, fMono, tframes.empty() ? Clock(Now()) : tframes.Timecode(FrameNow()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)},
+             theme::kTextDim);
         Text(dc, fMono, Clock(edit.OutputDuration()) + L" out", {S(12), play.bottom + S(24), tr.left - S(4), play.bottom + S(40)}, theme::kMuted);
     }
 
@@ -1720,6 +1736,7 @@ public:
             g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
             PaintToolbar(dc, g);
             PaintStage(dc, g);
+            PaintReadout(dc, g);
             PaintInspector(dc, g);
             PaintTimeline(dc, g);
             if (tipShown) PaintTooltip(dc, g);
@@ -1729,6 +1746,51 @@ public:
     }
     bool tipShown = false;
     BitmapPtr backBuffer;
+
+    // m:ss:ff · frame n · fps of the frame on screen.
+    std::wstring ReadoutText() const { return tframes.empty() ? Clock(Now()) : tframes.Readout(FrameNow()); }
+
+    void PaintReadout(HDC dc, gp::Graphics&) {
+        const RECT r = ReadoutRect();
+        const std::wstring text = ReadoutText();
+        const int w = Measure(dc, fMonoBig, text).cx;
+        Text(dc, fMonoBig, text, {r.left + S(2), r.top, r.left + S(2) + w + S(4), r.bottom}, theme::kText);
+        Hotspot({r.left, r.top, r.left + w + S(8), r.bottom}, [this] { BeginGoTo(); }, L"Go to a frame or time (Ctrl+G)");
+        Text(dc, fSmall, L"←/→ frame · Shift+←/→ second · Home/End trim ends · Ctrl+G go to", {r.left + w + S(24), r.top, r.right, r.bottom},
+             theme::kMuted, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // ---- go to ----
+
+    void BeginGoTo() {
+        Pause();
+        if (selected) Select(std::nullopt);
+        goingTo = true;
+        fieldsFor = 0;  // the field is emptied for it
+        FocusField();
+        Invalidate();
+    }
+    void EndGoTo() {
+        if (!goingTo) return;
+        goingTo = false;
+        if (field1 && GetFocus() == field1) SetFocus(hwnd);
+        SyncFields();
+        Invalidate();
+    }
+    // Enter in the go-to field: lands on that frame, or says it isn't one.
+    bool CommitGoTo() {
+        const int n = field1 ? GetWindowTextLengthW(field1) : 0;
+        std::wstring t(n, L'\0');
+        if (n) GetWindowTextW(field1, t.data(), n + 1);
+        const auto frame = tframes.Find(t);
+        if (!frame) {
+            ShowToast(L"Not a frame or time in this video", L"Type a frame number (757), a timecode (0:12:37) or seconds (12.6).", nullptr, nullptr, 3000);
+            return false;
+        }
+        EndGoTo();
+        GoToFrame(*frame);
+        return true;
+    }
 
     // ---- mouse ----
 
@@ -2075,6 +2137,7 @@ public:
                 case 'S': Save(shift); return true;
                 case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
+                case 'G': BeginGoTo(); return true;
                 case 'W': PostMessageW(hwnd, WM_CLOSE, 0, 0); return true;
                 default: return false;
             }
@@ -2234,13 +2297,14 @@ public:
     // ---- window ----
 
     void Fonts() {
-        for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji})
+        for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji, fMonoBig})
             if (f) DeleteObject(f);
         fUi = MakeFont(S(13));
         fSmall = MakeFont(S(11));
         fIcon = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, kIconFace);
         fIconSmall = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, kIconFace);
         fMono = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Cascadia Mono");
+        fMonoBig = CreateFontW(-S(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Cascadia Mono");
         fEmoji = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI Emoji");
         for (HWND f : {field1, field2})
             if (f) SendMessageW(f, WM_SETFONT, (WPARAM)fUi, TRUE);
@@ -2260,13 +2324,21 @@ LRESULT CALLBACK FieldProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     VideoEditor* e = FromHwnd(GetParent(h));
     if (!e) return DefWindowProcW(h, m, w, l);
     if (m == WM_KEYDOWN && (w == VK_RETURN || w == VK_ESCAPE)) {
-        SetFocus(e->hwnd);
+        if (e->goingTo && w == VK_RETURN) e->CommitGoTo();
+        else if (e->goingTo) e->EndGoTo();
+        else SetFocus(e->hwnd);
         return 0;
     }
     if (m == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0 && (w == 'S' || w == 'W')) return e->OnKey(w), 0;
     if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE)) return 0;  // no beep
-    if (m == WM_SETFOCUS) e->PushUndo();  // one undo step per editing session
+    if (m == WM_SETFOCUS && !e->goingTo) e->PushUndo();  // one undo step per editing session
+    if (m == WM_KILLFOCUS && e->goingTo) {  // clicked away: going to nowhere
+        const LRESULT r = CallWindowProcW(e->editProc, h, m, w, l);
+        e->EndGoTo();
+        return r;
+    }
     return CallWindowProcW(e->editProc, h, m, w, l);
+
 }
 
 LRESULT CALLBACK VideoProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2394,7 +2466,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_NCDESTROY: {  // after the children: they still need FieldProc to find this editor
             std::erase(g_editors, this);
             if (g_editors.empty()) ClearRenderCache();  // rendered titles and captions can be large
-            for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji})
+            for (HFONT f : {fUi, fSmall, fIcon, fIconSmall, fMono, fEmoji, fMonoBig})
                 if (f) DeleteObject(f);
             delete this;
             return 0;
@@ -2687,6 +2759,16 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
     }
     e->dirty = false;
     DestroyWindow(e->hwnd);
+    // A 60 fps recording on frame 757, as the readout's example.
+    const std::wstring sixty = outDir + L"\\snapshot-60fps.mp4";
+    if (WriteTestClip(sixty, 1280, 720, 60, 13, false) && (e = OpenHidden(sixty, 1180, 760))) {
+        for (int i = 0; i < 300 && (!e->FramesKnown() || e->thumbs.empty()); ++i) Pump(10);
+        e->GoToFrame(757);
+        Pump(800);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-readout.png");
+        e->dirty = false;
+        DestroyWindow(e->hwnd);
+    }
     return 0;
 }
 
@@ -2907,6 +2989,53 @@ ATHER_TEST(video_editor_steps_every_frame_at_60fps) {
     const auto end = ShownFrame(e);
     test::Note("end: " + std::to_string(end.first) + (end.second ? " b" : " a"));
     CHECK(end.first == 14 && end.second);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The readout shows m:ss:ff · frame n · fps for the frame on screen; Ctrl+G takes a frame number, a timecode or a time
+// and lands on that frame (nothing to undo); a joined 30 fps clip reads at its own rate.
+ATHER_TEST(video_editor_readout_and_go_to) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b30.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    CHECK(WriteNumberedClip(b, 320, 180, 30, 60, 255));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->ReadoutText() == L"0:00:00 · frame 0 · 60 fps");
+    auto goTo = [&](const wchar_t* text) {
+        e->Key('G', {true, false, false});
+        CHECK(e->goingTo);
+        SetWindowTextW(e->field1, text);
+        return e->CommitGoTo();
+    };
+    CHECK(goTo(L"0:01:30"));
+    CHECK(!e->goingTo);
+    CHECK(ShownFrame(e) == std::make_pair(90, false));
+    CHECK(e->ReadoutText() == L"0:01:30 · frame 90 · 60 fps");
+    CHECK(goTo(L"45"));
+    CHECK(ShownFrame(e) == std::make_pair(45, false));
+    CHECK(e->ReadoutText() == L"0:00:45 · frame 45 · 60 fps");
+    CHECK(goTo(L"1.26"));  // the frame on screen at 1.26 s: 75 (1.25 s)
+    CHECK(ShownFrame(e) == std::make_pair(75, false));
+    e->Key(VK_RIGHT, {});
+    CHECK(e->ReadoutText() == L"0:01:16 · frame 76 · 60 fps");
+    CHECK(!goTo(L"not a time"));  // says so and stays open
+    CHECK(e->goingTo);
+    e->EndGoTo();
+    CHECK(!e->goingTo);
+    CHECK(e->undoStack.empty() && !e->dirty);
+    // Joined with a 30 fps clip: frame numbers run on; that clip's frames read at 30 fps.
+    e->AddClips({b});
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(goTo(L"130"));
+    CHECK(ShownFrame(e) == std::make_pair(10, true));
+    CHECK(e->ReadoutText() == L"0:02:10 · frame 130 · 30 fps");
+    CHECK(goTo(L"0:03:00"));
+    CHECK(ShownFrame(e) == std::make_pair(30, true));
+    CHECK(e->ReadoutText() == L"0:03:00 · frame 150 · 30 fps");
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

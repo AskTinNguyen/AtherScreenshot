@@ -10,7 +10,9 @@
 #include <unordered_map>
 
 #include "annot.h"
+#include "json.h"
 #include "selftest.h"
+
 #include "textdraw.h"
 
 namespace ather {
@@ -1730,6 +1732,70 @@ ATHER_TEST(video_clip_changes_move_items_with_their_footage) {
     ApplyClips(kept, {b, a});  // the ends would cross: back to the whole sequence
     CHECK_NEAR(kept.trimStart, 0, 1e-9);
     CHECK_NEAR(kept.trimEnd, 6, 1e-9);
+}
+
+// The readout is m:ss:ff · frame n · fps, at 60, 30 and 29.97 fps, and go to finds every frame by its number, its
+// timecode or a time; frame numbers run on across joined clips of different rates.
+ATHER_TEST(video_frame_readout_and_go_to) {
+    auto clip = [](const wchar_t* path, double fps, double length) {
+        Clip c = TestClip(path, 0, length);
+        c.length = length;
+        c.fps = fps;
+        return c;
+    };
+    const TimelineFrames f60 = TimelineFrames::Of({clip(L"a", 60, 20)}, {});
+    CHECK_EQ(f60.size(), 1200u);
+    CHECK(f60.Readout(757) == L"0:12:37 · frame 757 · 60 fps");
+    CHECK(f60.Readout(0) == L"0:00:00 · frame 0 · 60 fps");
+    CHECK(f60.Timecode(59) == L"0:00:59" && f60.Timecode(60) == L"0:01:00");
+    CHECK(f60.Find(L"757") == std::optional<size_t>(757));
+    CHECK(f60.Find(L"0:12:37") == std::optional<size_t>(757));
+    CHECK(f60.Find(L" 0:12:37 ") == std::optional<size_t>(757));
+    CHECK(f60.Find(L"12.62") == std::optional<size_t>(757));    // the frame on screen at 12.62 s
+    CHECK(f60.Find(L"0:12.62") == std::optional<size_t>(757));
+    CHECK(f60.Find(L"0:00:00:10") == std::optional<size_t>(10));  // with hours
+    CHECK(!f60.Find(L"1200") && !f60.Find(L"abc") && !f60.Find(L"") && !f60.Find(L"1:2:3:4:5") && !f60.Find(L"0:30:00"));
+
+    const TimelineFrames f30 = TimelineFrames::Of({clip(L"a", 30, 10)}, {});
+    CHECK(f30.Readout(100) == L"0:03:10 · frame 100 · 30 fps");
+    CHECK(f30.Find(L"0:03:10") == std::optional<size_t>(100));
+
+    const double ntsc = 30000.0 / 1001;
+    const TimelineFrames f2997 = TimelineFrames::Of({clip(L"a", ntsc, 70)}, {});
+    CHECK(f2997.Readout(1000) == L"0:33:10 · frame 1000 · 29.97 fps");
+    CHECK(Timecode(3725.5, 30) == L"62:05:15");
+    // Every frame, at each rate: its timecode and its number lead back to it, and timecodes never repeat.
+    for (const TimelineFrames* f : {&f60, &f30, &f2997}) {
+        int wrong = 0, repeats = 0;
+        for (size_t n = 0; n < f->size(); ++n) {
+            wrong += f->Find(f->Timecode(n)) != std::optional<size_t>(n);
+            wrong += f->Find(std::to_wstring(n)) != std::optional<size_t>(n);
+            repeats += n > 0 && f->Timecode(n) == f->Timecode(n - 1);
+        }
+        test::Note(ToUtf8(f->Readout(f->size() - 1)) + ": " + std::to_string(wrong) + " wrong, " + std::to_string(repeats) + " repeats");
+        CHECK_EQ(wrong, 0);
+        CHECK_EQ(repeats, 0);
+    }
+
+    // Joined, 60 then 30 fps, the second cut in mid-frame: numbers run on, each clip's frames at its own rate.
+    Clip b = clip(L"b", 30, 10);
+    b.in = 1.01;  // between frames 30 (1.0 s) and 31: frame 30 shows first
+    b.out = 3;
+    const TimelineFrames j = TimelineFrames::Of({clip(L"a", 60, 2), b}, {});
+    CHECK_EQ(j.size(), 120u + 60u);
+    CHECK(j.size() > 121 && std::fabs(j.frames[120].t - 2) < 1e-9 && std::fabs(j.frames[120].src - 1) < 1e-9);
+    CHECK(j.size() > 121 && std::fabs(j.frames[121].src - 31 / 30.0) < 1e-9);
+    CHECK(j.Readout(119) == L"0:01:59 · frame 119 · 60 fps");
+    CHECK(j.Readout(120) == L"0:02:00 · frame 120 · 30 fps");
+    CHECK(j.Readout(121) == L"0:02:00 · frame 121 · 30 fps");  // 2.023 s: still frame 0 of the second at 30 fps
+    CHECK_EQ(j.Nearest(2.0), 120u);
+    CHECK_EQ(j.At(2.03), 121u);
+    // Frame times from the file replace the grid.
+    const std::vector<double> times = {0, 0.5, 0.75, 1.5};
+    const TimelineFrames k = TimelineFrames::Of({clip(L"c", 30, 2)}, [&](const Clip&) { return &times; });
+    CHECK_EQ(k.size(), 4u);
+    CHECK_EQ(k.Nearest(0.6), 1u);
+    CHECK_EQ(k.At(1.4), 2u);
 }
 
 }  // namespace ather
