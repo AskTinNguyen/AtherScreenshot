@@ -112,7 +112,8 @@ extension VideoExport {
         return CGSize(width: max(1, (s.width * k).rounded(.down)), height: max(1, (s.height * k).rounded(.down)))
     }
 
-    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12) async throws {
+    // `chunks`: how many parts ImageIO encodes at once (nil: by length and cores).
+    static func gif(_ e: VideoEdit, to url: URL, fps: Double = 12, chunks: Int? = nil) async throws {
         let p = try await prepare(e)
         let probe = VideoExport.probe
         VideoExport.probe = nil   // the bench taps the GIF's frames, not the compositor's
@@ -128,15 +129,32 @@ extension VideoExport {
         // As many frames as the saved MP4 is long (whole frames of the sequence), like before.
         let fd = p.video.frameDuration.seconds
         let n = max(1, Int((p.composition.duration.seconds / fd).rounded(.up) * fd * fps + 1e-6))
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.gif.identifier as CFString, n, nil) else { throw Failure.failed("Can't write the GIF.") }
-        CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-        probe?.note("gif 1 pass")
+        // ImageIO picks the palette and compresses at finalize, on one thread. So the frames go out in a few chunks,
+        // each finalized on its own as soon as its frames are in, and the chunks are joined (joinGIFs).
+        let k = max(1, min(chunks ?? gifChunks(n), n))
+        probe?.note(k == 1 ? "gif 1 pass" : "gif 1 pass, \(k) chunks")
         guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
+        var parts: [Task<Data?, Never>] = []
+        var dest: CGImageDestination?, data: CFMutableData?, chunk = -1
+        func close() {
+            guard let d = dest, let m = data else { return }
+            parts.append(Task.detached { CGImageDestinationFinalize(d) ? m as Data : nil })
+            dest = nil
+        }
+        func add(_ j: Int, _ img: CGImage, frames: Int) throws {
+            let c = j * k / n
+            if c != chunk || dest == nil {
+                close()
+                chunk = c
+                let m = CFDataCreateMutable(nil, 0)!
+                guard let d = CGImageDestinationCreateWithData(m, UTType.gif.identifier as CFString, ((c + 1) * n + k - 1) / k - (c * n + k - 1) / k, nil) else { throw Failure.failed("Can't write the GIF.") }
+                CGImageDestinationSetProperties(d, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+                (dest, data) = (d, m)
+            }
+            CGImageDestinationAddImage(dest!, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
+        }
         // Each frame shows until the next one; a frame the compositor skipped (nothing new) lengthens the one before.
         var pending: (Int, CGImage)?
-        func add(_ img: CGImage, frames: Int) {
-            CGImageDestinationAddImage(dest, img, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: Double(frames) / fps]] as CFDictionary)
-        }
         while let s = vo.copyNextSampleBuffer() {
             try Task.checkCancellation()
             guard let pb = CMSampleBufferGetImageBuffer(s), let img = cgImage(pb) else { continue }
@@ -144,16 +162,95 @@ extension VideoExport {
             guard i < n else { break }
             if let (j, prev) = pending {
                 guard i > j else { pending = (j, img); continue }
-                add(prev, frames: i - j)
+                try add(j, prev, frames: i - j)
             }
             probe?.frame(i, img)
             pending = (i, img)
         }
         if reader.status == .failed { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
-        if let (j, prev) = pending { add(prev, frames: max(1, n - j)) }
+        if let (j, prev) = pending { try add(j, prev, frames: max(1, n - j)) }
+        close()
         let t0 = Date()
-        defer { probe?.note(String(format: "finalize %.2f s", Date().timeIntervalSince(t0))) }
-        guard CGImageDestinationFinalize(dest) else { throw Failure.failed("Can't write the GIF.") }
+        var done: [Data] = []
+        for t in parts {
+            guard let d = await t.value else { throw Failure.failed("Can't write the GIF.") }
+            done.append(d)
+        }
+        probe?.note(String(format: "waited %.2f s for the last chunks", Date().timeIntervalSince(t0)))
+        if k == 1 { return try done[0].write(to: url) }
+        guard let gif = joinGIFs(done) else {   // not what ImageIO usually writes: one part after all
+            probe?.note("join failed, 1 chunk")
+            return try await self.gif(e, to: url, fps: fps, chunks: 1)
+        }
+        try gif.write(to: url)
+    }
+
+    static func gifChunks(_ frames: Int) -> Int {
+        if let v = ProcessInfo.processInfo.environment["ATHER_GIF_CHUNKS"], let k = Int(v) { return max(1, k) }   // the bench
+        return max(1, min(ProcessInfo.processInfo.activeProcessorCount / 2, frames / 24))
+    }
+
+    // GIFs from ImageIO joined into one: the first as it is, the frames of the others after it, each with its GIF's
+    // palette as a local color table. ImageIO writes a global palette and no local ones; nil if a part isn't like that.
+    static func joinGIFs(_ parts: [Data]) -> Data? {
+        guard var out = parts.first.map({ [UInt8]($0) }), out.last == 0x3B else { return nil }
+        out.removeLast()
+        for part in parts.dropFirst() {
+            let d = [UInt8](part)
+            guard d.count > 13, d.starts(with: Array("GIF".utf8)), d[10] & 0x80 != 0 else { return nil }
+            let bits = d[10] & 7
+            let table = d[13..<(13 + 3 * (2 << Int(bits)))]
+            var p = table.endIndex
+            func subBlocks() -> Bool {   // copies data sub-blocks up to and including the terminator
+                while p < d.count {
+                    let n = Int(d[p])
+                    guard p + 1 + n <= d.count else { return false }
+                    out += d[p..<(p + 1 + n)]
+                    p += 1 + n
+                    if n == 0 { return true }
+                }
+                return false
+            }
+            loop: while p < d.count {
+                switch d[p] {
+                case 0x21:   // extension: keep the frame's control block, drop the rest (the loop count is in the first)
+                    guard p + 1 < d.count else { return nil }
+                    if d[p + 1] == 0xF9 {
+                        out += d[p...(p + 1)]
+                        p += 2
+                        guard subBlocks() else { return nil }
+                    } else {
+                        let mark = out.count
+                        p += 2
+                        guard subBlocks() else { return nil }
+                        out.removeSubrange(mark...)
+                    }
+                case 0x2C:   // image: its own table, or this part's palette as its local one
+                    guard p + 11 <= d.count else { return nil }
+                    let flags = d[p + 9]
+                    out += d[p..<(p + 9)]
+                    if flags & 0x80 != 0 {
+                        out.append(flags)
+                        p += 10
+                        let n = 3 * (2 << Int(flags & 7))
+                        guard p + n <= d.count else { return nil }
+                        out += d[p..<(p + n)]
+                        p += n
+                    } else {
+                        out.append(0x80 | (flags & 0x40) | bits)
+                        out += table
+                        p += 10
+                    }
+                    out.append(d[p])   // LZW minimum code size
+                    p += 1
+                    guard subBlocks() else { return nil }
+                case 0x3B: break loop
+                default: return nil
+                }
+            }
+        }
+        out.append(0x3B)
+        return Data(out)
     }
 
     // A copy of a BGRA frame as a CGImage (the buffer goes back to the pool).
