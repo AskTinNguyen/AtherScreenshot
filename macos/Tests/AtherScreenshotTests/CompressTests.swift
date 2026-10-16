@@ -82,12 +82,19 @@ final class CompressTests: XCTestCase {
         // Too little room for the length: refused.
         do { _ = try await Compress.video(src, cap: 30 * 1024); XCTFail("should not fit") } catch {}
         // 1920 × 1080 at a cap that leaves it under 500 kbps of video: 1280 wide.
-        let hd = try await Self.noise(w: 1920, h: 1080, seconds: 4, tone: false)
-        var s = try await Compress.video(hd, cap: 200 * 1024)   // ~370 kbps: 1280 wide, also after a retry
+        let hd = try await Self.noise(w: 1920, h: 1080, seconds: 4, tone: false, screen: true)
+        // Under 500 kbps of video it's scaled down, keeping its shape. The cap: 200 KB (~370 kbps: 1280 wide), or less
+        // when the encoder made the source smaller than twice that.
+        let hdCap = min(200 * 1024, Compress.fileBytes(hd) * 0.5)
+        XCTAssertTrue(Compress.planVideo(cap: hdCap, seconds: 4, w: 1920, h: 1080, audio: false).fits, "source \(Compress.fileBytes(hd)) bytes")
+        var s = try await Compress.video(hd, cap: hdCap)
+        XCTAssertFalse(s.skipped)
         try Compress.finish(&s)
-        XCTAssertEqual([s.w, s.h], [1280, 720])
-        let hdSize = try await AVURLAsset(url: try XCTUnwrap(s.out)).loadTracks(withMediaType: .video).first?.load(.naturalSize)
-        XCTAssertEqual(hdSize, CGSize(width: 1280, height: 720))
+        XCTAssertTrue(s.w < 1920 && s.w >= 854 && abs(s.w * 9 - s.h * 16) <= 16, "\(s.w)×\(s.h)")
+        let hdOut = try XCTUnwrap(s.out)
+        XCTAssertLessThanOrEqual(Compress.fileBytes(hdOut), hdCap)
+        let hdSize = try await AVURLAsset(url: hdOut).loadTracks(withMediaType: .video).first?.load(.naturalSize)
+        XCTAssertEqual(hdSize, CGSize(width: s.w, height: s.h))
     }
 
     func testRotatedPhoneVideoComesOutUpright() async throws {
@@ -125,11 +132,21 @@ final class CompressTests: XCTestCase {
 
     // A gradient that moves every frame, with light grain: busy enough to need the bits, yet (unlike pure noise, which
     // no encoder squeezes below its quality floor) something an encoder can bring down to a low rate.
-    private static func noise(w: Int, h: Int, seconds: Double, tone: Bool) async throws -> URL {
-        try await TestMedia.clip(w: w, h: h, seconds: seconds, tone: tone) { i, ctx in paintGrain(ctx, frame: i) }
+    // `screen`: like a screen recording instead: a still gradient with a white box moving across it (grain at 720p
+    // needs more bits than the 1080p case asks for; screen content doesn't).
+    private static func noise(w: Int, h: Int, seconds: Double, tone: Bool, screen: Bool = false) async throws -> URL {
+        let n = Int(seconds * 30)
+        return try await TestMedia.clip(w: w, h: h, seconds: seconds, tone: tone) { i, ctx in
+            paintGrain(ctx, frame: i, still: screen)
+            if screen {
+                let bw = w / 6
+                ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+                ctx.fill(CGRect(x: i * w / n % (w - bw), y: h / 3, width: bw, height: bw))
+            }
+        }
     }
 
-    private static func paintGrain(_ ctx: CGContext, frame i: Int) {
+    private static func paintGrain(_ ctx: CGContext, frame i: Int, still: Bool = false) {
         guard let data = ctx.data else { return }
         let px = data.assumingMemoryBound(to: UInt32.self)
         let w = ctx.width, h = ctx.height, row = ctx.bytesPerRow / 4
@@ -137,9 +154,10 @@ final class CompressTests: XCTestCase {
         for yy in 0..<h {
             for xx in 0..<w {
                 x = x &* 1_664_525 &+ 1_013_904_223
-                let grain = Int((x >> 24) % 25) - 12
+                let grain = still ? 0 : Int((x >> 24) % 25) - 12
                 func c(_ v: Int) -> UInt32 { UInt32(min(255, max(0, v + grain))) }
-                let r = c((xx * 255 / w + i * 4) & 255), g = c(yy * 255 / h), b = c(((xx + yy) / 2 + i * 2) & 255)
+                let t = still ? 0 : i   // the screen's gradient stays put
+                let r = c((xx * 255 / w + t * 4) & 255), g = c(yy * 255 / h), b = c(((xx + yy) / 2 + t * 2) & 255)
                 px[yy * row + xx] = 0xFF00_0000 | (r << 16) | (g << 8) | b
             }
         }

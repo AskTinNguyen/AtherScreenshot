@@ -73,7 +73,7 @@ enum Compress {
 
     // "8 MB", "2.5 MB".
     static func label(_ mb: Double) -> String {
-        mb == mb.rounded() ? "\(Int(mb)) MB" : "\(String(format: "%g", mb)) MB"
+        mb == mb.rounded() ? "\(Int(mb)) MB" : "\(String(format: "%.3g", mb)) MB"
     }
 
     static func sizeText(_ bytes: Double) -> String {

@@ -432,7 +432,8 @@ ATHER_TEST(compress_sizes_and_names) {
 }
 
 // A moving gradient with grain, and a tone: ~2 Mbps as Mp4Writer makes it, so the rate has to come down.
-static bool WriteNoisyClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone) {
+// `screen`: like a screen recording instead: a still gradient with a white box moving across it.
+static bool WriteNoisyClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone, bool screen = false) {
     constexpr int kRate = 48000;
     constexpr double kTicks = 1e7;
     Mp4Writer mw;
@@ -447,10 +448,15 @@ static bool WriteNoisyClip(const std::wstring& path, int w, int h, int fps, doub
         // and unlike pure noise still something an encoder can squeeze to a low rate (as screen recordings are).
         for (int yy = 0; yy < h; ++yy)
             for (int xx = 0; xx < w; ++xx) {
-                const int grain = (int)(((x = x * 1664525 + 1013904223) >> 24) % 25) - 12;
+                const int grain = screen ? 0 : (int)(((x = x * 1664525 + 1013904223) >> 24) % 25) - 12;
                 auto c = [grain](int v) { return (uint32_t)std::clamp(v + grain, 0, 255); };
-                px[(size_t)yy * w + xx] = 0xFF000000 | c((xx * 255 / w + i * 4) & 255) << 16 | c(yy * 255 / h) << 8 | c(((xx + yy) / 2 + i * 2) & 255);
+                const int t = screen ? 0 : i;  // the screen's gradient stays put
+                px[(size_t)yy * w + xx] = 0xFF000000 | c((xx * 255 / w + t * 4) & 255) << 16 | c(yy * 255 / h) << 8 | c(((xx + yy) / 2 + t * 2) & 255);
             }
+        if (screen) {  // the box: a sixth of the width, moving across a third of the way down
+            const int bw = w / 6, x0 = (int)((int64_t)i * w / n % (w - bw)), y0 = h / 3;
+            for (int yy = y0; yy < std::min(h, y0 + bw); ++yy) std::fill_n(&px[(size_t)yy * w + x0], bw, 0xFFFFFFFFu);
+        }
         if (FAILED(mw.WriteFrame(px.data(), std::llround(i * kTicks / fps), std::llround(kTicks / fps)))) return false;
         if (!tone) continue;
         pcm.clear();
@@ -489,11 +495,17 @@ ATHER_TEST(compress_video_lands_under_the_cap) {
     CHECK(!tiny.ok && !tiny.error.empty() && tiny.tmp.empty() && tiny.attempts == 0);
     // 1920 × 1080 at a cap that leaves it under 500 kbps of video: 1280 wide.
     const std::wstring hd = dir + L"\\hd.mp4";
-    CHECK(WriteNoisyClip(hd, 1920, 1080, 30, 4, false));
-    CompressResult s = CompressVideo(hd, 200 * 1024);  // ~370 kbps: 1280 wide, also after a retry
-    test::Note("error: " + ToUtf8(s.error));
-    CHECK(s.ok && FinishCompress(s) && s.w == 1280 && s.h == 720);
-    CHECK(ProbeVideo(s.out, &vi) && vi.w == 1280 && vi.h == 720 && !vi.hasAudio);
+    CHECK(WriteNoisyClip(hd, 1920, 1080, 30, 4, false, true));  // grain at 720p needs more bits than this asks; screen content doesn't
+    // Under 500 kbps of video it's scaled down, keeping its shape. The cap: 200 KB (~370 kbps: 1280 wide), or less
+    // when the encoder made the source smaller than twice that.
+    const double hdCap = std::min(200.0 * 1024, FileBytes(hd) * 0.5);
+    CHECK(PlanCompressedVideo(hdCap, 4, 1920, 1080, false).fits);
+    CompressResult s = CompressVideo(hd, hdCap);
+    test::Note("error: " + ToUtf8(s.error) + ", source " + std::to_string((int)FileBytes(hd)) + " bytes, cap " + std::to_string((int)hdCap) +
+               ", " + std::to_string((int)s.bytesAfter) + " bytes in " + std::to_string(s.attempts) + " tries");
+    CHECK(s.ok && !s.skipped && FinishCompress(s));
+    CHECK(s.w < 1920 && s.w >= 854 && std::abs(s.w * 9 - s.h * 16) <= 16 && FileBytes(s.out) <= hdCap);
+    CHECK(ProbeVideo(s.out, &vi) && vi.w == s.w && vi.h == s.h && !vi.hasAudio);
 }
 
 ATHER_TEST(compress_picture_makes_a_smaller_jpeg) {

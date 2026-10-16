@@ -87,11 +87,11 @@ inline double ParseMegabytes(std::wstring s) {
     return mb >= 0.1 && mb <= 4096 ? mb : 0;
 }
 
-// "8 MB", "1.5 MB", "0.5 MB".
+// "8 MB", "1.5 MB", "0.5 MB", "0.195 MB".
 inline std::wstring MegabytesLabel(double mb) {
     wchar_t b[32];
     if (std::fabs(mb - std::round(mb)) < 1e-9) swprintf(b, 32, L"%.0f MB", mb);
-    else swprintf(b, 32, L"%g MB", mb);
+    else swprintf(b, 32, L"%.3g MB", mb);
     return b;
 }
 
