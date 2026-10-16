@@ -294,7 +294,7 @@ void ApplyEditorDefaults() {
         (picture ? g_settings.compressPictureMB : g_settings.compressVideoMB) = mb;
         wchar_t b[32];
         swprintf(b, 32, L"%g", mb);
-        g_settings.WriteString(L"Compress", picture ? L"PictureMB" : L"VideoMB", b);
+        g_settings.WriteString(L"Compress", picture ? L"CompressPictureMB" : L"CompressVideoMB", b);
     });
 
     SetFileNameTemplate(g_settings.fileNameTemplate);

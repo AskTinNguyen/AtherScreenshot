@@ -22,6 +22,7 @@ final class Settings: ObservableObject {
             "Uploader": "none", "ImgurClientId": "", "CustomUrl": "", "CustomFileField": "file", "CustomHeaders": "",
             "CustomResponseUrl": "", "S3Endpoint": "", "S3Bucket": "", "S3Region": "auto", "S3AccessKey": "",
             "S3SecretKey": "", "S3PublicUrl": "",
+            "CompressVideoMB": Compress.defaultVideoMB, "CompressPictureMB": Compress.defaultPictureMB,   // the last "under N MB" used
         ]
         for c in kCmds { m["Hotkey." + c.cmd.rawValue] = c.hotkey }
         return m
@@ -32,6 +33,7 @@ final class Settings: ObservableObject {
     func bool(_ k: String) -> Bool { d.bool(forKey: k) }
     func int(_ k: String) -> Int { d.integer(forKey: k) }
     func string(_ k: String) -> String { d.string(forKey: k) ?? "" }
+    func double(_ k: String) -> Double { d.double(forKey: k) }
 
     func set(_ k: String, _ v: Any?) {
         objectWillChange.send()

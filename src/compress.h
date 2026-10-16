@@ -129,7 +129,7 @@ void CompressFiles(const std::vector<std::wstring>& paths, double capMB);
 void ShowCompressPicker(const std::vector<std::wstring>& paths);
 // The sizes ShowCompressPicker offers, in order.
 std::vector<double> CompressSizesFor(const std::vector<std::wstring>& paths);
-// The last sizes used (settings.ini [Compress] VideoMB and PictureMB), and where a newly used one is saved.
+// The last sizes used (settings.ini [Compress] CompressVideoMB and CompressPictureMB), and where a newly used one is saved.
 void SetCompressSizes(double videoMB, double pictureMB, std::function<void(bool picture, double mb)> save);
 
 }  // namespace ather

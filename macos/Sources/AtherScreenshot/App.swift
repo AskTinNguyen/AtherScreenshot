@@ -387,6 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .editLast:
             if let img = lastImage { Editor.open(img, scale: lastScale) } else if let u = lastImageURL { Editor.open(url: u) } else { Toast.shared.show("Nothing captured yet") }
         case .openImage: openImage()
+        case .compressFile: compressFiles()
         case .pinLast:
             if let img = lastImage ?? lastImageURL.flatMap(CGImage.load) { Pin.show(img, scale: lastScale) } else { Toast.shared.show("Nothing captured yet") }
         case .copyLast:
@@ -708,6 +709,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.allowedContentTypes = MediaFiles.contentTypes(pictures: true, videos: true)
         p.directoryURL = s.capturesFolder
         if p.runModal() == .OK, let u = p.url { openToEdit(u) }
+    }
+
+    // Smaller copies next to the originals (Compress.swift), at a size picked from a palette.
+    private func compressFiles() {
+        activateApp()
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.allowedContentTypes = MediaFiles.contentTypes(pictures: true, videos: true)
+        p.directoryURL = s.capturesFolder
+        p.message = "Compress to a smaller file"
+        if p.runModal() == .OK, !p.urls.isEmpty { Compress.showPicker(p.urls) }
     }
 
     // Any file opened from outside: videos go to the video editor, everything else to the image editor.

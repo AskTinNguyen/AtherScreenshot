@@ -444,7 +444,10 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
         params->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         params->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, videoBps);
     }
-    if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), params.Get());
+    if (SUCCEEDED(hr)) {
+        hr = p_->writer->SetInputMediaType(p_->video, in.Get(), params.Get());
+        if (FAILED(hr) && params) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), nullptr);  // the rate on `out` still holds
+    }
     if (SUCCEEDED(hr) && audioRate > 0) hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio, audioBps);
     ComPtr<IMFTransform> enc;
     if (SUCCEEDED(hr) && SUCCEEDED(p_->writer->GetServiceForStream(p_->video, GUID_NULL, IID_PPV_ARGS(&enc)))) {
