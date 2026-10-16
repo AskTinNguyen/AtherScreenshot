@@ -57,12 +57,6 @@ jobs:
         timeout-minutes: 15
         working-directory: macos
         run: xcrun swift test --filter CompressTests 2>&1 | tee ../compress-test.log; exit ${PIPESTATUS[0]}
-      - name: Unit tests
-        id: tests
-        continue-on-error: true  # reported below; some tests can wait on things a runner lacks (screen, permissions)
-        timeout-minutes: 15
-        working-directory: macos
-        run: xcrun swift test 2>&1 | tee ../swift-test.log; exit ${PIPESTATUS[0]}
       - name: Package (universal, ad-hoc signed)
         working-directory: macos
         run: ./build.sh package
@@ -70,13 +64,10 @@ jobs:
         if: always()
         run: |
           {
-            echo "## macOS unit tests: ${{ steps.tests.outcome }} · CompressTests: ${{ steps.compress.outcome }}"
+            echo "## macOS CompressTests: ${{ steps.compress.outcome }}"
+            echo "(The full suite isn't run here: on the runner it waits on something past 15 minutes; run xcrun swift test on a Mac.)"
             echo '```'
             tail -n 40 compress-test.log 2>/dev/null || echo "no log"
-            echo '```'
-            echo 'All unit tests (last lines):'
-            echo '```'
-            tail -n 25 swift-test.log 2>/dev/null || echo "no log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -86,7 +77,6 @@ jobs:
             macos/dist/*.dmg
             macos/dist/*.zip
             macos/dist/SHA256SUMS.txt
-            swift-test.log
             compress-test.log
 
   publish:
