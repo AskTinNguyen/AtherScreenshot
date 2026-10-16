@@ -368,8 +368,15 @@ Mp4Writer::~Mp4Writer() = default;
 int64_t Mp4Writer::Frames() const { return p_->frames; }
 bool Mp4Writer::HardwareEncoder() const { return p_->hardware; }
 
-// The AAC stream of an MP4 (192 kbps), fed 16-bit PCM.
-static HRESULT AddAacStream(IMFSinkWriter* w, int rate, int channels, DWORD* index) {
+// The AAC stream of an MP4 (192 kbps unless `bps` says otherwise), fed 16-bit PCM.
+static HRESULT AddAacStream(IMFSinkWriter* w, int rate, int channels, DWORD* index, uint32_t bps = 0) {
+    // Media Foundation's AAC encoder takes only these: 96, 128, 160 and 192 kbps (in bytes a second).
+    UINT32 bytes = 24000;
+    for (UINT32 b : {12000u, 16000u, 20000u})
+        if (bps && bps <= b * 8) {
+            bytes = b;
+            break;
+        }
     ComPtr<IMFMediaType> aout, ain;
     HRESULT hr = MFCreateMediaType(&aout);
     if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
@@ -377,7 +384,7 @@ static HRESULT AddAacStream(IMFSinkWriter* w, int rate, int channels, DWORD* ind
     if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
     if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
     if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
+    if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes);
     if (SUCCEEDED(hr)) hr = w->AddStream(aout.Get(), index);
     if (SUCCEEDED(hr)) hr = MFCreateMediaType(&ain);
     if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
@@ -391,7 +398,8 @@ static HRESULT AddAacStream(IMFSinkWriter* w, int rate, int channels, DWORD* ind
     return hr;
 }
 
-HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels, int rotation, bool nv12) {
+HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int audioRate, int audioChannels, int rotation, bool nv12,
+                         uint32_t videoBps, uint32_t audioBps) {
     EnsureMediaFoundation();
     p_->nv12 = nv12;
     p_->w = w;
@@ -404,9 +412,9 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = attr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, attr.Get(), &p_->writer);
     // Screen content: ~0.12 bits per pixel per frame keeps text crisp.
-    const UINT32 bitrate = (UINT32)std::clamp<double>((double)w * h * fps * 0.12, 2e6, 50e6);
+    const UINT32 bitrate = videoBps ? videoBps : (UINT32)std::clamp<double>((double)w * h * fps * 0.12, 2e6, 50e6);
     if (w <= 0) {  // sound only
-        if (SUCCEEDED(hr)) hr = audioRate > 0 ? AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio) : E_INVALIDARG;
+        if (SUCCEEDED(hr)) hr = audioRate > 0 ? AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio, audioBps) : E_INVALIDARG;
         if (SUCCEEDED(hr)) hr = p_->writer->BeginWriting();
         if (FAILED(hr)) p_->writer.Reset();
         return hr;
@@ -430,8 +438,14 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, w, h);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), nullptr);
-    if (SUCCEEDED(hr) && audioRate > 0) hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio);
+    // A set size (Compress): constant bit rate, which software and GPU encoders all keep to closely.
+    ComPtr<IMFAttributes> params;
+    if (SUCCEEDED(hr) && videoBps && SUCCEEDED(MFCreateAttributes(&params, 2))) {
+        params->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+        params->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, videoBps);
+    }
+    if (SUCCEEDED(hr)) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), params.Get());
+    if (SUCCEEDED(hr) && audioRate > 0) hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio, audioBps);
     ComPtr<IMFTransform> enc;
     if (SUCCEEDED(hr) && SUCCEEDED(p_->writer->GetServiceForStream(p_->video, GUID_NULL, IID_PPV_ARGS(&enc)))) {
         ComPtr<IMFAttributes> ea;

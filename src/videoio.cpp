@@ -1485,6 +1485,21 @@ auto Mp4Frames(EditFrames& frames, SIZE sz) {
     };
 }
 
+// A sized MP4's frames (Compress): the rendered frame scaled to `to`, as NV12.
+auto ScaledFrames(EditFrames& frames, SIZE sz, SIZE to) {
+    return [&frames, sz, to](const VideoFrame& src, double st, bool alone, int) {
+        EncoderFrame ef;
+        BitmapPtr f = frames.Render(src, st, alone);
+        if (!f || f->Width() != sz.cx || f->Height() != sz.cy) return ef;
+        if (to.cx != sz.cx || to.cy != sz.cy) f = Resample(*f, to.cx, to.cy);
+        if (!f) return ef;
+        ef.nv12 = RecycledBytes((size_t)to.cx * to.cy * 3 / 2);
+        BgraToNv12(f->Bits(), to.cx, to.cy, ef.nv12->data());
+        if (g_exportTap) ef.bgra = f;
+        return ef;
+    };
+}
+
 // A review video's frames (see ReviewPlan): the summary card, then the edit's frames with the burn-in, and each note's
 // frame held under its card. `role[i]`: -1 the summary card, -2 an edit frame, k ≥ 0 note k's hold.
 auto ReviewFrames(EditFrames& frames, SIZE sz, const ReviewPlan& plan, const std::vector<int>& role, const FrameRenderer& view, BitmapPtr summary) {
@@ -1529,9 +1544,10 @@ auto ReviewFrames(EditFrames& frames, SIZE sz, const ReviewPlan& plan, const std
 }
 
 bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring& out, std::wstring* error, const ExportProgress& progress,
-                     const ReviewPlan* plan = nullptr) {
+                     const ReviewPlan* plan = nullptr, const Mp4Target* target = nullptr) {
     const int fps = (int)std::lround(seq.Fps());
     const SIZE sz = FrameRenderer(e, seq.size, false).Out();
+    const SIZE outSize = target ? target->size : sz;
     // A review video: which source time each output frame shows, and what it is.
     std::vector<double> times;
     std::vector<int> role;
@@ -1564,7 +1580,8 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
     Mp4Writer w;
     auto begun = std::async(std::launch::async, [&] {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        const HRESULT r = w.Begin(out, sz.cx, sz.cy, fps, audio ? kRate : 0, 2, 0, true);
+        const HRESULT r = w.Begin(out, outSize.cx, outSize.cy, fps, audio ? kRate : 0, 2, 0, true, target ? target->videoBps : 0,
+                                  target ? target->audioBps : 0);
         CoUninitialize();
         return r;
     });
@@ -1587,6 +1604,7 @@ bool ExportMp4Single(const Sequence& seq, const VideoEdit& e, const std::wstring
     bool cancelled = false;
     std::function<EncoderFrame(const VideoFrame&, double, bool, int)> make = Mp4Frames(frames, sz);
     if (plan) make = ReviewFrames(frames, sz, *plan, role, view, summary);
+    else if (target) make = ScaledFrames(frames, sz, outSize);
     ExportFrames<EncoderFrame>(frames, 0, n, make, [&](int i, EncoderFrame& f) {
         if (!start()) return false;
         if (g_exportTap) g_exportTap(i, *f.bgra);
@@ -1802,6 +1820,16 @@ bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstrin
     }
     if (shown <= 0) return ExportMp4Single(seq, e, out, error, progress);
     return ExportMp4Single(seq, e, out, error, [&](double p) { return progress(shown + (1 - shown) * p); });
+}
+
+bool ExportMp4Sized(const std::wstring& source, const VideoEdit& e, const Mp4Target& target, const std::wstring& out, std::wstring* error,
+                    ExportProgress progress) {
+    ReleaseFrameMemory release;
+    if (target.size.cx < 2 || target.size.cy < 2 || (target.size.cx & 1) || (target.size.cy & 1) || !target.videoBps) {
+        if (error) *error = L"Invalid size.";
+        return false;
+    }
+    return ExportMp4Single(SequenceOf(source, e), e, out, error, progress, nullptr, &target);
 }
 
 bool ExportReviewMp4(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& out, std::wstring* error,

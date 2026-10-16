@@ -18,6 +18,7 @@ using std::min;
 #include <gdiplus.h>
 
 #include "capture.h"
+#include "compress.h"
 #include "editor.h"
 #include "videoeditor.h"
 #include "videoio.h"
@@ -83,6 +84,7 @@ enum Cmd : int {
     CmdScrolling,
     CmdEditLast,
     CmdOpenImage,
+    CmdCompressFile,
     CmdFullscreen,
     CmdMonitor,
     CmdWindow,
@@ -145,6 +147,7 @@ const CmdDef kCmds[] = {
     {CmdScrolling, L"CaptureScrolling", L"Scrolling capture (long page)", L"scroll stitch full page chat long", 0xE8CB, L"Ctrl+Alt+S", true},
     {CmdEditLast, L"EditLastCapture", L"Annotate last capture", L"edit editor draw markup", 0xE70F, L"", false},
     {CmdOpenImage, L"OpenImageInEditor", L"Open a picture or video to edit…", L"edit file annotate load image video mp4 import", 0xE8E5, L"", false},
+    {CmdCompressFile, L"CompressFile", L"Compress a picture or video…", L"smaller shrink size mb discord email reduce file jpeg mp4", 0xE73F, L"", false},
     {CmdFullscreen, L"CaptureFullscreen", L"Capture full screen", L"all monitors desktop entire everything", 0xE7F4, L"Ctrl+PrintScreen", true},
     {CmdMonitor, L"CaptureMonitor", L"Capture current monitor", L"display screen", 0xE7F4, L"Ctrl+Shift+PrintScreen", true},
     {CmdWindow, L"CaptureWindow", L"Capture active window", L"app foreground focused", 0xE8A7, L"Alt+PrintScreen", true},
@@ -286,6 +289,12 @@ void ApplyEditorDefaults() {
     SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
         g_settings.noteAuthor = name;
         g_settings.WriteString(L"VideoEditor", L"NoteAuthor", name);
+    });
+    SetCompressSizes(g_settings.compressVideoMB, g_settings.compressPictureMB, [](bool picture, double mb) {
+        (picture ? g_settings.compressPictureMB : g_settings.compressVideoMB) = mb;
+        wchar_t b[32];
+        swprintf(b, 32, L"%g", mb);
+        g_settings.WriteString(L"Compress", picture ? L"PictureMB" : L"VideoMB", b);
     });
 
     SetFileNameTemplate(g_settings.fileNameTemplate);
@@ -645,6 +654,13 @@ void OpenImageInEditor() {
     if (!files.empty()) OpenFileToEdit(files[0]);
 }
 
+// Smaller copies next to the originals (compress.h), at a size picked from a palette.
+void CompressPickedFiles() {
+    SetForegroundWindow(g_hwnd);
+    const auto files = PickFiles(g_hwnd, MediaFilter(true, true), true, L"Compress to a smaller file", g_settings.CapturesFolder());
+    if (!files.empty()) ShowCompressPicker(files);
+}
+
 void CaptureActiveWindow(After after) {
     HWND fg = GetForegroundWindow();
     RECT r;
@@ -854,6 +870,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
             else Notify(L"No capture yet");
             break;
         case CmdOpenImage: OpenImageInEditor(); break;
+        case CmdCompressFile: CompressPickedFiles(); break;
         case CmdFullscreen: CaptureRect(VirtualScreenRect(), TakeCliAfter()); break;
         case CmdMonitor: {
             POINT pt;
@@ -1101,7 +1118,7 @@ bool CliTouchesFiles(const CliRequest& req) {
     if (!req.file.empty() || req.after == After::Upload) return true;
     switch (req.cmd) {
         case CmdRegionUpload: case CmdUploadLast: case CmdUploadFile: case CmdEditLast: case CmdPinLast:
-        case CmdOpenLast: case CmdOpenImage: case CmdRenameLast: return true;
+        case CmdOpenLast: case CmdOpenImage: case CmdCompressFile: case CmdRenameLast: return true;
     }
     for (const auto& a : req.args)
         if (_wcsicmp(a.c_str(), L"--upload") == 0 || _wcsicmp(a.c_str(), L"/upload") == 0) return true;

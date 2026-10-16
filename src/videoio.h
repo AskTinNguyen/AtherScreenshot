@@ -118,6 +118,15 @@ using ExportProgress = std::function<bool(double)>;
 bool ExportMp4(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, ExportProgress progress = {});
 bool ExportGif(const std::wstring& source, const VideoEdit& e, const std::wstring& out, std::wstring* error, double fps = 12,
                ExportProgress progress = {});
+// An MP4 at a set frame size and bit rates (Compress, see compress.h): the frames are scaled to `size` (even, the
+// edit's shape) and encoded at a constant `videoBps`, the sound as AAC at `audioBps`. One encoder, so the rate holds
+// over the whole video.
+struct Mp4Target {
+    SIZE size{};
+    uint32_t videoBps = 0, audioBps = 0;
+};
+bool ExportMp4Sized(const std::wstring& source, const VideoEdit& e, const Mp4Target& target, const std::wstring& out, std::wstring* error,
+                    ExportProgress progress = {});
 // "Save review video": the edit as an MP4 with `plan`'s summary card, burn-in and held note frames (silent while
 // held). One encoder; the frames go through the same frame renderer as Save's. A plain Save never comes here.
 bool ExportReviewMp4(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& out, std::wstring* error,
