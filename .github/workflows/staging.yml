@@ -51,16 +51,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unit tests
-        id: tests
-        continue-on-error: true  # reported below; UI snapshot tests can need things a runner lacks
-        working-directory: macos
-        run: xcrun swift test 2>&1 | tee ../swift-test.log; exit ${PIPESTATUS[0]}
       - name: Compress tests
         id: compress
         continue-on-error: true
+        timeout-minutes: 15
         working-directory: macos
         run: xcrun swift test --filter CompressTests 2>&1 | tee ../compress-test.log; exit ${PIPESTATUS[0]}
+      - name: Unit tests
+        id: tests
+        continue-on-error: true  # reported below; some tests can wait on things a runner lacks (screen, permissions)
+        timeout-minutes: 15
+        working-directory: macos
+        run: xcrun swift test 2>&1 | tee ../swift-test.log; exit ${PIPESTATUS[0]}
       - name: Package (universal, ad-hoc signed)
         working-directory: macos
         run: ./build.sh package
@@ -71,6 +73,10 @@ jobs:
             echo "## macOS unit tests: ${{ steps.tests.outcome }} · CompressTests: ${{ steps.compress.outcome }}"
             echo '```'
             tail -n 40 compress-test.log 2>/dev/null || echo "no log"
+            echo '```'
+            echo 'All unit tests (last lines):'
+            echo '```'
+            tail -n 25 swift-test.log 2>/dev/null || echo "no log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

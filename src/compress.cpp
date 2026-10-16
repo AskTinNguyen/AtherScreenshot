@@ -431,7 +431,7 @@ ATHER_TEST(compress_sizes_and_names) {
     CHECK(pic.size() == 3 && pic[0] == 2 && pic[1] == 1 && pic[2] == 5);
 }
 
-// Noise (which no encoder can shrink much, so the rate has to hold) with a tone: ~2 Mbps as Mp4Writer makes it.
+// A moving gradient with grain, and a tone: ~2 Mbps as Mp4Writer makes it, so the rate has to come down.
 static bool WriteNoisyClip(const std::wstring& path, int w, int h, int fps, double seconds, bool tone) {
     constexpr int kRate = 48000;
     constexpr double kTicks = 1e7;
@@ -443,7 +443,14 @@ static bool WriteNoisyClip(const std::wstring& path, int w, int h, int fps, doub
     int64_t audio = 0;
     const int n = (int)std::lround(seconds * fps);
     for (int i = 0; i < n; ++i) {
-        for (auto& p : px) p = 0xFF000000 | ((x = x * 1664525 + 1013904223) >> 8);
+        // A gradient that moves every frame, with light grain: busy enough to need the bits, unlike flat colour,
+        // and unlike pure noise still something an encoder can squeeze to a low rate (as screen recordings are).
+        for (int yy = 0; yy < h; ++yy)
+            for (int xx = 0; xx < w; ++xx) {
+                const int grain = (int)(((x = x * 1664525 + 1013904223) >> 24) % 25) - 12;
+                auto c = [grain](int v) { return (uint32_t)std::clamp(v + grain, 0, 255); };
+                px[(size_t)yy * w + xx] = 0xFF000000 | c((xx * 255 / w + i * 4) & 255) << 16 | c(yy * 255 / h) << 8 | c(((xx + yy) / 2 + i * 2) & 255);
+            }
         if (FAILED(mw.WriteFrame(px.data(), std::llround(i * kTicks / fps), std::llround(kTicks / fps)))) return false;
         if (!tone) continue;
         pcm.clear();
@@ -482,8 +489,8 @@ ATHER_TEST(compress_video_lands_under_the_cap) {
     CHECK(!tiny.ok && !tiny.error.empty() && tiny.tmp.empty() && tiny.attempts == 0);
     // 1920 × 1080 at a cap that leaves it under 500 kbps of video: 1280 wide.
     const std::wstring hd = dir + L"\\hd.mp4";
-    CHECK(WriteNoisyClip(hd, 1920, 1080, 30, 2, false));
-    CompressResult s = CompressVideo(hd, 100 * 1024);
+    CHECK(WriteNoisyClip(hd, 1920, 1080, 30, 4, false));
+    CompressResult s = CompressVideo(hd, 200 * 1024);  // ~370 kbps: 1280 wide, also after a retry
     test::Note("error: " + ToUtf8(s.error));
     CHECK(s.ok && FinishCompress(s) && s.w == 1280 && s.h == 720);
     CHECK(ProbeVideo(s.out, &vi) && vi.w == 1280 && vi.h == 720 && !vi.hasAudio);

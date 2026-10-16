@@ -82,8 +82,8 @@ final class CompressTests: XCTestCase {
         // Too little room for the length: refused.
         do { _ = try await Compress.video(src, cap: 30 * 1024); XCTFail("should not fit") } catch {}
         // 1920 × 1080 at a cap that leaves it under 500 kbps of video: 1280 wide.
-        let hd = try await Self.noise(w: 1920, h: 1080, seconds: 2, tone: false)
-        var s = try await Compress.video(hd, cap: 100 * 1024)
+        let hd = try await Self.noise(w: 1920, h: 1080, seconds: 4, tone: false)
+        var s = try await Compress.video(hd, cap: 200 * 1024)   // ~370 kbps: 1280 wide, also after a retry
         try Compress.finish(&s)
         XCTAssertEqual([s.w, s.h], [1280, 720])
         let hdSize = try await AVURLAsset(url: try XCTUnwrap(s.out)).loadTracks(withMediaType: .video).first?.load(.naturalSize)
@@ -91,7 +91,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testRotatedPhoneVideoComesOutUpright() async throws {
-        let src = try await TestMedia.clip(w: 640, h: 360, seconds: 2, rotation: 90) { i, ctx in Self.paintNoise(ctx, seed: UInt32(i)) }
+        let src = try await TestMedia.clip(w: 640, h: 360, seconds: 2, rotation: 90) { i, ctx in Self.paintGrain(ctx, frame: i) }
         var r = try await Compress.video(src, cap: min(200 * 1024, Compress.fileBytes(src) * 0.6))
         try Compress.finish(&r)
         XCTAssertEqual([r.w, r.h], [360, 640])
@@ -123,9 +123,26 @@ final class CompressTests: XCTestCase {
         XCTAssertLessThanOrEqual(img.width, 1600)
     }
 
-    // Noise, which no encoder can shrink much, so the rate has to hold.
+    // A gradient that moves every frame, with light grain: busy enough to need the bits, yet (unlike pure noise, which
+    // no encoder squeezes below its quality floor) something an encoder can bring down to a low rate.
     private static func noise(w: Int, h: Int, seconds: Double, tone: Bool) async throws -> URL {
-        try await TestMedia.clip(w: w, h: h, seconds: seconds, tone: tone) { i, ctx in paintNoise(ctx, seed: UInt32(i)) }
+        try await TestMedia.clip(w: w, h: h, seconds: seconds, tone: tone) { i, ctx in paintGrain(ctx, frame: i) }
+    }
+
+    private static func paintGrain(_ ctx: CGContext, frame i: Int) {
+        guard let data = ctx.data else { return }
+        let px = data.assumingMemoryBound(to: UInt32.self)
+        let w = ctx.width, h = ctx.height, row = ctx.bytesPerRow / 4
+        var x = UInt32(truncatingIfNeeded: i) &* 2_654_435_761 &+ 99
+        for yy in 0..<h {
+            for xx in 0..<w {
+                x = x &* 1_664_525 &+ 1_013_904_223
+                let grain = Int((x >> 24) % 25) - 12
+                func c(_ v: Int) -> UInt32 { UInt32(min(255, max(0, v + grain))) }
+                let r = c((xx * 255 / w + i * 4) & 255), g = c(yy * 255 / h), b = c(((xx + yy) / 2 + i * 2) & 255)
+                px[yy * row + xx] = 0xFF00_0000 | (r << 16) | (g << 8) | b
+            }
+        }
     }
 
     private static func paintNoise(_ ctx: CGContext, seed: UInt32) {
