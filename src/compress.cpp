@@ -18,6 +18,7 @@
 #include "palette.h"
 #include "selftest.h"
 #include "toast.h"
+#include "videoedit.h"
 #include "videoio.h"
 
 using Microsoft::WRL::ComPtr;
@@ -142,27 +143,16 @@ std::wstring CompressedPath(const std::wstring& source, const wchar_t* ext) {
     }
 }
 
-CompressResult CompressVideo(const std::wstring& path, double capBytes, CompressProgress progress) {
-    CompressResult r;
-    r.bytesBefore = FileBytes(path);
-    const auto clip = ClipOf(path);  // upright size, length, and whether its sound decodes here
-    if (!clip || clip->Duration() <= 0) {
-        r.error = L"Can't read this video.";
-        return r;
-    }
-    if (r.bytesBefore > 0 && r.bytesBefore <= capBytes) {
-        r.ok = r.skipped = true;
-        return r;
-    }
-    VideoEdit e;
-    e.clips = {*clip};
-    e.trimEnd = clip->Duration();
+// The edit (of `source`) encoded under the cap into r.tmp: the plan for its length, frame and sound, then up to two
+// smaller tries when it comes out over. `w` × `h`: the edit's output frame.
+static void EncodeUnderCap(const std::wstring& source, const VideoEdit& e, double seconds, int w, int h, bool audio, double capBytes,
+                           const CompressProgress& progress, CompressResult& r) {
     r.tmp = TempFile(L"mp4");
     double scale = 1;
     for (int attempt = 0; attempt <= kCompressRetries; ++attempt) {
-        const VideoPlan p = PlanCompressedVideo(capBytes, clip->Duration(), clip->w, clip->h, clip->hasAudio, scale);
+        const VideoPlan p = PlanCompressedVideo(capBytes, seconds, w, h, audio, scale);
         if (!p.fits) {
-            r.error = attempt == 0 ? Seconds(clip->Duration()) + L" of video doesn't fit in " + MegabytesLabel(capBytes / (1024 * 1024)) +
+            r.error = attempt == 0 ? Seconds(seconds) + L" of video doesn't fit in " + MegabytesLabel(capBytes / (1024 * 1024)) +
                                          L". Trim it first, or pick a larger size."
                                    : L"It still came out at " + SizeText(r.bytesAfter) + L". Trim it first, or pick a larger size.";
             break;
@@ -170,7 +160,7 @@ CompressResult CompressVideo(const std::wstring& path, double capBytes, Compress
         std::wstring err;
         const Mp4Target target{{p.w, p.h}, (uint32_t)p.videoBps, (uint32_t)p.audioBps};
         DeleteFileW(r.tmp.c_str());
-        const bool ok = ExportMp4Sized(L"", e, target, r.tmp, &err, [&](double x) {
+        const bool ok = ExportMp4Sized(source, e, target, r.tmp, &err, [&](double x) {
             if (progress) progress(x, attempt);
             return true;
         });
@@ -193,10 +183,46 @@ CompressResult CompressVideo(const std::wstring& path, double capBytes, Compress
     if (!r.ok) {
         DeleteFileW(r.tmp.c_str());
         r.tmp.clear();
+    }
+}
+
+CompressResult CompressVideo(const std::wstring& path, double capBytes, CompressProgress progress) {
+    CompressResult r;
+    r.bytesBefore = FileBytes(path);
+    const auto clip = ClipOf(path);  // upright size, length, and whether its sound decodes here
+    if (!clip || clip->Duration() <= 0) {
+        r.error = L"Can't read this video.";
         return r;
     }
-    r.out = CompressedPath(path, L"mp4");
+    if (r.bytesBefore > 0 && r.bytesBefore <= capBytes) {
+        r.ok = r.skipped = true;
+        return r;
+    }
+    VideoEdit e;
+    e.clips = {*clip};
+    e.trimEnd = clip->Duration();
+    EncodeUnderCap(L"", e, clip->Duration(), clip->w, clip->h, clip->hasAudio, capBytes, progress, r);
+    if (r.ok) r.out = CompressedPath(path, L"mp4");
     return r;
+}
+
+CompressResult CompressEdit(const std::wstring& source, const VideoEdit& e, double capBytes, CompressProgress progress) {
+    CompressResult r;
+    const Sequence seq = SequenceOf(source, e);
+    const double seconds = e.OutputDuration();
+    if (seq.clips.empty() || seconds <= 0) {
+        r.error = L"Can't read this video.";
+        return r;
+    }
+    const SIZE sz = FrameRenderer(e, seq.size, false).Out();  // after the crop
+    EncodeUnderCap(source, e, seconds, sz.cx, sz.cy, !e.muted && seq.HasAudio(), capBytes, progress, r);
+    return r;
+}
+
+void RememberCompressSize(bool picture, double mb) {
+    if (mb <= 0) return;
+    (picture ? g_pictureMB : g_videoMB) = mb;
+    if (g_saveSize) g_saveSize(picture, mb);
 }
 
 CompressResult CompressPicture(const std::wstring& path, double capBytes) {
@@ -290,8 +316,7 @@ std::vector<double> CompressSizesFor(const std::vector<std::wstring>& paths) {
 void CompressFiles(const std::vector<std::wstring>& paths, double capMB) {
     if (paths.empty() || capMB <= 0) return;
     const bool pictures = std::none_of(paths.begin(), paths.end(), IsVideo);
-    (pictures ? g_pictureMB : g_videoMB) = capMB;
-    if (g_saveSize) g_saveSize(pictures, capMB);
+    RememberCompressSize(pictures, capMB);
     const std::wstring label = MegabytesLabel(capMB);
     const uint64_t toast = ShowToast(L"Compressing to under " + label + L"…", paths.size() == 1 ? FileNameOf(paths[0]) : std::to_wstring(paths.size()) + L" files",
                                      nullptr, nullptr, 3600000);

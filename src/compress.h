@@ -116,6 +116,10 @@ using CompressProgress = std::function<void(double progress, int attempt)>;
 // Run on a worker thread with COM initialized. They write only temp files; FinishCompress puts the result in place.
 CompressResult CompressVideo(const std::wstring& path, double capBytes, CompressProgress progress = {});
 CompressResult CompressPicture(const std::wstring& path, double capBytes);
+// The video editor's "Save smaller": the edit (trim, crop, speed, captions, markup…) of `source` encoded under the cap
+// into `tmp`, the same way; `out` is left for the caller (the editor saves into the captures folder). Never skipped.
+struct VideoEdit;
+CompressResult CompressEdit(const std::wstring& source, const VideoEdit& e, double capBytes, CompressProgress progress = {});
 // Either, by the file's type.
 CompressResult CompressFile(const std::wstring& path, double capBytes, CompressProgress progress = {});
 // Moves the temp file to `out` (never over an existing file). False, with `error` set, when it can't.
@@ -131,5 +135,7 @@ void ShowCompressPicker(const std::vector<std::wstring>& paths);
 std::vector<double> CompressSizesFor(const std::vector<std::wstring>& paths);
 // The last sizes used (settings.ini [Compress] CompressVideoMB and CompressPictureMB), and where a newly used one is saved.
 void SetCompressSizes(double videoMB, double pictureMB, std::function<void(bool picture, double mb)> save);
+// Makes `mb` the first size offered next time (and saves it).
+void RememberCompressSize(bool picture, double mb);
 
 }  // namespace ather

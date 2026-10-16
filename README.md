@@ -200,6 +200,7 @@ Space plays, ←/→ step a frame (`Shift`: a second), `Home`/`End` go to the tr
 Make a smaller copy of a video or picture that fits a chat app's or email's limit, in two clicks:
 
 - **Gallery:** right-click › **Compress** › Under 30 MB, 8 MB (Discord), 25 MB (email) or 50 MB, or **Other size…** to type one. For pictures the sizes are 2, 1 and 5 MB. Several selected files are compressed one after another. Also in the gallery's action palette.
+- **While editing a video (Windows):** Save ▾ › **Save smaller** › Under 30, 8, 25 or 50 MB, or Other size…. It saves the edit (trim, crop, speed, captions, markup) as a new MP4 in your captures that fits the size.
 - **Any file:** the palette's "Compress a picture or video…" picks files first.
 - **Where it goes:** next to the original as `<name>_small.mp4` or `<name>_small.jpg` (`_small-2` and so on if that's taken). The original is never changed, and in the gallery the copy stacks with it.
 - **Videos** become H.264 + AAC MP4s, which play in every chat app and browser. The bit rate is worked out from the size and the length (90% of the size, leaving room for the file's own overhead, with 96 kbps for the sound). Videos wider than 1920 px are scaled down (never up). When the size leaves little room, they go down to 1280 or 854 px so they still look clean. If one still comes out too big, it's made again a bit smaller, at most twice. A size too small for the length is refused with a hint to trim the clip first.

@@ -13,7 +13,7 @@
 ## Coming in the next update (Windows and macOS)
 
 ### Compress a video or picture to fit a size
-- **Two clicks:** right-click a capture in the gallery › Compress › Under 30 MB, 8 MB (Discord), 25 MB (email), 50 MB or any size you type. Pictures offer 2, 1 and 5 MB. Or use "Compress a picture or video…" in the palette for any file.
+- **Two clicks:** right-click a capture in the gallery › Compress › Under 30 MB, 8 MB (Discord), 25 MB (email), 50 MB or any size you type. Pictures offer 2, 1 and 5 MB. Or use "Compress a picture or video…" in the palette for any file. While editing a video on Windows, Save ▾ › Save smaller saves your edit to fit the size.
 - **What you get:** a smaller copy next to the original (`<name>_small.mp4` or `.jpg`); the original stays as it is. Videos are H.264 MP4s that play in every chat app and browser, sized from the length so they land just under the limit (re-made a bit smaller if they don't). Pictures become JPEGs.
 
 ## What's new in this update (macOS, build 0.0.2.3)

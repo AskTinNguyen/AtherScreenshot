@@ -34,10 +34,12 @@ using std::min;
 #include <gdiplus.h>
 
 #include "annot.h"
+#include "compress.h"
 #include "json.h"
 #include "library.h"
 #include "media.h"
 #include "output.h"
+#include "palette.h"
 #include "selftest.h"
 #include "textdraw.h"
 #include "toast.h"
@@ -422,6 +424,7 @@ struct SaveResult {
     std::wstring out, tmp, err;
     bool review = false;          // a review video, with its notes list (and sheet) next to it
     std::wstring md, mdText, sheet;
+    double underMB = 0;           // "Save smaller": the size it had to fit
 };
 struct FrameTimesResult {
     std::wstring key;
@@ -1940,7 +1943,7 @@ public:
         Button(dc, g, save.left, y, h, 0, L"Save", false, false, [this] { Save(false); }, L"Save as a new MP4 in your captures (Ctrl+S)", true, saveW);
         FillRR(g, more, (float)S(7), A(theme::kAccent));
         Text(dc, fSmall, L"▾", more, theme::kOnAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        Hotspot(more, [this, more] { Popup(more, SaveMenu()); }, L"More ways to save: GIF, review video with your notes");
+        Hotspot(more, [this, more] { Popup(more, SaveMenu()); }, L"More ways to save: smaller (under 8, 25, 50 MB…), GIF, review video with your notes");
     }
     std::vector<MenuItem> SaveMenu() {
         std::vector<MenuItem> v;
@@ -1952,7 +1955,22 @@ public:
         review.label = L"Save review video\tCtrl+Alt+S";
         review.run = [this] { SaveReview(); };
         review.enabled = !tframes.empty();
+        // Save smaller ▸ Under 30 MB, 8 MB (Discord), 25 MB (email), 50 MB, Other size…: the edit, sized to fit.
+        MenuItem smaller;
+        smaller.label = L"Save smaller";
+        for (double mb : CompressSizesFor({path})) {
+            MenuItem m;
+            m.label = L"Under " + MegabytesLabel(mb) + (mb == 8 ? L"  (Discord)" : mb == 25 ? L"  (email)" : L"");
+            m.run = [this, mb] { SaveSmaller(mb); };
+            smaller.sub.push_back(m);
+        }
+        smaller.sub.push_back(MenuItem::Sep());
+        MenuItem other;
+        other.label = L"Other size…";
+        other.run = [this] { AskSmallerSize(); };
+        smaller.sub.push_back(other);
         v.push_back(mp4);
+        v.push_back(smaller);
         v.push_back(gif);
         v.push_back(MenuItem::Sep());
         v.push_back(review);
@@ -3257,6 +3275,63 @@ public:
         }).detach();
     }
 
+    // Save ▾ › Save smaller: the edit as a new MP4 in the captures folder that fits in `mb` (compress.h: H.264 at the rate
+    // that fits its length, scaled down when that's low, made again smaller when it comes out over).
+    double lastSmallerMB = 0;  // tests
+    void SaveSmaller(double mb) {
+        if (busy || mb <= 0) return;
+        SetFocus(hwnd);  // commits a field being edited
+        busy = saving = true;
+        Pause();
+        RememberCompressSize(false, mb);
+        lastSmallerMB = mb;
+        const std::wstring out = MakeCapturePath(g_folder, L"mp4", {window, app});
+        SHCreateDirectoryExW(nullptr, out.substr(0, out.find_last_of(L'\\')).c_str(), nullptr);
+        const std::wstring label = MegabytesLabel(mb);
+        const uint64_t toast = ShowToast(L"Saving under " + label + L"…", Clock(edit.OutputDuration()) + L" long", nullptr, nullptr, 600000);
+        const VideoEdit e = edit;
+        const std::wstring src = path, srcApp = app, srcWindow = window;
+        HWND h = hwnd;
+        std::thread([=] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            int lastPct = -1;
+            CompressResult c = CompressEdit(src, e, MegabytesToBytes(mb), [&](double p, int attempt) {
+                const int pct = (int)(p * 100);
+                if (pct / 5 == lastPct / 5) return;
+                lastPct = pct;
+                const std::wstring body = std::to_wstring(pct) + L"%" + (attempt ? L", smaller try " + std::to_wstring(attempt + 1) : L"");
+                RunOnUi([toast, body] { UpdateToastBody(toast, body); });
+            });
+            CoUninitialize();
+            auto* r = new SaveResult{c.ok, false, out, c.tmp, c.error};
+            r->underMB = mb;
+            if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {  // the editor was closed meanwhile
+                delete r;
+                if (!c.ok) {
+                    DeleteFileW(c.tmp.c_str());
+                } else {
+                    const std::wstring tmp = c.tmp;
+                    RunOnUi([src, out, tmp, srcApp, srcWindow] {
+                        Library::Shared().NoteEdit(out, src, srcApp, srcWindow, true);
+                        MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+                    });
+                }
+            }
+        }).detach();
+    }
+    void AskSmallerSize() {
+        if (busy) return;
+        wchar_t last[32];
+        swprintf_s(last, L"%g", CompressSizesFor({path}).front());
+        HWND h = hwnd;
+        ShowTextPrompt(L"Save smaller: under how many MB?  ·  Enter to save, Esc to cancel", last, [this, h](std::wstring text) {
+            if (!IsWindow(h)) return;  // the editor was closed meanwhile
+            const double mb = ParseMegabytes(text);
+            if (mb <= 0) return (void)ShowToast(L"Type a size in MB", L"For example 10 or 2.5", nullptr, nullptr, 3000);
+            SaveSmaller(mb);
+        });
+    }
+
     // Save review video (Ctrl+Alt+S): "<video> review.mp4" in the captures folder (the summary card, the edit with the
     // timecode and frame number burned in, each note's frame held under its card), with "<video> review notes.md" and
     // "<video> review sheet.png" next to it.
@@ -3334,13 +3409,14 @@ public:
                   [made] { RevealInExplorer(made); }, 6000);
     }
 
-    void Saved(bool ok, bool gif, const std::wstring& out, const std::wstring& tmp, const std::wstring& err) {
+    // `underMB` > 0: a "Save smaller" one.
+    void Saved(bool ok, bool gif, const std::wstring& out, const std::wstring& tmp, const std::wstring& err, double underMB = 0) {
         busy = saving = false;
         lastSaveError = ok ? L"" : err;
         Invalidate();
         if (!ok) {
             DeleteFileW(tmp.c_str());
-            ShowToast(L"Save failed", err, nullptr, nullptr, 8000);
+            ShowToast(underMB > 0 ? L"Couldn't save under " + MegabytesLabel(underMB) : L"Save failed", err, nullptr, nullptr, 8000);
             return;
         }
         // Joins the gallery stacked with the original, with its tags and collections, tagged "edited".
@@ -3357,7 +3433,8 @@ public:
         const double mb = ((uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) / 1048576.0;
         wchar_t size[32];
         swprintf_s(size, mb >= 1 ? L"%.1f MB" : L"%.0f KB", mb >= 1 ? mb : mb * 1024);
-        ShowToast(gif ? L"GIF saved" : L"Video saved", FileNameOf(out) + L"  ·  " + size + L"  ·  click to show in Explorer", nullptr,
+        ShowToast(underMB > 0 ? L"Saved under " + MegabytesLabel(underMB) : gif ? L"GIF saved" : L"Video saved",
+                  FileNameOf(out) + L"  ·  " + size + L"  ·  click to show in Explorer", nullptr,
                   [out] { RevealInExplorer({out}); }, 5000);
     }
 
@@ -3552,7 +3629,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_SAVED: {
             std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(l));
             if (r->review) ReviewSaved(*r);
-            else Saved(r->ok, r->gif, r->out, r->tmp, r->err);
+            else Saved(r->ok, r->gif, r->out, r->tmp, r->err, r->underMB);
             return 0;
         }
         case WM_CLOSE:
@@ -4133,6 +4210,45 @@ ATHER_TEST(video_editor_saves_new_files) {
     WIN32_FILE_ATTRIBUTE_DATA after{};
     GetFileAttributesExW(clip.c_str(), GetFileExInfoStandard, &after);
     CHECK(CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0);  // the original is untouched
+    DestroyWindow(e->hwnd);
+}
+
+// Save ▾ › Save smaller: the edit (here trimmed and cropped) as a new MP4 under the size, in the captures folder.
+ATHER_TEST(video_editor_saves_smaller) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"\\clip.mp4", caps = dir + L"\\caps";
+    CHECK(WriteTestClip(clip, 1280, 720, 30, 3, true));
+    const CapturesFolderForTest folder(caps);
+    VideoEditor* e = OpenHidden(clip, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    // The menu: Save smaller ▸ the sizes, then Other size…
+    const auto menu = e->SaveMenu();
+    const auto smaller = std::find_if(menu.begin(), menu.end(), [](const MenuItem& m) { return m.label == L"Save smaller"; });
+    CHECK(smaller != menu.end() && smaller->sub.size() >= 4 && smaller->sub.back().label == L"Other size…");
+    e->Seek(1);
+    e->OnKey('I');
+    e->edit.crop = VRect{0, 0, 640, 360};
+    const double mb = 0.15;  // 2 s in 154 KB: ~470 kbps with the sound, so a 640-wide crop stays as it is
+    e->SaveSmaller(mb);
+    for (int i = 0; i < 150 && e->busy; ++i) Pump(100);
+    CHECK(!e->busy);
+    test::Note("save error: " + ToUtf8(e->lastSaveError));
+    CHECK(e->lastSaveError.empty());
+    auto files = RecentCaptures(caps, 10, true);
+    CHECK_EQ(files.size(), 1u);
+    if (files.size() == 1) {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        GetFileAttributesExW(files[0].c_str(), GetFileExInfoStandard, &fa);
+        CHECK(fa.nFileSizeHigh == 0 && fa.nFileSizeLow <= MegabytesToBytes(mb));
+        VideoInfo vi;
+        CHECK(ProbeVideo(files[0], &vi) && std::fabs(vi.duration - 2) < 0.15 && vi.w == 640 && vi.h == 360 && vi.hasAudio);
+    }
+    // A size too small for the length: an error, and nothing saved.
+    e->SaveSmaller(0.01);
+    for (int i = 0; i < 50 && e->busy; ++i) Pump(100);
+    CHECK(!e->busy && !e->lastSaveError.empty());
+    CHECK_EQ(RecentCaptures(caps, 10, true).size(), 1u);
     DestroyWindow(e->hwnd);
 }
 
