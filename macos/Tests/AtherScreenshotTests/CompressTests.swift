@@ -106,6 +106,34 @@ final class CompressTests: XCTestCase {
         XCTAssertEqual(size, CGSize(width: 360, height: 640))
     }
 
+    // The video editor's Save smaller: the edit (here trimmed and cropped) rendered as Save renders it, under the size.
+    func testEditSavesUnderTheCap() async throws {
+        let clip = try await VideoSource.probe(try await TestMedia.colors(w: 1280, h: 720, seconds: 3, tone: true))
+        var e = TestMedia.edit([clip])
+        e.trimStart = 1
+        e.crop = CGRect(x: 0, y: 0, width: 640, height: 360)
+        let cap = Compress.bytes(mb: 0.15)   // 2 s in 154 KB: ~470 kbps with the sound, so a 640-wide crop stays as it is
+        var r = try await Compress.edit(e, cap: cap)
+        let tmp = try XCTUnwrap(r.tmp)
+        XCTAssertNil(r.out)   // the editor picks where it goes
+        XCTAssertLessThanOrEqual(Compress.fileBytes(tmp), cap)
+        let asset = AVURLAsset(url: tmp)
+        let size = try await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)
+        let sounds = try await asset.loadTracks(withMediaType: .audio).count
+        let seconds = try await asset.load(.duration).seconds
+        XCTAssertEqual(size, CGSize(width: r.w, height: r.h))
+        XCTAssertEqual([r.w, r.h], [640, 360], "the crop's size")
+        XCTAssertEqual(sounds, 1)
+        XCTAssertEqual(seconds, 2, accuracy: 0.15)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        r.out = dir.appendingPathComponent("smaller.mp4")
+        try Compress.finish(&r)
+        XCTAssertGreaterThan(Compress.fileBytes(dir.appendingPathComponent("smaller.mp4")), 0)
+        // A size too small for the length: refused.
+        do { _ = try await Compress.edit(e, cap: Compress.bytes(mb: 0.01)); XCTFail("should not fit") } catch {}
+    }
+
     func testPictureMakesASmallerJpeg() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -201,6 +201,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private let captionsMenu = NSPopUpButton(frame: .zero, pullsDown: true)
     private let aspectPopup = NSPopUpButton()
     private let addPopup = NSPopUpButton(frame: .zero, pullsDown: true)
+    let smallerMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Save smaller ▸ Under 30 / 8 / 25 / 50 MB, Other size…
     private let muteButton = NSButton()
     private let cropButton = NSButton()
     private let inspector = NSStackView()
@@ -352,6 +353,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         captionsMenu.toolTip = "Caption look, animation and size, for the whole video"
         rebuildCaptionsMenu()
 
+        smallerMenu.bezelStyle = .recessed
+        smallerMenu.toolTip = "Save the edit as an MP4 that fits a size: Discord, email or any limit you type"
+        rebuildSmallerMenu()
         let gif = barButton("Save GIF", "photo.stack", "Save as a GIF (⌘⇧S)") { [weak self] in self?.save(gif: true) }
         let save = NSButton(title: "Save", target: nil, action: nil)
         save.bezelStyle = .rounded
@@ -367,7 +371,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
@@ -615,6 +619,28 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     // Toolbar "Captions" menu: look, animation, word highlight and size, for the whole video.
+    // Save smaller's sizes: the last one used first (Compress.sizes), then Other size….
+    func rebuildSmallerMenu() {
+        let menu = smallerMenu.menu!
+        menu.removeAllItems()
+        actions.removeAll { $0.tag == 2 }
+        menu.addItem(withTitle: "Save smaller", action: nil, keyEquivalent: "")
+        smallerMenu.item(at: 0)?.image = NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left", accessibilityDescription: "Save smaller")
+        func item(_ t: String, _ run: @escaping () -> Void) {
+            let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
+            let a = MenuAction(run)
+            a.tag = 2
+            actions.append(a)
+            it.target = a
+            menu.addItem(it)
+        }
+        for mb in Compress.sizes(for: [url]) {
+            item("Under \(Compress.label(mb))" + (mb == 8 ? "  (Discord)" : mb == 25 ? "  (email)" : "")) { [weak self] in self?.saveSmaller(mb) }
+        }
+        menu.addItem(.separator())
+        item("Other size…") { [weak self] in self?.askSmallerSize() }
+    }
+
     private func rebuildCaptionsMenu() {
         let menu = captionsMenu.menu!
         menu.removeAllItems()
@@ -1069,6 +1095,56 @@ final class VideoEditor: NSObject, NSWindowDelegate {
                 try? FileManager.default.removeItem(at: tmp)
                 Toast.shared.show("Save failed", error.localizedDescription, ms: 8000)
             }
+        }
+    }
+
+    // Save smaller: the edit as a new MP4 in the captures folder that fits in `mb` (Compress.edit: H.264 at the rate that
+    // fits its length, scaled down when that's low, made again smaller when it comes out over).
+    private(set) var lastSmallerError: String?   // tests
+    func saveSmaller(_ mb: Double) {
+        guard !busy, mb > 0 else { return }
+        window.makeFirstResponder(stage)   // commits a field being edited
+        busy = true
+        player.pause()
+        playStateChanged()
+        Settings.shared.set("CompressVideoMB", mb)   // offered first next time, here and in the gallery
+        rebuildSmallerMenu()
+        let src = Library.shared.meta(url)
+        let info = NameInfo(app: src.app, window: src.window)
+        let label = Compress.label(mb)
+        let toast = Toast.shared.post("Saving under \(label)…", "\(clock(edit.outputDuration)) long", ms: 600_000)
+        let e = edit
+        Task { @MainActor in
+            defer { self.busy = false }
+            var tmp: URL?
+            do {
+                var r = try await Compress.edit(e, cap: Compress.bytes(mb: mb)) { f, attempt in
+                    let body = "\(Int(f * 100))%" + (attempt > 0 ? ", smaller try \(attempt + 1)" : "")
+                    DispatchQueue.main.async { Toast.shared.update(toast, body: body) }
+                }
+                tmp = r.tmp
+                let out = Output.newCaptureURL(ext: "mp4", info: info)
+                r.out = out
+                Library.shared.noteEdit(out, from: self.url, info: info, edited: true)
+                try Compress.finish(&r)
+                self.dirty = false
+                self.lastSmallerError = nil
+                let size = ByteCountFormatter.string(fromByteCount: Int64(Compress.fileBytes(out)), countStyle: .file)
+                Toast.shared.show("Saved under \(label)", "\(out.lastPathComponent)  ·  \(size)  ·  click to show in Finder") { Output.reveal(out) }
+            } catch {
+                if let tmp { try? FileManager.default.removeItem(at: tmp) }
+                self.lastSmallerError = error.localizedDescription
+                Toast.shared.show("Couldn't save under \(label)", error.localizedDescription, ms: 8000)
+            }
+        }
+    }
+
+    private func askSmallerSize() {
+        let last = Compress.sizes(for: [url]).first ?? Compress.defaultVideoMB
+        Palette.shared.prompt("Save smaller: under how many MB?  ·  ↩ saves, ⎋ cancels", initial: String(format: "%g", last)) { [weak self] text in
+            let mb = Compress.parseMegabytes(text)
+            guard mb > 0 else { return Toast.shared.show("Type a size in MB", "For example 10 or 2.5") }
+            self?.saveSmaller(mb)
         }
     }
 

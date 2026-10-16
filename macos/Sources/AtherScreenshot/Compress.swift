@@ -2,6 +2,7 @@ import AVFoundation
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
+import VideoToolbox
 
 // "Compress to under N MB": a smaller copy of a video or picture next to the original (<name>_small.mp4 / .jpg), sized
 // to fit a chat app's or email's limit. The original is never changed. Port of src/compress.h/.cpp; the math is the same.
@@ -143,8 +144,7 @@ enum Compress {
 
     // `progress(fraction, attempt)` from any thread, every 5% or so of an encode; `attempt` 0, then 1 and 2 for retries.
     static func video(_ url: URL, cap: Double, progress: ((Double, Int) -> Void)? = nil) async throws -> Result {
-        var r = Result()
-        r.bytesBefore = fileBytes(url)
+        let before = fileBytes(url)
         let asset = AVURLAsset(url: url)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.failed("Can't read this video.") }
         let audio = try await asset.loadTracks(withMediaType: .audio).first
@@ -153,13 +153,45 @@ enum Compress {
         let upright = CGRect(origin: .zero, size: natural).applying(transform).size
         let seconds = duration.seconds
         guard seconds > 0, upright.width >= 1, upright.height >= 1 else { throw Failure.failed("Can't read this video.") }
-        if r.bytesBefore > 0 && r.bytesBefore <= cap { r.skipped = true; return r }
+        if before > 0 && before <= cap {
+            var r = Result()
+            r.bytesBefore = before
+            r.skipped = true
+            return r
+        }
         let fps = nominal > 0 ? min(60, max(1, Double(nominal).rounded())) : 30
+        var r = try await underCap(seconds: seconds, w: Int(upright.width.rounded()), h: Int(upright.height.rounded()), audio: audio != nil, cap: cap,
+                                   progress: progress) { p, tmp, report in
+            try await encode(asset, video: track, audio: audio, transform: transform, upright: upright, duration: duration, fps: fps, plan: p, to: tmp,
+                             progress: report)
+        }
+        r.bytesBefore = before
+        r.out = outputURL(for: url, ext: "mp4")
+        return r
+    }
+
+    // The video editor's "Save smaller": the edit (trim, crop, speed, captions, markup…) rendered the way Save renders it
+    // and encoded under the cap the same way. `out` is left for the caller (the editor saves into the captures folder).
+    static func edit(_ e: VideoEdit, cap: Double, progress: ((Double, Int) -> Void)? = nil) async throws -> Result {
+        let prepared = try await VideoExport.prepare(e)
+        let seconds = prepared.composition.duration.seconds
+        guard seconds > 0, prepared.size.width >= 1, prepared.size.height >= 1 else { throw Failure.failed("Can't read this video.") }
+        let audio = prepared.composition.tracks(withMediaType: .audio)
+        return try await underCap(seconds: seconds, w: Int(prepared.size.width.rounded()), h: Int(prepared.size.height.rounded()), audio: !audio.isEmpty,
+                                  cap: cap, progress: progress) { p, tmp, report in
+            try await encodeEdit(prepared, audio: audio, plan: p, to: tmp, progress: report)
+        }
+    }
+
+    // The plan for the length, frame and sound, encoded by `encode` into a temporary file, then up to two smaller tries
+    // when it comes out over the cap. The result's `tmp` is the file; `out` isn't set.
+    private static func underCap(seconds: Double, w: Int, h: Int, audio: Bool, cap: Double, progress: ((Double, Int) -> Void)?,
+                                 encode: (VideoPlan, URL, @escaping (Double) -> Void) async throws -> Void) async throws -> Result {
+        var r = Result()
         let tmp = tempURL("mp4")
         var scale = 1.0
         for attempt in 0...retries {
-            let p = planVideo(cap: cap, seconds: seconds, w: Int(upright.width.rounded()), h: Int(upright.height.rounded()), audio: audio != nil,
-                              videoScale: scale)
+            let p = planVideo(cap: cap, seconds: seconds, w: w, h: h, audio: audio, videoScale: scale)
             guard p.fits else {
                 try? FileManager.default.removeItem(at: tmp)
                 throw Failure.failed(attempt == 0 ? "\(clockText(seconds)) of video doesn't fit in \(label(cap / (1024 * 1024))). Trim it first, or pick a larger size."
@@ -167,9 +199,7 @@ enum Compress {
             }
             try? FileManager.default.removeItem(at: tmp)
             do {
-                try await encode(asset, video: track, audio: audio, transform: transform, upright: upright, duration: duration, fps: fps, plan: p, to: tmp) {
-                    progress?($0, attempt)
-                }
+                try await encode(p, tmp) { progress?($0, attempt) }
             } catch {
                 try? FileManager.default.removeItem(at: tmp)
                 throw error
@@ -179,7 +209,6 @@ enum Compress {
             r.w = p.w; r.h = p.h
             if r.bytesAfter > 0 && r.bytesAfter <= cap {
                 r.tmp = tmp
-                r.out = outputURL(for: url, ext: "mp4")
                 return r
             }
             scale *= retryScale(cap: cap, actual: r.bytesAfter)
@@ -190,8 +219,36 @@ enum Compress {
 
     private static func clockText(_ s: Double) -> String { s < 90 ? "\(Int(s.rounded())) s" : String(format: "%d:%02d", Int(s) / 60, Int(s) % 60) }
 
-    // One encode: the video turned upright and scaled to the plan's frame by a video composition, H.264 at the plan's
-    // average rate; the sound as 48 kHz stereo AAC at 96 kbps; the index at the front so it previews and streams at once.
+    private static func videoInput(_ p: VideoPlan, fps: Double) -> AVAssetWriterInput {
+        let vi = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: p.w, AVVideoHeightKey: p.h,
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: Int(p.videoBps),
+                                              AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                                              AVVideoExpectedSourceFrameRateKey: fps,
+                                              AVVideoMaxKeyFrameIntervalDurationKey: 2] as [String: Any]])
+        vi.expectsMediaDataInRealTime = false
+        return vi
+    }
+
+    // 48 kHz stereo 16-bit PCM from the reader, AAC at the plan's rate into the file.
+    private static let pcmSettings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2,
+                                                     AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+                                                     AVLinearPCMIsNonInterleaved: false]
+    private static func audioInput(_ p: VideoPlan) -> AVAssetWriterInput {
+        let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: Int(p.audioBps)])
+        ai.expectsMediaDataInRealTime = false
+        return ai
+    }
+
+    private static func writer(_ url: URL) throws -> AVAssetWriter {
+        let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        w.shouldOptimizeForNetworkUse = true   // the index at the front: previews and streams at once
+        return w
+    }
+
+    // One encode of a file: the video turned upright and scaled to the plan's frame by a video composition, H.264 at the
+    // plan's average rate; the sound as 48 kHz stereo AAC at 96 kbps.
     private static func encode(_ asset: AVAsset, video track: AVAssetTrack, audio: AVAssetTrack?, transform: CGAffineTransform, upright: CGSize,
                                duration: CMTime, fps: Double, plan p: VideoPlan, to url: URL, progress: @escaping (Double) -> Void) async throws {
         let reader = try AVAssetReader(asset: asset)
@@ -210,54 +267,109 @@ enum Compress {
         vo.alwaysCopiesSampleData = false
         guard reader.canAdd(vo) else { throw Failure.failed("Can't read this video.") }
         reader.add(vo)
-
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        writer.shouldOptimizeForNetworkUse = true
-        let vi = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: p.w, AVVideoHeightKey: p.h,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: Int(p.videoBps),
-                                              AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                                              AVVideoExpectedSourceFrameRateKey: fps,
-                                              AVVideoMaxKeyFrameIntervalDurationKey: 2] as [String: Any]])
-        vi.expectsMediaDataInRealTime = false
-        writer.add(vi)
-        var pairs: [(AVAssetReaderOutput, AVAssetWriterInput)] = [(vo, vi)]
+        let w = try writer(url)
+        let vi = videoInput(p, fps: fps)
+        w.add(vi)
+        var streams = [Stream(input: vi, reports: true, next: { vo.copyNextSampleBuffer() }, append: { vi.append($0) })]
         if let audio, p.audioBps > 0 {
-            let ao = AVAssetReaderTrackOutput(track: audio, outputSettings: [
-                AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false])
+            let ao = AVAssetReaderTrackOutput(track: audio, outputSettings: pcmSettings)
             ao.alwaysCopiesSampleData = false
-            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: Int(p.audioBps)])
-            ai.expectsMediaDataInRealTime = false
-            if reader.canAdd(ao) && writer.canAdd(ai) {
+            let ai = audioInput(p)
+            if reader.canAdd(ao) && w.canAdd(ai) {
                 reader.add(ao)
-                writer.add(ai)
-                pairs.append((ao, ai))
+                w.add(ai)
+                streams.append(Stream(input: ai, reports: false, next: { ao.copyNextSampleBuffer() }, append: { ai.append($0) }))
             }
         }
+        try await run(reader, w, streams, duration: duration, progress: progress)
+    }
+
+    // One encode of an edit: its frames as the editor's renderer draws them (the same composition Save uses), scaled to
+    // the plan's frame when it's smaller; its sound mixed and, for a speed change, kept at its pitch, as Save does.
+    private static func encodeEdit(_ prepared: VideoExport.Prepared, audio: [AVAssetTrack], plan p: VideoPlan, to url: URL,
+                                   progress: @escaping (Double) -> Void) async throws {
+        let comp = prepared.composition
+        let reader = try AVAssetReader(asset: comp)
+        let vo = AVAssetReaderVideoCompositionOutput(videoTracks: comp.tracks(withMediaType: .video), videoSettings: nil)
+        vo.videoComposition = prepared.video
+        vo.alwaysCopiesSampleData = false
+        guard reader.canAdd(vo) else { throw Failure.failed("Can't read this video.") }
+        reader.add(vo)
+        let w = try writer(url)
+        let fps = min(60, max(1, 1 / prepared.video.frameDuration.seconds))
+        let vi = videoInput(p, fps: fps)
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vi, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: p.w,
+            kCVPixelBufferHeightKey as String: p.h])
+        w.add(vi)
+        let scaler = Scaler()
+        var streams = [Stream(input: vi, reports: true, next: { vo.copyNextSampleBuffer() }, append: { b in
+            guard let src = CMSampleBufferGetImageBuffer(b) else { return true }   // no picture: nothing to write
+            let t = CMSampleBufferGetPresentationTimeStamp(b)
+            if CVPixelBufferGetWidth(src) == p.w && CVPixelBufferGetHeight(src) == p.h { return adaptor.append(src, withPresentationTime: t) }
+            guard let pool = adaptor.pixelBufferPool, let dst = scaler.scaled(src, pool: pool) else { return false }
+            return adaptor.append(dst, withPresentationTime: t)
+        })]
+        if !audio.isEmpty, p.audioBps > 0 {
+            let ao = AVAssetReaderAudioMixOutput(audioTracks: audio, audioSettings: pcmSettings)
+            ao.audioTimePitchAlgorithm = .spectral   // sped-up sound keeps its pitch
+            ao.alwaysCopiesSampleData = false
+            let ai = audioInput(p)
+            if reader.canAdd(ao) && w.canAdd(ai) {
+                reader.add(ao)
+                w.add(ai)
+                streams.append(Stream(input: ai, reports: false, next: { ao.copyNextSampleBuffer() }, append: { ai.append($0) }))
+            }
+        }
+        try await run(reader, w, streams, duration: comp.duration, progress: progress)
+    }
+
+    // Scales frames down with VideoToolbox into buffers from the writer's pool.
+    private final class Scaler {
+        private var session: VTPixelTransferSession?
+        func scaled(_ src: CVPixelBuffer, pool: CVPixelBufferPool) -> CVPixelBuffer? {
+            if session == nil {
+                VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &session)
+                if let session { VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_Normal) }
+            }
+            var dst: CVPixelBuffer?
+            guard let session, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dst) == kCVReturnSuccess, let dst,
+                  VTPixelTransferSessionTransferImage(session, from: src, to: dst) == noErr else { return nil }
+            return dst
+        }
+    }
+
+    private struct Stream {
+        let input: AVAssetWriterInput
+        let reports: Bool                              // its timestamps drive the progress
+        let next: () -> CMSampleBuffer?
+        let append: (CMSampleBuffer) -> Bool
+    }
+
+    // Runs the reader into the writer, every stream pumped on its own queue, then closes the file.
+    private static func run(_ reader: AVAssetReader, _ writer: AVAssetWriter, _ streams: [Stream], duration: CMTime,
+                            progress: @escaping (Double) -> Void) async throws {
         guard reader.startReading() else { throw Failure.failed(reader.error?.localizedDescription ?? "Can't read this video.") }
         guard writer.startWriting() else { throw Failure.failed(writer.error?.localizedDescription ?? "Can't write the video.") }
         writer.startSession(atSourceTime: .zero)
         let total = max(duration.seconds, 0.001)
         let ok = await withTaskGroup(of: Bool.self) { g in
-            for (n, (out, input)) in pairs.enumerated() {
-                let reports = n == 0
+            for (n, s) in streams.enumerated() {
                 g.addTask {
                     await withCheckedContinuation { (k: CheckedContinuation<Bool, Never>) in
                         let state = PumpState()   // touched only on the pump's queue
-                        input.requestMediaDataWhenReady(on: DispatchQueue(label: "ather.compress.\(n)")) {
-                            while !state.done && input.isReadyForMoreMediaData {
-                                guard let b = out.copyNextSampleBuffer() else {
-                                    input.markAsFinished()
+                        s.input.requestMediaDataWhenReady(on: DispatchQueue(label: "ather.compress.\(n)")) {
+                            while !state.done && s.input.isReadyForMoreMediaData {
+                                guard let b = s.next() else {
+                                    s.input.markAsFinished()
                                     state.done = true
                                     return k.resume(returning: reader.status != .failed)
                                 }
-                                if reports {
+                                if s.reports {
                                     let f = min(1, max(0, CMSampleBufferGetPresentationTimeStamp(b).seconds / total))
                                     if Int(f * 20) != state.shown { state.shown = Int(f * 20); progress(f) }
                                 }
-                                if !input.append(b) {
+                                if !s.append(b) {
                                     state.done = true
                                     return k.resume(returning: false)
                                 }
@@ -273,6 +385,7 @@ enum Compress {
             writer.cancelWriting()
             throw Failure.failed((writer.error ?? reader.error)?.localizedDescription ?? "Encoding failed.")
         }
+        writer.endSession(atSourceTime: duration)
         await writer.finishWriting()
         guard writer.status == .completed else { throw Failure.failed(writer.error?.localizedDescription ?? "Couldn't finish the MP4.") }
         progress(1)
