@@ -1,16 +1,16 @@
 {
-    "windows": {
-        "version": "0.0.2.3",
-        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-        "sha256": "1d67995e8d711f66df278a1d0a642353b0ad8c486d388998577f951acb197b7e",
-        "size": 3550208,
-        "notes": "Review recordings frame by frame: exact 60 fps stepping, notes on frames, and a review video for other teams."
-    },
-    "macos": {
-        "version": "0.0.2.3",
-        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-        "sha256": "736d53f136c00cd98715073887ac361d059065d0dee97c0e14075d75d7fed5e7",
-        "size": 3581140,
-        "notes": "Saving videos is about twice as fast and GIFs about 9 times (videos are now saved as HEVC)."
-    }
+    "windows":  {
+                    "version":  "0.0.2.4",
+                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+                    "sha256":  "e820d1431c66ef61ca07363a0c0042a17597844ae7f8a41f914567651000682b",
+                    "size":  3951104,
+                    "notes":  "AI agents can take screenshots and record for you (MCP), and you can compress a video or picture to fit a size."
+                },
+    "macos":  {
+                  "version":  "0.0.2.3",
+                  "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+                  "sha256":  "736d53f136c00cd98715073887ac361d059065d0dee97c0e14075d75d7fed5e7",
+                  "size":  3581140,
+                  "notes":  "Saving videos is about twice as fast and GIFs about 9 times (videos are now saved as HEVC)."
+              }
 }
