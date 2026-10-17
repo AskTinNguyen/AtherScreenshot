@@ -313,6 +313,12 @@ enum MCP {
                 close(s)
                 throw MCP.failed("Port \(wanted) is in use by another app. Pick another in Settings › AI agents.")
             }
+            // Darwin's shutdown() doesn't reliably wake accept() on a listening socket. Poll a nonblocking
+            // listener so stop() can join the accept thread before the descriptor or port is reused.
+            guard fcntl(s, F_SETFL, O_NONBLOCK) == 0 else {
+                close(s)
+                throw MCP.failed("Couldn't configure the network socket.")
+            }
             var len = socklen_t(MemoryLayout<sockaddr_in>.size)
             _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(s, $0, &len) } }
             fd = s
@@ -336,14 +342,19 @@ enum MCP {
             lock.lock()
             stopping = true
             lock.unlock()
-            shutdown(fd, Int32(SHUT_RDWR))  // wakes the blocked accept()
-            _ = acceptorDone?.wait(timeout: .now() + 2)
+            acceptorDone?.wait()
             fd = -1
             port = 0
         }
 
         private func acceptLoop(_ listener: Int32) {
             while true {
+                lock.lock()
+                let shouldStop = stopping
+                lock.unlock()
+                if shouldStop { return }
+                var ready = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+                guard poll(&ready, 1, 100) > 0 else { continue }
                 let c = accept(listener, nil, nil)
                 lock.lock()
                 let stopped = stopping

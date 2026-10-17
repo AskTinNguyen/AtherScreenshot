@@ -93,11 +93,14 @@ final class AgentTests: XCTestCase {
         XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.utf8), timeout: 5).0, 202)
         XCTAssertEqual(MCP.post(port: port, token: "bad", body: Data(#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.utf8), timeout: 5).0, 401)
         http.stop()
-        Thread.sleep(forTimeInterval: 0.2)
         XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.utf8), timeout: 1).0, MCP.notListening)
-        try http.start(port: port)  // straight back on the same port (TIME_WAIT connections don't block it)
-        XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.utf8), timeout: 5).0, 200)
-        http.stop()
+        for _ in 0..<5 {
+            try http.start(port: port)  // straight back on the same port (TIME_WAIT connections don't block it)
+            XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.utf8), timeout: 5).0, 200)
+            http.stop()
+            XCTAssertFalse(http.running)
+            XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#.utf8), timeout: 1).0, MCP.notListening)
+        }
     }
 
     // The same tools as the Windows app, each with a valid object schema.
