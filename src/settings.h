@@ -55,6 +55,9 @@ public:
     // gallery
     bool autoTag = false;  // [Gallery] AutoTag: apply suggested tags
     bool checkUpdates = true;  // [Updates] CheckAutomatically
+    // AI agents: the MCP server on 127.0.0.1 ([AiAgents] Enabled, Port)
+    bool agentsEnabled = false;
+    int agentPort = 47821;
     // upload
     std::wstring uploader = L"none";  // none | imgur | custom | s3
     std::wstring imgurClientId;

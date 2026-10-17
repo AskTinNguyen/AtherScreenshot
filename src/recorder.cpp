@@ -651,4 +651,9 @@ bool IsRecording() { return g_state == State::Countdown || g_state == State::Rec
 bool IsRecordingPaused() { return g_session && g_state == State::Recording && g_session->clock.Paused(); }
 bool RecorderBusy() { return g_session != nullptr; }
 
+double RecordingSeconds() {
+    if (!g_session || g_state != State::Recording || !g_session->clock.start) return 0;
+    return g_session->clock.Active(RecClock::Now()) / (double)g_session->clock.freq;
+}
+
 }  // namespace ather

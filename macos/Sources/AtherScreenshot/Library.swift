@@ -429,6 +429,15 @@ final class Library: ObservableObject {
         pending[url.path] = p
     }
 
+    // Tags and a comment for a capture about to be written (an AI agent's), applied once it's in the library.
+    func noteCaptureDetails(_ url: URL, tags: [String], comment: String) {
+        guard !tags.isEmpty || !comment.isEmpty else { return }
+        var p = pending[url.path] ?? ItemMeta()
+        p.tags = Library.normalize(tags)
+        p.comment = comment
+        pending[url.path] = p
+    }
+
     // Called before an edited image is written: it joins the gallery tagged "edited", keeping the original's
     // tags, collections, rating, comment and source app, and remembers which capture it came from.
     // A collage is tagged "collage" and keeps the tags and collections all of its screenshots share.

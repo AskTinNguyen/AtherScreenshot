@@ -41,6 +41,7 @@ void StopRecording(bool discard);
 void TogglePauseRecording();
 bool IsRecording();        // counting down, capturing or paused
 bool IsRecordingPaused();
+double RecordingSeconds();  // recorded so far, without pauses (0 during the countdown)
 bool RecorderBusy();       // recording or still finalizing the file
 
 }  // namespace ather

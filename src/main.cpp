@@ -17,6 +17,7 @@ using std::min;
 }  // namespace Gdiplus
 #include <gdiplus.h>
 
+#include "agent.h"
 #include "capture.h"
 #include "editor.h"
 #include "videoeditor.h"
@@ -25,6 +26,7 @@ using std::min;
 #include "installer.h"
 #include "library.h"
 #include "logo.h"
+#include "mcp.h"
 #include "version.h"
 #include "ocr.h"
 #include "scroll.h"
@@ -105,6 +107,8 @@ enum Cmd : int {
     CmdReloadSettings,
     CmdAbout,
     CmdCheckUpdates,
+    CmdToggleAgents,
+    CmdCopyAgentSetup,
     CmdInstallUpdate,  // tray and notification only: never from a link or the command line
     CmdExit,
     CmdRecentBase = 1000,
@@ -167,6 +171,8 @@ const CmdDef kCmds[] = {
     {CmdReloadSettings, L"ReloadSettings", L"Reload settings", L"config refresh", 0xE72C, L"", false},
     {CmdAbout, L"About", L"About Ather Screenshot", L"version info help", 0xE946, L"", false},
     {CmdCheckUpdates, L"CheckForUpdates", L"Check for updates…", L"update upgrade new version download latest", 0xE895, L"", false},
+    {CmdToggleAgents, L"ToggleAiAgents", L"Allow AI agents (MCP)", L"toggle mcp claude codex agent ai automation llm", 0xE99A, L"", false},
+    {CmdCopyAgentSetup, L"CopyAiAgentSetup", L"Copy AI agent setup (MCP)", L"mcp claude codex agent ai config connect", 0xE8C8, L"", false},
     {CmdExit, L"Quit", L"Quit Ather Screenshot", L"exit close", 0xE7E8, L"", false},
 };
 
@@ -200,6 +206,8 @@ std::vector<int> g_mru;
 std::vector<std::wstring> g_recents;
 
 void Execute(int id, bool deferCapture, bool untrusted = false);
+void ApplyAgents();
+void CopyAgentSetup();
 void CheckForUpdates(bool manual);
 void InstallUpdate();
 
@@ -291,6 +299,7 @@ void ApplyEditorDefaults() {
     SetFileNameTemplate(g_settings.fileNameTemplate);
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);
+    ApplyAgents();  // start or stop the MCP server to match
 }
 
 void ReloadSettings(bool notify) {
@@ -313,6 +322,7 @@ bool ToggleState(int id, bool* on) {
         case CmdToggleKeys: *on = g_settings.showKeys; return true;
         case CmdToggleGamepad: *on = g_settings.showGamepad; return true;
         case CmdToggleAutoRedact: *on = g_settings.autoRedact; return true;
+        case CmdToggleAgents: *on = g_settings.agentsEnabled; return true;
     }
     return false;
 }
@@ -922,6 +932,16 @@ void Execute(int id, bool deferCapture, bool untrusted) {
             break;
         }
         case CmdCheckUpdates: CheckForUpdates(true); break;
+        case CmdToggleAgents:
+            g_settings.agentsEnabled = !g_settings.agentsEnabled;
+            g_settings.WriteBool(L"AiAgents", L"AllowAgents", g_settings.agentsEnabled);
+            ApplyAgents();
+            if (!g_settings.agentsEnabled) Notify(L"AI agents: Off");
+            else if (mcp::HttpRunning())
+                ShowToast(L"AI agents: On", L"Click to copy the setup for Claude Code, Codex and other MCP clients.", nullptr,
+                          [] { CopyAgentSetup(); }, g_settings.toastMs + 4000);
+            break;
+        case CmdCopyAgentSetup: CopyAgentSetup(); break;
         case CmdExit: DestroyWindow(g_hwnd); break;
     }
 }
@@ -958,12 +978,9 @@ bool InteractiveLaunch() {
     return interactive;
 }
 
-// A per-install secret in the support folder, readable only by this user. WM_COPYDATA can be sent by any
-// process on the desktop, so forwarded commands without it are treated like links from the web.
-std::wstring CliToken() {
-    static std::wstring cached;
-    if (!cached.empty()) return cached;
-    const std::wstring path = SupportFolder() + L"\\cli-token";
+// A per-install secret in the support folder (`name`), readable only by this user. Made on first use.
+std::wstring PrivateSecret(const wchar_t* name) {
+    const std::wstring path = SupportFolder() + L"\\" + name;
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
         char buf[256] = {};
@@ -971,7 +988,7 @@ std::wstring CliToken() {
         ReadFile(f, buf, sizeof(buf) - 1, &read, nullptr);
         CloseHandle(f);
         std::wstring t(buf, buf + read);
-        if (t.size() >= 32) return cached = t;
+        if (t.size() >= 32) return t;
     }
     BYTE rnd[32];
     if (BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return L"";
@@ -1004,7 +1021,22 @@ std::wstring CliToken() {
     DWORD wr = 0;
     WriteFile(f, hex.data(), (DWORD)hex.size(), &wr, nullptr);
     CloseHandle(f);
-    return cached = std::wstring(hex.begin(), hex.end());
+    return std::wstring(hex.begin(), hex.end());
+}
+
+// WM_COPYDATA can be sent by any process on the desktop, so forwarded commands without this are treated like
+// links from the web.
+std::wstring CliToken() {
+    static std::wstring cached;
+    if (cached.empty()) cached = PrivateSecret(L"cli-token");
+    return cached;
+}
+
+// AI agents present this to the MCP server (`AtherScreenshot.exe --mcp` reads it from the file).
+std::wstring AgentToken() {
+    static std::wstring cached;
+    if (cached.empty()) cached = PrivateSecret(L"agent-token");
+    return cached;
 }
 
 // atherscreenshot://region?pin&delay=3 -> {"region", "--pin", "--delay", "3"}
@@ -1186,6 +1218,96 @@ std::wstring AbsoluteCommandLine() {
     return out;
 }
 
+// ---- AI agents (MCP) ----
+
+std::shared_ptr<mcp::Server> g_agentServer;
+int g_agentPortRunning = 0;
+
+std::wstring AgentExePath() {
+    const std::wstring installed = InstalledExePath();
+    return GetFileAttributesW(installed.c_str()) != INVALID_FILE_ATTRIBUTES ? installed : SelfExePath();
+}
+
+std::shared_ptr<mcp::Server> AgentServer() {
+    if (g_agentServer) return g_agentServer;
+    AgentHost h;
+    h.settings = &g_settings;
+    for (const auto& c : kCmds)
+        if (c.id != CmdExit && c.id != CmdToggleAgents && c.id != CmdCopyAgentSetup) h.commands.push_back({c.key, c.title});
+    h.runCommand = [](const std::wstring& key) {
+        for (const auto& c : kCmds)
+            if (key == c.key) Execute(c.id, true);
+    };
+    h.setLast = [](BitmapPtr img, const std::wstring& path) {
+        if (img) {
+            g_last = img;
+            g_lastPath = path;
+        } else if (!path.empty()) {
+            g_lastPath = path;
+        }
+    };
+    h.openToEdit = [](const std::wstring& path) { OpenFileToEdit(path); };
+    h.settingsChanged = [] {
+        g_settings.Load(HotkeyDefs());
+        ApplyEditorDefaults();
+    };
+    h.uploadConfig = [] { return MakeUploadConfig(); };
+    return g_agentServer = MakeAgentServer(std::move(h));
+}
+
+void ApplyAgents() {
+    const bool want = g_settings.agentsEnabled;
+    if (want && mcp::HttpRunning() && g_agentPortRunning == g_settings.agentPort) return;
+    if (!want) {
+        if (mcp::HttpRunning()) mcp::StopHttp();
+        g_agentPortRunning = 0;
+        return;
+    }
+    std::wstring err;
+    if (!mcp::StartHttp(AgentServer(), g_settings.agentPort, ToUtf8(AgentToken()), &err)) {
+        g_agentPortRunning = 0;
+        return Notify(L"AI agents can't connect", err);
+    }
+    g_agentPortRunning = g_settings.agentPort;
+}
+
+// What to paste into an agent's configuration: the stdio command (it finds the port and token itself), or the
+// HTTP endpoint with its token for clients that connect to a URL.
+std::wstring AgentSetupText() {
+    const std::wstring exe = AgentExePath();
+    std::wstring json = exe;
+    for (size_t i = 0; (i = json.find(L'\\', i)) != std::wstring::npos; i += 2) json.insert(i, 1, L'\\');
+    const std::wstring port = std::to_wstring(g_settings.agentPort);
+    return L"Ather Screenshot for AI agents (MCP)\r\n\r\n"
+           L"Claude Code:\r\n  claude mcp add ather-screenshot -- \"" + exe + L"\" --mcp\r\n\r\n"
+           L"Codex (~/.codex/config.toml):\r\n  [mcp_servers.ather-screenshot]\r\n  command = '" + exe + L"'\r\n  args = [\"--mcp\"]\r\n\r\n"
+           L"Claude Desktop, Cursor and other JSON configs:\r\n  \"ather-screenshot\": { \"command\": \"" + json + L"\", \"args\": [\"--mcp\"] }\r\n\r\n"
+           L"Clients that connect to a URL (Streamable HTTP):\r\n  http://127.0.0.1:" + port + L"/mcp\r\n"
+           L"  Header: Authorization: Bearer " + AgentToken() + L"\r\n";
+}
+
+void CopyAgentSetup() {
+    CopyTextToClipboard(g_hwnd, AgentSetupText());
+    ShowToast(L"AI agent setup copied", g_settings.agentsEnabled ? L"Paste it into your agent's MCP settings."
+                                                                  : L"Paste it into your agent's MCP settings, then turn on “Allow AI agents (MCP)”.",
+              nullptr, nullptr, g_settings.toastMs + 2500);
+}
+
+// `AtherScreenshot.exe --mcp`: the stdio server an agent starts. It relays to the running app, starting it if needed.
+int RunAgentBridge() {
+    g_settings.Load(HotkeyDefs());
+    return mcp::RunStdioBridge(g_settings.agentPort, ToUtf8(AgentToken()), [] {
+        if (FindWindowW(kMainClass, nullptr)) return false;  // running: it just isn't accepting agents
+        std::wstring cmd = L"\"" + AgentExePath() + L"\"";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) return false;
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+    });
+}
+
 // ---- tray ----
 
 void AddTrayIcon() {
@@ -1234,7 +1356,7 @@ void ShowTrayMenu() {
     for (int id : {CmdPalette, CmdHistory, CmdOpenFolder, CmdEditLast, CmdOpenImage, CmdUploadLast}) add(id);
     sep();
     for (int id : {CmdToggleClipboard, CmdToggleSave, CmdToggleCursor, CmdToggleAutoRedact, CmdToggleSystemAudio,
-                   CmdToggleMic, CmdToggleStartup})
+                   CmdToggleMic, CmdToggleStartup, CmdToggleAgents})
         add(id);
     sep();
     if (g_update) {
@@ -1341,6 +1463,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     {  // build tool: regenerate res\app.ico from the vector logo
         int n = 0;
         LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &n);
+        const bool agentBridge = n >= 2 && _wcsicmp(av[1], L"--mcp") == 0;
         const bool writeIcon = n == 3 && _wcsicmp(av[1], L"--write-icon") == 0;
         const bool ok = writeIcon && WriteLogoIco(av[2]);
         const bool selftest = n >= 2 && _wcsicmp(av[1], L"--selftest") == 0;
@@ -1353,6 +1476,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         std::vector<std::wstring> bench;
         if (n >= 3 && (_wcsicmp(av[1], L"--bench-export") == 0 || _wcsicmp(av[1], L"--bench-compare") == 0)) bench.assign(av + 1, av + n);
         LocalFree(av);
+        if (agentBridge) return RunAgentBridge();  // started by an AI agent: stdio MCP, see mcp.h
         if (!bench.empty()) return VideoBench(bench);  // developer tool, see videobench.cpp
         if (writeIcon) return ok ? 0 : 1;
         if (featureStats) return FeatureStats(filter);  // developer tool, see library_tests.cpp
@@ -1456,6 +1580,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    mcp::StopHttp();
     // Let an in-flight recording finalize so the file isn't left truncated, and let video exports finish
     // (their completion registers the saved file with the library). Work posted back meanwhile still runs:
     // the dispatcher window outlives g_hwnd.

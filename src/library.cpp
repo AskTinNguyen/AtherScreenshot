@@ -1110,6 +1110,13 @@ void Library::NoteCapture(const std::wstring& path, const std::wstring& app, con
     p.window = window;
 }
 
+void Library::NoteCaptureDetails(const std::wstring& path, const std::vector<std::wstring>& tags, const std::wstring& comment) {
+    if (tags.empty() && comment.empty()) return;
+    ItemMeta& p = pending_[path];
+    p.tags = NormalizeTags(tags);
+    p.comment = comment;
+}
+
 void Library::NoteEdit(const std::wstring& path, const std::wstring& source, const std::wstring& app, const std::wstring& window,
                        bool edited, const std::vector<std::wstring>& includes, bool collage) {
     LoadIfNeeded();

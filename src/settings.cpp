@@ -201,6 +201,11 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"\r\n[Updates]\r\n"
         L"; Look for a new version on GitHub once a day. Updates install only when you click.\r\n"
         L"CheckAutomatically=1\r\n"
+        L"\r\n[AiAgents]\r\n"
+        L"; Let AI agents (Claude Code, Codex... through MCP) take screenshots and record. Only apps on this PC that\r\n"
+        L"; know the private token in the settings folder can connect.\r\n"
+        L"AllowAgents=0\r\n"
+        L"AgentPort=47821\r\n"
         L"\r\n[Gallery]\r\n"
         L"; Add suggested tags (chat, code, error, receipt...) to captures automatically\r\n"
         L"AutoTag=0\r\n"
@@ -266,6 +271,8 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Editor", L"StyledExport", L"0"},
         {L"Gallery", L"AutoTag", L"0"},
         {L"Updates", L"CheckAutomatically", L"1"},
+        {L"AiAgents", L"AllowAgents", L"0"},
+        {L"AiAgents", L"AgentPort", L"47821"},
         {L"Upload", L"Uploader", L"none"},
         {L"Upload", L"ImgurClientId", L""},
         {L"Upload", L"CustomUrl", L""},
@@ -312,6 +319,8 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
 
     autoTag = GetBool(L"Gallery", L"AutoTag", false);
     checkUpdates = GetBool(L"Updates", L"CheckAutomatically", true);
+    agentsEnabled = GetBool(L"AiAgents", L"AllowAgents", false);
+    agentPort = std::clamp(_wtoi(Get(L"AiAgents", L"AgentPort", L"47821").c_str()), 1024, 65535);
     uploader = Lower(Get(L"Upload", L"Uploader", L"none"));
     imgurClientId = Get(L"Upload", L"ImgurClientId", L"");
     customUrl = Get(L"Upload", L"CustomUrl", L"");

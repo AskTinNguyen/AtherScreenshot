@@ -131,6 +131,16 @@ If the app is already running, the command goes to that instance.
 
 Commands typed in a terminal run directly. Commands from `atherscreenshot://` links (which any web page can open) or from tools without a terminal (Shortcuts, Raycast, cron…) ask for confirmation first. They can never upload, or open, pin or edit files, even when "After capture" is set to upload.
 
+## AI agents (MCP)
+
+Claude Code, Codex and other MCP clients can take screenshots, record (with markers), look through recordings, read on-screen text and search the gallery. Turn on Settings › AI agents › Allow AI agents (MCP), then run "Copy AI agent setup (MCP)" from the palette and paste it into your agent, e.g.:
+
+```
+claude mcp add ather-screenshot -- "/Applications/Ather Screenshot.app/Contents/MacOS/AtherScreenshot" --mcp
+```
+
+`--mcp` is a stdio server that relays to the running app (and opens it in the background if needed). The app itself listens on 127.0.0.1:47821 (`AgentPort`) and needs the token in `~/Library/Application Support/AtherScreenshot/agent-token`. Window captures work even when the window is covered; coordinates are screen points. See [../docs/AI-AGENTS.md](../docs/AI-AGENTS.md) for every tool. Code: `MCP.swift` (protocol, server, bridge) and `Agent.swift` (the tools).
+
 ## Layout (`Sources/AtherScreenshot`)
 
 `App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, markup and clip lane UI) · `VideoSequence` (clips, the one list of media types, the sequence composition and its compositor) · `VideoRender` (frame renderer for preview and export) · `Gamepad` (controller input and drawing) · `Updater` (manifest, download, verify, swap) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key and controller overlays) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

@@ -192,6 +192,11 @@ void Window::Build() {
     add(Kind::Toggle, L"Updates", L"CheckAutomatically", L"Check for updates automatically",
         L"Once a day, from GitHub. A new version installs only when you click", L"1");
 
+    header(L"AI agents");
+    add(Kind::Toggle, L"AiAgents", L"AllowAgents", L"Allow AI agents (MCP)",
+        L"Claude Code, Codex and other agents on this PC can take screenshots, record and search the gallery", L"0");
+    add(Kind::Number, L"AiAgents", L"AgentPort", L"Agent port", L"Local port for agents (127.0.0.1 only)", L"47821", 1024, 65535);
+
     header(L"Gallery");
     add(Kind::Toggle, L"Gallery", L"AutoTag", L"Tag captures automatically",
         L"Adds suggested tags like chat, code, error or receipt. Turning it on tags your whole library once.", L"0");
