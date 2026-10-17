@@ -10,13 +10,20 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## Coming in the next update (Windows and macOS)
+## What's new in this update (Windows and macOS, build 0.0.2.4)
+
+### AI agents can take screenshots and record for you
+- **What:** Claude Code, Codex and other AI agents that speak MCP can now use Ather Screenshot: take screenshots of the screen, a display, a window or a region; record gameplay to MP4 or GIF and mark moments while it runs; look back through a recording frame by frame or as one contact sheet; read text on screen; and find, tag and rate captures in the gallery. They can also change capture settings and run any palette command.
+- **Playtesting:** ask your agent to record the game while it plays and to mark every bug it sees. Its markers are saved next to the video as review notes, and on Windows the video editor shows each one on its frame.
+- **Turning it on:** it's off until you turn on Settings › AI agents › **Allow AI agents (MCP)**. Then run **Copy AI agent setup (MCP)** from the command palette and paste it into your agent. For Claude Code that's one `claude mcp add` line.
+- **Privacy:** only programs on this computer that hold a private token from your settings folder can connect, and requests from web pages are refused. A notification shows when an agent connects. Agents can see your screen, so allow only agents you trust.
+- **Every tool:** see [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
 
 ### Compress a video or picture to fit a size
 - **Two clicks:** right-click a capture in the gallery › Compress › Under 30 MB, 8 MB (Discord), 25 MB (email), 50 MB or any size you type. Pictures offer 2, 1 and 5 MB. Or use "Compress a picture or video…" in the palette for any file. While editing a video, Save smaller (in Save ▾ on Windows, next to Save GIF on the Mac) saves your edit to fit the size.
 - **What you get:** a smaller copy next to the original (`<name>_small.mp4` or `.jpg`); the original stays as it is. Videos are H.264 MP4s that play in every chat app and browser, sized from the length so they land just under the limit (re-made a bit smaller if they don't). Pictures become JPEGs.
 
-## What's new in this update (macOS, build 0.0.2.3)
+## Earlier update (macOS, build 0.0.2.3)
 
 ### Saving videos is about twice as fast, GIFs about 9 times
 - **How much:** on an M4 Max, a 20-second 3K recording saves in about 2 s instead of 3.6 s, also with captions, callouts, blur and zoom; a 1080p one in 0.7 s instead of 1.5 s; a 2-minute 3K recording in about 15 s instead of 27 s. GIFs save in under half a second instead of 2.5 to 4.5 s.
@@ -25,7 +32,7 @@
 - **HEVC:** the saved MP4s play in QuickTime, Safari and current browsers. On Windows they need Microsoft's HEVC Video Extensions; some older players and sites may not take them.
 - **GIFs:** the same size and length as before. During a fast zoom a frame can sit a moment earlier or later than before.
 
-## What's new in this update (Windows, build 0.0.2.3)
+## Earlier update (Windows, build 0.0.2.3)
 
 ### Review recordings frame by frame, with notes
 - **Every frame:** ←/→ now step exactly one frame of the video, also in 60 fps recordings (before, a step skipped every other frame). The readout under the video shows `0:12:37 · frame 757 · 60 fps`; Ctrl+G goes to a frame or a time; J/K/L play backward and forward at 0.25×, 0.5× or 1× without skipping frames; zoom the timeline down to single frames and the video up to 8× to see every pixel.

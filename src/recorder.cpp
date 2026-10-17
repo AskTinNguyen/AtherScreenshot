@@ -165,6 +165,8 @@ struct Session {
 };
 
 Session* g_session = nullptr;
+uint64_t g_recordingId = 0;
+std::vector<std::function<void(const RecordResult&)>> g_finishWatchers;
 State g_state = State::Idle;
 int g_countdown = 0;
 HWND g_border = nullptr, g_bar = nullptr, g_count = nullptr;
@@ -607,8 +609,12 @@ bool StartRecording(const RecordOptions& opt, std::function<void(const RecordRes
         DestroyChrome();
         StopInputViz();
         if (done) done(r);
+        auto watchers = std::move(g_finishWatchers);
+        g_finishWatchers.clear();
+        for (auto& w : watchers) w(r);
     };
     g_session = s;
+    ++g_recordingId;
     g_countdown = std::clamp(opt.countdownSeconds, 0, 10);
     g_state = State::Countdown;
     CreateChrome(*s);
@@ -650,5 +656,14 @@ void TogglePauseRecording() {
 bool IsRecording() { return g_state == State::Countdown || g_state == State::Recording; }
 bool IsRecordingPaused() { return g_session && g_state == State::Recording && g_session->clock.Paused(); }
 bool RecorderBusy() { return g_session != nullptr; }
+
+uint64_t RecordingId() { return g_recordingId; }
+
+void WhenRecordingFinishes(std::function<void(const RecordResult&)> fn) { g_finishWatchers.push_back(std::move(fn)); }
+
+double RecordingSeconds() {
+    if (!g_session || g_state != State::Recording || !g_session->clock.start) return 0;
+    return g_session->clock.Active(RecClock::Now()) / (double)g_session->clock.freq;
+}
 
 }  // namespace ather

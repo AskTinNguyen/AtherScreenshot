@@ -67,14 +67,39 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var pausedAt: Date?
     var isPaused: Bool { pausedAt != nil }
 
-    static func start(gif: Bool, target: RecordTarget) {
-        guard current == nil else { return }
+    // Settings for this recording only (an AI agent's: fps, audio, overlays, countdown), by settings key.
+    var overrides: [String: Any] = [:]
+    // How it ended: the saved file, or why there is none. For agents; the user still gets the usual toast.
+    struct Outcome {
+        var url: URL?
+        var duration: TimeInterval
+        var error: String?
+        var discarded: Bool { url == nil && error == nil }
+    }
+    var onFinish: ((Outcome) -> Void)?
+    var copiesToClipboard = true
+
+    // `configure` runs before anything starts (overrides, onFinish).
+    @discardableResult
+    static func start(gif: Bool, target: RecordTarget, configure: ((Recorder) -> Void)? = nil) -> Recorder? {
+        guard current == nil else { return nil }
         let r = Recorder(gif: gif, target: target)
+        configure?(r)
         current = r
         r.begin()
+        return r
     }
 
+    private func int(_ k: String) -> Int { (overrides[k] as? Int) ?? s.int(k) }
+    private func bool(_ k: String) -> Bool { (overrides[k] as? Bool) ?? s.bool(k) }
+    private func string(_ k: String) -> String { (overrides[k] as? String) ?? s.string(k) }
+
+    private static var lastSerial = 0
+    let serial: Int  // tells recordings apart, even one that ended from the next
+
     private init(gif: Bool, target: RecordTarget) {
+        Recorder.lastSerial += 1
+        serial = Recorder.lastSerial
         self.gif = gif
         self.target = target
         tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).\(gif ? "gif" : "mp4")")
@@ -89,7 +114,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func begin() {
-        let secs = s.int("CountdownSeconds")
+        let secs = int("CountdownSeconds")
         guard secs > 0 else { return startCapture() }
         countdown = Countdown(over: regionRect, seconds: secs, done: { [weak self] ok in
             guard let self, !self.finished else { return }
@@ -100,16 +125,16 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func startCapture() {
         phase = .starting
-        if s.bool("ShowGamepad") {
+        if bool("ShowGamepad") {
             pad = GamepadMonitor()
-            padCorner = PadCorner.parse(s.string("GamepadCorner"))
-            padOpacity = CGFloat(max(10, min(100, s.int("GamepadOpacity")))) / 100
+            padCorner = PadCorner.parse(string("GamepadCorner"))
+            padOpacity = CGFloat(max(10, min(100, int("GamepadOpacity")))) / 100
         }
         if case .region(let r) = target { chrome.showFrame(around: r) }
         chrome.showBar(near: regionRect, recorder: self)
         Task { @MainActor in
             do {
-                if s.bool("RecordMicrophone"), !gif {
+                if bool("RecordMicrophone"), !gif {
                     self.micAllowed = await AVCaptureDevice.requestAccess(for: .audio)
                     if !self.micAllowed {
                         Toast.shared.show("Recording without the microphone", "Allow Ather Screenshot in System Settings › Privacy & Security › Microphone.", ms: 6000)
@@ -125,8 +150,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.phase = .recording
                 self.startDate = Date()
                 self.chrome.startTimer()
-                if self.s.bool("ShowClicks") || self.s.bool("ShowKeys") {
-                    self.viz = InputViz(clicks: self.s.bool("ShowClicks"), keys: self.s.bool("ShowKeys"), region: self.regionRect)
+                if self.bool("ShowClicks") || self.bool("ShowKeys") {
+                    self.viz = InputViz(clicks: self.bool("ShowClicks"), keys: self.bool("ShowKeys"), region: self.regionRect)
                 }
             } catch {
                 self.queue.sync {
@@ -174,17 +199,17 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let W = max(2, Int(pxSize.width) & ~1), H = max(2, Int(pxSize.height) & ~1)
         padScale = CGFloat(W) / max(1, regionRect.width)
-        let fps = gif ? max(1, min(50, s.int("GifFps"))) : max(1, min(120, s.int("VideoFps")))
+        let fps = gif ? max(1, min(50, int("GifFps"))) : max(1, min(120, int("VideoFps")))
         cfg.width = W
         cfg.height = H
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        cfg.showsCursor = s.bool("RecordCursor")
+        cfg.showsCursor = bool("RecordCursor")
         cfg.queueDepth = 6
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
         cfg.colorSpaceName = CGColorSpace.sRGB
         cfg.scalesToFit = true
-        let systemAudio = !gif && s.bool("RecordSystemAudio")
-        let mic = !gif && s.bool("RecordMicrophone") && micAllowed
+        let systemAudio = !gif && bool("RecordSystemAudio")
+        let mic = !gif && bool("RecordMicrophone") && micAllowed
         if systemAudio {
             cfg.capturesAudio = true
             cfg.excludesCurrentProcessAudio = true
@@ -453,6 +478,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         try? FileManager.default.removeItem(at: tmpURL)
         if let d = gifDir { try? FileManager.default.removeItem(at: d) }
         finishedCleanup()
+        onFinish?(Outcome(url: nil, duration: 0, error: error))
         if let error { Toast.shared.show("Recording failed", error, ms: 6000) } else if let notice { Toast.shared.show(notice) }
     }
 
@@ -523,7 +549,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func done(_ tmp: URL?, duration: TimeInterval, error: String?, note: String? = nil) {
-        defer { finishedCleanup() }
+        var outcome = Outcome(url: nil, duration: duration, error: error)
+        defer {
+            finishedCleanup()
+            onFinish?(outcome)
+        }
         if let error { return Toast.shared.show("Recording failed", error, ms: 6000) }
         guard let tmp else { return Toast.shared.show("Recording discarded") }
         var info = NameInfo()
@@ -532,12 +562,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try FileManager.default.moveItem(at: tmp, to: url)
         } catch {
+            outcome.error = "Couldn't save the recording: \(error.localizedDescription)"
             return Toast.shared.show("Save failed", error.localizedDescription)
         }
-        copyFile(url)
+        outcome.url = url
+        if copiesToClipboard { copyFile(url) }
         AppDelegate.shared?.setLast(nil, url: url)
         let size = ByteCountFormatter.string(fromByteCount: Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0), countStyle: .file)
-        Toast.shared.show(note == nil ? (gif ? "GIF saved and copied" : "Video saved and copied") : "Recording stopped: \(note!)",
+        Toast.shared.show(note == nil ? (gif ? "GIF saved" : "Video saved") + (copiesToClipboard ? " and copied" : "") : "Recording stopped: \(note!)",
                           "\(url.lastPathComponent)  ·  \(formatTime(duration))  ·  \(size)",
                           ms: Settings.shared.int("ToastMs") + 2500) { if self.gif { Output.open(url) } else { VideoEditor.open(url) } }
     }

@@ -46,6 +46,8 @@ enum Cmd: String, CaseIterable {
     case toggleLogin = "ToggleLaunchAtLogin"
     case settings = "EditSettings"
     case checkUpdates = "CheckForUpdates"
+    case toggleAgents = "ToggleAiAgents"
+    case copyAgentSetup = "CopyAiAgentSetup"
     case about = "About"
     case quit = "Quit"
 }
@@ -105,6 +107,8 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .toggleCursor, title: "Include mouse cursor", keywords: "toggle setting pointer", icon: "cursorarrow", hotkey: "", capture: false),
     CmdDef(cmd: .toggleLogin, title: "Launch at login", keywords: "toggle startup boot autostart", icon: "power", hotkey: "", capture: false),
     CmdDef(cmd: .settings, title: "Settings", keywords: "preferences options config hotkeys shortcuts keyboard", icon: "gearshape", hotkey: "", capture: false),
+    CmdDef(cmd: .toggleAgents, title: "Allow AI agents (MCP)", keywords: "toggle mcp claude codex agent ai automation llm", icon: "sparkles", hotkey: "", capture: false),
+    CmdDef(cmd: .copyAgentSetup, title: "Copy AI agent setup (MCP)", keywords: "mcp claude codex agent ai config connect", icon: "doc.on.clipboard", hotkey: "", capture: false),
     CmdDef(cmd: .checkUpdates, title: "Check for updates…", keywords: "update upgrade new version download latest", icon: "arrow.down.circle", hotkey: "", capture: false),
     CmdDef(cmd: .about, title: "About Ather Screenshot", keywords: "version info help", icon: "info.circle", hotkey: "", capture: false),
     CmdDef(cmd: .quit, title: "Quit Ather Screenshot", keywords: "exit close", icon: "power.circle", hotkey: "", capture: false),

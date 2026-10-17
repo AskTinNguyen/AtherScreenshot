@@ -54,6 +54,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3), and compress a video or picture to under 8, 25 or 50 MB (or any size) for chat apps and email |
 | ⌨️ **Automate** | Command palette, rebindable shortcuts, command line and `atherscreenshot://` links |
+| 🤖 **AI agents** | Claude Code, Codex and other MCP clients can take screenshots, record gameplay with markers, review videos frame by frame and search the gallery ([setup](#ai-agents-mcp)) |
 
 OCR, tags and search run on your computer. Upload is off until you set it up. Auto captions are transcribed on the device too; on a Mac without on-device speech recognition, macOS uses Apple's servers.
 
@@ -298,6 +299,29 @@ Any `[Hotkeys]` key name works as a command too (e.g. `CaptureRegionPin`). If th
 
 Commands typed in a terminal run directly. Commands from `atherscreenshot://` links (which any web page can open) or from tools without a console ask for confirmation first. They can never upload, or open, pin or edit files, even when "After capture" is set to upload.
 
+### AI agents (MCP)
+
+AI agents such as Claude Code and Codex can drive Ather Screenshot through the [Model Context Protocol](https://modelcontextprotocol.io): take screenshots while they playtest, record a gameplay session and mark moments in it, look through the recording frame by frame, read on-screen text and find earlier captures. It works the same on Windows and the Mac.
+
+1. Turn on **Settings › AI agents › Allow AI agents (MCP)**, or run "Allow AI agents (MCP)" from the palette. It's off until you do.
+2. Run **"Copy AI agent setup (MCP)"** from the palette and paste what fits your agent. For Claude Code:
+   ```
+   claude mcp add ather-screenshot -- "C:\Users\you\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe" --mcp
+   claude mcp add ather-screenshot -- "/Applications/Ather Screenshot.app/Contents/MacOS/AtherScreenshot" --mcp
+   ```
+   For Codex, in `~/.codex/config.toml`:
+   ```toml
+   [mcp_servers.ather-screenshot]
+   command = 'C:\Users\you\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe'
+   args = ["--mcp"]
+   ```
+   `--mcp` is a stdio MCP server that passes everything to the running app, and starts it if it isn't running. Clients that connect to a URL can use `http://127.0.0.1:47821/mcp` with the `Authorization: Bearer …` header the copied setup includes.
+3. Ask, e.g. *"Record the game window while you play the first level, mark every bug you see, then review the recording and list the bugs with timestamps."*
+
+The tools: `get_status`, `list_windows`, `take_screenshot`, `start_recording`, `add_marker`, `pause_recording`, `stop_recording`, `get_video_frames`, `get_capture`, `read_text`, `list_captures`, `tag_capture`, `configure`, `open_in_editor`, `upload_capture` and `run_command` (any palette command). Screenshots and recordings are saved in your captures folder and gallery as usual, with the tags and comments the agent gives them; markers are saved as review notes next to the video (`<video>.notes.json`), which the Windows video editor shows on their frames. All of it is in [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
+
+**Privacy:** the server listens on 127.0.0.1 only and needs the private token in your settings folder (`agent-token`, readable only by you), so web pages and other computers can't reach it. It refuses requests from web pages even on this computer. A notification shows when an agent connects. Agents can see your screen and, through `upload_capture`, send files with the uploader you've set up, so allow only agents you trust.
+
 ## Platform differences
 
 How the Windows app differs from the Mac app:
@@ -389,6 +413,8 @@ package.bat publish    # also puts them on the GitHub Release v<version> and wri
   - `ocr`: text, words, redaction
   - `upload`: Imgur, custom, S3
   - `settings`
+  - `mcp`: the MCP protocol, the 127.0.0.1 server and the `--mcp` stdio bridge
+  - `agent`: the tools AI agents get
 - **Tests:** `AtherScreenshot.exe --selftest [filter]` or `test.bat [--nobuild] [filter]`. Tests use a temporary support folder and never touch `%APPDATA%`.
 
 </details>

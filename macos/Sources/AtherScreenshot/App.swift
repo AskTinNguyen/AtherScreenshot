@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(Logo.writeIconset(URL(fileURLWithPath: args[1])) ? 0 : 1)
         }
         if args.first == "--bench-export" || args.first == "--bench-compare" { exit(VideoBench.main(args)) }
+        if args.first == "--mcp" { exit(Agent.runBridge()) }  // started by an AI agent: stdio MCP, see MCP.swift
         if args.first == "--help" || args.first == "-h" {
             print("""
             Ather Screenshot \(version)
@@ -25,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    record|gif|recordwindow|stop|pause|history|palette|folder|settings|quit
                                    [--pin|--edit|--upload|--redact|--ocr] [--delay N]
                    AtherScreenshot edit|pin|upload <file>
+                   AtherScreenshot --mcp     (for AI agents: an MCP server on stdin/stdout)
             Any shortcut name from Settings works as a command too (e.g. CaptureRegionPin).
             If the app is already running, the command goes to that instance.
             Commands from a terminal are trusted. Commands from atherscreenshot:// links or from
@@ -34,7 +36,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // Forward commands to the running instance.
         let me = ProcessInfo.processInfo.processIdentifier
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: kBundleID).filter { $0.processIdentifier != me }
+        // An AI agent's `--mcp` bridge runs this same binary without an app (no UI): it isn't the running instance.
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: kBundleID).filter { $0.processIdentifier != me && $0.activationPolicy != .prohibited }
         if !others.isEmpty {
             if !args.isEmpty {
                 let absolute = args.map { a -> String in
@@ -65,8 +68,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Started from a terminal (or a script attached to one), as opposed to by another app with arguments.
     static var interactiveLaunch: Bool { isatty(STDIN_FILENO) != 0 || isatty(STDERR_FILENO) != 0 }
 
-    static func cliToken() -> String {
-        let u = Settings.supportFolder.appendingPathComponent("cli-token")
+    static func cliToken() -> String { privateSecret("cli-token") }
+
+    // A per-user secret file in Application Support (mode 0600), made on first use. AI agents present
+    // privateSecret("agent-token") to the MCP server; `--mcp` reads it from the file.
+    static func privateSecret(_ name: String) -> String {
+        let u = Settings.supportFolder.appendingPathComponent(name)
         if let t = try? String(contentsOf: u, encoding: .utf8), t.count >= 32 { return t }
         let t = (0..<4).map { _ in UUID().uuidString }.joined()
         FileManager.default.createFile(atPath: u.path, contents: Data(t.utf8), attributes: [.posixPermissions: 0o600])
@@ -105,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         s.onChange = { [weak self] key in
             if key.hasPrefix("Hotkey.") { self?.registerHotkeys() }
+            if key == "AllowAgents" || key == "AgentPort" { Agent.apply() }
         }
         registerHotkeys()
         let token = AppDelegate.cliToken()
@@ -116,6 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         try? FileManager.default.createDirectory(at: s.capturesFolder, withIntermediateDirectories: true)
         Updater.cleanUp()  // only this, the running instance, clears an earlier update's leftovers
+        Agent.apply()
         UpdateController.shared.start()
 
         if afterUpdate {
@@ -156,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Finish an active recording and pending writes before quitting, so nothing is lost.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         UpdateController.shared.quitting = true  // a download finishing now must not install or relaunch
+        Agent.stop()
         let finishWrites = {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
@@ -279,7 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let more = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         let save = menu
-        for c in [Cmd.toggleClipboard, .toggleSave, .toggleCursor, .toggleAutoRedact, .toggleSystemAudio, .toggleMic, .toggleClicks, .toggleKeys, .toggleGamepad, .toggleLogin] {
+        for c in [Cmd.toggleClipboard, .toggleSave, .toggleCursor, .toggleAutoRedact, .toggleSystemAudio, .toggleMic, .toggleClicks, .toggleKeys, .toggleGamepad, .toggleLogin, .toggleAgents] {
             let d = cmdDef(c)
             let i = NSMenuItem(title: d.title, action: #selector(menuCommand(_:)), keyEquivalent: "")
             i.representedObject = c.rawValue
@@ -325,6 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleClicks: return s.bool("ShowClicks")
         case .toggleKeys: return s.bool("ShowKeys")
         case .toggleGamepad: return s.bool("ShowGamepad")
+        case .toggleAgents: return s.bool("AllowAgents")
         case .toggleLogin: return SMAppService.mainApp.status == .enabled
         default: return nil
         }
@@ -417,6 +428,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleLogin:
             setLaunchAtLogin(SMAppService.mainApp.status != .enabled)
             notifyToggle(c, SMAppService.mainApp.status == .enabled)
+        case .toggleAgents:
+            if s.toggle("AllowAgents") {  // the server follows the setting (onChange)
+                Toast.shared.show("AI agents: On", "Click to copy the setup for Claude Code, Codex and other MCP clients.", ms: 6000) { Agent.copySetup() }
+            } else {
+                Toast.shared.show("AI agents: Off")
+            }
+        case .copyAgentSetup: Agent.copySetup()
         case .settings: SettingsWindow.show()
         case .about: about()
         case .quit: NSApp.terminate(nil)

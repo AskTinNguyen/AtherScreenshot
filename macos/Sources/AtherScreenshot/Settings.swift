@@ -17,6 +17,7 @@ final class Settings: ObservableObject {
             "VideoFps": 30, "GifFps": 15, "RecordCursor": true, "RecordSystemAudio": true, "RecordMicrophone": false,
             "CountdownSeconds": 3, "ShowClicks": true, "ShowKeys": false,
             "CheckAutomatically": true,
+            "AllowAgents": false, "AgentPort": 47821,
             "ShowGamepad": false, "GamepadCorner": "bottomright", "GamepadOpacity": 100,
             "ScrollDelayMs": 400, "ScrollMaxFrames": 60, "StyledExport": false, "AutoTag": false,
             "Uploader": "none", "ImgurClientId": "", "CustomUrl": "", "CustomFileField": "file", "CustomHeaders": "",

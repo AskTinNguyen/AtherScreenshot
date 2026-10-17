@@ -57,6 +57,9 @@ private let rows: [Row] = {
         Row(key: "GamepadCorner", title: "Controller corner", section: "Recording", keywords: "gamepad position",
             kind: .choice(PadCorner.allCases.map { ($0.rawValue, $0.title) }), shownWhen: "ShowGamepad"),
         Row(key: "GamepadOpacity", title: "Controller opacity", section: "Recording", keywords: "gamepad transparent", kind: .number(10...100, 10, "%"), shownWhen: "ShowGamepad"),
+        Row(key: "AllowAgents", title: "Allow AI agents (MCP): Claude Code, Codex and other agents on this Mac can take screenshots, record and search the gallery",
+            section: "AI agents", keywords: "mcp claude codex agent automation llm", kind: .toggle),
+        Row(key: "AgentPort", title: "Agent port (127.0.0.1 only)", section: "AI agents", keywords: "mcp", kind: .number(1024...65535, 1, ""), shownWhen: "AllowAgents"),
         Row(key: "StyledExport", title: "Styled export by default", section: "Editor", keywords: "gradient shadow rounded background", kind: .toggle),
         Row(key: "Uploader", title: "Uploader", section: "Upload", keywords: "share link",
             kind: .choice([("none", "None"), ("imgur", "Imgur"), ("custom", "Custom (multipart POST)"), ("s3", "S3 / R2 / MinIO")])),
@@ -76,7 +79,7 @@ private let rows: [Row] = {
     return r
 }()
 
-private let sections = ["General", "Capture", "Recording", "Editor", "Gallery", "Upload", "Updates", "Shortcuts"]
+private let sections = ["General", "Capture", "Recording", "Editor", "Gallery", "Upload", "AI agents", "Updates", "Shortcuts"]
 
 struct SettingsView: View {
     @ObservedObject var s = Settings.shared
