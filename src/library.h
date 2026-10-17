@@ -162,6 +162,8 @@ public:
 
     // Pending metadata for a file we're about to write, applied when the scan finds it.
     void NoteCapture(const std::wstring& path, const std::wstring& app, const std::wstring& window);
+    // Tags and a comment for a capture about to be written (an AI agent's), applied once it's in the library.
+    void NoteCaptureDetails(const std::wstring& path, const std::vector<std::wstring>& tags, const std::wstring& comment);
     // An edit joins the gallery inheriting the original's tags, collections, rating, comment and source app,
     // tagged "edited" if something changed. A collage is tagged "collage" and keeps what all sources share.
     void NoteEdit(const std::wstring& path, const std::wstring& source, const std::wstring& app, const std::wstring& window,
