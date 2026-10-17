@@ -499,6 +499,7 @@ final class GalleryModel: ObservableObject {
             ("Pin to screen", "float", "pin", "⌘P", { self.pin() }),
             (n > 1 ? "Batch rename…" : "Rename…", "name", "character.cursor.ibeam", "⌘R", { self.rename() }),
             ("Upload and copy link", "share imgur s3", "icloud.and.arrow.up", "⌘U", { self.upload() }),
+            ("Compress to a smaller file…", "shrink size mb discord email reduce jpeg mp4", "arrow.down.right.and.arrow.up.left", "", { Compress.showPicker(self.targets) }),
             ("Show in Finder", "reveal folder", "folder", "⌘O", { self.reveal() }),
             ("Move to Trash", "delete remove", "trash", "⌘⌫", { self.trash() }),
         ]
@@ -679,6 +680,15 @@ private struct ItemMenu: View {
         Button("Pin to screen") { ensure(); model.pin() }
         Button(model.selection.count > 1 ? "Batch rename…" : "Rename…") { ensure(); model.rename() }
         Button("Upload and copy link") { ensure(); model.upload() }
+        if MediaType.of(url) != .gif {   // Compress ▸ Under 30 MB, Under 8 MB… Other size…
+            Menu("Compress") {
+                ForEach(Compress.sizes(for: model.selection.contains(url) ? model.targets : [url]), id: \.self) { mb in
+                    Button("Under \(Compress.label(mb))") { ensure(); Compress.run(model.targets, mb: mb) }
+                }
+                Divider()
+                Button("Other size…") { ensure(); Compress.showPicker(model.targets) }
+            }
+        }
         Button("Show in Finder") { ensure(); model.reveal() }
         Divider()
         Button("Move to Trash") { ensure(); model.trash() }

@@ -1,0 +1,203 @@
+import AVFoundation
+import ImageIO
+import UniformTypeIdentifiers
+import XCTest
+@testable import AtherScreenshot
+
+// "Compress to under N MB" (Compress.swift): the same checks as the Windows self-tests in src/compress.cpp.
+final class CompressTests: XCTestCase {
+    func testPlanFollowsTheHandoffMath() {
+        // 30 MB over 80.2 s with sound, from 2560 wide: ~2.9 Mbps in all, 96 kbps of it sound, 1920 wide.
+        var p = Compress.planVideo(cap: Compress.bytes(mb: 30), seconds: 80.2, w: 2560, h: 1440, audio: true)
+        XCTAssertTrue(p.fits)
+        XCTAssertEqual(p.videoBps + p.audioBps, 30 * 1024 * 1024 * 0.9 * 8 / 80.2, accuracy: 1)
+        XCTAssertEqual(p.audioBps, 96_000)
+        XCTAssertEqual([p.w, p.h], [1920, 1080])
+        // No sound: all of it video. Smaller than 1920: never scaled up.
+        p = Compress.planVideo(cap: Compress.bytes(mb: 30), seconds: 80.2, w: 1280, h: 720, audio: false)
+        XCTAssertEqual(p.audioBps, 0)
+        XCTAssertEqual([p.w, p.h], [1280, 720])
+        // Under 500 kbps: 1280 wide; under 250 kbps: 854; under 100 kbps it doesn't fit.
+        p = Compress.planVideo(cap: Compress.bytes(mb: 8), seconds: 120, w: 2560, h: 1440, audio: true)
+        XCTAssertTrue(p.videoBps < 500_000 && p.videoBps >= 250_000)
+        XCTAssertEqual([p.w, p.h], [1280, 720])
+        p = Compress.planVideo(cap: Compress.bytes(mb: 8), seconds: 240, w: 2560, h: 1440, audio: true)
+        XCTAssertLessThan(p.videoBps, 250_000)
+        XCTAssertEqual([p.w, p.h], [854, 480])
+        XCTAssertFalse(Compress.planVideo(cap: Compress.bytes(mb: 1), seconds: 300, w: 1920, h: 1080, audio: true).fits)
+        // Portrait phone video: the long side counts, and the sides stay even.
+        p = Compress.planVideo(cap: Compress.bytes(mb: 25), seconds: 30, w: 2160, h: 3840, audio: true)
+        XCTAssertEqual([p.w, p.h], [1080, 1920])
+        p = Compress.planVideo(cap: Compress.bytes(mb: 25), seconds: 30, w: 1001, h: 777, audio: true)
+        XCTAssertTrue(p.w % 2 == 0 && p.h % 2 == 0)
+        // A retry lowers the rate by cap / actual × 0.95.
+        XCTAssertEqual(Compress.retryScale(cap: 30, actual: 33), 30.0 / 33 * 0.95, accuracy: 1e-12)
+        let first = Compress.planVideo(cap: Compress.bytes(mb: 30), seconds: 80.2, w: 2560, h: 1440, audio: true)
+        let again = Compress.planVideo(cap: Compress.bytes(mb: 30), seconds: 80.2, w: 2560, h: 1440, audio: true, videoScale: Compress.retryScale(cap: 30, actual: 33))
+        XCTAssertEqual(again.videoBps, first.videoBps * 30 / 33 * 0.95, accuracy: 1)
+    }
+
+    func testSizesAndNames() throws {
+        XCTAssertEqual(Compress.parseMegabytes("12"), 12)
+        XCTAssertEqual(Compress.parseMegabytes("2,5 MB"), 2.5)
+        XCTAssertEqual(Compress.parseMegabytes("8mb"), 8)
+        XCTAssertEqual(Compress.parseMegabytes("ten"), 0)
+        XCTAssertEqual(Compress.parseMegabytes("12 GB"), 0)
+        XCTAssertEqual(Compress.parseMegabytes("0"), 0)
+        XCTAssertEqual(Compress.label(8), "8 MB")
+        XCTAssertEqual(Compress.label(2.5), "2.5 MB")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let src = dir.appendingPathComponent("clip.mp4")
+        XCTAssertEqual(Compress.outputURL(for: src, ext: "mp4").lastPathComponent, "clip_small.mp4")
+        XCTAssertEqual(Compress.outputURL(for: src, ext: "mp4").lastPathComponent, "clip_small-2.mp4")  // the first is reserved meanwhile
+        XCTAssertEqual(Compress.pictureSteps(w: 4000, h: 3000).first, Compress.PictureStep(quality: 0.85, scale: 1))
+        XCTAssertEqual(Compress.pictureSteps(w: 400, h: 300).count, 4)  // never below 320 px on the long side
+    }
+
+    func testVideoLandsUnderTheCap() async throws {
+        let src = try await Self.noise(w: 640, h: 360, seconds: 4, tone: true)
+        let before = Compress.fileBytes(src)
+        let cap = min(400 * 1024, before * 0.6)
+        var calls = 0
+        var r = try await Compress.video(src, cap: cap) { _, _ in calls += 1 }
+        XCTAssertFalse(r.skipped)
+        XCTAssertGreaterThan(calls, 0)
+        try Compress.finish(&r)
+        let out = try XCTUnwrap(r.out)
+        XCTAssertEqual(out.lastPathComponent, src.deletingPathExtension().lastPathComponent + "_small.mp4")
+        let after = Compress.fileBytes(out)
+        XCTAssertTrue(after > 0 && after <= cap, "\(after) bytes for a cap of \(cap), \(r.attempts) tries")
+        XCTAssertEqual(Compress.fileBytes(src), before)  // the original stays as it was
+        let asset = AVURLAsset(url: out)
+        let size = try await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)
+        let sounds = try await asset.loadTracks(withMediaType: .audio).count
+        let seconds = try await asset.load(.duration).seconds
+        XCTAssertEqual(size, CGSize(width: 640, height: 360))
+        XCTAssertEqual(sounds, 1)
+        XCTAssertEqual(seconds, 4, accuracy: 0.2)
+        // Already small enough: nothing made.
+        let again = try await Compress.video(out, cap: cap)
+        XCTAssertTrue(again.skipped && again.tmp == nil)
+        // Too little room for the length: refused.
+        do { _ = try await Compress.video(src, cap: 30 * 1024); XCTFail("should not fit") } catch {}
+        // 1920 × 1080 at a cap that leaves it under 500 kbps of video: 1280 wide.
+        let hd = try await Self.noise(w: 1920, h: 1080, seconds: 4, tone: false, screen: true)
+        // Under 500 kbps of video it's scaled down, keeping its shape. The cap: 200 KB (~370 kbps: 1280 wide), or less
+        // when the encoder made the source smaller than twice that.
+        let hdCap = min(200 * 1024, Compress.fileBytes(hd) * 0.5)
+        XCTAssertTrue(Compress.planVideo(cap: hdCap, seconds: 4, w: 1920, h: 1080, audio: false).fits, "source \(Compress.fileBytes(hd)) bytes")
+        var s = try await Compress.video(hd, cap: hdCap)
+        XCTAssertFalse(s.skipped)
+        try Compress.finish(&s)
+        XCTAssertTrue(s.w < 1920 && s.w >= 854 && abs(s.w * 9 - s.h * 16) <= 16, "\(s.w)×\(s.h)")
+        let hdOut = try XCTUnwrap(s.out)
+        XCTAssertLessThanOrEqual(Compress.fileBytes(hdOut), hdCap)
+        let hdSize = try await AVURLAsset(url: hdOut).loadTracks(withMediaType: .video).first?.load(.naturalSize)
+        XCTAssertEqual(hdSize, CGSize(width: s.w, height: s.h))
+    }
+
+    func testRotatedPhoneVideoComesOutUpright() async throws {
+        let src = try await TestMedia.clip(w: 640, h: 360, seconds: 2, rotation: 90) { i, ctx in Self.paintGrain(ctx, frame: i) }
+        var r = try await Compress.video(src, cap: min(200 * 1024, Compress.fileBytes(src) * 0.6))
+        try Compress.finish(&r)
+        XCTAssertEqual([r.w, r.h], [360, 640])
+        let size = try await AVURLAsset(url: try XCTUnwrap(r.out)).loadTracks(withMediaType: .video).first?.load(.naturalSize)
+        XCTAssertEqual(size, CGSize(width: 360, height: 640))
+    }
+
+    // The video editor's Save smaller: the edit (here trimmed and cropped) rendered as Save renders it, under the size.
+    func testEditSavesUnderTheCap() async throws {
+        let clip = try await VideoSource.probe(try await TestMedia.colors(w: 1280, h: 720, seconds: 3, tone: true))
+        var e = TestMedia.edit([clip])
+        e.trimStart = 1
+        e.crop = CGRect(x: 0, y: 0, width: 640, height: 360)
+        let cap = Compress.bytes(mb: 0.15)   // 2 s in 154 KB: ~470 kbps with the sound, so a 640-wide crop stays as it is
+        var r = try await Compress.edit(e, cap: cap)
+        let tmp = try XCTUnwrap(r.tmp)
+        XCTAssertNil(r.out)   // the editor picks where it goes
+        XCTAssertLessThanOrEqual(Compress.fileBytes(tmp), cap)
+        let asset = AVURLAsset(url: tmp)
+        let size = try await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)
+        let sounds = try await asset.loadTracks(withMediaType: .audio).count
+        let seconds = try await asset.load(.duration).seconds
+        XCTAssertEqual(size, CGSize(width: r.w, height: r.h))
+        XCTAssertEqual([r.w, r.h], [640, 360], "the crop's size")
+        XCTAssertEqual(sounds, 1)
+        XCTAssertEqual(seconds, 2, accuracy: 0.15)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        r.out = dir.appendingPathComponent("smaller.mp4")
+        try Compress.finish(&r)
+        XCTAssertGreaterThan(Compress.fileBytes(dir.appendingPathComponent("smaller.mp4")), 0)
+        // A size too small for the length: refused.
+        do { _ = try await Compress.edit(e, cap: Compress.bytes(mb: 0.01)); XCTFail("should not fit") } catch {}
+    }
+
+    func testPictureMakesASmallerJpeg() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let src = dir.appendingPathComponent("shot.png")
+        // Noise compresses badly as PNG, so the JPEG has to work for it.
+        let ctx = CGContext(data: nil, width: 1600, height: 1000, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+        Self.paintNoise(ctx, seed: 7)
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithURL(src as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        let before = Compress.fileBytes(src), cap = 400.0 * 1024
+        XCTAssertGreaterThan(before, cap)
+        var r = try Compress.picture(src, cap: cap)
+        try Compress.finish(&r)
+        let out = try XCTUnwrap(r.out)
+        XCTAssertEqual(out.lastPathComponent, "shot_small.jpg")
+        XCTAssertLessThanOrEqual(Compress.fileBytes(out), cap)
+        XCTAssertEqual(Compress.fileBytes(src), before)
+        let img = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) })
+        XCTAssertEqual([img.width, img.height], [r.w, r.h])
+        XCTAssertLessThanOrEqual(img.width, 1600)
+    }
+
+    // A gradient that moves every frame, with light grain: busy enough to need the bits, yet (unlike pure noise, which
+    // no encoder squeezes below its quality floor) something an encoder can bring down to a low rate.
+    // `screen`: like a screen recording instead: a still gradient with a white box moving across it (grain at 720p
+    // needs more bits than the 1080p case asks for; screen content doesn't).
+    private static func noise(w: Int, h: Int, seconds: Double, tone: Bool, screen: Bool = false) async throws -> URL {
+        let n = Int(seconds * 30)
+        return try await TestMedia.clip(w: w, h: h, seconds: seconds, tone: tone) { i, ctx in
+            paintGrain(ctx, frame: i, still: screen)
+            if screen {
+                let bw = w / 6
+                ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+                ctx.fill(CGRect(x: i * w / n % (w - bw), y: h / 3, width: bw, height: bw))
+            }
+        }
+    }
+
+    private static func paintGrain(_ ctx: CGContext, frame i: Int, still: Bool = false) {
+        guard let data = ctx.data else { return }
+        let px = data.assumingMemoryBound(to: UInt32.self)
+        let w = ctx.width, h = ctx.height, row = ctx.bytesPerRow / 4
+        var x = UInt32(truncatingIfNeeded: i) &* 2_654_435_761 &+ 99
+        for yy in 0..<h {
+            for xx in 0..<w {
+                x = x &* 1_664_525 &+ 1_013_904_223
+                let grain = still ? 0 : Int((x >> 24) % 25) - 12
+                func c(_ v: Int) -> UInt32 { UInt32(min(255, max(0, v + grain))) }
+                let t = still ? 0 : i   // the screen's gradient stays put
+                let r = c((xx * 255 / w + t * 4) & 255), g = c(yy * 255 / h), b = c(((xx + yy) / 2 + t * 2) & 255)
+                px[yy * row + xx] = 0xFF00_0000 | (r << 16) | (g << 8) | b
+            }
+        }
+    }
+
+    private static func paintNoise(_ ctx: CGContext, seed: UInt32) {
+        guard let data = ctx.data else { return }
+        let px = data.assumingMemoryBound(to: UInt32.self)
+        var x = seed &* 2_654_435_761 &+ 99
+        for i in 0..<(ctx.bytesPerRow / 4 * ctx.height) {
+            x = x &* 1_664_525 &+ 1_013_904_223
+            px[i] = 0xFF00_0000 | (x >> 8)
+        }
+    }
+}

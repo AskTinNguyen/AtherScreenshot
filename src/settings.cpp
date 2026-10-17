@@ -316,6 +316,8 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     scrollMaxFrames = std::clamp(_wtoi(Get(L"Scrolling", L"MaxFrames", L"60").c_str()), 2, 400);
     styledExport = GetBool(L"Editor", L"StyledExport", false);
     noteAuthor = Get(L"VideoEditor", L"NoteAuthor", L"");
+    compressVideoMB = std::clamp(_wtof(Get(L"Compress", L"CompressVideoMB", L"30").c_str()), 0.1, 4096.0);
+    compressPictureMB = std::clamp(_wtof(Get(L"Compress", L"CompressPictureMB", L"2").c_str()), 0.1, 4096.0);
 
     autoTag = GetBool(L"Gallery", L"AutoTag", false);
     checkUpdates = GetBool(L"Updates", L"CheckAutomatically", true);

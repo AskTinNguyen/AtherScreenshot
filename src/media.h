@@ -44,7 +44,10 @@ public:
     ~Mp4Writer();
     // `rotation` (0, 90, 180, 270) is stored for players to apply, as phones do; the frames stay as given.
     // `nv12`: frames come through WriteNv12 (see BgraToNv12) instead of WriteFrame. `w` ≤ 0: sound only.
-    HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0, bool nv12 = false);
+    // `videoBps` > 0: a constant bit rate of that many bits a second instead of the usual quality-led one (Compress, which
+    // needs a predictable size); `audioBps` > 0: the AAC rate (96, 128, 160 or 192 kbps; others round to one).
+    HRESULT Begin(const std::wstring& path, int w, int h, int fps, int audioRate = 0, int audioChannels = 2, int rotation = 0, bool nv12 = false,
+                  uint32_t videoBps = 0, uint32_t audioBps = 0);
     HRESULT WriteFrame(const uint32_t* px, int64_t t, int64_t duration);
     // NV12 frames (BgraToNv12's layout), uncopied: `yuv` stays alive, unchanged, until the encoder is done with it.
     HRESULT WriteNv12(std::shared_ptr<const uint8_t> yuv, int64_t t, int64_t duration);

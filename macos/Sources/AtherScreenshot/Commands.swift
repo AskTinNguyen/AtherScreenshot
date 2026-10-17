@@ -25,6 +25,7 @@ enum Cmd: String, CaseIterable {
     case scrolling = "CaptureScrolling"
     case editLast = "EditLastCapture"
     case openImage = "OpenImageInEditor"
+    case compressFile = "CompressFile"
     case fullscreen = "CaptureFullscreen"
     case monitor = "CaptureMonitor"
     case window = "CaptureWindow"
@@ -86,6 +87,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .scrolling, title: "Scrolling capture (long page)", keywords: "scroll stitch full page chat long", icon: "arrow.up.and.down.text.horizontal", hotkey: "Ctrl+Alt+S", capture: true),
     CmdDef(cmd: .editLast, title: "Annotate last capture", keywords: "edit editor draw markup", icon: "pencil.and.outline", hotkey: "", capture: false),
     CmdDef(cmd: .openImage, title: "Open a picture or video to edit…", keywords: "edit file annotate load image video mp4 mov import", icon: "photo", hotkey: "", capture: false),
+    CmdDef(cmd: .compressFile, title: "Compress a picture or video…", keywords: "smaller shrink size mb discord email reduce file jpeg mp4", icon: "arrow.down.right.and.arrow.up.left", hotkey: "", capture: false),
     CmdDef(cmd: .fullscreen, title: "Capture full screen", keywords: "all monitors desktop entire everything displays", icon: "rectangle.on.rectangle", hotkey: "Ctrl+Alt+3", capture: true),
     CmdDef(cmd: .monitor, title: "Capture current display", keywords: "monitor screen", icon: "display", hotkey: "Ctrl+Alt+Shift+3", capture: true),
     CmdDef(cmd: .window, title: "Capture active window", keywords: "app foreground focused", icon: "macwindow", hotkey: "Ctrl+Alt+W", capture: true),

@@ -1,0 +1,111 @@
+# Staging builds: builds Windows and macOS on GitHub's runners, runs the tests, and puts the installers on the
+# "staging" pre-release for testing. A pre-release is never the repository's latest release, and no latest.json is
+# uploaded, so copies people already have are never offered these builds (the updaters read
+# releases/latest/download/latest.json). Real releases stay manual: package.bat publish and macos/build.sh publish.
+name: Staging build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [staging, claude/affectionate-fermi-nnr321]
+
+concurrency:
+  group: staging
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        run: call build.bat
+      - name: Self-tests
+        id: tests
+        continue-on-error: true  # reported below; a runner without a GPU or some codecs can fail tests the app passes on a PC
+        shell: cmd
+        run: call test.bat --nobuild
+      - name: Package
+        shell: cmd
+        run: call package.bat
+      - name: Test summary
+        if: always()
+        shell: pwsh
+        run: |
+          $log = if (Test-Path build\selftest.log) { Get-Content build\selftest.log } else { @('no log') }
+          "## Windows self-tests: ${{ steps.tests.outcome }}" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          ($log | Select-Object -Last 40) >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            build/selftest.log
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compress tests
+        id: compress
+        continue-on-error: true
+        timeout-minutes: 15
+        working-directory: macos
+        run: xcrun swift test --filter CompressTests 2>&1 | tee ../compress-test.log; exit ${PIPESTATUS[0]}
+      - name: Package (universal, ad-hoc signed)
+        working-directory: macos
+        run: ./build.sh package
+      - name: Test summary
+        if: always()
+        run: |
+          {
+            echo "## macOS CompressTests: ${{ steps.compress.outcome }}"
+            echo "(The full suite isn't run here: on the runner it waits on something past 15 minutes; run xcrun swift test on a Mac.)"
+            echo '```'
+            tail -n 40 compress-test.log 2>/dev/null || echo "no log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            macos/dist/*.dmg
+            macos/dist/*.zip
+            macos/dist/SHA256SUMS.txt
+            compress-test.log
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish the staging pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir out
+          cp windows/dist/*.exe out/
+          for f in windows/dist/*.zip; do cp "$f" "out/$(basename "${f%.zip}")-windows.zip"; done
+          cp macos/macos/dist/*.dmg out/
+          cp macos/macos/dist/*.zip out/
+          (cd out && sha256sum * > SHA256SUMS-staging.txt)
+          short=$(echo "$GITHUB_SHA" | cut -c1-7)
+          {
+            echo "Staging build of \`$GITHUB_REF_NAME\` at $short, for testing only. Not offered to anyone by the in-app updater."
+            echo
+            echo "- **Windows:** \`AtherScreenshot-Setup-*.exe\` (installing replaces your installed copy), or the \`-portable-windows.zip\` to run it without installing."
+            echo "- **macOS:** the DMG (ad-hoc signed: open it once, then System Settings › Privacy & Security › Open Anyway)."
+            echo
+            echo "Test results are on the [workflow run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID)."
+          } > notes.md
+          gh release delete staging --repo "$REPO" --yes --cleanup-tag || true
+          gh release create staging out/* --repo "$REPO" --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Staging: $GITHUB_REF_NAME ($short)" --notes-file notes.md

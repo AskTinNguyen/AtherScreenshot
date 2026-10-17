@@ -51,6 +51,8 @@ public:
     bool styledExport = false;
     // video editor
     std::wstring noteAuthor;  // [VideoEditor] NoteAuthor: the name on review notes (empty: Windows' display name)
+    // compress: the last "under N MB" used, for videos and for pictures ([Compress] CompressVideoMB, CompressPictureMB)
+    double compressVideoMB = 30, compressPictureMB = 2;
 
     // gallery
     bool autoTag = false;  // [Gallery] AutoTag: apply suggested tags

@@ -24,6 +24,7 @@ using std::min;
 }  // namespace Gdiplus
 #include <gdiplus.h>
 
+#include "compress.h"
 #include "gallery_model.h"
 #include "media.h"
 #include "videoio.h"
@@ -3229,6 +3230,7 @@ void Gallery::ActionsPalette() {
         {L"Pin to screen", L"float", L"Ctrl+P", 0xE718, [this] { Pin(); }},
         {n > 1 ? L"Batch rename…" : L"Rename…", L"name", L"Ctrl+R", 0xE8AC, [this] { Rename(); }},
         {L"Upload and copy link", L"share imgur s3", L"Ctrl+U", 0xE898, [this] { Upload(); }},
+        {L"Compress to a smaller file…", L"shrink size mb discord email reduce jpeg mp4", L"", 0xE73F, [this] { ShowCompressPicker(model.Targets()); }},
         {L"Show in Explorer", L"reveal folder", L"Ctrl+O", 0xE838, [this] { Reveal(); }},
         {L"Move to the Recycle Bin", L"delete remove trash", L"Del", 0xE74D, [this] { Trash(); }},
     };
@@ -3302,6 +3304,17 @@ void Gallery::ContextMenu(const std::wstring& u, POINT at) {
     add(L"Pin to screen\tCtrl+P", [this] { Pin(); });
     add(std::wstring(multi ? L"Batch rename…" : L"Rename…") + L"\tCtrl+R", [this] { Rename(); });
     add(L"Upload and copy link\tCtrl+U", [this] { Upload(); });
+    if (mt != MediaType::Gif) {  // Compress ▸ Under 30 MB, Under 8 MB… Other size…
+        HMENU sizes = CreatePopupMenu();
+        for (double mb : CompressSizesFor(model.Targets())) {
+            acts.push_back([this, mb] { CompressFiles(model.Targets(), mb); });
+            AppendMenuW(sizes, MF_STRING, acts.size(), (L"Under " + MegabytesLabel(mb)).c_str());
+        }
+        AppendMenuW(sizes, MF_SEPARATOR, 0, nullptr);
+        acts.push_back([this] { ShowCompressPicker(model.Targets()); });
+        AppendMenuW(sizes, MF_STRING, acts.size(), L"Other size…");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sizes, L"Compress");
+    }
     add(L"Show in Explorer\tCtrl+O", [this] { Reveal(); });
     sep();
     add(L"Move to the Recycle Bin\tDel", [this] { Trash(); });

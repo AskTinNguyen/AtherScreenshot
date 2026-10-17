@@ -17,7 +17,11 @@
 - **Playtesting:** ask your agent to record the game while it plays and to mark every bug it sees. Its markers are saved next to the video as review notes, and on Windows the video editor shows each one on its frame.
 - **Turning it on:** it's off until you turn on Settings › AI agents › **Allow AI agents (MCP)**. Then run **Copy AI agent setup (MCP)** from the command palette and paste it into your agent. For Claude Code that's one `claude mcp add` line.
 - **Privacy:** only programs on this computer that hold a private token from your settings folder can connect, and requests from web pages are refused. A notification shows when an agent connects. Agents can see your screen, so allow only agents you trust.
-- **Everything else is unchanged.** See [docs/AI-AGENTS.md](docs/AI-AGENTS.md) for every tool.
+- **Every tool:** see [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
+
+### Compress a video or picture to fit a size
+- **Two clicks:** right-click a capture in the gallery › Compress › Under 30 MB, 8 MB (Discord), 25 MB (email), 50 MB or any size you type. Pictures offer 2, 1 and 5 MB. Or use "Compress a picture or video…" in the palette for any file. While editing a video, Save smaller (in Save ▾ on Windows, next to Save GIF on the Mac) saves your edit to fit the size.
+- **What you get:** a smaller copy next to the original (`<name>_small.mp4` or `.jpg`); the original stays as it is. Videos are H.264 MP4s that play in every chat app and browser, sized from the length so they land just under the limit (re-made a bit smaller if they don't). Pictures become JPEGs.
 
 ## Earlier update (macOS, build 0.0.2.3)
 
