@@ -70,11 +70,13 @@ int CheckHttpRequest(const HttpRequest& r, int port, const std::string& token);
 
 // ---- stdio ----
 
-// Newline-delimited JSON-RPC on stdin/stdout, relayed to http://127.0.0.1:port/mcp. `ensureRunning` starts the app
-// when it isn't, and returns false when it can't. Returns the process exit code.
-int RunStdioBridge(int port, const std::string& token, const std::function<bool()>& ensureRunning);
+// Newline-delimited JSON-RPC on stdin/stdout, relayed to http://127.0.0.1:port/mcp. `startApp` starts the app when
+// it isn't running and says whether it did. Returns the process exit code.
+int RunStdioBridge(int port, const std::string& token, const std::function<bool()>& startApp);
 
-// POSTs `body` to 127.0.0.1:port/mcp. Returns the HTTP status (0 when the connection failed) and the response body.
+// POSTs `body` to 127.0.0.1:port/mcp. Returns the HTTP status and the response body; kNotListening when nobody
+// accepted the connection, 0 when it was accepted but no answer came (dropped, or timed out).
+constexpr int kNotListening = -1;
 int HttpPost(int port, const std::string& token, const std::string& body, std::string* response, int timeoutMs);
 
 }  // namespace ather::mcp

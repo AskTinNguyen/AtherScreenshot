@@ -58,8 +58,6 @@ std::vector<std::wstring> StringList(const Json& j) {
     return out;
 }
 
-std::string Utf8(const std::wstring& s) { return ToUtf8(s); }
-
 std::wstring LowerW(std::wstring s) {
     for (auto& c : s) c = (wchar_t)towlower(c);
     return s;
@@ -227,7 +225,7 @@ bool ResolveTarget(const Json& args, Target* t, std::string* error) {
         WindowEntry w;
         if (!FindWindowFor(args, &w, error)) return false;
         if (w.minimized) {
-            if (!args["bring_to_front"].Bool(false)) return *error = "\"" + Utf8(w.title) + "\" is minimized. Pass bring_to_front: true to restore it.", false;
+            if (!args["bring_to_front"].Bool(false)) return *error = "\"" + ToUtf8(w.title) + "\" is minimized. Pass bring_to_front: true to restore it.", false;
             ShowWindow(w.hwnd, SW_RESTORE);
             Sleep(250);  // the restore animation
             GetWindowFrame(w.hwnd, &w.frame);
@@ -268,18 +266,22 @@ BitmapPtr PrintWindowFrame(HWND hwnd, const RECT& frame) {
     return full->Crop({frame.left - wr.left, frame.top - wr.top, frame.right - wr.left, frame.bottom - wr.top});
 }
 
-BitmapPtr Grab(const Target& t, const Json& args) {
+// `warning`: set when the picture may not show the window that was asked for.
+BitmapPtr Grab(const Target& t, const Json& args, std::string* warning) {
     const bool cursor = args["include_cursor"].Bool(g_host.settings->captureCursor);
     if (HideToast()) DwmFlush();  // our own notification must not be in the shot
     if (t.window) {
-        const bool front = args["bring_to_front"].Bool(false);
-        if (front && GetForegroundWindow() != t.window) {
-            SetForegroundWindow(t.window);
+        if (args["bring_to_front"].Bool(false) && GetForegroundWindow() != t.window) {
+            ForceForeground(t.window);  // a background app's SetForegroundWindow alone is usually refused
             Sleep(200);
             DwmFlush();
+            if (GetForegroundWindow() != t.window) *warning = "Windows didn't let the window come to the front.";
         }
-        if (GetForegroundWindow() != t.window)  // covered, maybe: let it draw itself
+        if (GetForegroundWindow() != t.window) {  // covered, maybe: let it draw itself
             if (BitmapPtr img = PrintWindowFrame(t.window, t.rect)) return img;
+            *warning = "The window isn't in front and couldn't draw itself (some games can't), so this is what's on the "
+                       "screen where it is, which may be another window. Pass bring_to_front: true, or capture its display.";
+        }
     }
     return CaptureScreen(t.rect, cursor);
 }
@@ -293,17 +295,17 @@ struct ShotOptions {
     int side = 1568;
 };
 
-void Deliver(BitmapPtr img, Target t, ShotOptions o, int redacted, Reply reply) {
+void Deliver(BitmapPtr img, Target t, ShotOptions o, int redacted, std::string warning, Reply reply) {
     if (o.redact && redacted < 0) {
-        RecognizeWordsAsync(img, [img, t, o, reply](std::vector<OcrWord> words, std::wstring err) {
-            if (!err.empty()) return reply(ErrorResult("Auto-redact failed, so nothing was saved: " + Utf8(err)));
+        RecognizeWordsAsync(img, [img, t, o, warning, reply](std::vector<OcrWord> words, std::wstring err) {
+            if (!err.empty()) return reply(ErrorResult("Auto-redact failed, so nothing was saved: " + ToUtf8(err)));
             auto clean = img->Crop({0, 0, img->Width(), img->Height()});
             int n = 0;
             for (const RECT& r : FindSensitive(words)) {
                 clean->Pixelate(r, std::max(6, RectH(r) / 3));
                 ++n;
             }
-            Deliver(clean, t, o, n, reply);
+            Deliver(clean, t, o, n, warning, reply);
         });
         return;
     }
@@ -313,6 +315,7 @@ void Deliver(BitmapPtr img, Target t, ShotOptions o, int redacted, Reply reply) 
     d.Set("width", img->Width());
     d.Set("height", img->Height());
     if (redacted >= 0) d.Set("redacted", redacted);
+    if (!warning.empty()) d.Set("warning", warning);
     if (o.clipboard) d.Set("copied_to_clipboard", CopyImageToClipboard(nullptr, *img));
     if (!o.save) {
         g_host.setLast(img, L"");
@@ -326,7 +329,7 @@ void Deliver(BitmapPtr img, Target t, ShotOptions o, int redacted, Reply reply) 
     Library::Shared().NoteCapture(path, info.app, info.window);
     Library::Shared().NoteCaptureDetails(path, o.tags, o.comment);
     SavePngAsync(img, path, [img, path, d, o, reply](bool ok) mutable {
-        if (!ok) return reply(ErrorResult("Couldn't save " + Utf8(path)));
+        if (!ok) return reply(ErrorResult("Couldn't save " + ToUtf8(path)));
         g_host.setLast(img, path);
         d.Set("saved", true);
         d.Set("path", path);
@@ -358,9 +361,10 @@ void TakeScreenshot(const Json& args, Reply reply) {
     After(std::clamp(args["delay_seconds"].Num(0), 0.0, 60.0), [t, args, o, reply] {
         Target now = t;
         if (now.window) GetWindowFrame(now.window, &now.rect);  // it may have moved while we waited
-        BitmapPtr img = Grab(now, args);
+        std::string warning;
+        BitmapPtr img = Grab(now, args, &warning);
         if (!img) return reply(ErrorResult("The capture failed."));
-        Deliver(img, now, o, -1, reply);
+        Deliver(img, now, o, -1, warning, reply);
     });
 }
 
@@ -373,45 +377,60 @@ struct Marker {
 };
 
 struct AgentRecording {
-    bool ours = false;  // started by an agent (its result comes back here)
+    bool ours = false;  // the running recording was started by an agent (its result comes back here)
     std::wstring path;
-    RecordFormat format = RecordFormat::Mp4;
+    int fps = 30;
     std::vector<Marker> markers;
+    uint64_t markersFor = 0;     // the RecordingId() the markers belong to
     std::wstring client;
     uint64_t generation = 0;     // which recording a max_seconds stop belongs to
-    std::optional<Json> result;  // the finished recording, until an agent reads it
+    std::optional<Json> result;  // the agent's finished recording, until an agent reads it
     std::vector<Reply> waiting;  // stop_recording calls waiting for the file
 };
 AgentRecording g_rec;
 uint64_t g_recGeneration = 0;
 std::wstring g_client = L"AI agent";  // the last client that connected (note author)
 
-NoteKind KindOf(const std::string& s) { return NoteKindOf(s); }
+// The markers on the running recording (markers left from an earlier one don't count).
+std::vector<Marker>& CurrentMarkers() {
+    if (g_rec.markersFor != RecordingId()) {
+        g_rec.markers.clear();
+        g_rec.markersFor = RecordingId();
+    }
+    return g_rec.markers;
+}
+
+// Writes `text` to `path` only if nothing is there yet, all at once (a temp file moved into place).
+bool WriteNewFileUtf8(const std::wstring& path, const std::string& text) {
+    const std::wstring tmp = path + L".tmp";
+    if (!WriteUtf8File(tmp, text)) return false;
+    if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) return true;  // fails if `path` exists
+    DeleteFileW(tmp.c_str());
+    return false;
+}
 
 // Markers become the video's review notes ("<video>.notes.json"), where the video editor shows them on their frames.
-void WriteMarkers(const std::wstring& video, std::vector<Marker> markers, std::wstring author) {
-    if (markers.empty()) return;
-    std::thread([video, markers = std::move(markers), author = std::move(author)] {
-        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        const std::vector<double> times = FrameTimes(video);
-        std::vector<Note> notes;
-        for (const auto& m : markers) {
-            Note n;
-            n.path = video;
-            n.src = m.seconds;
-            if (!times.empty()) {  // the frame on screen at that moment
-                auto it = std::upper_bound(times.begin(), times.end(), m.seconds + 1e-6);
-                n.src = it == times.begin() ? times.front() : *(it - 1);
-            }
-            n.text = m.label;
-            n.author = author;
-            n.kind = m.kind;
-            n.created = (int64_t)time(nullptr);
-            notes.push_back(std::move(n));
+// Never over notes that are already there. Written before anyone is told about the video, so an editor opened
+// from the notification finds them.
+bool WriteMarkers(const std::wstring& video, const std::vector<Marker>& markers, const std::wstring& author, int fps) {
+    if (markers.empty() || MediaTypeOf(video) != MediaType::Video) return false;
+    const std::vector<double> times = FrameTimes(video);
+    std::vector<Note> notes;
+    for (const auto& m : markers) {
+        Note n;
+        n.path = video;
+        n.src = m.seconds;
+        if (!times.empty()) {  // the frame on screen at that moment
+            auto it = std::upper_bound(times.begin(), times.end(), m.seconds + 1e-6);
+            n.src = it == times.begin() ? times.front() : *(it - 1);
         }
-        WriteUtf8File(NotesPath(video), NotesJson(video, notes, times, 30));
-        if (SUCCEEDED(co)) CoUninitialize();
-    }).detach();
+        n.text = m.label;
+        n.author = author;
+        n.kind = m.kind;
+        n.created = (int64_t)time(nullptr);
+        notes.push_back(std::move(n));
+    }
+    return WriteNewFileUtf8(NotesPath(video), NotesJson(video, notes, times, fps));
 }
 
 Json MarkersJson(const std::vector<Marker>& ms) {
@@ -426,48 +445,48 @@ Json MarkersJson(const std::vector<Marker>& ms) {
     return a;
 }
 
-void Finished(Json result) {
-    auto waiting = std::move(g_rec.waiting);
-    g_rec.waiting.clear();
-    if (waiting.empty()) g_rec.result = result;  // ended by the user or max_seconds: the next stop_recording reports it
-    else g_rec.result.reset();
-    for (auto& w : waiting) w(JsonResult(result));
-}
-
-void OnAgentRecordingDone(const RecordResult& r) {
+// What stop_recording reports for a finished recording; markers are saved with an MP4.
+Json RecordingResultJson(const RecordResult& r, const std::vector<Marker>& markers, const std::wstring& author, int fps) {
     Json d = Json::Object();
     if (r.discarded) {
         d.Set("discarded", true);
-    } else if (!r.ok) {
-        auto waiting = std::move(g_rec.waiting);
-        g_rec.waiting.clear();
-        for (auto& w : waiting) w(ErrorResult("The recording failed: " + Utf8(r.error)));
-        if (waiting.empty()) {
-            d.Set("error", r.error);
-            g_rec.result = d;
-        }
-        ShowToast(L"Recording failed", r.error, nullptr, nullptr, 5000);
-        g_rec.ours = false;
-        g_rec.markers.clear();
-        return;
-    } else {
-        d.Set("path", r.path);
-        d.Set("format", r.format == RecordFormat::Gif ? "gif" : "mp4");
-        d.Set("seconds", std::round(r.seconds * 100) / 100);
-        d.Set("bytes", (int64_t)r.bytes);
-        if (!r.warning.empty()) d.Set("warning", r.warning);
-        d.Set("markers", MarkersJson(g_rec.markers));
-        if (!g_rec.markers.empty() && r.format == RecordFormat::Mp4) {
-            d.Set("notes_file", NotesPath(r.path));
-            WriteMarkers(r.path, g_rec.markers, g_rec.client);
-        }
+        return d;
+    }
+    if (!r.ok) {
+        d.Set("error", r.error.empty() ? std::wstring(L"The recording wasn't saved.") : r.error);
+        return d;
+    }
+    d.Set("path", r.path);
+    d.Set("format", r.format == RecordFormat::Gif ? "gif" : "mp4");
+    d.Set("seconds", std::round(r.seconds * 100) / 100);
+    d.Set("bytes", (int64_t)r.bytes);
+    if (!r.warning.empty()) d.Set("warning", r.warning);
+    d.Set("markers", MarkersJson(markers));
+    if (WriteMarkers(r.path, markers, author, fps)) d.Set("notes_file", NotesPath(r.path));
+    else if (!markers.empty() && r.format == RecordFormat::Mp4) d.Set("notes_warning", "The markers couldn't be saved as review notes.");
+    return d;
+}
+
+Json ToolResultFor(const Json& d) {
+    return d.Has("error") ? ErrorResult("The recording failed: " + d["error"].Str()) : JsonResult(d);
+}
+
+void OnAgentRecordingDone(const RecordResult& r) {
+    const std::vector<Marker> markers = g_rec.markersFor == RecordingId() ? g_rec.markers : std::vector<Marker>{};
+    const Json d = RecordingResultJson(r, markers, g_rec.client, g_rec.fps);
+    if (r.ok) {
         g_host.setLast(nullptr, r.path);
         ShowToast(L"Recording saved", FileNameOf(r.path) + L"\nRecorded by " + g_rec.client, r.thumb,
                   [path = r.path] { g_host.openToEdit(path); }, 4000);
+    } else if (!r.discarded) {
+        ShowToast(L"Recording failed", r.error, nullptr, nullptr, 5000);
     }
     g_rec.ours = false;  // a recording started later from a shortcut isn't the agent's
     g_rec.markers.clear();
-    Finished(d);
+    auto waiting = std::move(g_rec.waiting);
+    g_rec.waiting.clear();
+    if (waiting.empty()) g_rec.result = d;  // ended by the user or max_seconds: the next stop_recording reports it
+    for (auto& w : waiting) w(ToolResultFor(d));
 }
 
 Json RecordingState() {
@@ -479,7 +498,7 @@ Json RecordingState() {
         j.Set("seconds", std::round(RecordingSeconds() * 100) / 100);
         j.Set("started_by_agent", g_rec.ours);
         if (g_rec.ours) j.Set("path", g_rec.path);
-        j.Set("markers", MarkersJson(g_rec.markers));
+        j.Set("markers", MarkersJson(CurrentMarkers()));
     }
     if (g_rec.result) j.Set("finished_unread", *g_rec.result);
     return j;
@@ -516,19 +535,20 @@ void StartRecordingTool(const Json& args, Reply reply) {
     Library::Shared().NoteCapture(o.path, info.app, info.window);
     Library::Shared().NoteCaptureDetails(o.path, StringList(args["tags"]), args["comment"].WStr());
     std::wstring error;
-    const uint64_t gen = ++g_recGeneration;
     if (!StartRecording(o, [](const RecordResult& r) { OnAgentRecordingDone(r); }, &error))
-        return reply(ErrorResult("Couldn't start recording: " + Utf8(error)));
+        return reply(ErrorResult("Couldn't start recording: " + ToUtf8(error)));
+    const uint64_t gen = ++g_recGeneration;
     g_rec = AgentRecording{};
     g_rec.ours = true;
     g_rec.path = o.path;
-    g_rec.format = o.format;
+    g_rec.fps = o.fps;
     g_rec.client = g_client;
     g_rec.generation = gen;
-    const double maxSeconds = args["max_seconds"].Num(0);
+    g_rec.markersFor = RecordingId();
+    const double maxSeconds = std::min(args["max_seconds"].Num(0), 24.0 * 3600);
     if (maxSeconds > 0)
-        After(maxSeconds + o.countdownSeconds, [gen] {
-            if (g_rec.generation == gen && IsRecording()) StopRecording(false);
+        After(maxSeconds + o.countdownSeconds, [gen] {  // only this recording: not a later one, nor one the user started
+            if (g_rec.ours && g_rec.generation == gen && IsRecording()) StopRecording(false);
         });
     Json d = Json::Object();
     d.Set("recording", true);
@@ -543,38 +563,14 @@ void StartRecordingTool(const Json& args, Reply reply) {
     reply(JsonResult(d));
 }
 
-// A recording someone else started: its file is the newest recording once the recorder is done.
-void WaitForRecorder(std::vector<Marker> markers, bool discard, Reply reply, int triesLeft = 2400) {
-    if (RecorderBusy() && triesLeft > 0)
-        return After(0.25, [markers = std::move(markers), discard, reply, triesLeft]() mutable {
-            WaitForRecorder(std::move(markers), discard, reply, triesLeft - 1);
-        });
-    Json d = Json::Object();
-    if (discard) {
-        d.Set("discarded", true);
-        return reply(JsonResult(d));
-    }
-    const auto recent = RecentCaptures(g_host.settings->CapturesFolder(), 8, true);
-    auto it = std::find_if(recent.begin(), recent.end(), [](const std::wstring& p) { return MediaTypeOf(p) != MediaType::Image; });
-    if (it == recent.end()) return reply(ErrorResult("The recording stopped, but its file wasn't found."));
-    d.Set("path", *it);
-    d.Set("markers", MarkersJson(markers));
-    if (!markers.empty() && MediaTypeOf(*it) == MediaType::Video) {
-        d.Set("notes_file", NotesPath(*it));
-        WriteMarkers(*it, markers, g_client);
-    }
-    reply(JsonResult(d));
-}
-
 void StopRecordingTool(const Json& args, Reply reply) {
     const bool discard = args["discard"].Bool(false);
+    if (g_rec.result) {  // the agent's recording already ended (the user stopped it, or max_seconds): that's the answer
+        Json r = *g_rec.result;
+        g_rec.result.reset();
+        return reply(ToolResultFor(r));
+    }
     if (!IsRecording()) {
-        if (g_rec.result) {  // it already ended (the user stopped it, or max_seconds)
-            Json r = *g_rec.result;
-            g_rec.result.reset();
-            if (r.Has("error")) return reply(ErrorResult("The recording failed: " + r["error"].Str()));
-            return reply(JsonResult(r));
-        }
         if (RecorderBusy() && g_rec.ours) return g_rec.waiting.push_back(reply);  // still saving
         return reply(ErrorResult("Nothing is being recorded."));
     }
@@ -583,10 +579,12 @@ void StopRecordingTool(const Json& args, Reply reply) {
         StopRecording(discard);
         return;
     }
-    auto markers = std::move(g_rec.markers);
+    // Started from a shortcut or the tray: the recorder says how it ended.
+    WhenRecordingFinishes([markers = CurrentMarkers(), reply](const RecordResult& r) {
+        reply(ToolResultFor(RecordingResultJson(r, markers, g_client, g_host.settings->videoFps)));
+    });
     g_rec.markers.clear();
     StopRecording(discard);
-    WaitForRecorder(std::move(markers), discard, reply);
 }
 
 void PauseRecordingTool(const Json& args, Reply reply) {
@@ -602,15 +600,16 @@ void PauseRecordingTool(const Json& args, Reply reply) {
 
 void AddMarkerTool(const Json& args, Reply reply) {
     if (!IsRecording()) return reply(ErrorResult("Markers go on a running recording, and nothing is being recorded."));
-    Marker m{args.Has("seconds") ? std::max(0.0, args["seconds"].Num()) : RecordingSeconds(), args["label"].WStr(),
-             KindOf(args["kind"].Str())};
+    const double at = args.Has("seconds") ? std::clamp(args["seconds"].Num(), 0.0, 24.0 * 3600) : RecordingSeconds();
+    Marker m{at, args["label"].WStr(), NoteKindOf(args["kind"].Str())};
     if (m.label.empty()) return reply(ErrorResult("A marker needs a label."));
-    g_rec.markers.push_back(m);
+    auto& markers = CurrentMarkers();
+    markers.push_back(m);
     Json d = Json::Object();
     d.Set("seconds", std::round(m.seconds * 1000) / 1000);
     d.Set("label", m.label);
     d.Set("kind", NoteKindKey(m.kind));
-    d.Set("markers", (int)g_rec.markers.size());
+    d.Set("markers", (int)markers.size());
     reply(JsonResult(d));
 }
 
@@ -666,8 +665,8 @@ void ListCapturesTool(const Json& args, Reply reply) {
 
 bool CheckMediaPath(const std::wstring& path, std::string* error) {
     if (path.empty()) return *error = "Pass the file's path (list_captures gives them).", false;
-    if (!FileExists(path)) return *error = "File not found: " + Utf8(path), false;
-    if (!IsMediaFile(path)) return *error = "Not a picture or video: " + Utf8(path), false;
+    if (!FileExists(path)) return *error = "File not found: " + ToUtf8(path), false;
+    if (!IsMediaFile(path)) return *error = "Not a picture or video: " + ToUtf8(path), false;
     return true;
 }
 
@@ -684,7 +683,7 @@ void GetCaptureTool(const Json& args, Reply reply) {
     if (MediaTypeOf(path) == MediaType::Video) {
         VideoInfo vi;
         const double at = std::max(0.0, args["time_seconds"].Num(0));
-        if (!ProbeVideo(path, &vi, at, side, &img) || !img) return reply(ErrorResult("Couldn't read a frame from " + Utf8(path)));
+        if (!ProbeVideo(path, &vi, at, side, &img) || !img) return reply(ErrorResult("Couldn't read a frame from " + ToUtf8(path)));
         d.Set("width", vi.w);
         d.Set("height", vi.h);
         d.Set("duration_seconds", std::round(vi.duration * 100) / 100);
@@ -693,7 +692,7 @@ void GetCaptureTool(const Json& args, Reply reply) {
     } else {
         int w = 0, h = 0;
         img = LoadImageScaled(path, side, &w, &h);
-        if (!img) return reply(ErrorResult("Couldn't open " + Utf8(path)));
+        if (!img) return reply(ErrorResult("Couldn't open " + ToUtf8(path)));
         d.Set("width", w);
         d.Set("height", h);
         if (MediaTypeOf(path) == MediaType::Gif) d.Set("duration_seconds", std::round(GifDuration(path) * 100) / 100);
@@ -729,7 +728,7 @@ void VideoFramesTool(const Json& args, Reply reply) {
     if (!CheckMediaPath(path, &err)) return reply(ErrorResult(err));
     if (MediaTypeOf(path) != MediaType::Video) return reply(ErrorResult("Not a video. Use get_capture for pictures and GIFs."));
     VideoInfo vi;
-    if (!ProbeVideo(path, &vi) || vi.duration <= 0) return reply(ErrorResult("Couldn't read " + Utf8(path)));
+    if (!ProbeVideo(path, &vi) || vi.duration <= 0) return reply(ErrorResult("Couldn't read " + ToUtf8(path)));
     std::vector<double> times;
     for (const auto& t : args["times"].Items())
         if (t.IsNumber()) times.push_back(std::clamp(t.Num(), 0.0, vi.duration));
@@ -752,7 +751,7 @@ void VideoFramesTool(const Json& args, Reply reply) {
         frames.push_back(f);
         list.Push(std::round(t * 1000) / 1000);
     }
-    if (frames.empty()) return reply(ErrorResult("Couldn't decode frames from " + Utf8(path)));
+    if (frames.empty()) return reply(ErrorResult("Couldn't decode frames from " + ToUtf8(path)));
     Json d = Json::Object();
     d.Set("path", path);
     d.Set("duration_seconds", std::round(vi.duration * 100) / 100);
@@ -773,10 +772,12 @@ void VideoFramesTool(const Json& args, Reply reply) {
 void TagCaptureTool(const Json& args, Reply reply) {
     const std::wstring path = args["path"].WStr();
     Library& lib = Library::Shared();
-    if (!lib.IsInLibrary(path) || !FileExists(path)) return reply(ErrorResult("Not a capture in the gallery: " + Utf8(path)));
+    if (!lib.IsInLibrary(path) || !FileExists(path)) return reply(ErrorResult("Not a capture in the gallery: " + ToUtf8(path)));
+    if (args.Has("rating") && !args["rating"].IsNumber()) return reply(ErrorResult("rating must be a number from 0 to 5."));
+    if (args.Has("comment") && !args["comment"].IsString()) return reply(ErrorResult("comment must be text."));
     if (auto add = StringList(args["add_tags"]); !add.empty()) lib.AddTags(add, {path});
     for (const auto& t : StringList(args["remove_tags"])) lib.RemoveTag(t, {path});
-    if (args.Has("rating")) lib.SetRating(std::clamp((int)args["rating"].Int(), 0, 5), {path});
+    if (args.Has("rating")) lib.SetRating((int)std::clamp<int64_t>(args["rating"].Int(), 0, 5), {path});
     if (args.Has("comment")) lib.SetComment(args["comment"].WStr(), path);
     reply(JsonResult(CaptureJson(path, lib.Meta(path))));
 }
@@ -801,14 +802,16 @@ void OcrTool(const Json& args, Reply reply) {
         Target t;
         std::string err;
         if (!ResolveTarget(args, &t, &err)) return reply(ErrorResult(err));
-        img = Grab(t, args);
+        std::string warning;
+        img = Grab(t, args, &warning);
+        if (!warning.empty()) d.Set("warning", warning);
         origin = {t.rect.left, t.rect.top};
         d.Set("rect", Rect(t.rect));
     }
     if (!img) return reply(ErrorResult("Nothing to read: the picture couldn't be loaded or captured."));
     const bool boxes = args["with_boxes"].Bool(false);
     RecognizeWordsAsync(img, [d, boxes, origin, reply](std::vector<OcrWord> words, std::wstring err) mutable {
-        if (!err.empty()) return reply(ErrorResult("OCR failed: " + Utf8(err)));
+        if (!err.empty()) return reply(ErrorResult("OCR failed: " + ToUtf8(err)));
         std::wstring text;
         int line = -1;
         Json list = Json::Array();
@@ -840,34 +843,35 @@ struct SettingKey {
     const char* name;
     const wchar_t* section;
     const wchar_t* key;
-    bool boolean;
+    bool Settings::*flag;  // a toggle, or
+    int Settings::*number;  // a number in [min, max]
     int min, max;
 };
 const SettingKey kSettings[] = {
-    {"copy_to_clipboard", L"Capture", L"CopyToClipboard", true, 0, 1},
-    {"save_to_file", L"Capture", L"SaveToFile", true, 0, 1},
-    {"capture_cursor", L"Capture", L"CaptureCursor", true, 0, 1},
-    {"auto_redact", L"Capture", L"AutoRedact", true, 0, 1},
-    {"show_notifications", L"Interface", L"ShowToast", true, 0, 1},
-    {"video_fps", L"Recording", L"VideoFps", false, 1, 60},
-    {"gif_fps", L"Recording", L"GifFps", false, 1, 50},
-    {"countdown_seconds", L"Recording", L"CountdownSeconds", false, 0, 10},
-    {"record_cursor", L"Recording", L"RecordCursor", true, 0, 1},
-    {"system_audio", L"Recording", L"RecordSystemAudio", true, 0, 1},
-    {"microphone", L"Recording", L"RecordMicrophone", true, 0, 1},
-    {"show_clicks", L"Recording", L"ShowClicks", true, 0, 1},
-    {"show_keys", L"Recording", L"ShowKeys", true, 0, 1},
-    {"show_gamepad", L"Recording", L"ShowGamepad", true, 0, 1},
-    {"gamepad_opacity", L"Recording", L"GamepadOpacity", false, 10, 100},
+    {"copy_to_clipboard", L"Capture", L"CopyToClipboard", &Settings::copyToClipboard, nullptr, 0, 0},
+    {"save_to_file", L"Capture", L"SaveToFile", &Settings::saveToFile, nullptr, 0, 0},
+    {"capture_cursor", L"Capture", L"CaptureCursor", &Settings::captureCursor, nullptr, 0, 0},
+    {"auto_redact", L"Capture", L"AutoRedact", &Settings::autoRedact, nullptr, 0, 0},
+    {"show_notifications", L"Interface", L"ShowToast", &Settings::showToast, nullptr, 0, 0},
+    {"video_fps", L"Recording", L"VideoFps", nullptr, &Settings::videoFps, 1, 60},
+    {"gif_fps", L"Recording", L"GifFps", nullptr, &Settings::gifFps, 1, 50},
+    {"countdown_seconds", L"Recording", L"CountdownSeconds", nullptr, &Settings::countdownSeconds, 0, 10},
+    {"record_cursor", L"Recording", L"RecordCursor", &Settings::recordCursor, nullptr, 0, 0},
+    {"system_audio", L"Recording", L"RecordSystemAudio", &Settings::systemAudio, nullptr, 0, 0},
+    {"microphone", L"Recording", L"RecordMicrophone", &Settings::microphone, nullptr, 0, 0},
+    {"show_clicks", L"Recording", L"ShowClicks", &Settings::showClicks, nullptr, 0, 0},
+    {"show_keys", L"Recording", L"ShowKeys", &Settings::showKeys, nullptr, 0, 0},
+    {"show_gamepad", L"Recording", L"ShowGamepad", &Settings::showGamepad, nullptr, 0, 0},
+    {"gamepad_opacity", L"Recording", L"GamepadOpacity", nullptr, &Settings::gamepadOpacity, 10, 100},
 };
 
+// The settings in effect (as loaded and clamped), not the raw text in settings.ini.
 Json SettingsJson() {
     Json j = Json::Object();
     const Settings& s = *g_host.settings;
     for (const auto& k : kSettings) {
-        const std::wstring v = s.Raw(k.section, k.key, L"");
-        if (k.boolean) j.Set(k.name, v == L"1" || _wcsicmp(v.c_str(), L"true") == 0);
-        else j.Set(k.name, _wtoi(v.c_str()));
+        if (k.flag) j.Set(k.name, s.*k.flag);
+        else j.Set(k.name, s.*k.number);
     }
     j.Set("gamepad_corner", s.gamepadCorner);
     j.Set("after_capture", s.afterCapture);
@@ -875,18 +879,26 @@ Json SettingsJson() {
 }
 
 void ConfigureTool(const Json& args, Reply reply) {
+    // Everything is checked before anything is written: a wrong value changes nothing.
+    for (const auto& k : kSettings) {
+        if (!args.Has(k.name)) continue;
+        if (k.flag && args[k.name].type() != Json::Type::Bool) return reply(ErrorResult(std::string(k.name) + " must be true or false."));
+        if (k.number && !args[k.name].IsNumber())
+            return reply(ErrorResult(std::string(k.name) + " must be a number from " + std::to_string(k.min) + " to " + std::to_string(k.max) + "."));
+    }
+    const std::string corner = args["gamepad_corner"].Str();
+    if (args.Has("gamepad_corner") && corner != "topleft" && corner != "topright" && corner != "bottomleft" && corner != "bottomright")
+        return reply(ErrorResult("gamepad_corner is topleft, topright, bottomleft or bottomright."));
     Settings& s = *g_host.settings;
     Json changed = Json::Array();
     for (const auto& k : kSettings) {
         if (!args.Has(k.name)) continue;
-        if (k.boolean) s.WriteBool(k.section, k.key, args[k.name].Bool());
-        else s.WriteString(k.section, k.key, std::to_wstring(std::clamp((int)args[k.name].Int(k.min), k.min, k.max)));
+        if (k.flag) s.WriteBool(k.section, k.key, args[k.name].Bool());
+        else s.WriteString(k.section, k.key, std::to_wstring(std::clamp<int64_t>(args[k.name].Int(), k.min, k.max)));
         changed.Push(k.name);
     }
-    if (const std::string c = args["gamepad_corner"].Str(); !c.empty()) {
-        if (c != "topleft" && c != "topright" && c != "bottomleft" && c != "bottomright")
-            return reply(ErrorResult("gamepad_corner is topleft, topright, bottomleft or bottomright."));
-        s.WriteString(L"Recording", L"GamepadCorner", FromUtf8(c));
+    if (!corner.empty()) {
+        s.WriteString(L"Recording", L"GamepadCorner", FromUtf8(corner));
         changed.Push("gamepad_corner");
     }
     g_host.settingsChanged();
@@ -954,9 +966,9 @@ void UploadTool(const Json& args, Reply reply) {
     if (!CheckMediaPath(path, &err)) return reply(ErrorResult(err));
     const UploadConfig cfg = g_host.uploadConfig();
     if (std::wstring problem = UploadConfigProblem(cfg); !problem.empty())
-        return reply(ErrorResult("Upload isn't set up: " + Utf8(problem) + " (Settings › Upload)."));
+        return reply(ErrorResult("Upload isn't set up: " + ToUtf8(problem) + " (Settings › Upload)."));
     UploadFileAsync(path, cfg, [path, reply](std::wstring url, std::wstring e) {
-        if (!e.empty()) return reply(ErrorResult("Upload failed: " + Utf8(e)));
+        if (!e.empty()) return reply(ErrorResult("Upload failed: " + ToUtf8(e)));
         Json d = Json::Object();
         d.Set("path", path);
         d.Set("url", url);
@@ -974,7 +986,7 @@ void RunCommandTool(const Json& args, Reply reply) {
             d.Set("title", c.title);
             return reply(JsonResult(d));
         }
-    return reply(ErrorResult("Unknown command: " + Utf8(want)));
+    return reply(ErrorResult("Unknown command: " + ToUtf8(want)));
 }
 
 // ---- the tool list ----
@@ -1015,8 +1027,8 @@ std::vector<Tool> AgentTools() {
     std::string commands;
     std::string commandList;
     for (const auto& c : g_host.commands) {
-        commands += (commands.empty() ? "\"" : ", \"") + Utf8(c.key) + "\"";
-        commandList += "\n- " + Utf8(c.key) + ": " + Utf8(c.title);
+        commands += (commands.empty() ? "\"" : ", \"") + ToUtf8(c.key) + "\"";
+        commandList += "\n- " + ToUtf8(c.key) + ": " + ToUtf8(c.title);
     }
     std::vector<Tool> tools;
     tools.push_back(Make("get_status", "Status",
@@ -1178,7 +1190,14 @@ std::shared_ptr<mcp::Server> MakeAgentServer(AgentHost host) {
 
 // ---- tests ----
 
+// Tests point the tools at their own settings and put the app's back when done.
+struct TestHost {
+    AgentHost saved = g_host;
+    ~TestHost() { g_host = saved; }
+};
+
 ATHER_TEST(agent_tool_schemas_are_valid) {
+    TestHost keep;
     Settings s;
     AgentHost h;
     h.settings = &s;
@@ -1207,6 +1226,7 @@ ATHER_TEST(agent_tool_schemas_are_valid) {
 }
 
 ATHER_TEST(agent_targets) {
+    TestHost keep;
     Settings s;
     g_host.settings = &s;
     Target t;
@@ -1224,6 +1244,46 @@ ATHER_TEST(agent_targets) {
     CHECK(!ResolveTarget(Json::Parse(R"({"target": "moon"})"), &t, &err));
     CHECK(!ResolveTarget(Json::Parse(R"({"target": "window", "window_title": "no window is called this 1f3c"})"), &t, &err));
     CHECK(!Displays().empty() && Displays()[0].primary);
+}
+
+ATHER_TEST(agent_configure_checks_before_writing) {
+    TestHost keep;
+    Settings s;
+    s.Load({});
+    g_host.settings = &s;
+    g_host.settingsChanged = [&s] { s.Load({}); };
+    const int fps = s.videoFps;
+    Json last;
+    const Reply into = [&](Json r) { last = std::move(r); };
+    ConfigureTool(Json::Parse(R"({"video_fps": "60", "show_clicks": false})"), into);  // a string where a number goes
+    CHECK(last["isError"].Bool());
+    CHECK_EQ(s.videoFps, fps);  // nothing written, not even the valid one
+    ConfigureTool(Json::Parse(R"({"video_fps": 24, "gamepad_corner": "bottom-right"})"), into);
+    CHECK(last["isError"].Bool());
+    CHECK_EQ(s.videoFps, fps);
+    ConfigureTool(Json::Parse(R"({"video_fps": 24, "show_keys": true, "gamepad_corner": "topleft"})"), into);
+    CHECK(!last.Has("isError"));
+    CHECK_EQ(s.videoFps, 24);
+    CHECK(s.showKeys);
+    CHECK_EQ(last["structuredContent"]["settings"]["video_fps"].Int(), 24);
+    ConfigureTool(Json::Parse(R"({"video_fps": 1000})"), into);
+    CHECK_EQ(s.videoFps, 60);  // clamped
+}
+
+ATHER_TEST(agent_notes_never_overwrite) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring path = dir + L"\\a.mp4.notes.json";
+    CHECK(WriteNewFileUtf8(path, "first"));
+    CHECK(!WriteNewFileUtf8(path, "second"));  // the editor's own notes stay
+    std::string text;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    char buf[16] = {};
+    DWORD n = 0;
+    ReadFile(f, buf, sizeof(buf), &n, nullptr);
+    CloseHandle(f);
+    CHECK_EQ(std::string(buf, n), std::string("first"));
+    CHECK(GetFileAttributesW((path + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+    CHECK(!WriteMarkers(dir + L"\\b.gif", {{1, L"x", NoteKind::Issue}}, L"t", 15));  // GIFs have no notes
 }
 
 }  // namespace ather

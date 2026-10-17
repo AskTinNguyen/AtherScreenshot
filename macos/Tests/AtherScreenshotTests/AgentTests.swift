@@ -65,6 +65,23 @@ final class AgentTests: XCTestCase {
         XCTAssertEqual(chunked.body, Data("{}".utf8))
     }
 
+    // Numbers and requests from a client can't crash the app.
+    func testHostileInputIsSafe() {
+        XCTAssertEqual(MCP.int(1e19), 1_000_000_000_000_000)  // clamped instead of trapping
+        XCTAssertEqual(MCP.int(-1e300), -1_000_000_000_000_000)
+        XCTAssertNil(MCP.int(Double.infinity))
+        XCTAssertNil(MCP.int("12"))
+        XCTAssertTrue(MCP.isBool(true))
+        XCTAssertFalse(MCP.isBool(1))
+        XCTAssertTrue(MCP.isNumber(1))
+        XCTAssertFalse(MCP.isNumber(true))
+        let huge = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:4000\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nX\r\n7fffffffffffffff\r\n"
+        guard case .bad = MCP.parseRequest(Data(huge.utf8)) else { return XCTFail("a giant chunk must be refused") }
+        let parsed = try? JSONSerialization.jsonObject(with: Data(#"{"a": true, "b": 1}"#.utf8)) as? [String: Any]
+        XCTAssertTrue(MCP.isBool(parsed?["a"]))
+        XCTAssertFalse(MCP.isBool(parsed?["b"]))
+    }
+
     func testHttpRoundTrip() throws {
         let http = MCP.HTTPServer(server: testServer(), token: "tok")
         try http.start(port: 0)
@@ -77,7 +94,10 @@ final class AgentTests: XCTestCase {
         XCTAssertEqual(MCP.post(port: port, token: "bad", body: Data(#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.utf8), timeout: 5).0, 401)
         http.stop()
         Thread.sleep(forTimeInterval: 0.2)
-        XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.utf8), timeout: 1).0, 0)
+        XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.utf8), timeout: 1).0, MCP.notListening)
+        try http.start(port: port)  // straight back on the same port (TIME_WAIT connections don't block it)
+        XCTAssertEqual(MCP.post(port: port, token: "tok", body: Data(#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.utf8), timeout: 5).0, 200)
+        http.stop()
     }
 
     // The same tools as the Windows app, each with a valid object schema.

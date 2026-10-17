@@ -128,8 +128,15 @@ Json Server::Call(const Json& params, const std::function<void(std::function<voi
             reply(ErrorResult("The tool failed unexpectedly."));
         }
     };
-    if (tool.uiThread) onUi(task);
-    else task();
+    if (tool.uiThread) {
+        onUi(task);
+    } else {
+        std::thread([task] {  // its own thread, so the timeout below holds even when it's slow
+            const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            task();
+            if (SUCCEEDED(co)) CoUninitialize();
+        }).detach();
+    }
     std::unique_lock<std::mutex> lock(p->m);
     if (!p->cv.wait_for(lock, std::chrono::milliseconds(tool.timeoutMs), [&] { return p->done; })) {
         p->done = true;  // a late reply is dropped
@@ -306,6 +313,7 @@ struct HttpState {
     std::thread acceptor;
     int port = 0;
     std::atomic<int> connections{0};
+    std::atomic<bool> stopping{false};
     ~HttpState() {  // quitting without StopHttp: don't take the process down with a joinable thread
         if (acceptor.joinable()) acceptor.detach();
     }
@@ -398,11 +406,17 @@ bool StartHttp(std::shared_ptr<Server> server, int port, const std::string& toke
     std::lock_guard<std::mutex> lock(g_http.m);
     g_http.listener = l;
     g_http.port = ntohs(a.sin_port);
+    g_http.stopping = false;
     g_http.acceptor = std::thread([l, server, token, p = g_http.port] {
         for (;;) {
             SOCKET c = accept(l, nullptr, nullptr);
-            if (c == INVALID_SOCKET) return;  // closed by StopHttp
+            if (c == INVALID_SOCKET) {
+                if (g_http.stopping) return;  // closed by StopHttp
+                Sleep(50);  // a client that gave up, or out of sockets for a moment: keep serving
+                continue;
+            }
             if (g_http.connections >= 16) {
+                Respond(c, 503, {}, "Retry-After: 1\r\n");
                 closesocket(c);
                 continue;
             }
@@ -423,6 +437,7 @@ void StopHttp() {
     {
         std::lock_guard<std::mutex> lock(g_http.m);
         if (g_http.listener == INVALID_SOCKET) return;
+        g_http.stopping = true;
         closesocket(g_http.listener);
         g_http.listener = INVALID_SOCKET;
         g_http.port = 0;
@@ -443,16 +458,16 @@ int HttpPort() {
 
 int HttpPost(int port, const std::string& token, const std::string& body, std::string* response, int timeoutMs) {
     response->clear();
-    if (!EnsureWinsock()) return 0;
+    if (!EnsureWinsock()) return kNotListening;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return 0;
+    if (s == INVALID_SOCKET) return kNotListening;
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons((u_short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) {
         closesocket(s);
-        return 0;
+        return kNotListening;
     }
     DWORD timeout = (DWORD)timeoutMs;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
@@ -493,19 +508,23 @@ int RunStdioBridge(int port, const std::string& token, const std::function<bool(
     if (!in || in == INVALID_HANDLE_VALUE || !out || out == INVALID_HANDLE_VALUE) return 2;
     std::mutex outLock;
     std::mutex startLock;  // the first request that finds the app missing starts it; the others wait for that
-    std::vector<std::thread> calls;
+    std::mutex runningLock;
+    std::condition_variable allDone;
+    int running = 0;
+    const int callMs = 15 * 60 * 1000;
     auto relay = [&](std::string line) {
         std::string resp;
-        int status = HttpPost(port, token, line, &resp, 15 * 60 * 1000);
-        if (status == 0) {
+        // Only a connection nobody accepted is retried (and may start the app). A call that was accepted and then
+        // dropped (the app quit or crashed mid-call) may have done its work already, so it's never sent twice.
+        int status = HttpPost(port, token, line, &resp, callMs);
+        if (status == kNotListening) {
             std::lock_guard<std::mutex> lock(startLock);
-            status = HttpPost(port, token, line, &resp, 15 * 60 * 1000);
-            if (status == 0 && startApp()) {
-                for (int i = 0; i < 80 && status == 0; ++i) {  // up to 20 s for it to start listening
-                    Sleep(250);
-                    status = HttpPost(port, token, line, &resp, 15 * 60 * 1000);
+            status = HttpPost(port, token, line, &resp, callMs);
+            if (status == kNotListening && startApp())
+                for (const ULONGLONG until = GetTickCount64() + 20000; status == kNotListening && GetTickCount64() < until;) {
+                    Sleep(250);  // up to 20 s for it to start listening (a refused connect itself can take a second)
+                    status = HttpPost(port, token, line, &resp, callMs);
                 }
-            }
         }
         if (status == 200 && !resp.empty()) return WriteLine(out, outLock, resp);
         if (status == 202) return;
@@ -513,11 +532,15 @@ int RunStdioBridge(int port, const std::string& token, const std::function<bool(
         const Json msg = Json::Parse(line, &ok);
         if (!ok || !msg.IsObject() || !msg.Has("id") || !msg.Has("method")) return;  // nothing to answer
         std::string why;
-        if (status == 0)
+        if (status == kNotListening)
             why = "Ather Screenshot isn't accepting AI agents. Turn on \"Allow AI agents (MCP)\" in Ather Screenshot's "
                   "Settings (AI agents), or run \"Allow AI agents (MCP)\" from its command palette (Ctrl+Alt+K).";
+        else if (status == 0)
+            why = "Ather Screenshot closed the connection before answering (it quit, or the call took over 15 minutes).";
         else if (status == 401 || status == 403)
             why = "Ather Screenshot refused the connection (the agent token didn't match). Restart Ather Screenshot and try again.";
+        else if (status == 503)
+            why = "Ather Screenshot is busy with other agent calls. Try again in a moment.";
         else
             why = "Ather Screenshot answered with HTTP " + std::to_string(status) + ".";
         Json e = Json::Object();
@@ -538,10 +561,19 @@ int RunStdioBridge(int port, const std::string& token, const std::function<bool(
             pending.erase(0, nl + 1);
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.find_first_not_of(" \t") == std::string::npos) continue;
-            calls.emplace_back(relay, std::move(line));  // concurrently: a long call doesn't hold up a ping
+            {
+                std::lock_guard<std::mutex> lock(runningLock);
+                ++running;
+            }
+            std::thread([&, line = std::move(line)]() mutable {  // concurrently: a long call doesn't hold up a ping
+                relay(std::move(line));
+                std::lock_guard<std::mutex> lock(runningLock);
+                if (--running == 0) allDone.notify_all();
+            }).detach();
         }
     }
-    for (auto& t : calls) t.join();
+    std::unique_lock<std::mutex> lock(runningLock);
+    allDone.wait(lock, [&] { return running == 0; });
     return 0;
 }
 
@@ -667,7 +699,7 @@ ATHER_TEST(mcp_http_round_trip) {
     CHECK_EQ(HttpPost(port, "wrong", R"({"jsonrpc":"2.0","id":1,"method":"ping"})", &resp, 5000), 401);
     StopHttp();
     CHECK(!HttpRunning());
-    CHECK_EQ(HttpPost(port, "tok", R"({"jsonrpc":"2.0","id":1,"method":"ping"})", &resp, 1000), 0);
+    CHECK_EQ(HttpPost(port, "tok", R"({"jsonrpc":"2.0","id":1,"method":"ping"})", &resp, 1000), kNotListening);
 }
 
 }  // namespace ather::mcp

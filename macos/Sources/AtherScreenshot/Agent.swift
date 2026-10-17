@@ -13,11 +13,12 @@ enum Agent {
     // MARK: lifecycle
 
     static var token: String { AppDelegate.privateSecret("agent-token") }
+    static var port: Int { min(65535, max(1024, s.int("AgentPort"))) }
     static var running: Bool { server?.running ?? false }
 
     // Starts or stops the server to match Settings (AllowAgents, AgentPort).
     static func apply() {
-        let want = s.bool("AllowAgents"), port = s.int("AgentPort")
+        let want = s.bool("AllowAgents")
         if want, let srv = server, srv.running, srv.port == port { return }
         server?.stop()
         server = nil
@@ -54,7 +55,7 @@ enum Agent {
     // What to paste into an agent's configuration.
     static var setupText: String {
         let exe = Bundle.main.executableURL?.path ?? "/Applications/Ather Screenshot.app/Contents/MacOS/AtherScreenshot"
-        let quoted = exe.replacingOccurrences(of: "\"", with: "\\\"")
+        let quoted = exe.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         return """
         Ather Screenshot for AI agents (MCP)
 
@@ -70,7 +71,7 @@ enum Agent {
           "ather-screenshot": { "command": "\(quoted)", "args": ["--mcp"] }
 
         Clients that connect to a URL (Streamable HTTP):
-          http://127.0.0.1:\(s.int("AgentPort"))/mcp
+          http://127.0.0.1:\(port)/mcp
           Header: Authorization: Bearer \(token)
         """
     }
@@ -83,7 +84,7 @@ enum Agent {
 
     // `AtherScreenshot --mcp`: the stdio server an agent starts. It relays to the running app, starting it if needed.
     static func runBridge() -> Int32 {
-        MCP.runStdioBridge(port: s.int("AgentPort"), token: token) {
+        MCP.runStdioBridge(port: port, token: token) {
             let me = ProcessInfo.processInfo.processIdentifier
             if NSRunningApplication.runningApplications(withBundleIdentifier: kBundleID).contains(where: { $0.processIdentifier != me && $0.activationPolicy != .prohibited }) {
                 return false  // running: it just isn't accepting agents
@@ -100,7 +101,8 @@ enum Agent {
     // MARK: helpers
 
     private static func rect(_ r: CGRect) -> JSON {
-        ["x": Int(r.minX.rounded()), "y": Int(r.minY.rounded()), "width": Int(r.width.rounded()), "height": Int(r.height.rounded())]
+        guard !r.isNull, !r.isInfinite else { return ["x": 0, "y": 0, "width": 0, "height": 0] }  // no displays (headless)
+        return ["x": Int(r.minX.rounded()), "y": Int(r.minY.rounded()), "width": Int(r.width.rounded()), "height": Int(r.height.rounded())]
     }
 
     private static func iso(_ t: Double) -> String {
@@ -298,9 +300,10 @@ enum Agent {
 
     private static var ours = false            // the running recording was started by an agent
     private static var markers: [Marker] = []
+    private static var markersFor: Int?  // the Recorder.serial the markers belong to
     private static var recordingFps = 30.0
     private static var generation = 0
-    private static var finishedUnread: JSON?   // ended by the user or max_seconds: the next stop_recording reports it
+    private static var finishedUnread: JSON?   // the agent's recording ended by the user or max_seconds: the next stop_recording reports it
     private static var waiting: [MCP.Reply] = []
     private static var recTags: [String] = []
     private static var recComment = ""
@@ -309,115 +312,134 @@ enum Agent {
         ms.map { ["seconds": round($0.seconds, 1000), "label": $0.label, "kind": $0.kind] }
     }
 
+    // The markers on the running recording (markers left from an earlier one don't count).
+    private static var currentMarkers: [Marker] {
+        guard let r = Recorder.current, markersFor == r.serial else { return [] }
+        return markers
+    }
+
     private static var recordingSeconds: Double {
         guard let r = Recorder.current, r.hasFootage else { return 0 }
         return max(0, r.elapsed)
     }
 
-    // Markers become the video's review notes, "<video>.notes.json" (the Windows video editor's format).
+    // Markers become the video's review notes, "<video>.notes.json" (the Windows video editor's format). Never over
+    // notes that are already there.
     private static func writeNotes(_ video: URL, _ ms: [Marker], fps: Double, author: String) -> URL? {
-        guard !ms.isEmpty else { return nil }
+        let u = URL(fileURLWithPath: video.path + ".notes.json")
+        guard !ms.isEmpty, MediaFiles.isVideo(video), !FileManager.default.fileExists(atPath: u.path) else { return nil }
         let now = ISO8601DateFormatter().string(from: Date())
         let notes: [JSON] = ms.enumerated().map { i, m in
             ["id": i + 1, "frame": Int((m.seconds * fps).rounded()), "time": round(m.seconds, 1000), "kind": m.kind, "resolved": false,
              "author": author, "text": m.label, "created": now]
         }
         let doc: JSON = ["app": "Ather Screenshot", "format": 1, "video": video.lastPathComponent, "fps": fps, "notes": notes]
-        let u = URL(fileURLWithPath: video.path + ".notes.json")
         return (try? Data(MCP.encode(doc).utf8).write(to: u, options: .atomic)) != nil ? u : nil
     }
 
+    // What stop_recording reports for a finished recording; markers are saved with an MP4.
+    private static func outcomeJSON(_ o: Recorder.Outcome, _ ms: [Marker], fps: Double) -> JSON {
+        guard let u = o.url else { return o.error.map { ["error": $0] } ?? ["discarded": true] }
+        var d: JSON = ["path": u.path, "format": u.pathExtension.lowercased(), "seconds": round(o.duration),
+                       "bytes": (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0, "markers": markersJSON(ms)]
+        if let n = writeNotes(u, ms, fps: fps, author: client) { d["notes_file"] = n.path }
+        else if !ms.isEmpty, MediaFiles.isVideo(u) { d["notes_warning"] = "The markers couldn't be saved as review notes." }
+        return d
+    }
+
+    private static func toolResult(_ d: JSON) -> JSON {
+        if let e = d["error"] { return MCP.error("The recording failed: \(e)") }
+        return MCP.result(d)
+    }
+
+    // On the main thread, right as the recording ends (before quitting can finish), so the notes and tags are saved.
     private static func recordingFinished(_ o: Recorder.Outcome) {
-        var d: JSON = [:]
-        let ms = markers
-        if let u = o.url {
-            Library.shared.noteCaptureDetails(u, tags: recTags, comment: recComment)
-            d = ["path": u.path, "format": u.pathExtension.lowercased(), "seconds": round(o.duration),
-                 "bytes": (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0, "markers": markersJSON(ms)]
-            if u.pathExtension.lowercased() == "mp4", let n = writeNotes(u, ms, fps: recordingFps, author: client) { d["notes_file"] = n.path }
-        } else if let e = o.error {
-            d = ["error": e]
-        } else {
-            d = ["discarded": true]
-        }
+        if let u = o.url { Library.shared.noteCaptureDetails(u, tags: recTags, comment: recComment) }
+        let d = outcomeJSON(o, markers, fps: recordingFps)
         ours = false
         markers = []
+        markersFor = nil
         let w = waiting
         waiting = []
         if w.isEmpty { finishedUnread = d }
-        for reply in w { reply(d["error"] != nil ? MCP.error("The recording failed: \(d["error"]!)") : MCP.result(d)) }
+        for reply in w { reply(toolResult(d)) }
     }
 
     @MainActor
     private static func startRecording(_ a: JSON) async throws -> JSON {
         guard !Recorder.isActive else { throw MCP.failed("A recording is already running. Call stop_recording first.") }
-        let t = try resolve(a)
-        guard t.rect.width >= 16, t.rect.height >= 16 else { throw MCP.failed("The area is too small to record (16 × 16 at least).") }
+        var t = try resolve(a)
         try await ensurePermission()
+        var note: String?
+        if t.window == nil {  // a region records on one display: the one under its centre, like the recorder picks
+            let ds = displays()
+            let center = CGPoint(x: t.rect.midX, y: t.rect.midY)
+            if let d = ds.first(where: { $0.rect.contains(center) }) ?? ds.first(where: { $0.rect.intersects(t.rect) }) {
+                let clipped = t.rect.intersection(d.rect)
+                if clipped != t.rect {
+                    note = "A recording covers one display, so this records \(t.kind == "screen" ? "the display in the middle of the screen area" : "the part of the region on one display"). Pass target: \"display\" to pick one."
+                    t.rect = clipped
+                }
+            }
+        }
+        guard t.rect.width >= 16, t.rect.height >= 16 else { throw MCP.failed("The area is too small to record (16 × 16 at least).") }
         let gif = MCP.str(a["format"]) == "gif"
         var o: [String: Any] = ["CountdownSeconds": min(10, max(0, MCP.int(a["countdown_seconds"]) ?? 0))]
-        if let fps = MCP.int(a["fps"]) { o[gif ? "GifFps" : "VideoFps"] = fps }
+        if let fps = MCP.int(a["fps"]) { o[gif ? "GifFps" : "VideoFps"] = gif ? min(50, max(1, fps)) : min(120, max(1, fps)) }
         let keys = ["include_cursor": "RecordCursor", "system_audio": "RecordSystemAudio", "microphone": "RecordMicrophone",
                     "show_clicks": "ShowClicks", "show_keys": "ShowKeys", "show_gamepad": "ShowGamepad"]
         for (arg, key) in keys { if let v = MCP.bool(a[arg]) { o[key] = v } }
         let follow = MCP.bool(a["follow_window"]) ?? true
         let target: RecordTarget = t.window.map { follow ? .window($0) : .region($0.frame) } ?? .region(t.rect)
-        generation += 1
-        let gen = generation
-        finishedUnread = nil
-        markers = []
-        recTags = MCP.strings(a["tags"])
-        recComment = MCP.str(a["comment"]) ?? ""
-        let fps = (o[gif ? "GifFps" : "VideoFps"] as? Int) ?? s.int(gif ? "GifFps" : "VideoFps")
-        recordingFps = Double(max(1, fps))
-        let started = Recorder.start(gif: gif, target: target) { r in
+        let fps = (o[gif ? "GifFps" : "VideoFps"] as? Int) ?? (gif ? min(50, max(1, s.int("GifFps"))) : min(120, max(1, s.int("VideoFps"))))
+        guard let started = Recorder.start(gif: gif, target: target, configure: { r in
             r.overrides = o
             r.copiesToClipboard = false
-            r.onFinish = { outcome in DispatchQueue.main.async { recordingFinished(outcome) } }
-        }
-        guard started != nil else { throw MCP.failed("Couldn't start recording.") }
+            r.onFinish = { recordingFinished($0) }  // already on the main thread
+        }) else { throw MCP.failed("Couldn't start recording.") }
+        generation += 1
+        let gen = generation, serialStarted = started.serial
+        finishedUnread = nil
+        markers = []
+        markersFor = started.serial
+        recTags = MCP.strings(a["tags"])
+        recComment = MCP.str(a["comment"]) ?? ""
+        recordingFps = Double(fps)
         ours = true
         AppDelegate.shared?.recordingChanged()
         let countdown = o["CountdownSeconds"] as? Int ?? 0
-        if let maxSeconds = MCP.num(a["max_seconds"]), maxSeconds > 0 {
+        let maxSeconds = min(MCP.num(a["max_seconds"]) ?? 0, 24 * 3600)
+        if maxSeconds > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + maxSeconds + Double(countdown) + 0.5) {
-                if gen == generation, let r = Recorder.current, ours { r.stop() }
+                // Only this recording: not a later one, nor one the user started.
+                if gen == generation, ours, let r = Recorder.current, r.serial == serialStarted { r.stop() }
             }
         }
-        var d: JSON = ["recording": true, "format": gif ? "gif" : "mp4", "target": t.kind, "rect": rect(t.rect), "fps": fps,
+        var d: JSON = ["recording": true, "format": gif ? "gif" : "mp4", "target": t.kind, "rect": rect(t.window?.frame ?? t.rect), "fps": fps,
                        "countdown_seconds": countdown, "path": "named when it's saved: stop_recording returns it"]
         if t.window != nil { d["follows_window"] = follow }
-        if let m = MCP.num(a["max_seconds"]), m > 0 { d["max_seconds"] = m }
+        if maxSeconds > 0 { d["max_seconds"] = maxSeconds }
+        if let note { d["note"] = note }
         return MCP.result(d)
     }
 
     private static func stopRecording(_ a: JSON, _ reply: @escaping MCP.Reply) {
         let discard = MCP.bool(a["discard"]) ?? false
-        guard let r = Recorder.current else {
-            if let d = finishedUnread {
-                finishedUnread = nil
-                return reply(d["error"] != nil ? MCP.error("The recording failed: \(d["error"]!)") : MCP.result(d))
-            }
-            return reply(MCP.error("Nothing is being recorded."))
+        if let d = finishedUnread {  // the agent's recording already ended (the user stopped it, or max_seconds): that's the answer
+            finishedUnread = nil
+            return reply(toolResult(d))
         }
+        guard let r = Recorder.current else { return reply(MCP.error("Nothing is being recorded.")) }
         if ours {
             waiting.append(reply)
             return r.stop(discard: discard)
         }
-        // Started from a shortcut or the menu: its file is the newest recording once it's saved.
-        let ms = markers
+        // Started from a shortcut or the menu: the recorder says how it ended.
+        guard r.onFinish == nil else { return reply(MCP.error("That recording is already being stopped.")) }
+        let ms = currentMarkers, fps = Double(min(120, max(1, s.int("VideoFps"))))
         markers = []
-        Recorder.onFinished.append {
-            DispatchQueue.main.async {
-                if discard { return reply(MCP.result(["discarded": true])) }
-                guard let u = Output.listCaptures().first(where: { MediaFiles.isVideo($0) || $0.pathExtension.lowercased() == "gif" }) else {
-                    return reply(MCP.error("The recording stopped, but its file wasn't found."))
-                }
-                var d: JSON = ["path": u.path, "markers": markersJSON(ms)]
-                if let n = writeNotes(u, ms, fps: Double(s.int("VideoFps")), author: client), MediaFiles.isVideo(u) { d["notes_file"] = n.path }
-                reply(MCP.result(d))
-            }
-        }
+        markersFor = nil
+        r.onFinish = { reply(toolResult(outcomeJSON($0, ms, fps: fps))) }
         r.stop(discard: discard)
     }
 
@@ -431,10 +453,15 @@ enum Agent {
     }
 
     private static func addMarker(_ a: JSON) throws -> JSON {
-        guard Recorder.isActive else { throw MCP.failed("Markers go on a running recording, and nothing is being recorded.") }
+        guard let r = Recorder.current else { throw MCP.failed("Markers go on a running recording, and nothing is being recorded.") }
         guard let label = MCP.str(a["label"]), !label.isEmpty else { throw MCP.failed("A marker needs a label.") }
         let kind = ["note", "issue", "question", "good"].contains(MCP.str(a["kind"]) ?? "") ? MCP.str(a["kind"])! : "note"
-        let m = Marker(seconds: max(0, MCP.num(a["seconds"]) ?? recordingSeconds), label: label, kind: kind)
+        let at = MCP.num(a["seconds"]).map { min(max(0, $0), 24 * 3600) } ?? recordingSeconds
+        if markersFor != r.serial {  // a new recording: earlier markers were for another one
+            markers = []
+            markersFor = r.serial
+        }
+        let m = Marker(seconds: at, label: label, kind: kind)
         markers.append(m)
         return MCP.result(["seconds": round(m.seconds, 1000), "label": m.label, "kind": m.kind, "markers": markers.count])
     }
@@ -445,7 +472,7 @@ enum Agent {
             j["state"] = !r.hasFootage ? "starting" : r.isPaused ? "paused" : "recording"
             j["seconds"] = round(recordingSeconds)
             j["started_by_agent"] = ours
-            j["markers"] = markersJSON(markers)
+            j["markers"] = markersJSON(currentMarkers)
         }
         if let f = finishedUnread { j["finished_unread"] = f }
         return j
@@ -582,6 +609,8 @@ enum Agent {
         let u = URL(fileURLWithPath: MCP.str(a["path"]) ?? "")
         let lib = Library.shared
         guard lib.isInLibrary(u), FileManager.default.fileExists(atPath: u.path) else { throw MCP.failed("Not a capture in the gallery: \(u.path)") }
+        if a["rating"] != nil, !MCP.isNumber(a["rating"]) { throw MCP.failed("rating must be a number from 0 to 5.") }
+        if a["comment"] != nil, !(a["comment"] is String) { throw MCP.failed("comment must be text.") }
         let add = MCP.strings(a["add_tags"])
         if !add.isEmpty { lib.addTags(add, to: [u]) }
         for t in MCP.strings(a["remove_tags"]) { lib.removeTag(t, from: [u]) }
@@ -657,6 +686,14 @@ enum Agent {
     }
 
     private static func configure(_ a: JSON) throws -> JSON {
+        // Everything is checked before anything is written: a wrong value changes nothing.
+        for (name, _, range) in settingKeys where a[name] != nil {
+            if let range, !MCP.isNumber(a[name]) { throw MCP.failed("\(name) must be a number from \(range.lowerBound) to \(range.upperBound).") }
+            if range == nil, !MCP.isBool(a[name]) { throw MCP.failed("\(name) must be true or false.") }
+        }
+        if a["gamepad_corner"] != nil, !["topleft", "topright", "bottomleft", "bottomright"].contains(MCP.str(a["gamepad_corner"]) ?? "") {
+            throw MCP.failed("gamepad_corner is topleft, topright, bottomleft or bottomright.")
+        }
         var changed: [String] = []
         for (name, key, range) in settingKeys where a[name] != nil {
             if let range { s.set(key, min(range.upperBound, max(range.lowerBound, MCP.int(a[name]) ?? range.lowerBound))) }
@@ -664,7 +701,6 @@ enum Agent {
             changed.append(name)
         }
         if let c = MCP.str(a["gamepad_corner"]) {
-            guard ["topleft", "topright", "bottomleft", "bottomright"].contains(c) else { throw MCP.failed("gamepad_corner is topleft, topright, bottomleft or bottomright.") }
             s.set("GamepadCorner", c)
             changed.append("gamepad_corner")
         }

@@ -43,7 +43,7 @@ Coordinates are physical pixels on Windows and points on the Mac, with the prima
 | `get_status` | Version, captures folder, displays, the active window, the recording state (time, markers) and the capture and recording settings |
 | `list_windows` | App windows with ids, titles, app names and rectangles (`query` filters) |
 | `take_screenshot` | Captures a target, saves a PNG (`save: false` to skip) and returns the path and the picture (`image`: `preview` at most 1568 px, `full` or `none`). `tags`, `comment`, `delay_seconds`, `redact`, `copy_to_clipboard` |
-| `start_recording` | Records a target to MP4 or GIF (`format`) and returns at once. A window target follows the window (`follow_window`). `fps`, `countdown_seconds` (default 0), `max_seconds`, `system_audio`, `microphone`, `show_clicks`, `show_keys`, `show_gamepad`, `tags`, `comment` |
+| `start_recording` | Records a target to MP4 or GIF (`format`) and returns at once (on the Mac a recording covers one display, so a wider area is cut to the display at its centre, and the reply says so). A window target follows the window (`follow_window`). `fps`, `countdown_seconds` (default 0), `max_seconds`, `system_audio`, `microphone`, `show_clicks`, `show_keys`, `show_gamepad`, `tags`, `comment` |
 | `add_marker` | Marks the current moment of the recording: `label`, `kind` (`note`, `issue`, `question`, `good`), optional `seconds` |
 | `pause_recording` | `paused: true` pauses, `false` resumes |
 | `stop_recording` | Stops, waits for the file and returns its path, length, size and markers (`discard: true` throws it away). Also reports a recording that already ended |

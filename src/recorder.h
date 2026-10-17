@@ -42,6 +42,9 @@ void TogglePauseRecording();
 bool IsRecording();        // counting down, capturing or paused
 bool IsRecordingPaused();
 double RecordingSeconds();  // recorded so far, without pauses (0 during the countdown)
+uint64_t RecordingId();     // changes with every recording started (0 before the first)
+// `fn` runs once, after the current recording's own `done`, with how it ended (saved, discarded or failed).
+void WhenRecordingFinishes(std::function<void(const RecordResult&)> fn);
 bool RecorderBusy();       // recording or still finalizing the file
 
 }  // namespace ather

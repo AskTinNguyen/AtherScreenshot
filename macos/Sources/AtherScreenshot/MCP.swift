@@ -55,8 +55,23 @@ enum MCP {
     // MARK: argument helpers (JSONSerialization numbers are NSNumber, booleans too)
 
     static func num(_ v: Any?) -> Double? { (v as? NSNumber)?.doubleValue }
-    static func int(_ v: Any?) -> Int? { num(v).map { Int($0.rounded()) } }
+    // Clamped, so a huge number can't trap the conversion.
+    static func int(_ v: Any?) -> Int? {
+        guard let d = num(v), d.isFinite else { return nil }
+        return Int(min(max(d, -1e15), 1e15).rounded())
+    }
     static func bool(_ v: Any?) -> Bool? { (v as? NSNumber)?.boolValue }
+    // A JSON true/false, not a number that happens to be 0 or 1.
+    static func isBool(_ v: Any?) -> Bool {
+        #if canImport(Darwin)
+        guard let n = v as? NSNumber else { return false }
+        return CFGetTypeID(n) == CFBooleanGetTypeID()
+        #else
+        guard let n = v as? NSNumber else { return false }
+        return v is Bool && String(cString: n.objCType) == "c"
+        #endif
+    }
+    static func isNumber(_ v: Any?) -> Bool { v is NSNumber && !isBool(v) }
     static func str(_ v: Any?) -> String? { v as? String }
     static func strings(_ v: Any?) -> [String] {
         if let s = v as? String, !s.isEmpty { return [s] }
@@ -184,7 +199,7 @@ enum MCP {
             while true {
                 guard let eol = rest[p...].range(of: Data("\r\n".utf8)) else { return .incomplete }
                 let n = Int(String(decoding: rest[p..<eol.lowerBound], as: UTF8.self).trimmingCharacters(in: .whitespaces), radix: 16) ?? -1
-                if n < 0 || body.count + n > maxRequest { return .bad }
+                if n < 0 || n > maxRequest - body.count { return .bad }
                 if n == 0 { break }
                 let start = eol.upperBound
                 guard rest.distance(from: start, to: rest.endIndex) >= n + 2 else { return .incomplete }
@@ -222,7 +237,7 @@ enum MCP {
     }
 
     private static func statusText(_ s: Int) -> String {
-        [200: "OK", 202: "Accepted", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed"][s] ?? "Error"
+        [200: "OK", 202: "Accepted", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 503: "Service Unavailable"][s] ?? "Error"
     }
 
     private static func sendAll(_ fd: Int32, _ data: Data) {
@@ -263,7 +278,7 @@ enum MCP {
         a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         #endif
         a.sin_family = sa_family_t(AF_INET)
-        a.sin_port = in_port_t(UInt16(port)).bigEndian
+        a.sin_port = in_port_t(UInt16(clamping: port)).bigEndian
         a.sin_addr.s_addr = in_addr_t(0x7F00_0001).bigEndian  // 127.0.0.1: never reachable from other machines
         return a
     }
@@ -275,6 +290,8 @@ enum MCP {
         private(set) var port = 0
         private let lock = NSLock()
         private var connections = 0
+        private var stopping = false
+        private var acceptorDone: DispatchSemaphore?
 
         init(server: Server, token: String) {
             self.server = server
@@ -284,8 +301,12 @@ enum MCP {
         // Port 0 picks a free one (tests).
         func start(port wanted: Int) throws {
             stop()
+            guard (0...65535).contains(wanted) else { throw MCP.failed("Port \(wanted) isn't a port (use 1024 to 65535).") }
             let s = socket(AF_INET, kSockStream, 0)
             guard s >= 0 else { throw MCP.failed("Couldn't open a network socket.") }
+            // Connections just closed linger in TIME_WAIT; without this, turning agents off and on can't bind for ~30 s.
+            var one: Int32 = 1
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
             var addr = MCP.loopback(wanted)
             let bound = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
             guard bound == 0, listen(s, 16) == 0 else {
@@ -296,7 +317,14 @@ enum MCP {
             _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(s, $0, &len) } }
             fd = s
             port = Int(UInt16(bigEndian: addr.sin_port))
-            let t = Thread { [weak self] in self?.acceptLoop(s) }
+            stopping = false
+            let done = DispatchSemaphore(value: 0)
+            acceptorDone = done
+            let t = Thread { [self] in
+                acceptLoop(s)
+                close(s)  // only once the loop is over, so its number can't be reused under it
+                done.signal()
+            }
             t.name = "ather.mcp.accept"
             t.start()
         }
@@ -305,8 +333,11 @@ enum MCP {
 
         func stop() {
             guard fd >= 0 else { return }
+            lock.lock()
+            stopping = true
+            lock.unlock()
             shutdown(fd, Int32(SHUT_RDWR))  // wakes the blocked accept()
-            close(fd)
+            _ = acceptorDone?.wait(timeout: .now() + 2)
             fd = -1
             port = 0
         }
@@ -314,15 +345,24 @@ enum MCP {
         private func acceptLoop(_ listener: Int32) {
             while true {
                 let c = accept(listener, nil, nil)
+                lock.lock()
+                let stopped = stopping
+                lock.unlock()
+                if stopped {
+                    if c >= 0 { close(c) }
+                    return
+                }
                 if c < 0 {
-                    if errno == EINTR { continue }
-                    return  // closed by stop()
+                    usleep(50_000)  // a client that gave up, or out of descriptors for a moment: keep serving
+                    continue
                 }
                 lock.lock()
                 let busy = connections >= 16
                 if !busy { connections += 1 }
                 lock.unlock()
                 if busy {
+                    MCP.setTimeout(c, seconds: 1)
+                    MCP.respond(c, 503, extra: "Retry-After: 1\r\n")
                     close(c)
                     continue
                 }
@@ -369,14 +409,17 @@ enum MCP {
     }
     static func failed(_ s: String) -> Failure { Failure(message: s) }
 
-    // POSTs `body` to 127.0.0.1:port/mcp. The HTTP status (0 when nothing is listening) and the response body.
+    // POSTs `body` to 127.0.0.1:port/mcp: the HTTP status and the response body. notListening when nobody accepted
+    // the connection, 0 when it was accepted but no answer came (dropped, or timed out).
+    static let notListening = -1
     static func post(port: Int, token: String, body: Data, timeout: Int) -> (Int, Data) {
+        guard (1...65535).contains(port) else { return (notListening, Data()) }
         let s = socket(AF_INET, kSockStream, 0)
-        guard s >= 0 else { return (0, Data()) }
+        guard s >= 0 else { return (notListening, Data()) }
         defer { close(s) }
         var addr = loopback(port)
         let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-        guard ok == 0 else { return (0, Data()) }
+        guard ok == 0 else { return (notListening, Data()) }
         setTimeout(s, seconds: timeout)
         let head = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nAuthorization: Bearer \(token)\r\nContent-Type: application/json\r\n"
             + "Accept: application/json, text/event-stream\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
@@ -418,12 +461,15 @@ enum MCP {
             }
         }
         func relay(_ line: Data) {
+            // Only a connection nobody accepted is retried (and may start the app). A call that was accepted and then
+            // dropped (the app quit or crashed mid-call) may have done its work already, so it's never sent twice.
             var (status, resp) = post(port: port, token: token, body: line, timeout: 15 * 60)
-            if status == 0 {
+            if status == notListening {
                 starting.lock()  // the first request that finds the app missing starts it; the others wait for that
                 (status, resp) = post(port: port, token: token, body: line, timeout: 15 * 60)
-                if status == 0, startApp() {
-                    for _ in 0..<80 where status == 0 {  // up to 20 s for it to start listening
+                if status == notListening, startApp() {
+                    let until = Date().addingTimeInterval(20)  // for it to start listening
+                    while status == notListening, Date() < until {
                         usleep(250_000)
                         (status, resp) = post(port: port, token: token, body: line, timeout: 15 * 60)
                     }
@@ -435,7 +481,9 @@ enum MCP {
             guard let msg = (try? JSONSerialization.jsonObject(with: line)) as? JSON, let id = msg["id"], msg["method"] != nil else { return }
             let why: String
             switch status {
-            case 0: why = "Ather Screenshot isn't accepting AI agents. Turn on \"Allow AI agents (MCP)\" in Ather Screenshot's Settings (AI agents), or run \"Allow AI agents (MCP)\" from its command palette (⌃⌥K)."
+            case notListening: why = "Ather Screenshot isn't accepting AI agents. Turn on \"Allow AI agents (MCP)\" in Ather Screenshot's Settings (AI agents), or run \"Allow AI agents (MCP)\" from its command palette (⌃⌥K)."
+            case 0: why = "Ather Screenshot closed the connection before answering (it quit, or the call took over 15 minutes)."
+            case 503: why = "Ather Screenshot is busy with other agent calls. Try again in a moment."
             case 401, 403: why = "Ather Screenshot refused the connection (the agent token didn't match). Restart Ather Screenshot and try again."
             default: why = "Ather Screenshot answered with HTTP \(status)."
             }

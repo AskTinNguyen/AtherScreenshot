@@ -1275,12 +1275,12 @@ void ApplyAgents() {
 // HTTP endpoint with its token for clients that connect to a URL.
 std::wstring AgentSetupText() {
     const std::wstring exe = AgentExePath();
-    std::wstring json = exe;
+    std::wstring json = exe;  // escaped for JSON and TOML strings (a path can't contain quotes)
     for (size_t i = 0; (i = json.find(L'\\', i)) != std::wstring::npos; i += 2) json.insert(i, 1, L'\\');
     const std::wstring port = std::to_wstring(g_settings.agentPort);
     return L"Ather Screenshot for AI agents (MCP)\r\n\r\n"
            L"Claude Code:\r\n  claude mcp add ather-screenshot -- \"" + exe + L"\" --mcp\r\n\r\n"
-           L"Codex (~/.codex/config.toml):\r\n  [mcp_servers.ather-screenshot]\r\n  command = '" + exe + L"'\r\n  args = [\"--mcp\"]\r\n\r\n"
+           L"Codex (~/.codex/config.toml):\r\n  [mcp_servers.ather-screenshot]\r\n  command = \"" + json + L"\"\r\n  args = [\"--mcp\"]\r\n\r\n"
            L"Claude Desktop, Cursor and other JSON configs:\r\n  \"ather-screenshot\": { \"command\": \"" + json + L"\", \"args\": [\"--mcp\"] }\r\n\r\n"
            L"Clients that connect to a URL (Streamable HTTP):\r\n  http://127.0.0.1:" + port + L"/mcp\r\n"
            L"  Header: Authorization: Bearer " + AgentToken() + L"\r\n";

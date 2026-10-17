@@ -94,7 +94,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private func bool(_ k: String) -> Bool { (overrides[k] as? Bool) ?? s.bool(k) }
     private func string(_ k: String) -> String { (overrides[k] as? String) ?? s.string(k) }
 
+    private static var lastSerial = 0
+    let serial: Int  // tells recordings apart, even one that ended from the next
+
     private init(gif: Bool, target: RecordTarget) {
+        Recorder.lastSerial += 1
+        serial = Recorder.lastSerial
         self.gif = gif
         self.target = target
         tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).\(gif ? "gif" : "mp4")")
