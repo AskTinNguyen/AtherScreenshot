@@ -95,8 +95,8 @@ int ImageSide(const Json& args, const char* key = "image") {
 Json Picture(const BitmapPtr& img, int side) {
     Json extra = Json::Array();
     if (side < 0 || !img) return extra;
-    BitmapPtr small = Shrink(img, side);
-    if (small) extra.Push(mcp::ImageContent(EncodePng(*small)));
+    BitmapPtr shrunk = Shrink(img, side);
+    if (shrunk) extra.Push(mcp::ImageContent(EncodePng(*shrunk)));
     return extra;
 }
 
