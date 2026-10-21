@@ -666,6 +666,21 @@ BitmapPtr Copy(const Bitmap& src) {
     return b;
 }
 
+// `src` mirrored left–right (`h`) and/or top–bottom (`v`), as a bitmap of its own.
+BitmapPtr Flipped(const Bitmap& src, bool h, bool v) {
+    const int W = src.Width(), H = src.Height();
+    auto out = Bitmap::CreateRecycled(W, H);
+    if (!out) return nullptr;
+    for (int y = 0; y < H; ++y) {
+        const uint32_t* s = src.Bits() + (size_t)(v ? H - 1 - y : y) * W;
+        uint32_t* d = out->Bits() + (size_t)y * W;
+        if (h)
+            for (int x = 0; x < W; ++x) d[x] = s[W - 1 - x];
+        else memcpy(d, s, (size_t)W * 4);
+    }
+    return out;
+}
+
 BitmapPtr Blank(int w, int h) {
     auto b = Bitmap::Create(std::max(1, w), std::max(1, h));
     if (b) memset(b->Bits(), 0, (size_t)b->Width() * b->Height() * 4);
@@ -1031,6 +1046,13 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw
 BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t, bool owned) const { return src ? Draw(*src, &src, t, owned) : nullptr; }
 
 BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
+    if (!edit_.Flipped()) return Compose(src, shared, t, owned);
+    // 0. The flip, first: everything else is placed on the flipped picture.
+    const BitmapPtr f = Flipped(src, edit_.flipH, edit_.flipV);
+    return f ? Compose(*f, &f, t, true) : nullptr;
+}
+
+BitmapPtr FrameRenderer::Compose(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
     if (!preview_) {  // an export frame under a title card that is fully shown and still: just the card (it's opaque)
         const Mark* top = nullptr;
         for (const auto& m : edit_.marks)
@@ -1150,7 +1172,7 @@ void FrameRenderer::DrawOverlays(Bitmap& target, double ox, double oy, POINT at,
 }
 
 bool FrameRenderer::Untouched(double t) const {
-    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy) return false;
+    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy || edit_.Flipped()) return false;
     for (const auto& m : edit_.marks)
         if (m.Active(t) && m.kind != MarkKind::Zoom) return false;
     for (const auto& c : edit_.captions)
@@ -1160,7 +1182,7 @@ bool FrameRenderer::Untouched(double t) const {
 
 std::optional<std::vector<RECT>> FrameRenderer::EditAreas(double t) const {
     const int vx = (int)view_.x, vy = (int)view_.y;
-    if (preview_ || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_)) return std::nullopt;
+    if (preview_ || edit_.Flipped() || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_)) return std::nullopt;  // flipped: no part is as decoded
     std::vector<RECT> areas;
     auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels: whole 2 × 2 blocks, in the frame
         const RECT r{(LONG)std::max(0.0, std::floor(x0)) & ~1L, (LONG)std::max(0.0, std::floor(y0)) & ~1L,
@@ -1723,6 +1745,32 @@ ATHER_TEST(video_blur_only_while_active) {
     CHECK(Px(*RenderAt(e, 0.5), 296, 180).g < 0.05);  // before: pure red
     CHECK(Px(*RenderAt(e, 2), 296, 180).g > 0.15);    // during: red mixed with the white bar
     CHECK(Px(*RenderAt(e, 3.5), 296, 180).g < 0.05);  // after
+}
+
+// A flip mirrors the whole picture first, in the preview and the export alike; the crop is taken from the flipped
+// picture; and an export never uses the as-decoded shortcuts while flipped.
+ATHER_TEST(video_flip_mirrors_the_picture) {
+    VideoEdit e = EditWith({});
+    e.flipH = true;
+    for (bool preview : {false, true}) {
+        const auto f = RenderAt(e, 2, preview);
+        CHECK(Px(*f, 10, 10).b > 0.9 && Px(*f, 10, 10).r < 0.1);  // the blue right half, now on the left
+        CHECK(Px(*f, 630, 10).r > 0.9 && Px(*f, 630, 10).b < 0.1);
+    }
+    const FrameRenderer r(e, kSize, false);
+    CHECK(!r.Untouched(2));
+    CHECK(!r.EditAreas(2).has_value());
+    e.crop = VRect{0, 0, 300, 360};  // the left of the flipped picture: blue
+    const auto c = RenderAt(e, 2);
+    CHECK(c->Width() == 300 && Px(*c, 150, 180).b > 0.9);
+    // Upside down: a frame green on top, black below.
+    const auto tb = Bitmap::Create(640, 360);
+    for (int y = 0; y < 360; ++y) std::fill_n(tb->Bits() + (size_t)y * 640, 640, y < 180 ? 0xFF00FF00u : 0xFF000000u);
+    VideoEdit v = EditWith({});
+    v.flipV = true;
+    const auto u = FrameRenderer(v, kSize, false).Render(*tb, 2);
+    CHECK(Px(*u, 10, 10).Brightness() < 0.05);
+    CHECK(Px(*u, 10, 350).g > 0.9);
 }
 
 ATHER_TEST(video_arrow_emoji_and_title) {

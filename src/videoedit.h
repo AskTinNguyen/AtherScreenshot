@@ -153,6 +153,10 @@ struct VideoEdit {
     std::optional<VRect> crop;
     double speed = 1;
     bool muted = false;
+    // Mirrors the whole picture (left–right, top–bottom) before anything else is drawn: the crop and markup are where
+    // they show on the flipped picture (turning a flip on mirrors them, so they stay on their footage).
+    bool flipH = false, flipV = false;
+    bool Flipped() const { return flipH || flipV; }
     std::vector<Caption> captions;
     int captionSize = 2;   // 0…4
     int captionColor = 6;  // text (white)
@@ -268,7 +272,8 @@ public:
     uint64_t settled = 0;        // preview while paused: the selected item shows fully, not mid-animation
 
 private:
-    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;
+    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;     // flips, then Compose
+    BitmapPtr Compose(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;  // steps 1–4
     // Draw's steps, on `img` holding the part of the frame from `at` on (source pixels for 1–2, output for 4).
     struct Effect {
         RECT rc{};  // the pixels a blur or pixelate changes

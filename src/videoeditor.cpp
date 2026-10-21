@@ -1331,8 +1331,11 @@ public:
         const auto f = NoteFrame(n);
         if (!n.pin || !f || tframes.frames[*f].clip >= edit.clips.size()) return std::nullopt;
         const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
-        return VPoint{r.x + n.pin->x * r.w, r.y + n.pin->y * r.h};
+        const VPoint at = FlipPin(*n.pin);  // the pin is on the footage, so on a flipped picture it's mirrored too
+        return VPoint{r.x + at.x * r.w, r.y + at.y * r.h};
     }
+    // A pin (fractions of the clip's picture) as it shows on the flipped picture, or the other way round.
+    VPoint FlipPin(VPoint p) const { return {edit.flipH ? 1 - p.x : p.x, edit.flipV ? 1 - p.y : p.y}; }
 
     void SetCrop(std::optional<VRect> r) {
         const VRect full{0, 0, (double)videoSize.cx, (double)videoSize.cy};
@@ -1489,6 +1492,42 @@ public:
         ec.sub = ColorItems(edit.captionEdge, [this](int i) { SetCaptions([i](VideoEdit& e) { e.captionEdge = i; }); });
         v.push_back(ec);
         return v;
+    }
+
+    // ---- flip ----
+
+    std::wstring FlipLabel() const {
+        return edit.flipH && edit.flipV ? L"Flipped ↔ ↕" : edit.flipH ? L"Flipped ↔" : edit.flipV ? L"Flipped ↕" : L"Flip";
+    }
+    std::vector<MenuItem> FlipMenu() {
+        MenuItem h;
+        h.label = L"Flip horizontally (mirror left–right)";
+        h.checked = edit.flipH;
+        h.run = [this] { ToggleFlip(true); };
+        MenuItem v;
+        v.label = L"Flip vertically (upside down)";
+        v.checked = edit.flipV;
+        v.run = [this] { ToggleFlip(false); };
+        return {h, v};
+    }
+    // One undo step: the picture mirrored one way, and the crop and markup with it, so they stay on the same footage.
+    // Captions stay where they are on screen; notes keep their spot on the footage (PinOnVideo mirrors it).
+    void ToggleFlip(bool horizontal) {
+        PushUndo();
+        const double W = videoSize.cx, H = videoSize.cy;
+        auto mirror = [&](VPoint& p) { (horizontal ? p.x : p.y) = (horizontal ? W - p.x : H - p.y); };
+        for (auto& m : edit.marks) {
+            mirror(m.a);
+            mirror(m.b);
+        }
+        if (edit.crop) {
+            VRect c = *edit.crop;
+            if (horizontal) c.x = W - c.MaxX();
+            else c.y = H - c.MaxY();
+            edit.crop = c;
+        }
+        (horizontal ? edit.flipH : edit.flipV) ^= true;
+        Changed();
     }
 
     std::vector<MenuItem> AddMenu() {
@@ -1894,6 +1933,12 @@ public:
             };
             x = r.right + S(4);
         }
+        r = Button(dc, g, x, y, h, 0, FlipLabel(), true, edit.Flipped(), [] {}, L"Mirror the video left–right or upside down");
+        {
+            const RECT fr = r;
+            hots.back().click = [this, fr] { Popup(fr, FlipMenu()); };
+        }
+        x = r.right + S(4);
         Separator(dc, x, y, h);
         int si = 1;
         for (int i = 0; i < 5; ++i)
@@ -2413,6 +2458,11 @@ public:
         (void)w2;
     }
 
+    // A timeline picture stretched into place, mirrored as the edit flips the video (the frames are decoded as they are).
+    void PutThumb(HDC dc, int x, int y, int w, int h, HDC src, int sw, int sh) const {
+        StretchBlt(dc, edit.flipH ? x + w - 1 : x, edit.flipV ? y + h - 1 : y, edit.flipH ? -w : w, edit.flipV ? -h : h, src, 0, 0, sw, sh, SRCCOPY);
+    }
+
     void PaintTimeline(HDC dc, gp::Graphics& g) {
         const RECT tr = TimelineRect();
         const int top = tr.top + LaneH();
@@ -2433,7 +2483,7 @@ public:
                 const auto it = stripThumbs.find(tile.frame);
                 if (it == stripThumbs.end() || !it->second) continue;  // still coming: the strip's own color meanwhile
                 MemDC src(it->second->Handle());
-                StretchBlt(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, 0, 0, it->second->Width(), it->second->Height(), SRCCOPY);
+                PutThumb(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, it->second->Width(), it->second->Height());
             }
             for (const auto& tile : tiles) {  // a hairline between tiles
                 const int x = (int)std::lround(TX(tile.t0));
@@ -2456,7 +2506,7 @@ public:
                 HRGN cr = CreateRectRgnIndirect(&cell);
                 ExtSelectClipRgn(dc, cr, RGN_AND);
                 MemDC src(img->Handle());  // fitted: each of the 16 shows the frame at its middle
-                StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
+                PutThumb(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, img->Width(), img->Height());
                 SelectClipRgn(dc, clip);
                 DeleteObject(cr);
             }
@@ -2743,7 +2793,7 @@ public:
             if (const auto f = NoteFrame(n); f && tframes.frames[*f].clip < edit.clips.size()) {
                 ReleaseCapture();
                 const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
-                const VPoint pin{std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)};
+                const VPoint pin = FlipPin({std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)});
                 UpdateNote([pin](Note& x) { x.pin = pin; });
                 if (FrameNow() != *f) GoToFrame(*f);
                 return;
@@ -4020,6 +4070,11 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->GoToFrame(757);
         Pump(800);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-readout.png");
+        e->ToggleFlip(true);  // the same frame mirrored, filmstrip too
+        Pump(300);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-flip.png");
+        e->Undo();
+        Pump(300);
         // Notes of every kind, one resolved, the selected one pinned.
         struct Spec {
             size_t frame;
@@ -5078,6 +5133,74 @@ ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
     for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
     CHECK(FileNameOf(e->lastReviewOut) == L"shot 60 review 2.mp4");
     CHECK(GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Flip in the editor: each way is one undo step that mirrors the crop and markup with the picture (they stay on their
+// footage); a note's pin stays on its spot of the footage; and a saved video is the mirror image of the unflipped one.
+ATHER_TEST(video_editor_flip) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"/numbers.mp4";
+    CHECK(WriteFrameNumberClip(clip, 640, 360, 30, 45));  // lopsided pictures: a number, a grid and a moving bar
+    VideoEditor* e = OpenHidden(clip, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK(e->FlipLabel() == L"Flip");
+    e->AddMark(MarkKind::Box);
+    e->edit.marks.back().a = {20, 30};
+    e->edit.marks.back().b = {120, 90};
+    e->edit.crop = VRect{0, 0, 400, 300};
+    e->ToggleFlip(true);
+    CHECK(e->edit.flipH && !e->edit.flipV);
+    CHECK_NEAR(e->edit.marks.back().a.x, 620, 1e-9);
+    CHECK_NEAR(e->edit.marks.back().b.x, 520, 1e-9);
+    CHECK_NEAR(e->edit.crop->x, 240, 1e-9);
+    e->ToggleFlip(false);
+    CHECK(e->edit.flipH && e->edit.flipV);
+    CHECK_NEAR(e->edit.marks.back().a.y, 330, 1e-9);
+    CHECK_NEAR(e->edit.crop->y, 60, 1e-9);
+    e->Undo();
+    CHECK(e->edit.flipH && !e->edit.flipV);
+    e->Undo();
+    CHECK(!e->edit.flipH && e->edit.marks.back().a == (VPoint{20, 30}) && e->edit.crop->x == 0);
+    // A pin a quarter in from the left of the footage shows a quarter in from the right once flipped.
+    e->Seek(0.5);
+    e->AddNote();
+    e->edit.notes.back().pin = VPoint{0.25, 0.5};
+    e->ToggleFlip(true);
+    if (const auto p = e->PinOnVideo(e->edit.notes.back())) CHECK_NEAR(p->x, 480, 1);
+    else CHECK(false);
+    // Saved: the mirror image of the same frame saved unflipped.
+    e->edit.marks.clear();
+    e->edit.crop.reset();
+    e->edit.notes.clear();
+    auto saveFrame = [&](bool flip) -> BitmapPtr {
+        e->edit.flipH = flip;
+        const std::wstring out = dir + (flip ? L"/flipped.mp4" : L"/plain.mp4");
+        if (!ExportMp4(clip, e->edit, out, nullptr)) return nullptr;
+        BitmapPtr f;
+        return ProbeVideo(out, nullptr, 0.5, 0, &f) ? f : nullptr;
+    };
+    const BitmapPtr plain = saveFrame(false), flipped = saveFrame(true);
+    CHECK(plain && flipped);
+    if (plain && flipped && plain->Width() == 640 && flipped->Width() == 640) {
+        int mirrored = 0, same = 0, n = 0;
+        for (int y = 8; y < 360; y += 16)
+            for (int x = 4; x < 640; x += 12) {
+                auto close = [](uint32_t a, uint32_t b) {
+                    for (int sh : {0, 8, 16})
+                        if (std::abs((int)((a >> sh) & 255) - (int)((b >> sh) & 255)) > 40) return false;
+                    return true;
+                };
+                ++n;
+                mirrored += close(flipped->Pixel(x, y), plain->Pixel(639 - x, y));
+                same += close(flipped->Pixel(x, y), plain->Pixel(x, y));
+            }
+        test::Note("mirrored " + std::to_string(mirrored) + ", same " + std::to_string(same) + " of " + std::to_string(n));
+        CHECK(mirrored > n * 9 / 10);
+        CHECK(same < mirrored);
+    }
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
