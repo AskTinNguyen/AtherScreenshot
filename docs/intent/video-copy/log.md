@@ -38,3 +38,9 @@ Wishes 1 and 2 became this intent (issues #6 and #7), rev 1 with proposed defaul
 > A: Yes, Mac opt-in
 
 CI artifacts may be downloaded, so Windows snapshot proofs can be checked from the runner's artifact. (The Vietnamese answer applies to `bug-report`.)
+
+## R-1 (2026-10-21 16:05) | orchestrator review at the PR head (#10) | -> rev unchanged
+
+- **A5, A7 (snapshots):** `proof/a5-range.png` passes. It shows the lime band with grips and the label `6.2 s · Ctrl+C copies`, and the hint line names Shift+drag and Ctrl+C. The readout there (`0:05:01 · frame 300`) is off by one frame; that's the runner's software-encoder offset, fixed separately in `intent/runner-video-tests`.
+- **A8 (docs):** passes. README covers the Features row, the guide section, the shortcut line and Platform differences; RELEASE_NOTES has the "Coming in the next update" entry.
+- **F-1:** resolved. The runner's 11 baseline failures came from Windows' software H.264 encoder writing B-frames that the MP4 stores one frame late. `intent/runner-video-tests` (Mp4Writer without B-frames) brings the runner to `0 failed`. A4 is met once a Check run of this branch with that fix merged in reports `0 failed`.
