@@ -159,10 +159,10 @@ func copyText(_ s: String) {
     NSPasteboard.general.setString(s, forType: .string)
 }
 
+// `pb`: the general pasteboard, or a test's own.
 @discardableResult
-func copyImage(_ img: CGImage) -> Bool {
+func copyImage(_ img: CGImage, to pb: NSPasteboard = .general) -> Bool {
     guard let png = img.pngData() else { return false }
-    let pb = NSPasteboard.general
     pb.clearContents()
     let item = NSPasteboardItem()
     item.setData(png, forType: .png)
@@ -170,9 +170,10 @@ func copyImage(_ img: CGImage) -> Bool {
     return pb.writeObjects([item])
 }
 
-func copyFile(_ url: URL) {
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.writeObjects([url as NSURL])
+@discardableResult
+func copyFile(_ url: URL, to pb: NSPasteboard = .general) -> Bool {
+    pb.clearContents()
+    return pb.writeObjects([url as NSURL])
 }
 
 final class KeyablePanel: NSPanel {
