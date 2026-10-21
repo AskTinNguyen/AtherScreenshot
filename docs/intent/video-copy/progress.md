@@ -2,9 +2,9 @@
 
 - Working under rev: 1
 - Worker: `video-copy-worker`
-- Current step: S5: draft PR; a CI run on the final commit
+- Current step: none
 - Next step: the orchestrator's review of A8 (docs) and F-1 (A4 on the runner); A9 is the owner's (paste into Slack on a PC and a Mac)
-- PR: none yet
+- PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/10 (draft)
 
 ## Acceptance
 
@@ -12,10 +12,10 @@
 
 | Item | Verdict | Evidence |
 | --- | --- | --- |
-| A1 | met | S1/S2: CI run https://github.com/AskTinNguyen/AtherScreenshot/actions/runs/39615745081 → `ok   video_editor_marks_a_range_to_copy`; the run's line `114 tests, 1770 checks, 12 failed` is the 11 runner-baseline failures plus a playback-timing flake, none in this feature (F-1) |
-| A2 | met | S2: same run → `ok   video_editor_copies_the_marked_range_as_a_clip` (120 frames, the editor's own first and last frames, CF_HDROP = that path, H.264 + AAC, the clip saved with the clipboard held elsewhere) and `ok   video_editor_copies_the_selected_clip`; same gate note (F-1) |
-| A3 | met | S1/S2: same run → `ok   video_editor_copies_the_frame_on_screen` (CF_DIB and PNG pixel-equal to `FrameRenderer`'s cropped frame with a caption and a box, and to the export's own first frame there; a focused field's Ctrl+C copies its text); same gate note (F-1) |
-| A4 | open | Waits on F-1: the runner fails 11 existing video tests on main too (S0). On this branch every other existing test passes (S2); Save, Save GIF, Save smaller and the review video are untouched (`ExportMp4` is only called) |
+| A1 | met | S5: CI run https://github.com/AskTinNguyen/AtherScreenshot/actions/runs/39617583897 → `ok   video_editor_marks_a_range_to_copy`; the run's line `114 tests, 1770 checks, 11 failed` is exactly the runner's baseline set from S0 (F-1) |
+| A2 | met | S5: same run → `ok   video_editor_copies_the_marked_range_as_a_clip` (120 frames, the editor's own first and last frames, CF_HDROP = that path, H.264 + AAC, the clip saved with the clipboard held elsewhere) and `ok   video_editor_copies_the_selected_clip`; same gate note (F-1) |
+| A3 | met | S5: same run → `ok   video_editor_copies_the_frame_on_screen` (CF_DIB and PNG pixel-equal to `FrameRenderer`'s cropped frame with a caption and a box, and to the export's own first frame there; a focused field's Ctrl+C copies its text); same gate note (F-1) |
+| A4 | open | Waits on F-1: S5's run fails exactly main's 11 runner-baseline tests (S0) and nothing else; Save, Save GIF, Save smaller and the review video are untouched (`ExportMp4` is only called) |
 | A5 | met | S2: `--video-snapshots` on the runner (run 39615745081), opened: `docs/intent/video-copy/proof/a5-range.png` (band from frame 300 to 671, white grips, "6.2 s · Ctrl+C copies") and `proof/a5-save-menu.png` (the real Save ▾ menu: Copy clip Ctrl+C, Copy frame Ctrl+Shift+C) |
 | A6 | met | S3: `cd macos && ./build.sh && xcrun swift test` → `Executed 91 tests, with 10 tests skipped and 0 failures`, with `VideoCopyTests` (⇧-drag, grips, ⇧I/⇧O, Esc; H.264 + AAC clip of 30 frames 20…49, file URL on a private pasteboard; selected clip; ⌘C/⌘⇧C frame equal to the export's frame, difference 0 of 255; the general pasteboard's changeCount unchanged) |
 | A7 | met | S3: `ATHER_TEST_OUT=… xcrun swift test --filter VideoCopyTests` → `proof/a7-mac-range.png` (opened: band, grips, "6.2 s · ⌘C copies", Copy ▾ next to Save smaller) |
@@ -45,6 +45,8 @@
   - Tests: `VideoCopyTests` (4 tests; the snapshot one only with `ATHER_TEST_OUT`). The test clip shows each frame's number as eight black-and-white stripes, since 16-step color codes drifted by one step through the Mac's color handling.
   - Evidence: `cd macos && ./build.sh && xcrun swift test` → `Executed 91 tests, with 10 tests skipped and 0 failures` (exit 0; `testClipLaneEdgesKnobAndKeys`, `testEditorJoinsSplitsAndReordersClips` and `testCancelLeavesNoPieces` passed in this run); `xcrun swift test --filter VideoCopyTests` with `ATHER_TEST_OUT` → `Executed 4 tests, with 0 failures`, printing "the copy differs from the renderer's frame by at most 0 of 255" at 1.5 s and 2.0 s; `proof/a7-mac-range.png` opened. Build warnings: 30 before and after. Acceptance: A6, A7.
 - S4 (rev 1, 2026-10-21): docs. README: a "Copy a clip" Features row; in the Video editor guide, "Copy a clip or a frame (to paste into Slack)"; the shortcut line (Shift+drag, Shift+I/O, Ctrl+C, Ctrl+Shift+C, Esc clears the range first); Platform differences (Save ▾ vs the Mac's Copy menu, H.264 on the Mac, its frame-rate snapping). `macos/README.md`: a Video editor bullet and its shortcut line. `RELEASE_NOTES.md`: "Coming in the next update" › "Copy a clip or a frame, then paste it into Slack". Acceptance: A8 ready for review.
+
+- S5 (rev 1, 2026-10-21): draft PR #10. CI on the final code (d4a4971): https://github.com/AskTinNguyen/AtherScreenshot/actions/runs/39617583897 → `114 tests, 1770 checks, 11 failed`, the 11 being exactly S0's baseline list; `ok` for all four new tests and for `video_editor_plays_and_seeks` (so S2's failure of it was runner timing); MSVC `Built build\AtherScreenshot.exe` with no `warning C` / `error C` (run 39615745081); the range and Save-menu snapshots rendered again. No include order changed (the orchestrator's min/max note doesn't apply). Acceptance: A1–A3 re-confirmed.
 
 ## Reconciliations
 
