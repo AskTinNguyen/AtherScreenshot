@@ -1,4 +1,6 @@
 // Temporary diagnostics (not for merging): what Media Foundation on the CI runner does with the app's own test clips.
+#include "videoio.h"
+
 #include <shlobj.h>
 
 #include <cstdio>
@@ -7,7 +9,6 @@
 #include "json.h"
 #include "media.h"
 #include "selftest.h"
-#include "videoio.h"
 
 namespace ather {
 namespace {
