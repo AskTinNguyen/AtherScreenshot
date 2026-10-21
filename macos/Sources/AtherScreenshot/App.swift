@@ -113,8 +113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.onChange = { [weak self] key in
             if key.hasPrefix("Hotkey.") { self?.registerHotkeys() }
             if key == "AllowAgents" || key == "AgentPort" { Agent.apply() }
+            if ["VoiceCommands", "LogPaths", "PreRollSeconds", "LogMaxMB", "CloudVietnamese", "SaveFolder", "CaptureCursor", "Hotkey.BugReport"].contains(key) {
+                BugReports.shared.configure(.fromSettings())
+            }
         }
         registerHotkeys()
+        BugReports.shared.onListeningChanged = { [weak self] in  // the menu-bar icon says when the microphone is open for it
+            self?.statusItem.button?.toolTip = kProductName + (BugReports.shared.listening ? "\nListening for “bug start”" : "")
+        }
+        BugReports.shared.configure(.fromSettings())
         let token = AppDelegate.cliToken()
         DistributedNotificationCenter.default().addObserver(forName: kCliNote, object: nil, queue: .main) { [weak self] n in
             guard let s = n.object as? String else { return }
@@ -166,6 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         UpdateController.shared.quitting = true  // a download finishing now must not install or relaunch
         Agent.stop()
+        BugReports.shared.stop()
         let finishWrites = {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
@@ -283,6 +291,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for c in [Cmd.region, .regionEdit, .fullscreen, .monitor, .window, .scrolling, .ocr] { add(c) }
         menu.addItem(.separator())
         for c in [Cmd.recordVideo, .recordGif, .recordWindow] { add(c) }
+        add(.bugReport, BugReports.shared.isOpen ? "Bug report: stop" : nil)
+        if BugReports.shared.listening {
+            let i = NSMenuItem(title: "Listening for “bug start”", action: nil, keyEquivalent: "")
+            i.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
+            i.isEnabled = false
+            menu.addItem(i)
+        }
         menu.addItem(.separator())
         for c in [Cmd.colorPicker, .ruler, .history, .palette] { add(c) }
         menu.addItem(.separator())
@@ -393,6 +408,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .stopRecording:
             if Recorder.isActive { Recorder.current?.stop() } else if ScrollCapture.active != nil { ScrollCapture.cancel() } else { Toast.shared.show("Not recording") }
         case .pauseRecording: Recorder.current?.togglePause()
+        case .bugReport: BugReports.shared.toggle()
+        case .copyLastBug: BugReports.shared.copyLast(to: .general)
+        case .openBugsFolder: BugReports.shared.openFolder()
         case .checkUpdates: UpdateController.shared.check(manual: true)
         case .history: GalleryWindow.show()
         case .editLast:

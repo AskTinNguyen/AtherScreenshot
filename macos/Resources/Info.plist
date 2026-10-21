@@ -15,8 +15,8 @@
     <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
-    <key>NSMicrophoneUsageDescription</key><string>Ather Screenshot records your microphone in screen recordings when “Record microphone” is on.</string>
-    <key>NSSpeechRecognitionUsageDescription</key><string>Ather Screenshot turns speech in your screen recordings into captions when you choose Auto captions.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Ather Screenshot records your microphone in screen recordings when “Record microphone” is on, and listens for “bug start” / “bug stop” when voice commands for bug reports are on.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>Ather Screenshot turns speech in your screen recordings into captions when you choose Auto captions, and recognizes “bug start” / “bug stop” and what you say about a bug when voice commands for bug reports are on.</string>
     <key>NSHumanReadableCopyright</key><string>Ather</string>
     <key>CFBundleURLTypes</key>
     <array>
