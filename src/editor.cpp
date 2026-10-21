@@ -2950,10 +2950,13 @@ void Editor::DrawStrip(HDC dc) {
             } else {
                 FillSolid(dc, r, theme::kBgRaised);
             }
-            // tick
+            // tick: lime with a check, or an empty box
             const RECT t = TickRect(i);
+            gp::GraphicsPath box;
+            RoundedPath(box, gp::RectF((float)t.left, (float)t.top, (float)RectW(t), (float)RectH(t)), 4 * s_);
             if (p.keep) {
-                FillRounded(dc, t, S(5), theme::kAccent);
+                gp::SolidBrush lime(GC(theme::kAccent));
+                g.FillPath(&lime, &box);
                 gp::Pen pen(GC(theme::kOnAccent), 2 * s_);
                 pen.SetStartCap(gp::LineCapRound);
                 pen.SetEndCap(gp::LineCapRound);
@@ -2962,7 +2965,10 @@ void Editor::DrawStrip(HDC dc) {
                 const gp::PointF check[] = {{t.left + 4.5f * u, t.top + 9.5f * u}, {t.left + 7.5f * u, t.top + 12.5f * u}, {t.left + 13.5f * u, t.top + 5.5f * u}};
                 g.DrawLines(&pen, check, 3);
             } else {
-                FillRounded(dc, t, S(5), theme::kBg, hover && hoverPart_ == 1 ? theme::kText : theme::kMuted);
+                gp::SolidBrush shade(GC(theme::kBg, 140));
+                g.FillPath(&shade, &box);
+                gp::Pen edge(hover && hoverPart_ == 1 ? GC(theme::kAccent) : GC(theme::kText, 235), 1.5f * s_);
+                g.DrawPath(&edge, &box);
             }
             // unsaved changes, or saved
             if (DirtyOf(i)) {
@@ -3480,10 +3486,10 @@ int EditorSnapshots(const std::wstring& outDir) {
     t->Layout();
     t->AddPicture(card(1600, 1000, RGB(255, 59, 48), RGB(255, 149, 0), L"Payment failed"), {});
     t->AddPicture(card(1400, 900, RGB(52, 199, 89), RGB(48, 176, 199), L"Release notes"), {});
-    t->AddPicture(card(900, 1400, RGB(88, 86, 214), RGB(175, 82, 222), L"Sign in"), {});
     t->AddPicture(card(1800, 1000, RGB(255, 204, 0), RGB(255, 149, 0), L"Build 0.0.2.4"), {});
+    t->AddPicture(card(900, 1400, RGB(88, 86, 214), RGB(175, 82, 222), L"Sign in"), {});
     t->PushUndo();  // the fifth: changes not saved yet
-    add(Tool::Rect, {gp::PointF(150, 170), gp::PointF(1400, 360)}, 0, 2);
+    add(Tool::Rect, {gp::PointF(100, 260), gp::PointF(800, 520)}, 0, 2);
     t->Changed(false);
     t->SwitchTo(2);
     add(Tool::Arrow, {gp::PointF(1050, 700), gp::PointF(800, 380)}, 0, 2);
