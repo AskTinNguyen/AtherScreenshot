@@ -141,6 +141,29 @@ struct Clip {
     bool operator==(const Clip&) const = default;
 };
 
+// A second video shown together with the timeline's, without its sound: in a box over the picture (picture in
+// picture), or in one half of a split screen with the timeline's video in the other half. It sits at a timeline time,
+// not on footage: moving clips around leaves it where it is.
+enum class OverlayLayout { Pip, SplitLeft, SplitRight, SplitTop, SplitBottom };  // split: the half the overlay takes
+const wchar_t* OverlayLayoutLabel(OverlayLayout l);
+struct Overlay {
+    uint64_t id = NewItemId();
+    Clip clip;          // its footage: [in, out) of a file
+    double start = 0;   // where it begins on the timeline
+    OverlayLayout layout = OverlayLayout::Pip;
+    VPoint pos{0.62, 0.6};  // picture in picture: the box's top-left, as fractions of the output frame
+    double width = 0.34;    // and its width, as a fraction of the frame's (its height follows the video's shape)
+    bool fill = false;      // split: fills its half (cut to fit) instead of showing all of the picture
+    double End() const { return start + clip.Duration(); }
+    bool Active(double t) const { return t >= start && t < End(); }
+    bool IsSplit() const { return layout != OverlayLayout::Pip; }
+    bool operator==(const Overlay&) const = default;
+};
+// Where an overlay's picture goes in an output frame of `out` pixels: the box, or its half.
+VRect OverlayRect(const Overlay& o, SIZE out);
+// The other half of a split screen, where the timeline's video goes.
+VRect MainHalf(const Overlay& o, SIZE out);
+
 double ClipsDuration(const std::vector<Clip>& clips);
 double ClipStart(const std::vector<Clip>& clips, size_t i);  // where clip i begins on the timeline
 // The clip playing at timeline time `t` and the source time in it (the last clip's end past the end).
@@ -148,6 +171,8 @@ std::optional<std::pair<size_t, double>> LocateClip(const std::vector<Clip>& cli
 
 struct VideoEdit {
     std::vector<Clip> clips;  // empty = the whole source file
+    std::vector<Clip> bin;    // pieces taken off the timeline, kept to put back: not played or saved
+    std::vector<Overlay> overlays;  // second videos on top, in the order they're drawn
     int frameW = 0, frameH = 0;  // the sequence frame; 0 = the first clip's size
     double trimStart = 0, trimEnd = 0;
     std::optional<VRect> crop;
@@ -251,6 +276,11 @@ public:
     std::optional<std::vector<RECT>> EditAreas(double t) const;
     void DrawEdits(Bitmap& area, POINT at, double t) const;
 
+    // The frame of an overlay video (see VideoEdit::overlays) at timeline time `t`, upright at its own size; null when
+    // it isn't there (yet), and then that overlay isn't drawn. Called from the threads Render runs on.
+    std::function<BitmapPtr(const Overlay&, double t)> overlayFrame;
+    bool HasOverlay(double t) const;  // an overlay video shows at `t`
+
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
     Motion MotionOf(const Mark& m, double t) const;
@@ -279,7 +309,9 @@ private:
     std::optional<Effect> EffectOf(const Mark& m, double t) const;
     void DrawRegions(Bitmap& img, POINT at, double t) const;  // 1. blur and pixelate
     void DrawMarks(Bitmap& img, POINT at, double t) const;    // 2. markup on the video
-    void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4. captions, title cards
+    // 4a. Overlay videos on the output frame: a split screen makes a new frame with `framed` in its half.
+    BitmapPtr DrawVideos(const BitmapPtr& framed, double t) const;
+    void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4b. captions, title cards
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;
     std::optional<Placed> RingImage(VRect r) const;
 
