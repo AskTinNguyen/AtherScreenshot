@@ -10,6 +10,13 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## Coming in the next update (Windows and macOS)
+
+### Capture tray: keep capturing, then save the pictures you pick together
+- **What:** Capture and annotate (Ctrl+Alt+E, ⌃⌥E on the Mac) no longer opens a new window for every capture. Captures collect in the open editor, in a strip of thumbnails along its bottom edge. Click one to annotate it, switch with Ctrl+Tab (⌃⇥), and each picture keeps its own notes and undo.
+- **Saving:** tick the pictures to keep and press **Save selected**. Each is saved as its own PNG in your captures folder and shows up in the gallery. Done saves the ticked ones and closes. Closing with pictures that aren't saved asks first.
+- **Every capture:** set After capture to "Open in editor" to collect every capture this way. Settings › **Collect captures in one editor** turns it off.
+
 ## What's new in this update (Windows and macOS, build 0.0.2.4)
 
 ### AI agents can take screenshots and record for you

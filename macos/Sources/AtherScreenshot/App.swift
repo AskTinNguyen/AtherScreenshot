@@ -662,7 +662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if after == .edit || (after == .normal && afterSetting == "edit") {
-            Editor.open(img, scale: scale, info: nameInfo)  // the editor copies/saves the result on Done
+            Editor.capture(img, scale: scale, info: nameInfo)  // the editor copies/saves the result on Done
             return
         }
         let copied = s.bool("CopyToClipboard") && copyImage(img)

@@ -159,10 +159,10 @@ func copyText(_ s: String) {
     NSPasteboard.general.setString(s, forType: .string)
 }
 
+// `pb`: tests pass a pasteboard of their own, never the general one.
 @discardableResult
-func copyImage(_ img: CGImage) -> Bool {
+func copyImage(_ img: CGImage, to pb: NSPasteboard = .general) -> Bool {
     guard let png = img.pngData() else { return false }
-    let pb = NSPasteboard.general
     pb.clearContents()
     let item = NSPasteboardItem()
     item.setData(png, forType: .png)
