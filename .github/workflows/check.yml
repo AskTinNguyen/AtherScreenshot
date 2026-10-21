@@ -1,0 +1,57 @@
+# Checks intent branches on GitHub's Windows runner: build.bat, test.bat and the UI snapshot tools. Agents working on
+# a Mac can't run MSVC, so this is their Windows gate. Nothing is published: the self-test log and the snapshots are
+# kept as the run's artifact for a week. The Mac side is checked on a Mac (cd macos && ./build.sh && xcrun swift test).
+name: Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['intent/**']
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      ATHER_TEST_OUT: ${{ github.workspace }}\build\snapshots\tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        id: build
+        shell: cmd
+        run: call build.bat
+      - name: Self-tests
+        id: tests
+        shell: cmd
+        run: call test.bat --nobuild
+      - name: Snapshots
+        if: always() && steps.build.outcome == 'success'
+        shell: cmd
+        run: |
+          set ATHER_SUPPORT_DIR=%RUNNER_TEMP%\ather-support
+          start "" /wait /b build\AtherScreenshot.exe --editor-snapshots build\snapshots\editor
+          start "" /wait /b build\AtherScreenshot.exe --video-snapshots build\snapshots\video
+          start "" /wait /b build\AtherScreenshot.exe --gallery-snapshots build\snapshots\gallery
+          dir /s /b build\snapshots
+      - name: Test summary
+        if: always()
+        shell: pwsh
+        run: |
+          $log = if (Test-Path build\selftest.log) { Get-Content build\selftest.log } else { @('no log') }
+          "## Windows self-tests: ${{ steps.tests.outcome }}" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          ($log | Select-String -Pattern 'FAIL|skipped' | ForEach-Object { $_.Line }) >> $env:GITHUB_STEP_SUMMARY
+          ($log | Select-Object -Last 4) >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-check
+          retention-days: 7
+          path: |
+            build/selftest.log
+            build/snapshots/
