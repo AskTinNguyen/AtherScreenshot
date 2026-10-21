@@ -33,9 +33,9 @@ jobs:
         shell: cmd
         run: |
           set ATHER_SUPPORT_DIR=%RUNNER_TEMP%\ather-support
-          start "" /wait /b build\AtherScreenshot.exe --editor-snapshots build\snapshots\editor
-          start "" /wait /b build\AtherScreenshot.exe --video-snapshots build\snapshots\video
-          start "" /wait /b build\AtherScreenshot.exe --gallery-snapshots build\snapshots\gallery
+          start "" /wait /b build\AtherScreenshot.exe --editor-snapshots "%CD%\build\snapshots\editor"
+          start "" /wait /b build\AtherScreenshot.exe --video-snapshots "%CD%\build\snapshots\video"
+          start "" /wait /b build\AtherScreenshot.exe --gallery-snapshots "%CD%\build\snapshots\gallery"
           dir /s /b build\snapshots
       - name: Test summary
         if: always()
