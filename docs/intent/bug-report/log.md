@@ -28,3 +28,13 @@ Append-only. Each user prompt verbatim, with credentials and machine paths redac
 > [image: a Snagit editor screenshot, the reference: a "Recent" thumbnail tray along the bottom of the editor window]
 
 Wish 3 became this intent (issue #8), rev 1 with proposed defaults D1–D9. Wishes 1 and 2 are `video-copy` (#6, #7), the Art wish is `capture-tray` (#9).
+
+## L-2 (2026-10-21 10:55) | class: decision | -> rev 2
+
+> Q: To check the Windows screens, the workers need to download the test log and UI snapshot PNGs (a few MB per run) that this repo's own GitHub Actions "Check" runs produce. May they download those artifacts during this session?
+> A: Yes, allow (Recommended)
+>
+> Q: Bug reports: Windows' offline speech recognition doesn't understand Vietnamese, so a description spoken in Vietnamese won't show up as text. The voice recording is always kept in the bug folder either way. Should the Mac offer Apple's cloud recognition for Vietnamese, behind its own opt-in?
+> A: Yes, Mac opt-in
+
+Rev 2: D10 (opt-in Mac cloud transcription for Vietnamese narration), F-2 (d) accepted. CI artifacts may be downloaded.

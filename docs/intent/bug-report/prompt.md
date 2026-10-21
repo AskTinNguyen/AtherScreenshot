@@ -1,6 +1,6 @@
 # Bug Report: "Bug Start" / "Bug Stop" Make One Bug Bundle (Picture with What Was Said, Clip, Game Logs)
 
-- Rev: 1
+- Rev: 2
 - Status: active
 - Area: Recording
 - Owner: AskTinNguyen
@@ -95,6 +95,15 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording, saved fi
   - MinGW (`x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -DUNICODE -D_UNICODE -Dsmall=char`) is a quick local type-check, never a proof.
   - The Mac part is proven with `gate: mac` on this Mac.
 - **D9 (rev 1): no waiting.** Further owner-level calls (wording, look, details the spec leaves open) are the worker's. It picks what fits the app's style and records each, with the options it considered, in `progress.md` under "Owner-level calls". Findings are still written for anything that changes the intent; none is blocking unless it's destructive, a release, or a security, privacy or credential matter.
+- **D10 (rev 2): Vietnamese on the Mac, behind its own opt-in.** Source: L-2, F-2 (d).
+  - Settings › Bug reports › **Transcribe Vietnamese with Apple's servers** (`[Bugs] CloudVietnamese=0`, off by default, Mac only). Its description says plainly that the narration audio is sent to Apple.
+  - When it's on:
+    - The commands are still recognized on the computer.
+    - At "bug stop", only the narration between "bug start" and "bug stop" (`voice.wav`) goes to `SFSpeechRecognizer` with the `vi-VN` locale and `requiresOnDeviceRecognition = false`.
+    - The result becomes the description and the captions, with the words' times.
+  - When it's off, nothing is ever sent: recognition stays on-device only (D1).
+  - If the server transcription fails or is unavailable, the bug keeps the on-device words (if any) and `voice.wav`, and `bug.json` notes the failure.
+  - Windows has no equivalent: its offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav` (F-2 (b)).
 
 ## Acceptance
 
@@ -127,7 +136,8 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording, saved fi
 - **A7: Mac.**
   - The same state machine, bundle, overlay, logs and clip-on-recording-stop.
   - Voice via on-device `SFSpeechRecognizer`, with the hotkey working without it.
-  - Proof: `gate: mac`. Recognition from a `say`-made audio file is tested if the test runner gets speech permission; otherwise that part is `owner`.
+  - (rev 2) With "Transcribe Vietnamese with Apple's servers" on, the description comes from a `vi-VN` server request on `voice.wav` only. With it off, no request ever leaves the Mac. Tested through a seam that records the request's locale and on-device flag, without a real network call.
+  - Proof: `gate: mac`. Recognition from a `say`-made audio file is tested if the test runner gets speech permission; otherwise that part is `owner`, and so is a real Vietnamese transcription.
 - **A8: docs.**
   - README gets a "Bug reports" guide section, Settings keys and the shortcut row, and so does `macos/README.md`.
   - `RELEASE_NOTES.md` gets a line under the next update.
@@ -154,5 +164,7 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording, saved fi
   - Put the feature in new files: `src/bugreport.*`, and on the Mac `BugReport.swift`.
 
 ## Changelog
+
+- rev 2 (2026-10-21): from L-2. D10 adds an opt-in Mac setting that transcribes Vietnamese narration with Apple's servers (F-2 (d) accepted). A7 covers it. CI artifacts may be downloaded (L-2).
 
 - rev 1 (2026-10-21): created from L-1 (issue #8), with the orchestrator's proposed defaults D1–D9. F-1 (the team's draft requirement) and F-2 (dictation language) are open, non-blocking.
