@@ -863,6 +863,7 @@ private:
     void Paint(HDC hdc);
     void DrawToolbar(HDC dc);
     void DrawStatus(HDC dc);
+    std::wstring StatusRight() const;
     void DrawCanvasBar(HDC dc);
     void Invalidate() { InvalidateRect(hwnd, nullptr, FALSE); }
     void RebuildFonts();
@@ -2138,8 +2139,7 @@ std::wstring Editor::StripTip() const {
     if (hoverThumb_ == -2) return L"Save every ticked picture to the captures folder";
     if (hoverPart_ == 1) return L"Tick the pictures to keep  ·  Save selected saves them together";
     if (hoverPart_ == 2) return L"Remove this picture from the tray";
-    return L"Picture " + std::to_wstring(hoverThumb_ + 1) + L" of " + std::to_wstring(tray_.size()) +
-           L"  —  click to open it  ·  Ctrl+Tab next, Ctrl+Shift+Tab previous";
+    return L"Click to open picture " + std::to_wstring(hoverThumb_ + 1) + L"  ·  Ctrl+Tab next, Ctrl+Shift+Tab previous";
 }
 
 void Editor::ClampStripScroll() {
@@ -2712,6 +2712,16 @@ void Editor::DrawToolbar(HDC dc) {
     }
 }
 
+// The status bar's right side; in a tray it starts with the current picture's number.
+std::wstring Editor::StatusRight() const {
+    const RECT f = Frame();
+    wchar_t right[160];
+    swprintf_s(right, L"%s%d × %d   ·   %d%%   ·   Ctrl+K commands", styled_ ? L"Styled export   ·   " : L"", RectW(f), RectH(f),
+               (int)std::lround(Zoom() * 100));
+    if (!Tray()) return right;
+    return L"Picture " + std::to_wstring(cur_ + 1) + L" of " + std::to_wstring(tray_.size()) + L"   ·   " + right;
+}
+
 void Editor::DrawStatus(HDC dc) {
     const int top = client_.bottom - S(kStatusH);
     FillSolid(dc, {0, top, client_.right, client_.bottom}, theme::kSurface);
@@ -2722,13 +2732,10 @@ void Editor::DrawStatus(HDC dc) {
     RECT r{S(12), top, client_.right - S(12), client_.bottom};
     std::wstring left = hoverBtn_ >= 0 ? buttons_[hoverBtn_].tip : std::wstring(CurTool().name) + L"  —  " + CurTool().hint;
     if (hoverThumb_ != -1) left = StripTip();
-    const RECT f = Frame();
-    wchar_t right[160];
-    swprintf_s(right, L"%s%d × %d   ·   %d%%   ·   Ctrl+K commands", styled_ ? L"Styled export   ·   " : L"", RectW(f), RectH(f),
-               (int)std::lround(Zoom() * 100));
-    DrawTextW(dc, right, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    const std::wstring right = StatusRight();
+    DrawTextW(dc, right.c_str(), -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SIZE rs{};
-    GetTextExtentPoint32W(dc, right, (int)wcslen(right), &rs);
+    GetTextExtentPoint32W(dc, right.c_str(), (int)right.size(), &rs);
     r.right -= rs.cx + S(24);
     DrawTextW(dc, left.c_str(), -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     SelectObject(dc, of);
@@ -4087,6 +4094,7 @@ void EditorTest::TrayStrip() {
     Editor* e = Open(SolidBmp(400, 300, 0xFFFFFFFF));
     if (!e) return CHECK(false);
     const RECT one = e->Canvas();
+    CHECK(e->StatusRight().find(L"Picture") == std::wstring::npos);  // one picture: the status bar as before
     CHECK(!e->Tray() && e->StripH() == 0 && one.bottom == e->client_.bottom - e->S(kStatusH));  // exactly as before
     int part = 0;
     CHECK_EQ(e->StripHit({one.right / 2, one.bottom - 4}, &part), -1);
@@ -4107,10 +4115,13 @@ void EditorTest::TrayStrip() {
 
     CHECK(e->AddPicture(SolidBmp(200, 400, 0xFFCC6633), {}));
     CHECK_EQ(e->cur_, 2);
+    CHECK(e->StatusRight().rfind(L"Picture 3 of 3", 0) == 0);
     e->Key(VK_TAB, true, false);
     CHECK_EQ(e->cur_, 0);
+    CHECK(e->StatusRight().rfind(L"Picture 1 of 3", 0) == 0);  // the status bar names the current picture
     e->Key(VK_TAB, true, true);
     CHECK_EQ(e->cur_, 2);
+    CHECK(e->StatusRight().rfind(L"Picture 3 of 3", 0) == 0);
     e->Key(VK_NEXT, true, false);
     CHECK_EQ(e->cur_, 0);
     e->Key(VK_PRIOR, true, false);
