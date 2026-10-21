@@ -3,7 +3,7 @@
 - Working under rev: 1
 - Worker: `video-copy-worker`
 - Current step: none
-- Next step: the orchestrator's review of A8 (docs) and F-1 (A4 on the runner); A9 is the owner's (paste into Slack on a PC and a Mac)
+- Next step: A9, the owner pastes a copied clip and frame into Slack on a PC and a Mac; then the merge
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/10 (draft)
 
 ## Acceptance
@@ -19,7 +19,7 @@
 | A5 | met | S2: `--video-snapshots` on the runner (run 39615745081), opened: `docs/intent/video-copy/proof/a5-range.png` (band from frame 300 to 671, white grips, "6.2 s · Ctrl+C copies") and `proof/a5-save-menu.png` (the real Save ▾ menu: Copy clip Ctrl+C, Copy frame Ctrl+Shift+C) |
 | A6 | met | S3: `cd macos && ./build.sh && xcrun swift test` → `Executed 91 tests, with 10 tests skipped and 0 failures`, with `VideoCopyTests` (⇧-drag, grips, ⇧I/⇧O, Esc; H.264 + AAC clip of 30 frames 20…49, file URL on a private pasteboard; selected clip; ⌘C/⌘⇧C frame equal to the export's frame, difference 0 of 255; the general pasteboard's changeCount unchanged) |
 | A7 | met | S3: `ATHER_TEST_OUT=… xcrun swift test --filter VideoCopyTests` → `proof/a7-mac-range.png` (opened: band, grips, "6.2 s · ⌘C copies", Copy ▾ next to Save smaller) |
-| A8 | open | S4: written (README Features row, Video editor guide, shortcut line, Platform differences; `macos/README.md`; `RELEASE_NOTES.md` "Coming in the next update"); ready for review |
+| A8 | met | review R-1 in log.md (commit 1f66f6d): passes. Docs from S4 (README Features row, Video editor guide, shortcut line, Platform differences; `macos/README.md`; `RELEASE_NOTES.md` "Coming in the next update") |
 | A9 | open | owner: paste a copied clip and a copied frame into Slack on a PC and a Mac |
 
 ## Steps
