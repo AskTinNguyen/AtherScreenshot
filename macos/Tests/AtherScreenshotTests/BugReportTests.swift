@@ -390,6 +390,8 @@ final class BugReportTests: XCTestCase {
     private final class FakeTranscriber: BugTranscriber {
         var calls: [(url: URL, locale: String, onDevice: Bool)] = []
         var fail = false
+        var device = false  // this Mac recognizes vi-VN on its own
+        func supportsOnDevice(locale: String) -> Bool { device }
         func transcribe(_ wav: URL, locale: String, onDevice: Bool) async throws -> [CaptionWord] {
             calls.append((wav, locale, onDevice))
             if fail { throw VideoExport.Failure.failed("The server didn't answer.") }
@@ -397,7 +399,7 @@ final class BugReportTests: XCTestCase {
         }
     }
 
-    func testVietnameseGoesToTheServerOnlyWhenOnAndOnlyVoiceWav() async throws {
+    func testVietnameseOnTheMacFirstServerOnlyAsFallbackOnlyVoiceWav() async throws {
         let dir = try temp()
         let fake = FakeTranscriber()
         // Off: nothing is sent (the app only calls it with the setting on).
@@ -406,7 +408,7 @@ final class BugReportTests: XCTestCase {
         off.finish(logPaths: "", logMaxBytes: 1 << 20)
         XCTAssertTrue(fake.calls.isEmpty)
         XCTAssertNil(object(off.folder.appendingPathComponent("bug.json"))["transcription"])
-        // On: voice.wav as vi-VN, on the server; the answer becomes the description and the captions.
+        // On, and this Mac can't do vi-VN: voice.wav as vi-VN on the server; the answer becomes the description and the captions.
         let on = bundle(dir, words: "the door")
         on.voiceStart = 50.2
         try on.begin(voice: [Int16](repeating: 100, count: 32000))
@@ -437,6 +439,20 @@ final class BugReportTests: XCTestCase {
         try silent.begin(voice: [])
         await silent.transcribeVietnamese(fake) { $0 }
         XCTAssertEqual(fake.calls.count, 2)
+        // On, and this Mac can do vi-VN (D11): on the Mac, never the server.
+        fake.fail = false
+        fake.device = true
+        let local = bundle(dir, words: "the door")
+        try local.begin(voice: [1, 2, 3])
+        await local.transcribeVietnamese(fake) { $0 }
+        local.finish(logPaths: "", logMaxBytes: 1 << 20)
+        XCTAssertEqual(fake.calls.count, 3)
+        XCTAssertEqual(fake.calls.last?.locale, "vi-VN")
+        XCTAssertEqual(fake.calls.last?.onDevice, true)
+        XCTAssertFalse(fake.calls.dropFirst(2).contains { !$0.onDevice })
+        XCTAssertEqual(local.bug.description, "Cửa không mở.")
+        XCTAssertEqual((object(local.folder.appendingPathComponent("bug.json"))["transcription"] as? [String: Any])?["on_device"] as? Bool, true)
+        XCTAssertTrue(text(local.folder.appendingPathComponent("bug.md")).contains("**Transcribed by:** this Mac (vi-VN)"))
     }
 
     // The voice commands' requests never leave the Mac.

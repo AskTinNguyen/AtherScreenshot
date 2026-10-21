@@ -368,7 +368,7 @@ How the Windows app differs from the Mac app:
   - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.
 - **Bug reports:**
   - Windows recognizes "bug start" / "bug stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses on-device speech recognition.
-  - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it sends `voice.wav` to Apple to write the description. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
+  - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it writes `voice.wav` down as Vietnamese on the Mac when the Mac can, and sends it to Apple only when it can't. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
   - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 

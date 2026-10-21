@@ -63,7 +63,7 @@ private let rows: [Row] = {
             kind: .text("~/Library/Logs/MyGame/*.log; another path", secure: false)),
         Row(key: "PreRollSeconds", title: "Clip starts before “bug start”", section: "Bug reports", keywords: "pre-roll recording seconds", kind: .number(0...120, 1, "s")),
         Row(key: "LogMaxMB", title: "Largest log copied (a bigger one keeps its end)", section: "Bug reports", keywords: "size logs", kind: .number(1...1024, 1, "MB")),
-        Row(key: "CloudVietnamese", title: "Transcribe Vietnamese with Apple's servers: at “bug stop”, the narration (voice.wav) is sent to Apple to write the description",
+        Row(key: "CloudVietnamese", title: "Transcribe Vietnamese with Apple's servers: at “bug stop”, the narration (voice.wav) is written down on this Mac when it can, and sent to Apple only when it can't",
             section: "Bug reports", keywords: "vietnamese tiếng việt vi-VN cloud server speech dictation", kind: .toggle),
         Row(key: "AllowAgents", title: "Allow AI agents (MCP): Claude Code, Codex and other agents on this Mac can take screenshots, record and search the gallery",
             section: "AI agents", keywords: "mcp claude codex agent automation llm", kind: .toggle),

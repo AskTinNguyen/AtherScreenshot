@@ -382,12 +382,15 @@ enum BugOverlay {
 
 // MARK: - The bundle
 
-// The server transcription of voice.wav (Transcribe Vietnamese with Apple's servers): a seam, so tests see the request.
+// The Vietnamese transcription of voice.wav (Transcribe Vietnamese, D10/D11): a seam, so tests see the request.
 protocol BugTranscriber {
+    func supportsOnDevice(locale: String) -> Bool
     func transcribe(_ wav: URL, locale: String, onDevice: Bool) async throws -> [CaptionWord]
 }
 
 struct AppleSpeech: BugTranscriber {
+    func supportsOnDevice(locale: String) -> Bool { SFSpeechRecognizer(locale: Locale(identifier: locale))?.supportsOnDeviceRecognition ?? false }
+
     func transcribe(_ wav: URL, locale: String, onDevice: Bool) async throws -> [CaptionWord] {
         guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
             throw VideoExport.Failure.failed("Allow Ather Screenshot in System Settings › Privacy & Security › Speech Recognition.")
@@ -415,7 +418,7 @@ final class BugBundle {
     var missingLogs: [String] = []
     var voice = false                     // voice.wav was written
     var voiceStart = 0.0                  // bugClock() of voice.wav's first sample
-    var transcription: (locale: String, error: String?)?  // the server transcription, when asked for
+    var transcription: (locale: String, onDevice: Bool, error: String?)?  // the Vietnamese transcription, when asked for
     enum Clip: String { case none, pending, saved, failed }
     var clip = Clip.none
     var recordingPath = ""
@@ -506,7 +509,7 @@ final class BugBundle {
         }
         s += "- **Clip:** \(clipLine)\n"
         if let t = transcription {
-            s += "- **Transcribed by:** Apple's servers (\(t.locale))" + (t.error.map { ", which failed: \($0)" } ?? "") + "\n"
+            s += "- **Transcribed by:** " + (t.onDevice ? "this Mac" : "Apple's servers") + " (\(t.locale))" + (t.error.map { ", which failed: \($0)" } ?? "") + "\n"
         }
         s += "\n## What was said\n\n"
         let d = bug.description
@@ -560,7 +563,7 @@ final class BugBundle {
         j["clip"] = c
         j["voice"] = voice ? "voice.wav" : NSNull()
         if let t = transcription {
-            var e: [String: Any] = ["locale": t.locale, "on_device": false, "source": "voice.wav"]
+            var e: [String: Any] = ["locale": t.locale, "on_device": t.onDevice, "source": "voice.wav"]
             if let err = t.error { e["error"] = err }
             j["transcription"] = e
         }
@@ -589,13 +592,15 @@ final class BugBundle {
         if !samples.isEmpty { voice = (try? BugBundle.wav(samples, rate: 16000).write(to: folder.appendingPathComponent("voice.wav"))) != nil }
     }
 
-    // With "Transcribe Vietnamese with Apple's servers" on: voice.wav, and only it, goes to the server as vi-VN; what comes
-    // back becomes the description and the captions. `recordingTime` maps bug-clock times onto the recording's.
+    // With "Transcribe Vietnamese" on: voice.wav, and only it, is transcribed as vi-VN, on this Mac when it can, and by
+    // Apple's servers only when it can't (D11). What comes back becomes the description and the captions.
+    // `recordingTime` maps bug-clock times onto the recording's.
     func transcribeVietnamese(_ t: BugTranscriber, recordingTime: (Double) -> Double) async {
         guard voice else { return }
+        let onDevice = t.supportsOnDevice(locale: "vi-VN")
         do {
-            let words = try await t.transcribe(folder.appendingPathComponent("voice.wav"), locale: "vi-VN", onDevice: false)
-            transcription = ("vi-VN", nil)
+            let words = try await t.transcribe(folder.appendingPathComponent("voice.wav"), locale: "vi-VN", onDevice: onDevice)
+            transcription = ("vi-VN", onDevice, nil)
             guard !words.isEmpty else { return }
             bug.words = words.map { CaptionWord(start: voiceStart + $0.start, end: voiceStart + $0.end, text: $0.text) }
             if bug.recording != 0 {
@@ -605,7 +610,7 @@ final class BugBundle {
                 }
             }
         } catch {
-            transcription = ("vi-VN", error.localizedDescription)  // the on-device words (if any) and voice.wav stay
+            transcription = ("vi-VN", onDevice, error.localizedDescription)  // the on-device words (if any) and voice.wav stay
         }
     }
 

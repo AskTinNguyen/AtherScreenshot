@@ -82,7 +82,7 @@ For playtests, as on Windows (see "Bug reports" in the main README): say "bug st
 
 - **Listening** (Settings › Bug reports › Listen for "bug start" / "bug stop", `VoiceCommands`) is off by default. It asks for the Microphone and Speech Recognition once, recognizes on this Mac only, and the menu-bar menu says "Listening for “bug start”" while it's on. A Mac without on-device recognition says so, and ⌃⌥B still works.
 - **Game log paths** (`LogPaths`): files, folders or wildcards separated by `;`, e.g. `~/Library/Logs/MyGame/*.log`. `~`, `$NAME` and `%NAME%` are expanded.
-- **Transcribe Vietnamese with Apple's servers** (`CloudVietnamese`, off by default, Mac only): at "bug stop", only `voice.wav` goes to Apple's speech recognition as Vietnamese, and what comes back becomes the description and the captions. If that fails, the bug keeps what was recognized on the Mac, and `bug.json` says why. With it off, nothing is ever sent.
+- **Transcribe Vietnamese with Apple's servers** (`CloudVietnamese`, off by default, Mac only): at "bug stop", `voice.wav` is transcribed as Vietnamese on this Mac when it can do that on the device, and only otherwise sent to Apple's speech recognition (just `voice.wav`). What comes back becomes the description and the captions. If that fails, the bug keeps what was recognized on the Mac, and `bug.json` says why. With it off, nothing is ever sent.
 
 ## Game controller in recordings
 
@@ -127,7 +127,7 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 - System audio and microphone are recorded as two AAC tracks instead of one mixed track.
 - A recorded region that spans displays is clamped to the display under its center.
 - The game controller overlay reads Xbox, PlayStation and MFi pads directly (Windows uses XInput: Xbox and compatible pads).
-- Bug reports listen with on-device speech recognition (Windows uses Windows speech recognition), can send the narration to Apple for Vietnamese when you allow it, and save the bug's Issue note with the recording for the Windows video editor.
+- Bug reports listen with on-device speech recognition (Windows uses Windows speech recognition), transcribe the narration as Vietnamese when you allow it (on the Mac when it can, otherwise with Apple's servers), and save the bug's Issue note with the recording for the Windows video editor.
 - Updates replace the app bundle (Windows replaces the exe).
 - There is no installer: drag the app to /Applications. "Launch at login" uses SMAppService.
 
