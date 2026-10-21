@@ -4,7 +4,7 @@
 - Worker: `capture-tray-worker`
 - Current step: none
 - Next step: review of the docs (A7); the owner's check on a real PC (A8)
-- PR: none yet
+- PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/11 (draft)
 
 ## Acceptance
 
