@@ -182,6 +182,14 @@ void Window::Build() {
     add(Kind::Number, L"Recording", L"GamepadOpacity", L"Controller opacity", L"Percent: lower lets the video show through", L"100", 10, 100);
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
+    header(L"Bug reports");
+    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug start” / “bug stop”",
+        L"Then describe the bug and say “bug stop”. Keeps the microphone open; nothing leaves this PC", L"0");
+    add(Kind::Text, L"Bugs", L"LogPaths", L"Game log paths",
+        L"Separate with ;  e.g. %LOCALAPPDATA%\\MyGame\\Saved\\Logs\\*.log", L"");
+    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug start”", L"Seconds of the recording before the bug", L"10", 0, 120);
+    add(Kind::Number, L"Bugs", L"LogMaxMB", L"Largest log copied", L"MB; a bigger log keeps only its end", L"20", 1, 1024);
+
     header(L"Scrolling capture & editor");
     add(Kind::Number, L"Scrolling", L"DelayMs", L"Scroll delay", L"Milliseconds to wait after each scroll", L"400", 100, 3000);
     add(Kind::Number, L"Scrolling", L"MaxFrames", L"Maximum frames", L"Stop after this many scroll steps", L"60", 2, 400);
@@ -732,6 +740,40 @@ LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 }  // namespace
+
+BitmapPtr SettingsSnapshot(const SettingsUiHost& host, const std::wstring& query, std::vector<std::wstring>* shown) {
+    if (g_win) return nullptr;  // the window is open: leave it alone
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = Proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kClass;
+    RegisterClassExW(&wc);  // fails harmlessly once registered
+    auto* W = new Window();
+    W->host = host;
+    W->Fonts();
+    W->Build();
+    W->query = query;
+    g_win = W;
+    W->hwnd = CreateWindowExW(0, kClass, L"", WS_POPUP, 0, 0, W->S(kWidth + 2 * kPad), 860, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!W->hwnd) {
+        g_win = nullptr;
+        delete W;
+        return nullptr;
+    }
+    const RECT rc = W->Client();
+    BitmapPtr out = Bitmap::Create(rc.right, rc.bottom);
+    if (out) {
+        MemDC dc(out->Handle());
+        W->Paint(dc);
+    }
+    if (out)
+        for (size_t i = 0, n = (size_t)out->Width() * out->Height(); i < n; ++i) out->Bits()[i] |= 0xFF000000u;
+    if (shown)
+        for (const Row& r : W->rows)
+            if (!IsRectEmpty(&r.rect)) shown->push_back(r.label);
+    DestroyWindow(W->hwnd);  // WM_DESTROY frees W
+    return out;
+}
 
 void ShowSettingsWindow(const SettingsUiHost& host) {
     if (g_win) {

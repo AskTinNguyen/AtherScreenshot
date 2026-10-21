@@ -46,5 +46,8 @@ uint64_t RecordingId();     // changes with every recording started (0 before th
 // `fn` runs once, after the current recording's own `done`, with how it ended (saved, discarded or failed).
 void WhenRecordingFinishes(std::function<void(const RecordResult&)> fn);
 bool RecorderBusy();       // recording or still finalizing the file
+// What the running recording captures: its area on screen (a followed window's frame now), its format and file. False
+// during the countdown and when nothing is recorded.
+bool RecordingTarget(RECT* area, RecordFormat* format, std::wstring* path = nullptr);
 
 }  // namespace ather

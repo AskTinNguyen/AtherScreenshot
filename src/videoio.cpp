@@ -667,6 +667,51 @@ std::vector<double> FrameTimes(const std::wstring& path) {
     return out;
 }
 
+bool AddVideoNotes(const std::wstring& video, std::vector<Note> notes, double fps) {
+    if (notes.empty()) return false;
+    const std::vector<double> times = FrameTimes(video);
+    auto onScreen = [&](double t) {  // the frame on screen at that moment
+        if (times.empty()) return t;
+        const auto it = std::upper_bound(times.begin(), times.end(), t + 1e-6);
+        return it == times.begin() ? times.front() : *(it - 1);
+    };
+    for (Note& n : notes) {
+        n.path = video;
+        n.src = onScreen(n.src);
+        if (n.srcEnd && (n.srcEnd = onScreen(*n.srcEnd)) <= n.src) n.srcEnd.reset();
+    }
+    const std::wstring side = NotesPath(video), tmp = side + L".tmp";
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::vector<Note> all;
+        const bool exists = GetFileAttributesW(side.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (exists) {  // the notes already there stay; a sidecar that can't be read is left as it is
+            std::string text;
+            HANDLE f = CreateFileW(side.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            LARGE_INTEGER size{};
+            bool read = f != INVALID_HANDLE_VALUE && GetFileSizeEx(f, &size) && size.QuadPart < (16 << 20);
+            if (read) {
+                text.resize((size_t)size.QuadPart);
+                DWORD got = 0;
+                read = text.empty() || (ReadFile(f, text.data(), (DWORD)text.size(), &got, nullptr) && got == text.size());
+            }
+            if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+            if (!read || !ParseNotes(text, video, times, fps, &all)) return false;
+        }
+        all.insert(all.end(), notes.begin(), notes.end());
+        const std::string json = NotesJson(video, all, times, fps);
+        HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return false;
+        DWORD wrote = 0;
+        const bool ok = WriteFile(f, json.data(), (DWORD)json.size(), &wrote, nullptr) && wrote == json.size();
+        CloseHandle(f);
+        if (ok && MoveFileExW(tmp.c_str(), side.c_str(), MOVEFILE_WRITE_THROUGH | (exists ? MOVEFILE_REPLACE_EXISTING : 0))) return true;
+        DeleteFileW(tmp.c_str());
+        if (!ok || exists) return false;
+        // Another writer made the sidecar meanwhile: once more, on top of its notes.
+    }
+    return false;
+}
+
 Sequence SequenceOf(const std::wstring& source, const VideoEdit& e) {
     Sequence s;
     s.clips = e.clips;
@@ -2014,10 +2059,8 @@ std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide
 
 // ---------- speech to text ----------
 
-namespace {
-
-bool WriteWav16(const std::wstring& path, const std::vector<int16_t>& pcm, int rate) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+bool WriteWav16(const std::wstring& path, const std::vector<int16_t>& pcm, int rate, bool temporary) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, temporary ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     const uint32_t data = (uint32_t)(pcm.size() * 2);
     struct {
@@ -2042,6 +2085,31 @@ bool WriteWav16(const std::wstring& path, const std::vector<int16_t>& pcm, int r
     return ok;
 }
 
+ISpRecognizer* NewSpeechRecognizer(std::wstring* error) {
+    ComPtr<ISpRecognizer> rec;
+    ComPtr<ISpObjectTokenCategory> cat;
+    ComPtr<ISpObjectToken> token;
+    LPWSTR id = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_SpInprocRecognizer, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&rec));
+    if (SUCCEEDED(hr)) hr = CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&cat));
+    if (SUCCEEDED(hr)) hr = cat->SetId(SPCAT_RECOGNIZERS, FALSE);
+    if (SUCCEEDED(hr)) hr = cat->GetDefaultTokenId(&id);
+    if (SUCCEEDED(hr) && !id) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = CoCreateInstance(CLSID_SpObjectToken, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&token));
+    if (SUCCEEDED(hr)) hr = token->SetId(nullptr, id, FALSE);
+    CoTaskMemFree(id);
+    if (SUCCEEDED(hr)) hr = rec->SetRecognizer(token.Get());
+    if (FAILED(hr)) {
+        if (error)
+            *error = L"Windows speech recognition isn't installed for your language. Add a speech pack in Settings › Time & language › "
+                     L"Speech.";
+        return nullptr;
+    }
+    return rec.Detach();
+}
+
+namespace {
+
 void ClearEvent(SPEVENT& ev) {
     if (ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) reinterpret_cast<IUnknown*>(ev.lParam)->Release();
     else if ((ev.elParamType == SPET_LPARAM_IS_POINTER || ev.elParamType == SPET_LPARAM_IS_STRING) && ev.lParam) CoTaskMemFree((void*)ev.lParam);
@@ -2050,29 +2118,16 @@ void ClearEvent(SPEVENT& ev) {
 
 // SAPI dictation over a 16 kHz mono WAV file. Word times are relative to the file, plus `offset`.
 bool TranscribeWav(const std::wstring& wav, double offset, std::vector<CaptionWord>* words, std::wstring* error) {
-    const std::wstring noEngine =
-        L"Auto captions use Windows speech recognition, which isn't installed for your language. Add a speech pack in "
-        L"Settings › Time & language › Speech, or add captions by hand with T.";
     ComPtr<ISpRecognizer> rec;
-    ComPtr<ISpObjectTokenCategory> cat;
-    ComPtr<ISpObjectToken> token;
-    LPWSTR id = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_SpInprocRecognizer, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&rec))) ||
-        FAILED(CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&cat))) || FAILED(cat->SetId(SPCAT_RECOGNIZERS, FALSE)) ||
-        FAILED(cat->GetDefaultTokenId(&id)) || !id) {
-        if (error) *error = noEngine;
-        return false;
-    }
-    HRESULT hr = CoCreateInstance(CLSID_SpObjectToken, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&token));
-    if (SUCCEEDED(hr)) hr = token->SetId(nullptr, id, FALSE);
-    CoTaskMemFree(id);
-    if (SUCCEEDED(hr)) hr = rec->SetRecognizer(token.Get());
-    if (FAILED(hr)) {
-        if (error) *error = noEngine;
+    rec.Attach(NewSpeechRecognizer(nullptr));
+    if (!rec) {
+        if (error)
+            *error = L"Auto captions use Windows speech recognition, which isn't installed for your language. Add a speech pack in "
+                     L"Settings › Time & language › Speech, or add captions by hand with T.";
         return false;
     }
     ComPtr<ISpStream> stream;
-    hr = CoCreateInstance(CLSID_SpStream, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&stream));
+    HRESULT hr = CoCreateInstance(CLSID_SpStream, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&stream));
     WAVEFORMATEX wfx{WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0};
     if (SUCCEEDED(hr)) hr = stream->BindToFile(wav.c_str(), SPFM_OPEN_READONLY, &SPDFID_WaveFormatEx, &wfx, SPFEI_ALL_EVENTS);
     if (SUCCEEDED(hr)) hr = rec->SetInput(stream.Get(), TRUE);
