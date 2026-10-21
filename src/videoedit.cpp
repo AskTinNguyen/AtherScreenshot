@@ -225,6 +225,16 @@ Motion Motion::Between(AnimStyle inS, AnimStyle outS, double start, double end, 
 
 // ---------- captions from words ----------
 
+bool Clip::SameFootage(const Clip& o) const {
+    Clip a = *this, b = o;
+    a.flipH = a.flipV = b.flipH = b.flipV = false;
+    return a == b;
+}
+
+bool SameFootage(const std::vector<Clip>& a, const std::vector<Clip>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const Clip& x, const Clip& y) { return x.SameFootage(y); });
+}
+
 double ClipsDuration(const std::vector<Clip>& clips) {
     double d = 0;
     for (const auto& c : clips) d += c.Duration();
@@ -1087,10 +1097,17 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw
 
 BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t, bool owned) const { return src ? Draw(*src, &src, t, owned) : nullptr; }
 
+const Clip* FrameRenderer::FlippedAt(double t) const {
+    const auto spot = LocateClip(edit_.clips, t);
+    return spot && edit_.clips[spot->first].Flipped() ? &edit_.clips[spot->first] : nullptr;
+}
+
 BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
-    if (!edit_.Flipped()) return Compose(src, shared, t, owned);
-    // 0. The flip, first: everything else is placed on the flipped picture.
-    const BitmapPtr f = Flipped(src, edit_.flipH, edit_.flipV);
+    const Clip* c = FlippedAt(t);
+    if (!c) return Compose(src, shared, t, owned);
+    // 0. The clip's flip, first: everything else is placed on the flipped picture. (The frame is fitted into the
+    // sequence frame centered, so its bars mirror onto themselves.)
+    const BitmapPtr f = Flipped(src, c->flipH, c->flipV);
     return f ? Compose(*f, &f, t, true) : nullptr;
 }
 
@@ -1231,6 +1248,12 @@ static void PutPicture(Bitmap& dst, const Bitmap& src, VRect to, bool fill) {
         memcpy(dst.Bits() + (size_t)(at.top + y) * dst.Width() + at.left, pic->Bits() + (size_t)y * pic->Width(), (size_t)RectW(at) * 4);
 }
 
+BitmapPtr FrameRenderer::OverlayPicture(const Overlay& o, double t) const {
+    BitmapPtr f = overlayFrame(o, t);
+    if (f && o.clip.Flipped()) f = Flipped(*f, o.clip.flipH, o.clip.flipV);
+    return f;
+}
+
 BitmapPtr FrameRenderer::DrawVideos(const BitmapPtr& framed, double t) const {
     if (!framed) return nullptr;
     const SIZE size{framed->Width(), framed->Height()};
@@ -1241,12 +1264,12 @@ BitmapPtr FrameRenderer::DrawVideos(const BitmapPtr& framed, double t) const {
             if (!out) return nullptr;
             std::fill_n(out->Bits(), (size_t)size.cx * size.cy, 0xFF000000u);
             PutPicture(*out, *framed, MainHalf(o, size), o.fill);
-            if (const BitmapPtr f = overlayFrame(o, t)) PutPicture(*out, *f, OverlayRect(o, size), o.fill);
+            if (const BitmapPtr f = OverlayPicture(o, t)) PutPicture(*out, *f, OverlayRect(o, size), o.fill);
             break;
         }
     for (const auto& o : edit_.overlays)
         if (!o.IsSplit() && o.Active(t))
-            if (const BitmapPtr f = overlayFrame(o, t)) PutPicture(*out, *f, OverlayRect(o, size), true);
+            if (const BitmapPtr f = OverlayPicture(o, t)) PutPicture(*out, *f, OverlayRect(o, size), true);
     return out;
 }
 
@@ -1265,7 +1288,7 @@ void FrameRenderer::DrawOverlays(Bitmap& target, double ox, double oy, POINT at,
 }
 
 bool FrameRenderer::Untouched(double t) const {
-    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy || edit_.Flipped() || HasOverlay(t)) return false;
+    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy || FlippedAt(t) || HasOverlay(t)) return false;
     for (const auto& m : edit_.marks)
         if (m.Active(t) && m.kind != MarkKind::Zoom) return false;
     for (const auto& c : edit_.captions)
@@ -1275,7 +1298,7 @@ bool FrameRenderer::Untouched(double t) const {
 
 std::optional<std::vector<RECT>> FrameRenderer::EditAreas(double t) const {
     const int vx = (int)view_.x, vy = (int)view_.y;
-    if (preview_ || edit_.Flipped() || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_) || HasOverlay(t))
+    if (preview_ || FlippedAt(t) || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_) || HasOverlay(t))
         return std::nullopt;  // flipped: no part is as decoded
     std::vector<RECT> areas;
     auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels: whole 2 × 2 blocks, in the frame
@@ -1887,16 +1910,23 @@ ATHER_TEST(video_overlay_box_and_split_screen) {
 // A flip mirrors the whole picture first, in the preview and the export alike; the crop is taken from the flipped
 // picture; and an export never uses the as-decoded shortcuts while flipped.
 ATHER_TEST(video_flip_mirrors_the_picture) {
+    // Two clips of the timeline, 0–1 s as it is and 1–10 s flipped left–right: only the second one's frames mirror.
+    Clip a;
+    a.w = 640, a.h = 360, a.out = 1, a.length = 10;
+    Clip b = a;
+    b.in = 1, b.out = 10;
+    b.flipH = true;
     VideoEdit e = EditWith({});
-    e.flipH = true;
+    e.clips = {a, b};
     for (bool preview : {false, true}) {
         const auto f = RenderAt(e, 2, preview);
         CHECK(Px(*f, 10, 10).b > 0.9 && Px(*f, 10, 10).r < 0.1);  // the blue right half, now on the left
         CHECK(Px(*f, 630, 10).r > 0.9 && Px(*f, 630, 10).b < 0.1);
+        CHECK(Px(*RenderAt(e, 0.5, preview), 10, 10).r > 0.9);  // the first clip: as it is
     }
     const FrameRenderer r(e, kSize, false);
-    CHECK(!r.Untouched(2));
-    CHECK(!r.EditAreas(2).has_value());
+    CHECK(!r.Untouched(2) && !r.EditAreas(2).has_value());
+    CHECK(r.Untouched(0.5));
     e.crop = VRect{0, 0, 300, 360};  // the left of the flipped picture: blue
     const auto c = RenderAt(e, 2);
     CHECK(c->Width() == 300 && Px(*c, 150, 180).b > 0.9);
@@ -1904,10 +1934,27 @@ ATHER_TEST(video_flip_mirrors_the_picture) {
     const auto tb = Bitmap::Create(640, 360);
     for (int y = 0; y < 360; ++y) std::fill_n(tb->Bits() + (size_t)y * 640, 640, y < 180 ? 0xFF00FF00u : 0xFF000000u);
     VideoEdit v = EditWith({});
-    v.flipV = true;
+    b.flipH = false, b.flipV = true;
+    v.clips = {a, b};
     const auto u = FrameRenderer(v, kSize, false).Render(*tb, 2);
     CHECK(Px(*u, 10, 10).Brightness() < 0.05);
     CHECK(Px(*u, 10, 350).g > 0.9);
+    // A flipped video on top: its picture is mirrored in its box.
+    const auto lr = Bitmap::Create(320, 180);  // green left, black right
+    for (int y = 0; y < 180; ++y)
+        for (int x = 0; x < 320; ++x) lr->Bits()[(size_t)y * 320 + x] = x < 160 ? 0xFF00FF00u : 0xFF000000u;
+    Overlay o;
+    o.clip.w = 320, o.clip.h = 180, o.clip.out = 5, o.clip.length = 5;
+    o.clip.flipH = true;
+    o.pos = {0.5, 0.5};
+    o.width = 0.25;  // 160 × 90 at (320, 180)
+    VideoEdit w = EditWith({});
+    w.overlays = {o};
+    FrameRenderer wr(w, kSize, false);
+    wr.overlayFrame = [&](const Overlay&, double) { return lr; };
+    const auto boxed = wr.Render(*TestFrame(), 2);
+    CHECK(Px(*boxed, 330, 220).Brightness() < 0.05);  // its left: the black right half
+    CHECK(Px(*boxed, 470, 220).g > 0.9);
 }
 
 ATHER_TEST(video_arrow_emoji_and_title) {

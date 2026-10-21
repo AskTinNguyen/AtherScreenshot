@@ -137,9 +137,14 @@ struct Clip {
     int w = 0, h = 0;   // upright size
     double fps = 0;
     bool hasAudio = false;
+    // Its picture mirrored left–right and/or upside down (before anything is drawn on it). Pieces split from it keep it.
+    bool flipH = false, flipV = false;
     double Duration() const { return std::max(0.0, out - in); }
+    bool Flipped() const { return flipH || flipV; }
+    bool SameFootage(const Clip& o) const;  // the same but for the flip: what the decoders and thumbnails care about
     bool operator==(const Clip&) const = default;
 };
+bool SameFootage(const std::vector<Clip>& a, const std::vector<Clip>& b);
 
 // A second video shown together with the timeline's, without its sound: in a box over the picture (picture in
 // picture), or in one half of a split screen with the timeline's video in the other half. It sits at a timeline time,
@@ -178,10 +183,6 @@ struct VideoEdit {
     std::optional<VRect> crop;
     double speed = 1;
     bool muted = false;
-    // Mirrors the whole picture (left–right, top–bottom) before anything else is drawn: the crop and markup are where
-    // they show on the flipped picture (turning a flip on mirrors them, so they stay on their footage).
-    bool flipH = false, flipV = false;
-    bool Flipped() const { return flipH || flipV; }
     std::vector<Caption> captions;
     int captionSize = 2;   // 0…4
     int captionColor = 6;  // text (white)
@@ -302,6 +303,7 @@ public:
     uint64_t settled = 0;        // preview while paused: the selected item shows fully, not mid-animation
 
 private:
+    const Clip* FlippedAt(double t) const;  // the clip showing at `t`, when it's flipped
     BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;     // flips, then Compose
     BitmapPtr Compose(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;  // steps 1–4
     // Draw's steps, on `img` holding the part of the frame from `at` on (source pixels for 1–2, output for 4).
@@ -316,6 +318,7 @@ private:
     void DrawMarks(Bitmap& img, POINT at, double t) const;    // 2. markup on the video
     // 4a. Overlay videos on the output frame: a split screen makes a new frame with `framed` in its half.
     BitmapPtr DrawVideos(const BitmapPtr& framed, double t) const;
+    BitmapPtr OverlayPicture(const Overlay& o, double t) const;  // overlayFrame's, flipped as its clip is
     void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4b. captions, title cards
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;
     std::optional<Placed> RingImage(VRect r) const;

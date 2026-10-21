@@ -630,7 +630,8 @@ public:
 
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
-        if (edit.clips != builtClips) RebuildSequence();
+        if (!SameFootage(edit.clips, builtClips)) RebuildSequence();
+        else builtClips = edit.clips;  // only a flip: the players and thumbnails stay (the renderer and strip flip)
         RequestOverlays(playing ? rawT : paused);
         LoadNotes();
         PlaceNotes();
@@ -1562,12 +1563,13 @@ public:
     std::optional<VPoint> PinOnVideo(const Note& n) const {
         const auto f = NoteFrame(n);
         if (!n.pin || !f || tframes.frames[*f].clip >= edit.clips.size()) return std::nullopt;
-        const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
-        const VPoint at = FlipPin(*n.pin);  // the pin is on the footage, so on a flipped picture it's mirrored too
+        const Clip& c = edit.clips[tframes.frames[*f].clip];
+        const VRect r = ClipFit(c);
+        const VPoint at = FlipPin(*n.pin, c);  // the pin is on the footage, so on a flipped clip it's mirrored too
         return VPoint{r.x + at.x * r.w, r.y + at.y * r.h};
     }
-    // A pin (fractions of the clip's picture) as it shows on the flipped picture, or the other way round.
-    VPoint FlipPin(VPoint p) const { return {edit.flipH ? 1 - p.x : p.x, edit.flipV ? 1 - p.y : p.y}; }
+    // A pin (fractions of the clip's picture) as it shows on the clip's flipped picture, or the other way round.
+    static VPoint FlipPin(VPoint p, const Clip& c) { return {c.flipH ? 1 - p.x : p.x, c.flipV ? 1 - p.y : p.y}; }
 
     void SetCrop(std::optional<VRect> r) {
         const VRect full{0, 0, (double)videoSize.cx, (double)videoSize.cy};
@@ -1728,37 +1730,67 @@ public:
 
     // ---- flip ----
 
+    // What Flip flips: the selected video on top, else the selected clip, else the clip at the playhead.
+    struct FlipTarget {
+        int overlay = -1, clip = -1;
+    };
+    FlipTarget FlipWhat() const {
+        if (const auto oi = SelOverlay()) return {(int)*oi, -1};
+        if (const auto ci = SelClipIndex()) return {-1, (int)*ci};
+        if (const auto spot = LocateClip(edit.clips, Now())) return {-1, (int)spot->first};
+        return {};
+    }
+    const Clip* FlipClip() const {
+        const FlipTarget w = FlipWhat();
+        return w.overlay >= 0 ? &edit.overlays[(size_t)w.overlay].clip : w.clip >= 0 ? &edit.clips[(size_t)w.clip] : nullptr;
+    }
     std::wstring FlipLabel() const {
-        return edit.flipH && edit.flipV ? L"Flipped ↔ ↕" : edit.flipH ? L"Flipped ↔" : edit.flipV ? L"Flipped ↕" : L"Flip";
+        const Clip* c = FlipClip();
+        return !c ? L"Flip" : c->flipH && c->flipV ? L"Flipped ↔ ↕" : c->flipH ? L"Flipped ↔" : c->flipV ? L"Flipped ↕" : L"Flip";
+    }
+    std::wstring FlipTip() const {
+        const FlipTarget w = FlipWhat();
+        if (w.overlay >= 0) return L"Mirror the selected video on top";
+        if (SelClipIndex()) return L"Mirror the selected clip (left–right or upside down)";
+        return edit.clips.size() > 1 ? L"Mirror the clip at the playhead (select a clip to pick another)" : L"Mirror the video (left–right or upside down)";
     }
     std::vector<MenuItem> FlipMenu() {
+        const Clip* c = FlipClip();
         MenuItem h;
         h.label = L"Flip horizontally (mirror left–right)";
-        h.checked = edit.flipH;
+        h.checked = c && c->flipH;
+        h.enabled = c != nullptr;
         h.run = [this] { ToggleFlip(true); };
         MenuItem v;
         v.label = L"Flip vertically (upside down)";
-        v.checked = edit.flipV;
+        v.checked = c && c->flipV;
+        v.enabled = c != nullptr;
         v.run = [this] { ToggleFlip(false); };
         return {h, v};
     }
-    // One undo step: the picture mirrored one way, and the crop and markup with it, so they stay on the same footage.
-    // Captions stay where they are on screen; notes keep their spot on the footage (PinOnVideo mirrors it).
+    // One undo step: one clip's (or video on top's) picture mirrored one way. On a clip, the markup that sits wholly
+    // on it is mirrored with it, so it stays on the same footage; the crop (all clips share it) and captions stay put;
+    // notes keep their spot on the footage (PinOnVideo mirrors it).
     void ToggleFlip(bool horizontal) {
+        const FlipTarget w = FlipWhat();
+        if (w.overlay < 0 && w.clip < 0) return;
         PushUndo();
+        if (w.overlay >= 0) {
+            Clip& c = edit.overlays[(size_t)w.overlay].clip;
+            (horizontal ? c.flipH : c.flipV) ^= true;
+            return Changed();
+        }
+        const size_t i = (size_t)w.clip;
+        const double t0 = ClipStart(edit.clips, i), t1 = t0 + edit.clips[i].Duration();
         const double W = videoSize.cx, H = videoSize.cy;
         auto mirror = [&](VPoint& p) { (horizontal ? p.x : p.y) = (horizontal ? W - p.x : H - p.y); };
-        for (auto& m : edit.marks) {
-            mirror(m.a);
-            mirror(m.b);
-        }
-        if (edit.crop) {
-            VRect c = *edit.crop;
-            if (horizontal) c.x = W - c.MaxX();
-            else c.y = H - c.MaxY();
-            edit.crop = c;
-        }
-        (horizontal ? edit.flipH : edit.flipV) ^= true;
+        for (auto& m : edit.marks)
+            if (m.start >= t0 - 1e-6 && m.end <= t1 + 1e-6) {
+                mirror(m.a);
+                mirror(m.b);
+            }
+        Clip& c = edit.clips[i];
+        (horizontal ? c.flipH : c.flipV) ^= true;
         Changed();
     }
 
@@ -2218,7 +2250,8 @@ public:
             };
             x = r.right + S(4);
         }
-        r = Button(dc, g, x, y, h, 0, FlipLabel(), true, edit.Flipped(), [] {}, L"Mirror the video left–right or upside down");
+        const Clip* flipping = FlipClip();
+        r = Button(dc, g, x, y, h, 0, FlipLabel(), true, flipping && flipping->Flipped(), [] {}, FlipTip());
         {
             const RECT fr = r;
             hots.back().click = [this, fr] { Popup(fr, FlipMenu()); };
@@ -2792,9 +2825,17 @@ public:
         (void)w2;
     }
 
-    // A timeline picture stretched into place, mirrored as the edit flips the video (the frames are decoded as they are).
-    void PutThumb(HDC dc, int x, int y, int w, int h, HDC src, int sw, int sh) const {
-        StretchBlt(dc, edit.flipH ? x + w - 1 : x, edit.flipV ? y + h - 1 : y, edit.flipH ? -w : w, edit.flipV ? -h : h, src, 0, 0, sw, sh, SRCCOPY);
+    // A timeline picture stretched into place, mirrored as its clip `c` is flipped (the frames are decoded as they are).
+    void PutThumb(HDC dc, int x, int y, int w, int h, HDC src, int sw, int sh, const Clip* c) const {
+        const bool fh = c && c->flipH, fv = c && c->flipV;
+        StretchBlt(dc, fh ? x + w - 1 : x, fv ? y + h - 1 : y, fh ? -w : w, fv ? -h : h, src, 0, 0, sw, sh, SRCCOPY);
+    }
+    const Clip* ClipAt(double t) const {
+        const auto spot = LocateClip(edit.clips, t);
+        return spot ? &edit.clips[spot->first] : nullptr;
+    }
+    const Clip* ClipOfFrame(size_t n) const {
+        return n < tframes.size() && tframes.frames[n].clip < edit.clips.size() ? &edit.clips[tframes.frames[n].clip] : nullptr;
     }
 
     void PaintTimeline(HDC dc, gp::Graphics& g) {
@@ -2817,7 +2858,7 @@ public:
                 const auto it = stripThumbs.find(tile.frame);
                 if (it == stripThumbs.end() || !it->second) continue;  // still coming: the strip's own color meanwhile
                 MemDC src(it->second->Handle());
-                PutThumb(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, it->second->Width(), it->second->Height());
+                PutThumb(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, it->second->Width(), it->second->Height(), ClipOfFrame(tile.frame));
             }
             for (const auto& tile : tiles) {  // a hairline between tiles
                 const int x = (int)std::lround(TX(tile.t0));
@@ -2840,7 +2881,7 @@ public:
                 HRGN cr = CreateRectRgnIndirect(&cell);
                 ExtSelectClipRgn(dc, cr, RGN_AND);
                 MemDC src(img->Handle());  // fitted: each of the 16 shows the frame at its middle
-                PutThumb(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, img->Width(), img->Height());
+                PutThumb(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, img->Width(), img->Height(), ClipAt(D * (i + 0.5) / thumbs.size()));
                 SelectClipRgn(dc, clip);
                 DeleteObject(cr);
             }
@@ -3015,7 +3056,8 @@ public:
         FillRR(g, r, (float)S(4), sel ? A(theme::kAccent, alpha) : gp::Color((BYTE)(46 * alpha / 255), 255, 255, 255));
         HRGN clip = CreateRectRgn(r.left + S(3), r.top, r.right - S(3), r.bottom);
         SelectClipRgn(dc, clip);
-        Text(dc, fSmall, FileNameOf(c.path) + L"  " + Clock(c.Duration()), {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
+        const std::wstring flips = std::wstring(c.flipH ? L"  ↔" : L"") + (c.flipV ? L"  ↕" : L"");  // flipped, at a glance
+        Text(dc, fSmall, FileNameOf(c.path) + L"  " + Clock(c.Duration()) + flips, {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
         SelectClipRgn(dc, nullptr);
         DeleteObject(clip);
     }
@@ -3221,8 +3263,9 @@ public:
             const Note& n = edit.notes[*ni];
             if (const auto f = NoteFrame(n); f && tframes.frames[*f].clip < edit.clips.size()) {
                 ReleaseCapture();
-                const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
-                const VPoint pin = FlipPin({std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)});
+                const Clip& c = edit.clips[tframes.frames[*f].clip];
+                const VRect r = ClipFit(c);
+                const VPoint pin = FlipPin({std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)}, c);
                 UpdateNote([pin](Note& x) { x.pin = pin; });
                 if (FrameNow() != *f) GoToFrame(*f);
                 return;
@@ -5720,8 +5763,9 @@ ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
     DestroyWindow(e->hwnd);
 }
 
-// Flip in the editor: each way is one undo step that mirrors the crop and markup with the picture (they stay on their
-// footage); a note's pin stays on its spot of the footage; and a saved video is the mirror image of the unflipped one.
+// Flip flips one clip: the selected one, else the one at the playhead; one undo step each way. Markup that sits wholly
+// on that clip is mirrored with it, the crop (every clip shares it) isn't; a note's pin stays on its spot of the
+// footage; a selected video on top flips by itself. Saved, that clip's frames are mirror images, the others as they were.
 ATHER_TEST(video_editor_flip) {
     const std::wstring dir = test::TempDir();
     const std::wstring clip = dir + L"/numbers.mp4";
@@ -5729,58 +5773,95 @@ ATHER_TEST(video_editor_flip) {
     VideoEditor* e = OpenHidden(clip, 1180, 760);
     CHECK(e != nullptr);
     if (!e) return;
-    CHECK(e->FlipLabel() == L"Flip");
-    e->AddMark(MarkKind::Box);
-    e->edit.marks.back().a = {20, 30};
-    e->edit.marks.back().b = {120, 90};
+    e->Seek(0.75);
+    e->SplitAtPlayhead();  // [0, 0.75) and [0.75, 1.5), the second selected
+    CHECK(e->edit.clips.size() == 2);
+    auto box = [&](double s0, double e0) {
+        e->Seek(s0);
+        e->AddMark(MarkKind::Box);
+        Mark& m = e->edit.marks.back();
+        m.start = s0, m.end = e0, m.a = {20, 30}, m.b = {120, 90};
+    };
+    box(0.9, 1.3);  // on the second clip
+    box(0.1, 0.5);  // on the first
     e->edit.crop = VRect{0, 0, 400, 300};
+    e->SelectClip(e->edit.clips[1].id);
+    CHECK(e->FlipLabel() == L"Flip");
     e->ToggleFlip(true);
-    CHECK(e->edit.flipH && !e->edit.flipV);
-    CHECK_NEAR(e->edit.marks.back().a.x, 620, 1e-9);
-    CHECK_NEAR(e->edit.marks.back().b.x, 520, 1e-9);
-    CHECK_NEAR(e->edit.crop->x, 240, 1e-9);
+    CHECK(!e->edit.clips[0].flipH && e->edit.clips[1].flipH);
+    CHECK(e->FlipLabel() == L"Flipped ↔");
+    CHECK_NEAR(e->edit.marks[0].a.x, 620, 1e-9);
+    CHECK_NEAR(e->edit.marks[1].a.x, 20, 1e-9);
+    CHECK_NEAR(e->edit.crop->x, 0, 1e-9);
     e->ToggleFlip(false);
-    CHECK(e->edit.flipH && e->edit.flipV);
-    CHECK_NEAR(e->edit.marks.back().a.y, 330, 1e-9);
-    CHECK_NEAR(e->edit.crop->y, 60, 1e-9);
+    CHECK(e->edit.clips[1].flipH && e->edit.clips[1].flipV);
+    CHECK_NEAR(e->edit.marks[0].a.y, 330, 1e-9);
     e->Undo();
-    CHECK(e->edit.flipH && !e->edit.flipV);
     e->Undo();
-    CHECK(!e->edit.flipH && e->edit.marks.back().a == (VPoint{20, 30}) && e->edit.crop->x == 0);
-    // A pin a quarter in from the left of the footage shows a quarter in from the right once flipped.
-    e->Seek(0.5);
+    CHECK(!e->edit.clips[1].Flipped() && e->edit.marks[0].a == (VPoint{20, 30}));
+    // Nothing selected: the clip at the playhead.
+    e->SelectClip(std::nullopt);
+    e->Seek(0.3);
+    e->ToggleFlip(true);
+    CHECK(e->edit.clips[0].flipH && !e->edit.clips[1].flipH);
+    e->Undo();
+    // A pin a quarter in from the left of the footage shows a quarter in from the right once its clip is flipped.
+    e->Seek(1.0);
     e->AddNote();
     e->edit.notes.back().pin = VPoint{0.25, 0.5};
+    e->SelectClip(e->edit.clips[1].id);
     e->ToggleFlip(true);
     if (const auto p = e->PinOnVideo(e->edit.notes.back())) CHECK_NEAR(p->x, 480, 1);
     else CHECK(false);
-    // Saved: the mirror image of the same frame saved unflipped.
+    // A selected video on top flips by itself.
+    if (const auto oc = ClipOf(clip)) {
+        e->AddOverlay(*oc, 0, OverlayLayout::Pip);
+        e->ToggleFlip(true);
+        CHECK(e->edit.overlays.size() == 1 && e->edit.overlays[0].clip.flipH && e->edit.clips[1].flipH && !e->edit.clips[0].flipH);
+        e->Undo();
+        e->Undo();
+    }
+    CHECK(e->edit.overlays.empty());
+    // Saved: the second clip's frames mirror the unflipped save's, the first clip's match them.
     e->edit.marks.clear();
     e->edit.crop.reset();
     e->edit.notes.clear();
-    auto saveFrame = [&](bool flip) -> BitmapPtr {
-        e->edit.flipH = flip;
-        const std::wstring out = dir + (flip ? L"/flipped.mp4" : L"/plain.mp4");
-        if (!ExportMp4(clip, e->edit, out, nullptr)) return nullptr;
-        BitmapPtr f;
-        return ProbeVideo(out, nullptr, 0.5, 0, &f) ? f : nullptr;
+    auto frames = [&](const VideoEdit& ed, const wchar_t* name) {
+        std::pair<BitmapPtr, BitmapPtr> f;
+        const std::wstring out = dir + name;
+        if (ExportMp4(clip, ed, out, nullptr)) {
+            ProbeVideo(out, nullptr, 0.4, 0, &f.first);
+            ProbeVideo(out, nullptr, 1.1, 0, &f.second);
+        }
+        return f;
     };
-    const BitmapPtr plain = saveFrame(false), flipped = saveFrame(true);
-    CHECK(plain && flipped);
-    if (plain && flipped && plain->Width() == 640 && flipped->Width() == 640) {
-        int mirrored = 0, same = 0, n = 0;
+    VideoEdit plainEdit = e->edit;
+    for (auto& c : plainEdit.clips) c.flipH = c.flipV = false;
+    const auto plain = frames(plainEdit, L"/plain.mp4"), flipped = frames(e->edit, L"/flipped.mp4");
+    // Of a grid of points on `a`: how many match `b` at the same spot, and at the mirrored one.
+    auto compare = [](const BitmapPtr& a, const BitmapPtr& b, int* same, int* mirrored) {
+        *same = *mirrored = 0;
+        auto close = [](uint32_t p, uint32_t q) {
+            for (int sh : {0, 8, 16})
+                if (std::abs((int)((p >> sh) & 255) - (int)((q >> sh) & 255)) > 40) return false;
+            return true;
+        };
+        int n = 0;
         for (int y = 8; y < 360; y += 16)
-            for (int x = 4; x < 640; x += 12) {
-                auto close = [](uint32_t a, uint32_t b) {
-                    for (int sh : {0, 8, 16})
-                        if (std::abs((int)((a >> sh) & 255) - (int)((b >> sh) & 255)) > 40) return false;
-                    return true;
-                };
-                ++n;
-                mirrored += close(flipped->Pixel(x, y), plain->Pixel(639 - x, y));
-                same += close(flipped->Pixel(x, y), plain->Pixel(x, y));
+            for (int x = 4; x < 640; x += 12, ++n) {
+                *same += close(a->Pixel(x, y), b->Pixel(x, y));
+                *mirrored += close(a->Pixel(x, y), b->Pixel(639 - x, y));
             }
-        test::Note("mirrored " + std::to_string(mirrored) + ", same " + std::to_string(same) + " of " + std::to_string(n));
+        return n;
+    };
+    CHECK(plain.first && plain.second && flipped.first && flipped.second);
+    if (plain.first && plain.second && flipped.first && flipped.second && plain.first->Width() == 640 && flipped.first->Width() == 640) {
+        int same = 0, mirrored = 0;
+        const int n = compare(flipped.first, plain.first, &same, &mirrored);
+        test::Note("first clip: same " + std::to_string(same) + ", mirrored " + std::to_string(mirrored) + " of " + std::to_string(n));
+        CHECK(same > n * 9 / 10);
+        compare(flipped.second, plain.second, &same, &mirrored);
+        test::Note("second clip: same " + std::to_string(same) + ", mirrored " + std::to_string(mirrored) + " of " + std::to_string(n));
         CHECK(mirrored > n * 9 / 10);
         CHECK(same < mirrored);
     }
