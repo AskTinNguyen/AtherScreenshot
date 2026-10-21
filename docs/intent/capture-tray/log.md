@@ -38,3 +38,10 @@ The Art team's wish became this intent (issue #9), rev 1 with proposed defaults 
 > A: Yes, Mac opt-in
 
 CI artifacts may be downloaded, so Windows snapshot proofs can be checked from the runner's artifact. (The Vietnamese answer applies to `bug-report`.)
+
+## R-1 (2026-10-21 16:35) | orchestrator review at dda08ea (#11) | -> rev unchanged
+
+- **A5 (snapshot):** passes after one fix. `editor-tray.png` shows the five-picture strip: the current picture outlined, one unticked, one saved, `Save selected (3)`, and "Picture 3 of 5" in the status bar, which earlier showed the hovered picture's tip.
+  - The toolbar overlap at the top right comes from the runner's 1024×768 display. It's pixel-identical in the one-picture snapshot, so it isn't from this feature.
+- **A7 (docs):** passes. README covers the Features row, the "Capture tray" guide part (with "set After capture to Open in editor") and the keys; `macos/README.md` and RELEASE_NOTES are updated too.
+- **Runner baseline:** the 11 failures are fixed in #13 (Mp4Writer without B-frames, `110 tests, 1675 checks, 0 failed`). This branch should merge it and show `0 failed`.
