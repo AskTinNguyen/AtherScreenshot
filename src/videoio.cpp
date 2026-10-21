@@ -2599,6 +2599,8 @@ ATHER_TEST(video_frame_times_match_the_decoded_frames) {
     const std::vector<double> s = FrameTimes(steady);
     CHECK_EQ(s.size(), 60u);
     CHECK(s.size() == 60 && std::fabs(s[59] - 59 / 60.0) < 1e-4);
+    // Whichever encoder wrote it (the software one too, which would reorder B-frames a frame late): it starts at 0.
+    CHECK(!s.empty() && std::fabs(s[0]) < 1e-6);
     CHECK(FrameTimes(dir + L"\\missing.mp4").empty());
 }
 
