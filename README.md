@@ -49,6 +49,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
+| 🐞 **Bug reports** | Say "bug start", describe the bug, say "bug stop": one folder with the screenshot and what you said on it, a clip of the recording, your narration and the game's logs ([how](#bug-reports)) |
 | 🔍 **Review video** | Step 60 fps recordings frame by frame, leave notes on exact frames, and save a review video with the notes in it for another team (Windows) |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
@@ -71,6 +72,7 @@ OCR, tags and search run on your computer. Upload is off until you set it up. Au
 | Capture and upload | `⌃⌥U` | `Ctrl+Alt+U` |
 | Capture gallery | `⌃⌥H` | `Ctrl+Alt+H` |
 | Record MP4 / GIF (press again to stop) | `⌃⌥5` / `⌃⌥G` | `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` |
+| Bug report: start / stop | `⌃⌥B` | `Ctrl+Alt+B` |
 
 macOS reserves `⌘⇧3/4/5`, so the Mac defaults use `⌃⌥`. In the gallery and editors, `Ctrl` on Windows replaces `⌘` on the Mac.
 
@@ -145,6 +147,26 @@ Select a region, or use "Record a window", which follows one window wherever it 
 - **Click and keystroke overlay:** click ripples (`ShowClicks`) and a keystroke pill (`ShowKeys`, off by default because it would show anything you type, including passwords).
 - **Game controller overlay:** with "Show game controller" on (`ShowGamepad`), a connected Xbox-style (XInput) controller is drawn in a corner of the video, like OBS's Input Overlay: a white controller whose sticks move, triggers fill and buttons light up as you use them. Pick the corner with `GamepadCorner` and how visible it is with "Controller opacity" (`GamepadOpacity`, 10–100%). Nothing is drawn while no controller is connected. PlayStation controllers show up when Steam Input or DS4Windows presents them as XInput.
 - When a recording finishes, the file is copied to the clipboard so you can paste it into chats.
+
+### Bug reports
+
+For playtests: while the game is recorded, say "bug start", describe the bug, then say "bug stop". Ather Screenshot makes one folder for the bug, and you keep playing.
+
+- **Start and stop:** say "bug start" and "bug stop", or press `Ctrl+Alt+B` once to start and again to stop ("Bug report: start / stop" in the palette). "Bug cancel" throws the bug away. A bug left open stops itself after 2 minutes. A short "Bug started" / "Bug saved" notification shows each step without taking focus from the game.
+- **Listening is opt-in:** turn on Settings › Bug reports › **Listen for "bug start" / "bug stop"** (`[Bugs] VoiceCommands`). It keeps the microphone open while it's on, and the tray icon's tooltip says so. Windows speech recognition does the listening on this PC; nothing is uploaded. The shortcut works with listening off, but then nothing you say is written down.
+- **What's in the folder** (`<captures>\Bugs\<date time> <first words>\`):
+  - `bug.png`: the screenshot from "bug start" with a bar along the bottom: `BUG · date time · app`, then what you said (up to 6 lines).
+  - `screenshot.png`: the same screenshot without the bar. It shows what's being recorded, or else the monitor with the game.
+  - `clip.mp4`: with a recording running, from 10 s before "bug start" (`[Bugs] PreRollSeconds`) to "bug stop", with what you said as captions. A recording can't be read while it runs, so the clip is made when you stop it; until then `bug.md` says "Clip: when the recording stops". Pauses are left out of the times, as in the recording.
+  - `voice.wav`: what the microphone heard between "bug start" and "bug stop", so nothing is lost, also in a language Windows can't write down.
+  - `logs\`: the game's logs (below).
+  - `bug.md` for people and `bug.json` for tools: the title (the first sentence), time, app and window, what was said with each word's time, the recording and the bug's place in it, and the files.
+- **Game logs:** Settings › Bug reports › **Game log paths** (`[Bugs] LogPaths`) takes files, folders or wildcards separated by `;`, with environment variables, e.g. `%LOCALAPPDATA%\MyGame\Saved\Logs\*.log`.
+  - At "bug stop" each file named is copied, also while the game is still writing it.
+  - From a folder or wildcard come the files changed in the last 30 minutes, or the newest one if none was (at most 20).
+  - A log over `[Bugs] LogMaxMB` (20 MB) keeps only its end, and `bug.json` says so. A path that matches nothing is listed in `bug.md`.
+- **In the recording:** each bug is also an Issue note over its stretch of the recording (`<video>.notes.json`), so the video editor shows it on its frames.
+- **Sharing:** "Copy last bug report" puts `bug.png`, `clip.mp4`, `bug.md` and up to 10 logs on the clipboard as files, ready to paste into Slack. Click "Bug saved" to open the bug's folder, or use "Open bug reports folder". The pictures and the clip show in the gallery tagged `bug`.
 
 ### Video editor
 
@@ -344,6 +366,10 @@ How the Windows app differs from the Mac app:
 - **Recording:**
   - System audio and microphone are mixed into one AAC track (two tracks on the Mac).
   - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.
+- **Bug reports:**
+  - Windows recognizes "bug start" / "bug stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses on-device speech recognition.
+  - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it sends `voice.wav` to Apple to write the description. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
+  - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 
 ## Build from source
