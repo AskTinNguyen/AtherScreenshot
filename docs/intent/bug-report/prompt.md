@@ -1,6 +1,6 @@
 # Bug Report: "Bug Start" / "Bug Stop" Make One Bug Bundle (Picture with What Was Said, Clip, Game Logs)
 
-- Rev: 2
+- Rev: 3
 - Status: active
 - Area: Recording
 - Owner: AskTinNguyen
@@ -104,6 +104,7 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording, saved fi
   - When it's off, nothing is ever sent: recognition stays on-device only (D1).
   - If the server transcription fails or is unavailable, the bug keeps the on-device words (if any) and `voice.wav`, and `bug.json` notes the failure.
   - Windows has no equivalent: its offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav` (F-2 (b)).
+- **D11 (rev 3): on-device Vietnamese first.** Source: F-4, R-1. With "Transcribe Vietnamese with Apple's servers" on, `voice.wav` is first transcribed as `vi-VN` on the Mac when on-device recognition supports it. It goes to Apple's servers only when it doesn't. This only ever sends less than D10 allowed, so the orchestrator accepted it within the owner's opt-in (L-2). The setting's description says so.
 
 ## Acceptance
 
@@ -164,6 +165,8 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording, saved fi
   - Put the feature in new files: `src/bugreport.*`, and on the Mac `BugReport.swift`.
 
 ## Changelog
+
+- rev 3 (2026-10-21): from R-1. F-4 accepted as D11: on-device `vi-VN` first, servers only as the fallback. Runner baseline failures are fixed separately (`intent/runner-video-tests`).
 
 - rev 2 (2026-10-21): from L-2. D10 adds an opt-in Mac setting that transcribes Vietnamese narration with Apple's servers (F-2 (d) accepted). A7 covers it. CI artifacts may be downloaded (L-2).
 

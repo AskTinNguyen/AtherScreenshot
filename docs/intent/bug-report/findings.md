@@ -34,11 +34,11 @@ Recommendation: (a)–(c) now (as in rev 1), and ask the owner about (d).
 **Proposed amendment:** none to the intent. A7's voice recognition and a real Vietnamese transcription are `owner`, as A7 says: turn on Settings › Bug reports › Listen for "bug start" / "bug stop" in the Mac app (it asks for the Microphone and Speech Recognition once), say "bug start … bug stop" twice, and check both bundles (part of A9). Optionally, allowing Speech Recognition for the terminal that runs `xcrun swift test` makes the test run.
 **Resolution:**
 
-## F-4 (2026-10-21, rev 2) | blocking: no | status: open
+## F-4 (2026-10-21, rev 2) | blocking: no | status: accepted
 
 **Found (worker):** this Mac (macOS 27.0.1, Apple silicon) reports `SFSpeechRecognizer(locale: vi-VN).supportsOnDeviceRecognition == true` (and for en-US). So Vietnamese can be recognized on the Mac itself, without Apple's servers, at least on recent macOS. D10 as written always sends `voice.wav` to the server when "Transcribe Vietnamese with Apple's servers" is on.
 **Proposed amendment (owner, privacy):**
 - (a) Keep D10 as built: the opt-in always uses the server (simple; the setting's name says what happens).
 - (b) Recommended: with the setting on, transcribe `voice.wav` as `vi-VN` on the Mac when `supportsOnDeviceRecognition` is true, and use the server only when it isn't. The setting could then read "Transcribe Vietnamese (with Apple's servers when this Mac can't)". Narration then leaves the Mac only where it has to.
 - (c) Add a separate, default-on "Transcribe Vietnamese on this Mac" when on-device vi-VN exists, and keep the server opt-in for older Macs.
-**Resolution:**
+**Resolution:** accepted as D11 in rev 3 (R-1): on-device first, servers only as the fallback.

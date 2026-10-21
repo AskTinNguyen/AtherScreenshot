@@ -38,3 +38,12 @@ Wish 3 became this intent (issue #8), rev 1 with proposed defaults D1–D9. Wish
 > A: Yes, Mac opt-in
 
 Rev 2: D10 (opt-in Mac cloud transcription for Vietnamese narration), F-2 (d) accepted. CI artifacts may be downloaded.
+
+## R-1 (2026-10-21 16:20) | orchestrator review at the PR head (#12) | -> rev 3
+
+- **A5, A6, A7 (snapshots):** pass.
+  - The Settings › Bug reports section lists the four settings and three shortcuts, and its wording says the microphone stays open and nothing leaves the PC.
+  - `bug.png` has the `BUG · date · app` header and the wrapped description on a dark bar.
+- **A8 (docs):** passes.
+- **A1–A5 gate lines:** the runner's 11–12 failures are the baseline video tests. They're caused by Windows' software H.264 encoder writing B-frames one frame late, and fixed in `intent/runner-video-tests`. The items stay met on the evidence that every bug-report test passes and the failures equal the baseline set. A Check run with that fix merged in should read `0 failed`.
+- **F-4:** accepted as D11 (on-device `vi-VN` first), since it only reduces what is sent.
