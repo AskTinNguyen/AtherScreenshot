@@ -788,9 +788,30 @@ public:
         if (n < tframes.size()) Seek(tframes.frames[n].t);
     }
 
+    // ---- loop ----
+    // On, playback goes back to the start of the loop at its end instead of stopping: the selected clip (as much of it as
+    // is in the trim), else the trim. Review playback (J/L) wraps the same way. A preview setting, not part of the edit;
+    // it stays on for the next video opened.
+    static inline bool lastLoop = false;
+    bool loop = lastLoop;
+    int loops = 0;  // tests: times playback went round
+    std::pair<double, double> LoopRange() const {
+        double a = edit.trimStart, b = edit.trimEnd;
+        if (const auto i = SelClipIndex()) {
+            const double c0 = ClipStart(edit.clips, *i), c1 = c0 + edit.clips[*i].Duration();
+            if (std::max(a, c0) < std::min(b, c1) - 0.05) a = std::max(a, c0), b = std::min(b, c1);
+        }
+        return {a, b};
+    }
+    void ToggleLoop() {
+        lastLoop = loop = !loop;
+        Invalidate();
+    }
+
     void Play() {
         if (!player) return;
-        if (Now() < edit.trimStart || Now() >= edit.trimEnd - 0.05) Seek(edit.trimStart);
+        const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
+        if (Now() < from || Now() >= to - 0.05) Seek(from);
         player->Seek(paused);
         player->SetRate(edit.speed);
         player->SetMuted(edit.muted);
@@ -866,9 +887,14 @@ public:
         const double now = Seconds();
         if (now < reviewDue) return;
         const size_t n = tframes.Nearest(paused);
-        const size_t first = tframes.At(edit.trimStart + 1e-3), last = tframes.At(edit.trimEnd - 1e-3);
-        if ((reviewDir > 0 && n >= last) || (reviewDir < 0 && n <= first)) return StopReview();  // at the trim's end
-        const size_t next = reviewDir > 0 ? n + 1 : n - 1;
+        const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
+        const size_t first = tframes.At(from + 1e-3), last = tframes.At(to - 1e-3);
+        size_t next = reviewDir > 0 ? n + 1 : n - 1;
+        if ((reviewDir > 0 && n >= last) || (reviewDir < 0 && n <= first)) {  // at the end: round again, or stop
+            if (!loop) return StopReview();
+            next = reviewDir > 0 ? first : last;
+            ++loops;
+        }
         GoToFrame(next);
         reviewDue = std::max(reviewDue + FrameStep(n, reviewDir), now);  // no catching up by skipping
         ++reviewFrames;
@@ -919,7 +945,14 @@ public:
                 Rerender();
                 Invalidate();  // only when there's a new frame (the playhead moves with it)
             }
-            if (player->Now() >= edit.trimEnd - 0.01 || !player->Playing()) {
+            const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
+            const bool atEnd = player->Now() >= to - 0.01;
+            if (loop && atEnd) {  // round again, still playing
+                player->Seek(from);
+                if (!player->Playing()) player->Play();
+                KeepOnView(from);
+                ++loops;
+            } else if (atEnd || !player->Playing()) {
                 Pause();
                 Seek(edit.trimStart);
             }
@@ -2982,6 +3015,12 @@ public:
         if (EqualRect(&play, &hoverRect)) FillRR(g, play, (float)S(6), A(theme::kBgRaised));
         Text(dc, fIcon, playing || reviewDir ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         Hotspot(play, [this] { TogglePlay(); }, L"Play / pause (Space)");
+        const RECT loopBtn{play.right + S(4), play.top, play.right + S(4) + S(34), play.bottom};  // round and round
+        if (loop) FillRR(g, loopBtn, (float)S(6), A(theme::kSelected));
+        else if (EqualRect(&loopBtn, &hoverRect)) FillRR(g, loopBtn, (float)S(6), A(theme::kBgRaised));
+        Text(dc, fIcon, L"\xE8EE", loopBtn, loop ? theme::kAccent : theme::kTextDim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Hotspot(loopBtn, [this] { ToggleLoop(); },
+                loop ? L"Loop is on (Ctrl+L): plays the selected clip, or the trim, over and over" : L"Loop (Ctrl+L): play the selected clip, or the trim, over and over");
         Text(dc, fMono, tframes.empty() ? Clock(Now()) : tframes.Timecode(FrameNow()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)},
              theme::kTextDim);
         Text(dc, fMono, Clock(edit.OutputDuration()) + L" out", {S(12), play.bottom + S(24), tr.left - S(4), play.bottom + S(40)}, theme::kMuted);
@@ -3756,6 +3795,7 @@ public:
                 case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
                 case 'G': BeginGoTo(); return true;
+                case 'L': ToggleLoop(); return true;
                 case VK_OEM_PLUS:
                 case VK_ADD: ZoomTimeline(1.5); return true;
                 case VK_OEM_MINUS:
@@ -4700,6 +4740,10 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         Pump(300);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-flip.png");
         e->Undo();
+        e->ToggleLoop();  // the Loop button, on
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-loop.png");
+        e->ToggleLoop();
         Pump(300);
         // Notes of every kind, one resolved, the selected one pinned.
         struct Spec {
@@ -5759,6 +5803,70 @@ ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
     for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
     CHECK(FileNameOf(e->lastReviewOut) == L"shot 60 review 2.mp4");
     CHECK(GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Loop: playback goes round the trim (or the selected clip) instead of stopping at its end, still playing; review
+// playback (L at a slower speed) wraps too; off, playback stops at the end as before. Ctrl+L toggles it.
+ATHER_TEST(video_editor_loop) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 2, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const bool before = VideoEditor::lastLoop;
+    if (e->loop) e->ToggleLoop();
+    e->Key('L', {true, false, false});  // Ctrl+L
+    CHECK(e->loop);
+    // Round the trim 0.3–0.9.
+    e->edit.trimStart = 0.3;
+    e->edit.trimEnd = 0.9;
+    e->Changed();
+    e->Seek(0.3);
+    e->Play();
+    Pump(1600);
+    test::Note("loops " + std::to_string(e->loops) + ", now " + std::to_string(e->Now()));
+    CHECK(e->loops >= 1);
+    CHECK(e->playing);
+    CHECK(e->Now() >= 0.25 && e->Now() <= 0.95);
+    e->Pause();
+    // Round the selected clip: the second half of a split.
+    e->edit.trimStart = 0;
+    e->edit.trimEnd = e->duration;
+    e->Seek(1.0);
+    e->SplitAtPlayhead();  // [0, 1) and [1, 2), the second selected
+    CHECK(e->SelClipIndex() == 1u);
+    CHECK_NEAR(e->LoopRange().first, 1.0, 0.02);
+    e->loops = 0;
+    e->Seek(1.5);
+    e->Play();
+    Pump(1500);
+    CHECK(e->loops >= 1 && e->playing && e->Now() >= 0.95);
+    e->Pause();
+    // Review playback at a slower speed wraps too.
+    e->SelectClip(std::nullopt);
+    e->edit.trimStart = 0;
+    e->edit.trimEnd = 0.3;
+    e->Changed();
+    e->loops = 0;
+    e->Seek(0.2);
+    e->previewRate = 0.5;
+    e->Review(1);
+    Pump(1500);
+    CHECK(e->loops >= 1 && e->reviewDir == 1);
+    e->Pause();
+    // Off: it stops at the end.
+    e->Key('L', {true, false, false});
+    CHECK(!e->loop);
+    e->edit.trimEnd = e->duration;
+    e->Changed();
+    e->Seek(1.6);
+    e->Play();
+    Pump(1200);
+    CHECK(!e->playing);
+    if (VideoEditor::lastLoop != before) VideoEditor::lastLoop = before;
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
