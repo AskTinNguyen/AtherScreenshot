@@ -1,8 +1,10 @@
 #include "editor.h"
 
+#include <commctrl.h>  // TaskDialogIndirect: the tray's close prompt
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <objidl.h>  // GDI+ needs IStream, which WIN32_LEAN_AND_MEAN leaves out
+#include <psapi.h>   // the tray's memory test
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
@@ -30,6 +32,9 @@ using std::min;
 #include "selftest.h"
 #include "toast.h"
 
+#pragma comment(lib, "comctl32")
+#pragma comment(lib, "psapi")
+
 namespace ather {
 namespace {
 
@@ -37,6 +42,8 @@ namespace gp = Gdiplus;
 
 constexpr wchar_t kClass[] = L"AtherScreenshotEditor";
 constexpr int kToolbarH = 52, kStatusH = 26, kMargin = 16, kBtn = 34, kBarH = 40;
+// The capture tray's strip: thumbnails in kThumbW × kThumbH boxes, then the count and Save selected at the right.
+constexpr int kStripH = 96, kThumbW = 120, kThumbH = 68, kThumbGap = 12, kStripPanelW = 196, kTrayMax = 100;
 
 enum class Tool { Select, Arrow, Line, Rect, Ellipse, Pen, Highlight, Text, Step, Blur, Pixelate, Spotlight, Magnify, Crop, Canvas, Image };
 
@@ -89,7 +96,8 @@ const float kMagR[kLevels] = {36, 48, 64, 84, 110};  // magnifier bubble radius 
 enum Action {
     ActUndo, ActRedo, ActCopy, ActSave, ActSaveAs, ActPin, ActDone, ActClose,
     ActStyle, ActRedact, ActCopyAnnots, ActPasteAnnots, ActDuplicate,
-    ActInsertImage, ActSpaceBelow, ActSpaceRight, ActEvenMargin, ActResetFrame, ActFront, ActBack
+    ActInsertImage, ActSpaceBelow, ActSpaceRight, ActEvenMargin, ActResetFrame, ActFront, ActBack,
+    ActNextPicture, ActPrevPicture, ActSaveSelected
 };
 
 // A screenshot placed on the canvas. Always flattened on export.
@@ -743,28 +751,78 @@ void DrawToolIcon(gp::Graphics& g, Tool t, const RECT& r, float s, gp::Color c) 
     }
 }
 
+// ---- the capture tray ----
+
+// One picture's document. A window holds one, or several in a capture tray. The current picture's document lives
+// in the editor's own members (base_, st_, undo_...), the others' in their tray slots.
+struct Picture {
+    BitmapPtr base;
+    EditorSource source;
+    DocState st;
+    std::vector<DocState> undo, redo;
+    bool dirty = false;
+    uint64_t version = 0;
+    // the tray's own
+    uint64_t id = 0;     // stays the same when others are removed, for saves that finish later
+    bool keep = true;    // ticked: Save selected saves it (new captures come ticked)
+    bool saved = false;  // written to a file at least once
+    BitmapPtr thumb;
+    std::weak_ptr<const Bitmap> thumbOf;  // the composed picture the thumbnail was made from
+};
+uint64_t g_pictureIds = 0;
+
+// A thumbnail's size in a boxW × boxH box: the picture's own shape, but never narrower than half the box or
+// lower than two thirds of it, so the tick, the × and the badge fit on very tall or wide pictures.
+SIZE ThumbFit(int w, int h, int boxW, int boxH) {
+    const float k = std::min((float)boxW / std::max(1, w), (float)boxH / std::max(1, h));
+    return {std::clamp((int)std::lround(w * k), boxW / 2, boxW), std::clamp((int)std::lround(h * k), boxH * 2 / 3, boxH)};
+}
+
+// The strip's thumbnail of a composed picture (a very tall or wide one shows its top or left part), flattened
+// onto light grey where it's transparent.
+BitmapPtr TrayThumb(const Bitmap& img, int boxW, int boxH) {
+    const SIZE z = ThumbFit(img.Width(), img.Height(), boxW, boxH);
+    const float k = std::max((float)z.cx / img.Width(), (float)z.cy / img.Height());
+    const RECT part{0, 0, std::min(img.Width(), (int)std::ceil(z.cx / k)), std::min(img.Height(), (int)std::ceil(z.cy / k))};
+    BitmapPtr cut;
+    if (part.right < img.Width() || part.bottom < img.Height()) cut = img.Crop(part);
+    auto t = Resample(cut ? *cut : img, z.cx, z.cy);
+    return t && HasAlpha(*t) ? Flatten(*t, RGB(217, 217, 217)) : t;
+}
+
+// A save of several pictures (Save selected): one toast once they're all written.
+struct SaveBatch {
+    int left = 0;
+    std::vector<std::wstring> paths;
+};
+
 // ---- the editor window ----
 
 struct EditorTest;
 
 class Editor;
 std::vector<Editor*> g_editors;  // most recently active last
+bool g_hideNewEditors = false;   // tests: editors they open (through the routing too) stay hidden
 
 class Editor {
 public:
     Editor(BitmapPtr img, const EditorSource& src) : base_(std::move(img)), source_(src) {
         st_.fill = EdgeColor(*base_);
         version_ = 0;
+        tray_.emplace_back();
+        tray_[0].id = ++g_pictureIds;
     }
     bool Create();
     LRESULT Proc(UINT m, WPARAM w, LPARAM l);
     void RunCommand(int id);
     void InsertImages(const std::vector<std::wstring>& paths, const gp::PointF* at = nullptr);
+    // A capture for the editor: joins the most recently used window that holds captures, or opens one.
+    static Editor* Route(BitmapPtr img, const EditorSource& source);
     HWND hwnd = nullptr;
 
 private:
     int S(int v) const { return Px(s_, v); }
-    RECT Canvas() const { return {0, S(kToolbarH), client_.right, client_.bottom - S(kStatusH)}; }
+    RECT Canvas() const { return {0, S(kToolbarH), client_.right, client_.bottom - S(kStatusH) - StripH()}; }
     const ToolInfo& CurTool() const { return kTools[(int)tool_]; }
     RECT Frame() const { return FrameOf(*base_, st_); }
 
@@ -826,8 +884,9 @@ private:
     BitmapPtr StyledFrame(const Bitmap& img) const;
     void AutoRedact();
     // Pixelate boxes from auto-redact. While a drag is under way they wait: the drag's rollback (Esc, a collage
-    // swap) restores a snapshot from before they existed and would silently drop them.
-    void ReceiveRedactions(std::vector<Annot> boxes);
+    // swap) restores a snapshot from before they existed and would silently drop them. `id`: the tray picture
+    // they were found in, which may no longer be the current one.
+    void ReceiveRedactions(std::vector<Annot> boxes, uint64_t id = 0);
     void AddRedactions(std::vector<Annot> boxes);
     void FlushRedactions();
     bool Gesture() const { return drawing_ || moving_ || resizing_.has_value() || framing_.has_value(); }
@@ -849,10 +908,7 @@ private:
     void ExtendFrame(Extend how);
     void ResetFrame();
     void FillMenu(POINT screen);
-    std::vector<std::wstring> Includes() const;
-    bool Edited(const Bitmap& out) const {
-        return !st_.annots.empty() || out.Width() != base_->Width() || out.Height() != base_->Height();
-    }
+    std::vector<std::wstring> Includes(int picture) const;
 
     void Copy();
     void Save(bool quiet = false);
@@ -862,12 +918,63 @@ private:
     void Close();
     void Action(int act);
     void OpenCommandPalette();
+    bool ToClipboard(const Bitmap& img) { return copyForTest_ ? copyForTest_(img) : CopyImageToClipboard(hwnd, img); }
+    Library& Lib() { return library_ ? *library_ : Library::Shared(); }
+
+    // ---- the capture tray: a strip of the window's pictures along the bottom, from two pictures on ----
+    bool Tray() const { return tray_.size() > 1; }
+    int StripH() const { return Tray() ? S(kStripH) : 0; }
+    RECT StripRect() const {
+        const LONG b = client_.bottom - S(kStatusH);
+        return {0, b - StripH(), client_.right, b};
+    }
+    RECT StripView() const;  // where the thumbnails scroll
+    RECT ThumbBox(int i) const;
+    RECT ThumbRect(int i) const;  // the picture inside its box
+    RECT TickRect(int i) const;
+    RECT RemoveRect(int i) const;
+    RECT SaveSelectedRect() const;
+    int StripHit(POINT p, int* part) const;
+    std::wstring StripTip() const;
+    void ClampStripScroll();
+    void ScrollStripTo(int i);
+    void UpdateThumb();
+    void DrawStrip(HDC dc);
+    // A picture's document, wherever it is: the current one's is in the members.
+    const Bitmap& BaseOf(int i) const { return i == cur_ ? *base_ : *tray_[i].base; }
+    const DocState& StateOf(int i) const { return i == cur_ ? st_ : tray_[i].st; }
+    const EditorSource& SourceOf(int i) const { return i == cur_ ? source_ : tray_[i].source; }
+    bool& DirtyOf(int i) { return i == cur_ ? dirty_ : tray_[i].dirty; }
+    bool DirtyOf(int i) const { return i == cur_ ? dirty_ : tray_[i].dirty; }
+    uint64_t VersionOf(int i) const { return i == cur_ ? version_ : tray_[i].version; }
+    bool Unsaved(int i) const { return !tray_[i].saved || DirtyOf(i); }
+    int IndexOf(uint64_t id) const;
+    int ToSaveCount() const;
+    void SwapDoc(Picture& p);
+    void Stash();
+    void Load();
+    bool AddPicture(BitmapPtr img, const EditorSource& src);
+    void SwitchTo(int i);
+    void Cycle(int step);
+    void RemovePicture(int i);
+    BitmapPtr ExportPicture(int i);
+    bool SavePicture(int i, bool quiet, const std::shared_ptr<SaveBatch>& batch);
+    void Saved(uint64_t id, uint64_t version);
+    int SaveSelected(bool quiet);
+    void TrayDone();
+    enum CloseAnswer { CloseSave, CloseDiscard, CloseCancel };
+    int AskClose(int unsaved, bool done);
+    bool ConfirmDiscard();
 
     void OnLButtonDown(int x, int y, bool dbl);
     void OnMouseMove(int x, int y);
     void OnLButtonUp(int x, int y);
     void OnRButtonUp(int x, int y);
-    void OnKeyDown(WPARAM vk);
+    void OnKeyDown(WPARAM vk) {
+        // AltGr arrives as Ctrl+Alt: typing "ż" or "@" must not trigger Ctrl shortcuts.
+        Key(vk, GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, GetKeyState(VK_SHIFT) < 0);
+    }
+    void Key(WPARAM vk, bool ctrl, bool shift);  // split out so tests can pass the modifiers
     void OnChar(wchar_t ch);
     void OnDropFiles(HDROP drop);
 
@@ -931,7 +1038,19 @@ private:
     int hoverBar_ = -1;
     int minClientW_ = 600;
 
-    bool hidden_ = false;  // drawn into memory by the snapshot tool, never shown
+    bool hidden_ = g_hideNewEditors;  // drawn into memory by the snapshot tool, never shown
+
+    // capture tray
+    std::vector<Picture> tray_;  // every picture of the window, in order; tray_[cur_] is the current one
+    int cur_ = 0;
+    int stripScroll_ = 0;
+    int hoverThumb_ = -1, hoverPart_ = 0;  // the picture under the mouse (part: 0 itself, 1 its tick, 2 its ×), -2 Save selected
+    bool takesCaptures_ = false;           // opened for a capture: later captures join it
+    // Tests: their own library, answers to the prompts (a CloseAnswer; true = discard), and a clipboard.
+    Library* library_ = nullptr;
+    std::function<int(int unsaved, bool done)> answerClose_;
+    std::function<bool()> answerDiscard_;
+    std::function<bool(const Bitmap&)> copyForTest_;
     // Collage: the screenshots, where each came from, and the layout options.
     std::optional<CollageSpec> collage_;
     std::vector<BitmapPtr> collageImages_;
@@ -1015,6 +1134,7 @@ void Editor::UpdateTitle() {
     const RECT f = Frame();
     const std::wstring size = std::to_wstring(RectW(f)) + L" × " + std::to_wstring(RectH(f));
     std::wstring t = collage_ ? L"Collage — " + std::to_wstring(collageImages_.size()) + L" screenshots, " + size : L"Annotate — " + size;
+    if (Tray()) t = L"Annotate — picture " + std::to_wstring(cur_ + 1) + L" of " + std::to_wstring(tray_.size()) + L" — " + size;
     SetWindowTextW(hwnd, t.c_str());
 }
 
@@ -1318,6 +1438,7 @@ void Editor::AutoRedact() {
     ShowToast(L"Looking for sensitive text…", L"Emails, IPs, keys, tokens, card and phone numbers", nullptr, nullptr, 8000);
     HWND h = hwnd;
     const float unit = unit_;
+    const uint64_t id = tray_[cur_].id;
     RECT f;
     BitmapPtr raster = Raster(*base_, st_, &f);  // includes image layers and added space
     if (raster) raster = Flatten(*raster);
@@ -1325,7 +1446,7 @@ void Editor::AutoRedact() {
         redacting_ = false;
         return (void)ShowToast(L"Auto-redact failed", L"Not enough memory for this image.", nullptr, nullptr, 4000);
     }
-    RecognizeWordsAsync(raster, [h, unit, f](std::vector<OcrWord> words, std::wstring err) {
+    RecognizeWordsAsync(raster, [h, unit, f, id](std::vector<OcrWord> words, std::wstring err) {
         Editor* e = FromHwnd(h);
         if (!e) return;
         e->redacting_ = false;
@@ -1342,11 +1463,27 @@ void Editor::AutoRedact() {
             a.pts = {gp::PointF((float)(r.left + f.left), (float)(r.top + f.top)), gp::PointF((float)(r.right + f.left), (float)(r.bottom + f.top))};
             boxes.push_back(a);
         }
-        e->ReceiveRedactions(std::move(boxes));
+        e->ReceiveRedactions(std::move(boxes), id);
     });
 }
 
-void Editor::ReceiveRedactions(std::vector<Annot> boxes) {
+void Editor::ReceiveRedactions(std::vector<Annot> boxes, uint64_t id) {
+    if (const int i = id ? IndexOf(id) : cur_; i != cur_) {  // switched to another picture of the tray meanwhile
+        if (i < 0) return;                                    // removed meanwhile
+        Picture& p = tray_[i];
+        p.undo.push_back(p.st);
+        if (p.undo.size() > 200) p.undo.erase(p.undo.begin());
+        p.redo.clear();
+        const size_t n = boxes.size();
+        for (auto& a : boxes) p.st.annots.push_back(std::move(a));
+        p.dirty = true;
+        ++p.version;
+        p.thumb = nullptr;  // made again from the new document
+        Invalidate();
+        ShowToast(L"Redacted " + std::to_wstring(n) + (n == 1 ? L" item" : L" items") + L" in picture " + std::to_wstring(i + 1),
+                  L"Each one is a normal pixelate box: move, delete or undo it.", nullptr, nullptr, 3000);
+        return;
+    }
     if (Gesture()) {  // added when the drag ends
         pendingRedactions_.insert(pendingRedactions_.end(), boxes.begin(), boxes.end());
         return;
@@ -1639,10 +1776,11 @@ void Editor::FillMenu(POINT at) {
 }
 
 // Screenshots placed on the canvas, recorded on the saved copy.
-std::vector<std::wstring> Editor::Includes() const {
+std::vector<std::wstring> Editor::Includes(int picture) const {
     std::vector<std::wstring> out;
-    for (const auto& a : st_.annots)
-        if (a.layer && !a.layer->source.empty() && _wcsicmp(a.layer->source.c_str(), source_.path.c_str()) != 0 &&
+    const std::wstring& own = SourceOf(picture).path;
+    for (const auto& a : StateOf(picture).annots)
+        if (a.layer && !a.layer->source.empty() && _wcsicmp(a.layer->source.c_str(), own.c_str()) != 0 &&
             std::find(out.begin(), out.end(), a.layer->source) == out.end())
             out.push_back(a.layer->source);
     return out;
@@ -1651,30 +1789,65 @@ std::vector<std::wstring> Editor::Includes() const {
 void Editor::Copy() {
     auto img = Export();
     if (!img) return;
-    if (CopyImageToClipboard(hwnd, *img))
+    if (ToClipboard(*img))
         ShowToast(L"Copied to clipboard", std::to_wstring(img->Width()) + L" × " + std::to_wstring(img->Height()), nullptr, nullptr, 1800);
 }
 
-void Editor::Save(bool quiet) {
-    auto img = Export();
-    if (!img) return;
-    CaptureNameInfo info{source_.window, source_.app, img->Width(), img->Height()};
+void Editor::Save(bool quiet) { SavePicture(cur_, quiet, nullptr); }
+
+// What Save writes for a picture of the tray: the current one's composed view, or a stored document composed
+// the same way (fill, base, layers, pixel tools, spotlight, annotations; styled when that's on).
+BitmapPtr Editor::ExportPicture(int i) {
+    if (i == cur_) return Export();
+    BitmapPtr out = ather::Compose(BaseOf(i), StateOf(i));
+    if (out && styled_) out = StyledFrame(*out);
+    if (!out) ShowToast(L"Not enough memory for this image", L"Remove some added space or layers and try again.", nullptr, nullptr, 4000);
+    return out;
+}
+
+// Saves picture i as a new PNG in the captures folder. `batch`: one of several (Save selected), with one toast.
+bool Editor::SavePicture(int i, bool quiet, const std::shared_ptr<SaveBatch>& batch) {
+    auto img = ExportPicture(i);
+    if (!img) return false;
+    const EditorSource& src = SourceOf(i);
+    CaptureNameInfo info{src.window, src.app, img->Width(), img->Height()};
     const std::wstring path = MakeCapturePath(g_defaults.capturesFolder, L"png", info);
     // Joins the gallery with the original's tags and collections, stacked as a version of it. A collage is
     // tagged "collage" and keeps what all of its screenshots share.
-    Library::Shared().NoteEdit(path, source_.path, source_.app, source_.window, Edited(*img), Includes(), collage_.has_value());
+    const Bitmap& base = BaseOf(i);
+    const bool edited = !StateOf(i).annots.empty() || img->Width() != base.Width() || img->Height() != base.Height();
+    Lib().NoteEdit(path, src.path, src.app, src.window, edited, Includes(i), collage_.has_value());
     HWND h = hwnd;
-    const uint64_t version = version_;
-    SavePngAsync(img, path, [path, h, version, quiet, img](bool ok) {
-        if (ok) {
-            if (!quiet) ShowToast(L"Saved", FileNameOf(path), nullptr, [path] { RevealInExplorer({path}); }, 2200);
-        } else {
+    const uint64_t id = tray_[i].id, version = VersionOf(i);
+    if (batch) ++batch->left;
+    SavePngAsync(img, path, [path, h, id, version, quiet, img, batch](bool ok) {
+        if (!ok) {
             ShowToast(L"Save failed", path, nullptr, nullptr, 4000);
+        } else if (batch) {
+            batch->paths.push_back(path);
+        } else if (!quiet) {
+            ShowToast(L"Saved", FileNameOf(path), nullptr, [path] { RevealInExplorer({path}); }, 2200);
+        }
+        if (batch && --batch->left == 0 && !quiet && !batch->paths.empty()) {
+            const std::vector<std::wstring> paths = batch->paths;
+            const size_t n = paths.size();
+            ShowToast(n == 1 ? std::wstring(L"Saved 1 picture") : L"Saved " + std::to_wstring(n) + L" pictures",
+                      FileNameOf(paths[0]) + (n > 1 ? L" and " + std::to_wstring(n - 1) + L" more" : L""), nullptr,
+                      [paths] { RevealInExplorer(paths); }, 2600);
         }
         // Only a successful write counts as saved, and only if nothing changed while it was written.
         Editor* e = FromHwnd(h);
-        if (e && ok && e->version_ == version) e->dirty_ = false;
+        if (e && ok) e->Saved(id, version);
     });
+    return true;
+}
+
+void Editor::Saved(uint64_t id, uint64_t version) {
+    const int i = IndexOf(id);
+    if (i < 0) return;
+    tray_[i].saved = true;
+    if (VersionOf(i) == version) DirtyOf(i) = false;
+    Invalidate();
 }
 
 void Editor::SaveAs() {
@@ -1689,9 +1862,13 @@ void Editor::SaveAs() {
     ofn.lpstrDefExt = L"png";
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    Library::Shared().NoteEdit(file, source_.path, source_.app, source_.window, true, Includes(), collage_.has_value());
-    if (SavePng(*img, file)) dirty_ = false;  // a failed save must still warn before closing
-    else ShowToast(L"Save failed", file, nullptr, nullptr, 4000);
+    Lib().NoteEdit(file, source_.path, source_.app, source_.window, true, Includes(cur_), collage_.has_value());
+    if (SavePng(*img, file)) {  // a failed save must still warn before closing
+        dirty_ = false;
+        tray_[cur_].saved = true;
+    } else {
+        ShowToast(L"Save failed", file, nullptr, nullptr, 4000);
+    }
 }
 
 void Editor::Pin() {
@@ -1700,9 +1877,10 @@ void Editor::Pin() {
 }
 
 void Editor::Done() {
+    if (Tray()) return TrayDone();
     auto img = Export();
     if (!img) return;
-    const bool copied = CopyImageToClipboard(hwnd, *img);
+    const bool copied = ToClipboard(*img);
     if (g_defaults.saveToFile) {
         Save(true);
         ShowToast(copied ? L"Copied and saved" : L"Saved", std::to_wstring(img->Width()) + L" × " + std::to_wstring(img->Height()), nullptr, nullptr, 2000);
@@ -1719,9 +1897,261 @@ void Editor::Done() {
 
 void Editor::Close() {
     CommitText();
+    if (Tray()) {  // asks when a picture would be lost: never saved, or changed since
+        int unsaved = 0;
+        for (int i = 0; i < (int)tray_.size(); ++i) unsaved += Unsaved(i);
+        if (unsaved) {
+            const int a = AskClose(unsaved, false);
+            if (a == CloseCancel) return;
+            if (a == CloseSave) SaveSelected(false);
+        }
+        DestroyWindow(hwnd);
+        return;
+    }
     if (dirty_ && MessageBoxW(hwnd, L"Close the editor and discard your changes?", L"Ather Screenshot", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
         return;
     DestroyWindow(hwnd);
+}
+
+// ---- the capture tray ----
+
+int Editor::IndexOf(uint64_t id) const {
+    for (int i = 0; i < (int)tray_.size(); ++i)
+        if (tray_[i].id == id) return i;
+    return -1;
+}
+
+// Ticked pictures that Save selected would write: never saved, or changed since.
+int Editor::ToSaveCount() const {
+    int n = 0;
+    for (int i = 0; i < (int)tray_.size(); ++i) n += tray_[i].keep && Unsaved(i);
+    return n;
+}
+
+void Editor::SwapDoc(Picture& p) {
+    std::swap(base_, p.base);
+    std::swap(source_, p.source);
+    std::swap(st_, p.st);
+    std::swap(undo_, p.undo);
+    std::swap(redo_, p.redo);
+    std::swap(dirty_, p.dirty);
+    std::swap(version_, p.version);
+}
+
+// The current picture's document goes back to its slot, with a fresh thumbnail. Its composed bitmaps are
+// dropped: only the current picture keeps them, so a full tray holds little more than its screenshots.
+void Editor::Stash() {
+    UpdateThumb();
+    SwapDoc(tray_[cur_]);
+    pixel_.reset();
+    committed_.reset();
+}
+
+// Takes tray_[cur_]'s document into the editor and shows it.
+void Editor::Load() {
+    SwapDoc(tray_[cur_]);
+    selected_ = -1;
+    Changed(true);
+    ScrollStripTo(cur_);
+    UpdateTitle();
+    Invalidate();
+}
+
+// A capture joins the tray and becomes the current picture. False when the tray is full.
+bool Editor::AddPicture(BitmapPtr img, const EditorSource& src) {
+    if (!img || collage_ || (int)tray_.size() >= kTrayMax) return false;
+    CommitText();
+    CancelLive();
+    FlushRedactions();
+    Picture p;
+    p.base = std::move(img);
+    p.source = src;
+    p.st.fill = EdgeColor(*p.base);
+    p.id = ++g_pictureIds;
+    Stash();
+    tray_.push_back(std::move(p));
+    cur_ = (int)tray_.size() - 1;
+    Load();
+    return true;
+}
+
+// Tool, color and size stay with the window; everything else is the picture's.
+void Editor::SwitchTo(int i) {
+    if (i < 0 || i >= (int)tray_.size() || i == cur_ || Gesture()) return;
+    CommitText();  // an unfinished text box stays with its picture
+    CancelLive();
+    Stash();
+    cur_ = i;
+    Load();
+}
+
+void Editor::Cycle(int step) {
+    const int n = (int)tray_.size();
+    if (n > 1) SwitchTo(((cur_ + step) % n + n) % n);
+}
+
+// ×: takes a picture out of the tray. Asks first when it has changes that aren't saved.
+void Editor::RemovePicture(int i) {
+    if (!Tray() || i < 0 || i >= (int)tray_.size() || Gesture()) return;
+    CommitText();
+    if (DirtyOf(i) && !ConfirmDiscard()) return;
+    if (i == cur_) SwitchTo(i + 1 < (int)tray_.size() ? i + 1 : i - 1);
+    tray_.erase(tray_.begin() + i);
+    if (cur_ > i) --cur_;
+    hoverThumb_ = -1;
+    ClampStripScroll();
+    FitView();  // the strip goes when one picture is left
+    UpdateTitle();
+    Invalidate();
+}
+
+// Saves every ticked picture that isn't saved yet, or changed since, as Save would. Returns how many.
+int Editor::SaveSelected(bool quiet) {
+    CommitText();
+    auto batch = std::make_shared<SaveBatch>();
+    int n = 0;
+    for (int i = 0; i < (int)tray_.size(); ++i)
+        if (tray_[i].keep && Unsaved(i)) n += SavePicture(i, quiet, batch);
+    if (!n && !quiet)
+        ShowToast(L"Nothing new to save", L"Every ticked picture is saved. Tick the ones to save.", nullptr, nullptr, 2200);
+    Invalidate();
+    return n;
+}
+
+// Done with a tray: saves the ticked pictures, copies the current one and closes. Asks first when a picture that
+// isn't ticked would be lost.
+void Editor::TrayDone() {
+    CommitText();
+    int left = 0;
+    for (int i = 0; i < (int)tray_.size(); ++i) left += !tray_[i].keep && Unsaved(i);
+    if (left) {
+        const int a = AskClose(left, true);
+        if (a == CloseCancel) return;
+        if (a == CloseDiscard) return (void)DestroyWindow(hwnd);
+    }
+    const int n = SaveSelected(true);
+    auto img = Export();
+    const bool copied = img && ToClipboard(*img);
+    const std::wstring saved = n == 1 ? std::wstring(L"1 picture") : std::to_wstring(n) + L" pictures";
+    if (n) ShowToast(copied ? L"Copied and saved" : L"Saved", saved + (copied ? L"  ·  the current one is on the clipboard" : L""), nullptr, nullptr, 2400);
+    else if (copied) ShowToast(L"Copied to clipboard", std::to_wstring(img->Width()) + L" × " + std::to_wstring(img->Height()), nullptr, nullptr, 1800);
+    DestroyWindow(hwnd);
+}
+
+// "3 pictures aren't saved": Save selected and close (the default), Close without saving, or Cancel.
+int Editor::AskClose(int unsaved, bool done) {
+    if (answerClose_) return answerClose_(unsaved, done);
+    const std::wstring head = std::to_wstring(unsaved) + (unsaved == 1 ? L" picture isn't saved" : L" pictures aren't saved");
+    const wchar_t* body = done ? L"They aren't ticked, so Done won't save them. Pictures you don't save are gone once the editor closes."
+                               : L"Save selected saves the ticked pictures to your captures folder. Pictures you don't save are gone once the editor closes.";
+    enum { kSave = 1001, kDiscard = 1002 };
+    const TASKDIALOG_BUTTON buttons[] = {{kSave, L"Save selected and close"}, {kDiscard, L"Close without saving"}};
+    TASKDIALOGCONFIG c{};
+    c.cbSize = sizeof(c);
+    c.hwndParent = hwnd;
+    c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    c.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    c.pszWindowTitle = L"Ather Screenshot";
+    c.pszMainInstruction = head.c_str();
+    c.pszContent = body;
+    c.cButtons = (UINT)std::size(buttons);
+    c.pButtons = buttons;
+    c.nDefaultButton = kSave;  // never "Close without saving"
+    int pressed = IDCANCEL;
+    if (FAILED(TaskDialogIndirect(&c, &pressed, nullptr, nullptr))) {
+        const std::wstring q = head + L"\n\nYes: save the ticked pictures, then close.\nNo: close without saving.";
+        const int r = MessageBoxW(hwnd, q.c_str(), L"Ather Screenshot", MB_YESNOCANCEL | MB_ICONQUESTION);
+        pressed = r == IDYES ? kSave : r == IDNO ? kDiscard : IDCANCEL;
+    }
+    return pressed == kSave ? CloseSave : pressed == kDiscard ? CloseDiscard : CloseCancel;
+}
+
+bool Editor::ConfirmDiscard() {
+    if (answerDiscard_) return answerDiscard_();
+    return MessageBoxW(hwnd, L"Remove this picture and discard your changes?", L"Ather Screenshot", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+}
+
+// The current picture's thumbnail, made again whenever its composed picture changed.
+void Editor::UpdateThumb() {
+    if (!committed_) return;
+    Picture& p = tray_[cur_];
+    if (p.thumb && p.thumbOf.lock() == committed_) return;
+    p.thumb = TrayThumb(*committed_, S(kThumbW), S(kThumbH));
+    p.thumbOf = committed_;
+}
+
+RECT Editor::StripView() const {
+    const RECT s = StripRect();
+    return {s.left + S(8), s.top + 1, s.right - S(kStripPanelW), s.bottom};
+}
+
+RECT Editor::ThumbBox(int i) const {
+    const RECT v = StripView(), s = StripRect();
+    const int x = v.left + S(6) + i * (S(kThumbW) + S(kThumbGap)) - stripScroll_;
+    const int y = s.top + (RectH(s) - S(kThumbH)) / 2;
+    return {x, y, x + S(kThumbW), y + S(kThumbH)};
+}
+
+RECT Editor::ThumbRect(int i) const {
+    const RECT b = ThumbBox(i);
+    const RECT f = i == cur_ ? Frame() : FrameOf(*tray_[i].base, tray_[i].st);
+    const SIZE z = ThumbFit(RectW(f), RectH(f), RectW(b), RectH(b));
+    const int x = b.left + (RectW(b) - z.cx) / 2, y = b.top + (RectH(b) - z.cy) / 2;
+    return {x, y, x + z.cx, y + z.cy};
+}
+
+RECT Editor::TickRect(int i) const {
+    const RECT r = ThumbRect(i);
+    return {r.left + S(5), r.top + S(5), r.left + S(23), r.top + S(23)};
+}
+
+RECT Editor::RemoveRect(int i) const {
+    const RECT r = ThumbRect(i);
+    return {r.right - S(23), r.top + S(5), r.right - S(5), r.top + S(23)};
+}
+
+RECT Editor::SaveSelectedRect() const {
+    const RECT s = StripRect();
+    const int r = s.right - S(14), b = s.bottom - S(16);
+    return {r - S(kStripPanelW) + S(28), b - S(kBtn), r, b};
+}
+
+// What's under p in the strip: a picture's index (part 0, or 1 its tick, 2 its ×), -2 Save selected, or -1.
+int Editor::StripHit(POINT p, int* part) const {
+    *part = 0;
+    const RECT s = StripRect(), save = SaveSelectedRect(), v = StripView();
+    if (!Tray() || !PtInRect(&s, p)) return -1;
+    if (PtInRect(&save, p)) return -2;
+    if (!PtInRect(&v, p)) return -1;
+    for (int i = 0; i < (int)tray_.size(); ++i) {
+        const RECT b = ThumbBox(i);
+        if (!PtInRect(&b, p)) continue;
+        const RECT t = TickRect(i), x = RemoveRect(i);
+        if (PtInRect(&t, p)) *part = 1;
+        else if (PtInRect(&x, p)) *part = 2;
+        return i;
+    }
+    return -1;
+}
+
+std::wstring Editor::StripTip() const {
+    if (hoverThumb_ == -2) return L"Save every ticked picture to the captures folder";
+    if (hoverPart_ == 1) return L"Tick the pictures to keep  ·  Save selected saves them together";
+    if (hoverPart_ == 2) return L"Remove this picture from the tray";
+    return L"Picture " + std::to_wstring(hoverThumb_ + 1) + L" of " + std::to_wstring(tray_.size()) +
+           L"  —  click to open it  ·  Ctrl+Tab next, Ctrl+Shift+Tab previous";
+}
+
+void Editor::ClampStripScroll() {
+    const int content = (int)tray_.size() * (S(kThumbW) + S(kThumbGap)) - S(kThumbGap) + 2 * S(6);
+    stripScroll_ = std::clamp(stripScroll_, 0, std::max(0, content - RectW(StripView())));
+}
+
+void Editor::ScrollStripTo(int i) {
+    const RECT v = StripView(), b = ThumbBox(i);
+    if (b.left < v.left) stripScroll_ -= v.left - b.left + S(6);
+    else if (b.right > v.right) stripScroll_ += b.right - v.right + S(6);
+    ClampStripScroll();
 }
 
 void Editor::Action(int act) {
@@ -1751,6 +2181,9 @@ void Editor::Action(int act) {
         case ActResetFrame: ResetFrame(); break;
         case ActFront: Reorder(true); break;
         case ActBack: Reorder(false); break;
+        case ActNextPicture: Cycle(1); break;
+        case ActPrevPicture: Cycle(-1); break;
+        case ActSaveSelected: SaveSelected(false); break;
     }
 }
 
@@ -1793,6 +2226,11 @@ void Editor::OpenCommandPalette() {
                       {ActBack, L"Send to back", L"Ctrl+[", L"image layer order", 0xE8F4},
                       {ActClose, L"Close editor", L"Esc", L"discard quit", 0xE711}};
     for (const auto& a : acts) items.push_back({400 + a.act, a.title, a.hint, a.kw, a.icon});
+    if (Tray()) {
+        items.push_back({400 + ActSaveSelected, L"Save selected pictures (" + std::to_wstring(ToSaveCount()) + L")", L"", L"tray strip ticked all", 0xE74E});
+        items.push_back({400 + ActNextPicture, L"Next picture", L"Ctrl+Tab", L"tray strip switch", 0xE76C});
+        items.push_back({400 + ActPrevPicture, L"Previous picture", L"Ctrl+Shift+Tab", L"tray strip switch", 0xE76B});
+    }
     for (int i = 0; i < (int)std::size(kTools); ++i)
         items.push_back({100 + i, std::wstring(L"Tool: ") + kTools[i].name, std::wstring(1, kTools[i].key), L"tool draw annotate", 0xE70F});
     for (int i = 0; i < (int)std::size(kColors); ++i)
@@ -1847,7 +2285,19 @@ void Editor::OnLButtonDown(int x, int y, bool dbl) {
         }
         return;
     }
-    if (y < S(kToolbarH) || y >= client_.bottom - S(kStatusH)) return;
+    if (Tray()) {  // the strip: open a picture, tick or untick it, remove it, Save selected
+        int part = 0;
+        const int hit = StripHit({x, y}, &part);
+        if (hit == -2) return (void)SaveSelected(false);
+        if (hit >= 0) {
+            if (part == 1) tray_[hit].keep = !tray_[hit].keep;
+            else if (part == 2) return RemovePicture(hit);
+            else SwitchTo(hit);
+            Invalidate();
+            return;
+        }
+    }
+    if (y < S(kToolbarH) || y >= Canvas().bottom) return;
     const gp::PointF p = ToImg(x, y);
     if (wasTexting && tool_ == Tool::Text) return;  // that click only finished the text
     const float z = Zoom();
@@ -1955,9 +2405,13 @@ void Editor::OnMouseMove(int x, int y) {
     int hb = -1;
     for (int i = 0; i < (int)barButtons_.size(); ++i)
         if (PtInRect(&barButtons_[i].r, {x, y})) hb = i;
-    if (hover != hoverBtn_ || hb != hoverBar_) {
+    int part = 0;
+    const int thumb = StripHit({x, y}, &part);
+    if (hover != hoverBtn_ || hb != hoverBar_ || thumb != hoverThumb_ || part != hoverPart_) {
         hoverBtn_ = hover;
         hoverBar_ = hb;
+        hoverThumb_ = thumb;
+        hoverPart_ = part;
         Invalidate();
     }
     const gp::PointF p = ToImg(x, y);
@@ -2086,7 +2540,7 @@ void Editor::OnLButtonUp(int x, int y) {
 }
 
 void Editor::OnRButtonUp(int x, int y) {
-    if (y < S(kToolbarH) || y >= client_.bottom - S(kStatusH) || drawing_ || moving_) return;
+    if (y < S(kToolbarH) || y >= Canvas().bottom || drawing_ || moving_) return;
     const int i = HitTest(ToImg(x, y));
     if (i < 0 || st_.annots[i].type != Tool::Image || !st_.annots[i].layer) return;
     selected_ = i;
@@ -2108,9 +2562,7 @@ void Editor::OnDropFiles(HDROP drop) {
     InsertImages(files, &at);
 }
 
-void Editor::OnKeyDown(WPARAM vk) {
-    // AltGr arrives as Ctrl+Alt: typing "ż" or "@" must not trigger Ctrl shortcuts.
-    const bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0, shift = GetKeyState(VK_SHIFT) < 0;
+void Editor::Key(WPARAM vk, bool ctrl, bool shift) {
     if (Gesture()) {  // mid-drag only Esc does anything: other commands would act on a half-moved document
         if (vk == VK_ESCAPE) {
             CancelLive();
@@ -2149,6 +2601,9 @@ void Editor::OnKeyDown(WPARAM vk) {
             case 'W': Close(); return;
             case VK_OEM_6: Reorder(true); return;   // Ctrl+]
             case VK_OEM_4: Reorder(false); return;  // Ctrl+[
+            case VK_TAB: Cycle(shift ? -1 : 1); return;  // the tray's next / previous picture
+            case VK_NEXT: Cycle(1); return;              // Ctrl+PageDown
+            case VK_PRIOR: Cycle(-1); return;            // Ctrl+PageUp
         }
         return;
     }
@@ -2266,6 +2721,7 @@ void Editor::DrawStatus(HDC dc) {
     SetTextColor(dc, theme::kMuted);
     RECT r{S(12), top, client_.right - S(12), client_.bottom};
     std::wstring left = hoverBtn_ >= 0 ? buttons_[hoverBtn_].tip : std::wstring(CurTool().name) + L"  —  " + CurTool().hint;
+    if (hoverThumb_ != -1) left = StripTip();
     const RECT f = Frame();
     wchar_t right[160];
     swprintf_s(right, L"%s%d × %d   ·   %d%%   ·   Ctrl+K commands", styled_ ? L"Styled export   ·   " : L"", RectW(f), RectH(f),
@@ -2455,6 +2911,112 @@ void Editor::DrawCollageBar(HDC dc) {
     }
     SelectObject(dc, of);
 }
+
+// The capture tray along the bottom: each picture at its own shape, the current one outlined in lime, a tick for
+// "save this", a dot for unsaved changes, "Saved" once saved and × on hover; then the count and Save selected.
+void Editor::DrawStrip(HDC dc) {
+    if (!Tray()) return;
+    const RECT s = StripRect();
+    FillSolid(dc, s, theme::kSurface);
+    FillSolid(dc, {s.left, s.top, s.right, s.top + 1}, theme::kBorder);
+    UpdateThumb();
+    ClampStripScroll();
+    const RECT v = StripView();
+    FillSolid(dc, {v.right, s.top + S(14), v.right + 1, s.bottom - S(14)}, theme::kBorder);
+    const int saved = SaveDC(dc);
+    IntersectClipRect(dc, v.left, v.top, v.right, v.bottom);
+    SetBkMode(dc, TRANSPARENT);
+    SetStretchBltMode(dc, HALFTONE);
+    HGDIOBJ of = SelectObject(dc, fStatus_);
+    {
+        gp::Graphics g(dc);
+        g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+        g.SetClip(gp::Rect(v.left, v.top, RectW(v), RectH(v)));
+        for (int i = 0; i < (int)tray_.size(); ++i) {
+            const RECT b = ThumbBox(i);
+            if (b.right + S(4) < v.left || b.left - S(4) > v.right) continue;
+            Picture& p = tray_[i];
+            if (!p.thumb && i != cur_)  // its document changed while it wasn't current (auto-redact)
+                if (auto c = ather::Compose(*p.base, p.st)) p.thumb = TrayThumb(*c, S(kThumbW), S(kThumbH));
+            const RECT r = ThumbRect(i);
+            const bool hover = i == hoverThumb_;
+            if (i == cur_) FillRounded(dc, {r.left - S(3), r.top - S(3), r.right + S(3), r.bottom + S(3)}, S(5), theme::kAccent);
+            else FrameSolid(dc, {r.left - 1, r.top - 1, r.right + 1, r.bottom + 1}, hover ? theme::kMuted : theme::kBorder);
+            if (p.thumb) {
+                MemDC th(p.thumb->Handle(), dc);
+                if (p.thumb->Width() == RectW(r) && p.thumb->Height() == RectH(r)) BitBlt(dc, r.left, r.top, RectW(r), RectH(r), th, 0, 0, SRCCOPY);
+                else StretchBlt(dc, r.left, r.top, RectW(r), RectH(r), th, 0, 0, p.thumb->Width(), p.thumb->Height(), SRCCOPY);
+            } else {
+                FillSolid(dc, r, theme::kBgRaised);
+            }
+            // tick
+            const RECT t = TickRect(i);
+            if (p.keep) {
+                FillRounded(dc, t, S(5), theme::kAccent);
+                gp::Pen pen(GC(theme::kOnAccent), 2 * s_);
+                pen.SetStartCap(gp::LineCapRound);
+                pen.SetEndCap(gp::LineCapRound);
+                pen.SetLineJoin(gp::LineJoinRound);
+                const float u = RectW(t) / 18.f;
+                const gp::PointF check[] = {{t.left + 4.5f * u, t.top + 9.5f * u}, {t.left + 7.5f * u, t.top + 12.5f * u}, {t.left + 13.5f * u, t.top + 5.5f * u}};
+                g.DrawLines(&pen, check, 3);
+            } else {
+                FillRounded(dc, t, S(5), theme::kBg, hover && hoverPart_ == 1 ? theme::kText : theme::kMuted);
+            }
+            // unsaved changes, or saved
+            if (DirtyOf(i)) {
+                const float d = 9 * s_, cx = r.right - S(10) - d / 2, cy = r.bottom - S(10) - d / 2;
+                gp::SolidBrush ring(GC(theme::kBg)), dot(GC(theme::kText));
+                g.FillEllipse(&ring, cx - d / 2 - 2 * s_, cy - d / 2 - 2 * s_, d + 4 * s_, d + 4 * s_);
+                g.FillEllipse(&dot, cx - d / 2, cy - d / 2, d, d);
+            } else if (p.saved) {
+                std::wstring label = L"✓ Saved";
+                SIZE z{};
+                GetTextExtentPoint32W(dc, label.c_str(), (int)label.size(), &z);
+                if (z.cx + S(12) > RectW(r) - S(10)) {
+                    label = L"✓";
+                    GetTextExtentPoint32W(dc, label.c_str(), (int)label.size(), &z);
+                }
+                RECT pill{r.left + S(5), r.bottom - S(5) - S(17), r.left + S(5) + z.cx + S(12), r.bottom - S(5)};
+                FillRounded(dc, pill, S(8), theme::kBg);
+                SetTextColor(dc, theme::kAccent);
+                DrawTextW(dc, label.c_str(), -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            // ×
+            if (hover) {
+                const RECT x = RemoveRect(i);
+                FillRounded(dc, x, RectW(x) / 2, hoverPart_ == 2 ? RGB(255, 59, 48) : theme::kBg, theme::kBorder);
+                gp::Pen pen(GC(theme::kText), 1.6f * s_);
+                pen.SetStartCap(gp::LineCapRound);
+                pen.SetEndCap(gp::LineCapRound);
+                const float c = RectW(x) / 2.f, k = 3.6f * s_, mx = x.left + c, my = x.top + c;
+                g.DrawLine(&pen, mx - k, my - k, mx + k, my + k);
+                g.DrawLine(&pen, mx - k, my + k, mx + k, my - k);
+            }
+        }
+    }
+    RestoreDC(dc, saved);
+    // the count and Save selected
+    int ticked = 0;
+    for (const auto& p : tray_) ticked += p.keep;
+    const int n = ToSaveCount();
+    const RECT btn = SaveSelectedRect();
+    RECT count{btn.left - S(24), s.top + S(10), btn.right, btn.top - S(4)};
+    const std::wstring text = std::to_wstring(tray_.size()) + L" pictures · " + std::to_wstring(ticked) + L" selected";
+    SetBkMode(dc, TRANSPARENT);
+    SelectObject(dc, fStatus_);
+    SetTextColor(dc, theme::kMuted);
+    DrawTextW(dc, text.c_str(), -1, &count, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, fBar_);
+    FillRounded(dc, btn, S(7), n ? (hoverThumb_ == -2 ? theme::kAccentSoft : theme::kAccent) : theme::kBgRaised);
+    SetTextColor(dc, n ? theme::kOnAccent : theme::kMuted);
+    const std::wstring label = L"Save selected (" + std::to_wstring(n) + L")";
+    RECT lr = btn;
+    DrawTextW(dc, label.c_str(), -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, of);
+}
+
 void DrawLayerPreview(gp::Graphics& g, const Annot& a) {
     if (!a.layer || !a.layer->image) return;
     const gp::RectF r = NormRect(a.pts[0], a.pts.back());
@@ -2583,6 +3145,7 @@ void Editor::Paint(HDC hdc) {
     }
     DrawToolbar(dc);
     DrawStatus(dc);
+    DrawStrip(dc);
     DrawCanvasBar(dc);
     DrawCollageBar(dc);
     BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
@@ -2621,10 +3184,10 @@ LRESULT Editor::Proc(UINT m, WPARAM w, LPARAM l) {
                 ScreenToClient(hwnd, &p);
                 LPCWSTR cur = IDC_ARROW;
                 const RECT sh = Shown();
-                const bool inView = PtInRect(&sh, p) && p.y >= S(kToolbarH) && p.y < client_.bottom - S(kStatusH);
+                const bool inView = PtInRect(&sh, p) && p.y >= S(kToolbarH) && p.y < Canvas().bottom;
                 bool overBar = false;
                 for (const auto& b : barButtons_) overBar = overBar || PtInRect(&b.r, p);
-                if (hoverBtn_ >= 0 || overBar) {
+                if (hoverBtn_ >= 0 || overBar || hoverThumb_ != -1) {
                     cur = IDC_HAND;
                 } else if (tool_ == Tool::Canvas) {
                     const gp::PointF ip = ToImg(p.x, p.y);
@@ -2651,8 +3214,8 @@ LRESULT Editor::Proc(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_MOUSELEAVE:
-            if (hoverBtn_ >= 0 || hoverBar_ >= 0) {
-                hoverBtn_ = hoverBar_ = -1;
+            if (hoverBtn_ >= 0 || hoverBar_ >= 0 || hoverThumb_ != -1) {
+                hoverBtn_ = hoverBar_ = hoverThumb_ = -1;
                 Invalidate();
             }
             return 0;
@@ -2662,8 +3225,21 @@ LRESULT Editor::Proc(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_RBUTTONUP: OnRButtonUp(GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
         case WM_MOUSEWHEEL:
-            if (!Gesture()) SetLevel(level_ + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1));  // not the shape being dragged
+        case WM_MOUSEHWHEEL: {
+            POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ScreenToClient(hwnd, &p);
+            const RECT strip = StripRect();
+            if (Tray() && PtInRect(&strip, p)) {  // the strip scrolls sideways
+                const int d = GET_WHEEL_DELTA_WPARAM(w);
+                stripScroll_ += (m == WM_MOUSEHWHEEL ? d : -d) * (S(kThumbW) + S(kThumbGap)) / WHEEL_DELTA;
+                ClampStripScroll();
+                hoverThumb_ = StripHit(p, &hoverPart_);  // what's under the mouse now
+                Invalidate();
+                return 0;
+            }
+            if (m == WM_MOUSEWHEEL && !Gesture()) SetLevel(level_ + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1));  // not the shape being dragged
             return 0;
+        }
         case WM_KEYDOWN: OnKeyDown(w); return 0;
         case WM_CHAR: OnChar((wchar_t)w); return 0;
         case WM_DROPFILES: OnDropFiles((HDROP)w); return 0;
@@ -2694,6 +3270,35 @@ LRESULT Editor::Proc(UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(hwnd, m, w, l);
 }
 
+// Captures collect in the most recently used window opened for a capture; never in a collage or a window opened
+// on a file, so a saved file isn't mixed with session captures. A full tray leaves the capture to a new window.
+Editor* Editor::Route(BitmapPtr img, const EditorSource& source) {
+    if (!img) return nullptr;
+    auto copy = img->Crop({0, 0, img->Width(), img->Height()});
+    if (g_defaults.tray)
+        for (auto it = g_editors.rbegin(); it != g_editors.rend(); ++it) {
+            Editor* e = *it;
+            if (!e->takesCaptures_) continue;
+            if (e->AddPicture(copy, source)) {
+                if (!e->hidden_) {
+                    if (IsIconic(e->hwnd)) ShowWindow(e->hwnd, SW_RESTORE);
+                    ForceForeground(e->hwnd);
+                }
+                return e;
+            }
+            ShowToast(L"The editor holds " + std::to_wstring(kTrayMax) + L" pictures",
+                      L"Save or remove some there. This capture opened in a new window.", nullptr, nullptr, 4000);
+            break;
+        }
+    auto* e = new Editor(copy, source);
+    e->takesCaptures_ = true;
+    if (!e->Create()) {
+        delete e;
+        return nullptr;
+    }
+    return e;
+}
+
 }  // namespace
 
 void SetEditorDefaults(const EditorOptions& opt) { g_defaults = opt; }
@@ -2703,6 +3308,8 @@ void OpenEditor(BitmapPtr img, const EditorSource& source) {
     auto* e = new Editor(img->Crop({0, 0, img->Width(), img->Height()}), source);
     if (!e->Create()) delete e;
 }
+
+void OpenCaptureInEditor(BitmapPtr img, const EditorSource& source) { Editor::Route(std::move(img), source); }
 
 bool OpenEditorFile(const std::wstring& path) {
     BitmapPtr img = LoadImageFile(path);
@@ -2862,6 +3469,38 @@ int EditorSnapshots(const std::wstring& outDir) {
     c->ApplyCollage(true);
     snap(L"editor-collage-feature");
     DestroyWindow(c->hwnd);
+
+    // A capture tray of five pictures: the third current, with notes; the second unticked; the fourth saved; the
+    // fifth with unsaved changes; the mouse over the first, showing its ×.
+    auto* t = new Editor(card(1600, 900, RGB(48, 176, 199), RGB(10, 132, 255), L"Weekly revenue"), {});
+    t->hidden_ = true;
+    if (!t->Create()) return 1;
+    SetWindowPos(t->hwnd, nullptr, 0, 0, RectW(wr), RectH(wr), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+    e = t;
+    t->Layout();
+    t->AddPicture(card(1600, 1000, RGB(255, 59, 48), RGB(255, 149, 0), L"Payment failed"), {});
+    t->AddPicture(card(1400, 900, RGB(52, 199, 89), RGB(48, 176, 199), L"Release notes"), {});
+    t->AddPicture(card(900, 1400, RGB(88, 86, 214), RGB(175, 82, 222), L"Sign in"), {});
+    t->AddPicture(card(1800, 1000, RGB(255, 204, 0), RGB(255, 149, 0), L"Build 0.0.2.4"), {});
+    t->PushUndo();  // the fifth: changes not saved yet
+    add(Tool::Rect, {gp::PointF(150, 170), gp::PointF(1400, 360)}, 0, 2);
+    t->Changed(false);
+    t->SwitchTo(2);
+    add(Tool::Arrow, {gp::PointF(1050, 700), gp::PointF(800, 380)}, 0, 2);
+    add(Tool::Step, {gp::PointF(140, 160)}, 0, 2);
+    add(Tool::Text, {gp::PointF(1000, 730)}, 0, 2, L"New: export to PDF");
+    t->Changed(false);
+    t->tray_[1].keep = false;
+    t->tray_[3].saved = true;
+    t->hoverThumb_ = 0;
+    snap(L"editor-tray");
+    // Fourteen: the strip scrolls to keep the newest (current) in view; the mouse on Save selected.
+    const COLORREF tones[][2] = {{RGB(255, 59, 48), RGB(255, 149, 0)}, {RGB(52, 199, 89), RGB(48, 176, 199)}, {RGB(88, 86, 214), RGB(175, 82, 222)}};
+    for (int i = 0; i < 9; ++i)
+        t->AddPicture(card(1600 - (i % 3) * 300, 900 + (i % 2) * 200, tones[i % 3][0], tones[i % 3][1], (L"Capture " + std::to_wstring(i + 6)).c_str()), {});
+    t->hoverThumb_ = -2;
+    snap(L"editor-tray-scrolled");
+    DestroyWindow(t->hwnd);
     return 0;
 }
 
@@ -2982,11 +3621,29 @@ namespace {
 struct EditorTest {
     static void Redactions();
     static void UndoWhileTyping();
+    // the capture tray
+    static Editor* Open(BitmapPtr img, const EditorSource& src = {});
+    static POINT ToClient(Editor* e, gp::PointF p);
+    static void Drag(Editor* e, Tool t, gp::PointF a, gp::PointF b);
+    static void TrayRouting();
+    static void TrayKeepsEachDocument();
+    static void TraySaveSelectedAndDone();
+    static void TrayClosePrompt();
+    static void TrayStrip();
+    static void TrayLimit();
+    static void TrayMemory();
 };
 }  // namespace
 
 ATHER_TEST(editor_redactions_survive_a_cancelled_drag) { EditorTest::Redactions(); }
 ATHER_TEST(editor_undo_while_typing_keeps_the_previous_step) { EditorTest::UndoWhileTyping(); }
+ATHER_TEST(editor_tray_routes_captures_to_the_open_editor) { EditorTest::TrayRouting(); }
+ATHER_TEST(editor_tray_keeps_each_pictures_document) { EditorTest::TrayKeepsEachDocument(); }
+ATHER_TEST(editor_tray_save_selected_and_done) { EditorTest::TraySaveSelectedAndDone(); }
+ATHER_TEST(editor_tray_close_prompt_answers) { EditorTest::TrayClosePrompt(); }
+ATHER_TEST(editor_tray_strip_clicks_keys_and_wheel) { EditorTest::TrayStrip(); }
+ATHER_TEST(editor_tray_holds_at_most_100_pictures) { EditorTest::TrayLimit(); }
+ATHER_TEST(editor_tray_memory_for_40_captures) { EditorTest::TrayMemory(); }
 
 void EditorTest::UndoWhileTyping() {
     auto* e = new Editor(SolidBmp(400, 300, 0xFFFFFFFF), {});
@@ -3058,6 +3715,492 @@ void EditorTest::Redactions() {
     CHECK(!e->Gesture());
     CHECK(std::any_of(e->st_.annots.begin(), e->st_.annots.end(), [](const Annot& a) { return a.type == Tool::Pixelate; }));
     e->dirty_ = false;
+    DestroyWindow(e->hwnd);
+}
+
+// ---- the capture tray (A1–A4 of docs/intent/capture-tray) ----
+
+namespace {
+
+// For a test's scope: editors stay hidden, save into a temp folder, and trays are on (or off).
+struct TrayTestScope {
+    EditorOptions old = g_defaults;
+    explicit TrayTestScope(const std::wstring& folder, bool tray = true) {
+        g_defaults.capturesFolder = folder;
+        g_defaults.tray = tray;
+        g_hideNewEditors = true;
+    }
+    ~TrayTestScope() {
+        g_defaults = old;
+        g_hideNewEditors = false;
+    }
+};
+
+// Saves report back through the UI dispatcher, which the self-tests don't run otherwise.
+struct UiForTest {
+    HWND h = StartUiDispatcher();
+    ~UiForTest() { StopUiDispatcher(h); }
+};
+
+void Pump(int ms) {
+    const ULONGLONG end = GetTickCount64() + ms;
+    while (GetTickCount64() < end) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(10);
+    }
+}
+
+void FinishSaves() {
+    WaitForPendingSaves(15000);
+    Pump(150);
+}
+
+bool Same(const Bitmap& a, const Bitmap& b) {
+    return a.Width() == b.Width() && a.Height() == b.Height() && memcmp(a.Bits(), b.Bits(), (size_t)a.Width() * a.Height() * 4) == 0;
+}
+
+BitmapPtr Copy(const Bitmap& b) { return b.Crop({0, 0, b.Width(), b.Height()}); }
+
+POINT Center(const RECT& r) { return {(r.left + r.right) / 2, (r.top + r.bottom) / 2}; }
+
+std::vector<std::wstring> SavedApps(Library& lib, const std::wstring& dir) {
+    const auto files = Library::ListCaptures(dir);
+    lib.Apply(files);
+    std::vector<std::wstring> apps;
+    for (const auto& f : files) apps.push_back(lib.Meta(f.path).app);
+    std::sort(apps.begin(), apps.end());
+    return apps;
+}
+
+}  // namespace
+
+// A hidden editor opened for a capture, sized like a window on a 1400 × 900 screen.
+Editor* EditorTest::Open(BitmapPtr img, const EditorSource& src) {
+    auto* e = new Editor(std::move(img), src);
+    e->hidden_ = true;
+    e->takesCaptures_ = true;
+    if (!e->Create()) {
+        delete e;
+        return nullptr;
+    }
+    RECT wr{0, 0, 1400, 900};
+    AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    SetWindowPos(e->hwnd, nullptr, 0, 0, RectW(wr), RectH(wr), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+    e->Layout();
+    return e;
+}
+
+POINT EditorTest::ToClient(Editor* e, gp::PointF p) {
+    const float z = e->Zoom();
+    const POINT o = e->Origin(), m = e->ViewMin();
+    return {(LONG)std::lround(o.x + (p.X - m.x) * z), (LONG)std::lround(o.y + (p.Y - m.y) * z)};
+}
+
+// A drag with the mouse from a to b (image coordinates) with tool t.
+void EditorTest::Drag(Editor* e, Tool t, gp::PointF a, gp::PointF b) {
+    e->SetTool(t);
+    const POINT p = ToClient(e, a), q = ToClient(e, b);
+    e->OnLButtonDown(p.x, p.y, false);
+    e->OnMouseMove(q.x, q.y);
+    e->OnLButtonUp(q.x, q.y);
+}
+
+// A1: with an editor open, a capture for the editor joins it (no new window) and becomes the current picture. A
+// collage or a window opened on a file never receives captures, and a file opens its own window. Trays off: one
+// window per capture, as before.
+void EditorTest::TrayRouting() {
+    TrayTestScope scope(test::TempDir());
+    const int before = EditorCount();
+    Editor* a = Editor::Route(SolidBmp(400, 300, 0xFFFFFFFF), {L"", L"Notepad", L"notes.txt"});
+    CHECK(a != nullptr);
+    if (!a) return;
+    CHECK_EQ(EditorCount(), before + 1);
+    CHECK(a->takesCaptures_ && a->tray_.size() == 1 && !a->Tray());
+    auto shot = SolidBmp(320, 200, 0xFF3366CC);
+    CHECK(Editor::Route(shot, {L"", L"Paint", L"Untitled"}) == a);
+    CHECK_EQ(EditorCount(), before + 1);
+    CHECK(a->Tray() && a->tray_.size() == 2 && a->cur_ == 1);
+    CHECK(a->base_ != shot && a->base_->Width() == 320 && Rgb(At(*a->base_, 5, 5)) == 0x3366CCu);  // a copy, now current
+    CHECK(a->source_.app == L"Paint" && a->tray_[0].source.app == L"Notepad");
+
+    // A newer collage and a newer window on a saved file: captures still go to the capture window.
+    auto blank = Bitmap::Create(1, 1);
+    blank->Bits()[0] = 0;
+    auto* c = new Editor(blank, {});
+    c->hidden_ = true;
+    c->collageImages_ = {SolidBmp(200, 100, 0xFFFF0000), SolidBmp(100, 200, 0xFF00FF00)};
+    c->collageSources_ = {L"", L""};
+    c->collage_ = CollageSpec(std::vector<SIZE>{{200, 100}, {100, 200}});
+    c->ApplyCollage(false);
+    CHECK(c->Create());
+    const std::wstring file = test::TempDir() + L"\\saved.png";
+    CHECK(SavePng(*SolidBmp(300, 200, 0xFF00AA00), file));
+    CHECK(OpenEditorFile(file));  // its own window
+    CHECK_EQ(EditorCount(), before + 3);
+    Editor* f = g_editors.back();
+    CHECK(f != a && f != c && f->source_.path == file && !f->takesCaptures_);
+    CHECK(Editor::Route(SolidBmp(64, 48, 0xFFFF0000), {}) == a);
+    CHECK(a->tray_.size() == 3 && a->cur_ == 2);
+    CHECK(c->tray_.size() == 1 && f->tray_.size() == 1);
+    CHECK_EQ(EditorCount(), before + 3);
+
+    // Trays off: a new window, as before.
+    g_defaults.tray = false;
+    Editor* own = Editor::Route(SolidBmp(64, 48, 0xFF00FF00), {});
+    CHECK(own != nullptr && own != a);
+    CHECK_EQ(EditorCount(), before + 4);
+    CHECK_EQ(a->tray_.size(), 3u);
+    for (Editor* x : {a, c, f, own})
+        if (x) DestroyWindow(x->hwnd);
+    CHECK_EQ(EditorCount(), before);
+}
+
+// A2: each picture keeps its own document. Switching away and back shows the same pixels, undo stack, crop and
+// canvas, and undo goes on where it was. Tool, color and size stay with the window; a text box being typed is
+// committed into its own picture first.
+void EditorTest::TrayKeepsEachDocument() {
+    TrayTestScope scope(test::TempDir());
+    Editor* e = Open(SolidBmp(400, 300, 0xFFFFFFFF), {L"", L"Notepad", L""});
+    if (!e) return CHECK(false);
+    Drag(e, Tool::Rect, {40, 40}, {200, 160});
+    Drag(e, Tool::Arrow, {300, 250}, {220, 120});
+    CHECK(e->st_.annots.size() == 2 && e->undo_.size() == 2 && e->dirty_);
+    const BitmapPtr pixels1 = Copy(*e->committed_);
+    const size_t undo1 = e->undo_.size();
+
+    CHECK(e->AddPicture(SolidBmp(500, 260, 0xFF3366CC), {L"", L"Paint", L""}));
+    CHECK(e->cur_ == 1 && e->st_.annots.empty() && e->undo_.empty() && !e->dirty_);
+    Drag(e, Tool::Ellipse, {50, 50}, {250, 200});
+    Drag(e, Tool::Crop, {20, 10}, {420, 230});
+    CHECK(std::abs(RectW(e->Frame()) - 400) <= 2 && std::abs(RectH(e->Frame()) - 220) <= 2);
+    e->ExtendFrame(Editor::Extend::Below);  // and space below it
+    const RECT frame2 = e->Frame();
+    CHECK(RectH(frame2) > 230);
+    const BitmapPtr pixels2 = Copy(*e->committed_);
+    const size_t undo2 = e->undo_.size();
+    CHECK_EQ(undo2, 3u);
+    e->SetColor(3);
+    e->SetLevel(4);
+
+    e->Key(VK_TAB, true, true);  // Ctrl+Shift+Tab: the previous picture
+    CHECK_EQ(e->cur_, 0);
+    CHECK(Same(*e->committed_, *pixels1));
+    CHECK_EQ(e->undo_.size(), undo1);
+    CHECK(RectW(e->Frame()) == 400 && RectH(e->Frame()) == 300);
+    CHECK(e->color_ == 3 && e->level_ == 4);  // these stay with the window
+    e->Key('Z', true, false);                 // undo: this picture's last step, the arrow
+    CHECK(e->st_.annots.size() == 1 && e->st_.annots[0].type == Tool::Rect);
+
+    // A text box being typed when switching away goes into its own picture.
+    e->SetTool(Tool::Text);
+    const POINT at = ToClient(e, {60, 220});
+    e->OnLButtonDown(at.x, at.y, false);
+    e->OnChar(L'H');
+    e->OnChar(L'i');
+    CHECK(e->texting_);
+    e->Key(VK_TAB, true, false);  // Ctrl+Tab: the next picture
+    CHECK(e->cur_ == 1 && !e->texting_);
+    CHECK(Same(*e->committed_, *pixels2));
+    CHECK_EQ(e->undo_.size(), undo2);
+    const RECT back2 = e->Frame();
+    CHECK(EqualRect(&frame2, &back2) != 0);
+    e->Key('Z', true, false);  // undoes the space below, not anything of the first picture
+    CHECK(RectH(e->Frame()) < RectH(frame2) && e->st_.annots.size() == 1);
+    e->Key(VK_PRIOR, true, false);  // Ctrl+PageUp
+    CHECK_EQ(e->cur_, 0);
+    CHECK(e->st_.annots.size() == 2 && e->st_.annots.back().text == L"Hi");
+    e->Undo();
+    CHECK(e->st_.annots.size() == 1 && e->st_.annots[0].type == Tool::Rect);
+    DestroyWindow(e->hwnd);
+}
+
+// A3: Save selected writes one PNG per ticked picture that isn't saved yet, pixel for pixel what Save writes for
+// it, noted in the library with its app and window; unticked ones are left alone. Saved badges and dirty dots
+// follow. Done saves the ticked ones, copies the current one and closes, asking first about an unticked picture
+// that would be lost.
+void EditorTest::TraySaveSelectedAndDone() {
+    const std::wstring dir = test::TempDir();
+    TrayTestScope scope(dir);
+    UiForTest ui;
+    Library lib(false);
+    Editor* e = Open(SolidBmp(400, 300, 0xFFFFFFFF), {L"", L"Notepad", L"notes.txt"});
+    if (!e) return CHECK(false);
+    e->library_ = &lib;
+    CHECK(e->AddPicture(SolidBmp(320, 240, 0xFF3366CC), {L"", L"Paint", L"Untitled"}));
+    CHECK(e->AddPicture(SolidBmp(360, 200, 0xFFCC6633), {L"", L"Excel", L"Book1"}));
+    Drag(e, Tool::Arrow, {300, 30}, {80, 150});
+    e->SwitchTo(0);
+    Drag(e, Tool::Rect, {40, 40}, {200, 160});
+    CHECK(e->tray_[0].keep && e->tray_[1].keep && e->tray_[2].keep);  // new captures come ticked
+    const POINT tick = Center(e->TickRect(1));
+    e->OnLButtonDown(tick.x, tick.y, false);  // untick the second
+    CHECK(!e->tray_[1].keep);
+    CHECK_EQ(e->ToSaveCount(), 2);
+    const DocState second = e->tray_[1].st;
+
+    e->SwitchTo(2);  // the first isn't current while Save selected writes it
+    const POINT save = Center(e->SaveSelectedRect());
+    e->OnLButtonDown(save.x, save.y, false);
+    FinishSaves();
+    const auto files = Library::ListCaptures(dir);
+    CHECK_EQ(files.size(), 2u);
+    CHECK((SavedApps(lib, dir) == std::vector<std::wstring>{L"Excel", L"Notepad"}));
+    std::wstring first;
+    for (const auto& f : files)
+        if (lib.Meta(f.path).app == L"Notepad") first = f.path;
+    CHECK(!first.empty() && lib.Meta(first).window == L"notes.txt");
+    CHECK(e->tray_[0].saved && !e->DirtyOf(0) && e->tray_[2].saved && !e->DirtyOf(2));  // "Saved" badges, no dots
+    CHECK(!e->tray_[1].saved && e->tray_[1].st.annots.size() == second.annots.size());   // untouched
+    CHECK_EQ(e->ToSaveCount(), 0);
+
+    // Ctrl+S on the first writes exactly what Save selected wrote for it (it wasn't current then).
+    e->SwitchTo(0);
+    e->Key('S', true, false);
+    FinishSaves();
+    std::wstring again;
+    for (const auto& f : Library::ListCaptures(dir))
+        if (std::none_of(files.begin(), files.end(), [&](const FileStat& x) { return x.path == f.path; })) again = f.path;
+    CHECK(!again.empty());
+    auto a = LoadImageFile(first), b = LoadImageFile(again);
+    CHECK(a && b && Same(*a, *b));
+    CHECK(a && a->Width() == 400 && Rgb(At(*a, 40, 100)) != 0xFFFFFFu);  // with its rectangle
+
+    // Edited again: dirty again, saved again.
+    Drag(e, Tool::Ellipse, {250, 60}, {380, 200});
+    CHECK(e->DirtyOf(0) && e->ToSaveCount() == 1);
+
+    // Done: the second isn't ticked and was never saved, so it asks first. Cancel leaves everything as it was.
+    int asked = -1;
+    bool askedDone = false;
+    BitmapPtr copied;
+    e->answerClose_ = [&](int n, bool done) {
+        asked = n;
+        askedDone = done;
+        return (int)Editor::CloseCancel;
+    };
+    e->copyForTest_ = [&](const Bitmap& img) {
+        copied = Copy(img);
+        return true;
+    };
+    const HWND h = e->hwnd;
+    e->Key(VK_RETURN, false, false);
+    CHECK(asked == 1 && askedDone && IsWindow(h) && !copied);
+    const BitmapPtr current = e->Export();
+    e->answerClose_ = [&](int, bool) { return (int)Editor::CloseSave; };
+    e->Key(VK_RETURN, false, false);
+    CHECK(!IsWindow(h));
+    FinishSaves();
+    CHECK_EQ(Library::ListCaptures(dir).size(), 4u);  // the first again; nothing of the second
+    CHECK((SavedApps(lib, dir) == std::vector<std::wstring>{L"Excel", L"Notepad", L"Notepad", L"Notepad"}));
+    CHECK(copied && current && Same(*copied, *current));
+}
+
+// A3: closing with pictures that would be lost asks "n pictures aren't saved": Cancel keeps the window, Close
+// without saving closes, Save selected and close saves the ticked ones first. Nothing to lose: no question.
+void EditorTest::TrayClosePrompt() {
+    const std::wstring dir = test::TempDir();
+    TrayTestScope scope(dir);
+    UiForTest ui;
+    Library lib(false);
+    auto make = [&]() -> Editor* {
+        Editor* e = Open(SolidBmp(400, 300, 0xFFFFFFFF), {L"", L"Notepad", L""});
+        if (!e) return nullptr;
+        e->library_ = &lib;
+        e->AddPicture(SolidBmp(320, 240, 0xFF3366CC), {L"", L"Paint", L""});
+        e->AddPicture(SolidBmp(360, 200, 0xFFCC6633), {L"", L"Excel", L""});
+        e->tray_[1].keep = false;
+        return e;
+    };
+    int asked = -1;
+    bool askedDone = true;
+    int answer = Editor::CloseCancel;
+    auto hook = [&](Editor* e) {
+        e->answerClose_ = [&](int n, bool done) {
+            asked = n;
+            askedDone = done;
+            return answer;
+        };
+    };
+
+    Editor* e = make();
+    if (!e) return CHECK(false);
+    hook(e);
+    HWND h = e->hwnd;
+    e->Key(VK_ESCAPE, false, false);  // Cancel
+    CHECK(asked == 3 && !askedDone && IsWindow(h));
+    answer = Editor::CloseDiscard;
+    e->Proc(WM_CLOSE, 0, 0);  // Close without saving
+    CHECK(!IsWindow(h));
+    FinishSaves();
+    CHECK(Library::ListCaptures(dir).empty());
+
+    e = make();
+    if (!e) return CHECK(false);
+    hook(e);
+    h = e->hwnd;
+    asked = -1;
+    answer = Editor::CloseSave;
+    e->Key('W', true, false);  // Save selected and close
+    CHECK(asked == 3 && !IsWindow(h));
+    FinishSaves();
+    CHECK((SavedApps(lib, dir) == std::vector<std::wstring>{L"Excel", L"Notepad"}));
+
+    // Every picture saved: closing asks nothing; Done with every picture ticked asks nothing either.
+    e = make();
+    if (!e) return CHECK(false);
+    hook(e);
+    h = e->hwnd;
+    asked = -1;
+    e->tray_[1].keep = true;
+    e->SaveSelected(true);
+    FinishSaves();
+    CHECK_EQ(e->ToSaveCount(), 0);
+    e->Close();
+    CHECK(asked == -1 && !IsWindow(h));
+    e = make();
+    if (!e) return CHECK(false);
+    hook(e);
+    h = e->hwnd;
+    e->tray_[1].keep = true;
+    e->copyForTest_ = [](const Bitmap&) { return true; };
+    e->Done();
+    CHECK(asked == -1 && !IsWindow(h));
+    FinishSaves();
+    CHECK_EQ(Library::ListCaptures(dir).size(), 8u);  // 2 + 3 + 3
+}
+
+// A4: the strip shows from two pictures; a click opens a picture, the tick toggles, × removes (asking first when
+// the picture has changes); Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+PageDown and Ctrl+PageUp go round; the wheel scrolls
+// a full strip sideways.
+void EditorTest::TrayStrip() {
+    TrayTestScope scope(test::TempDir());
+    Editor* e = Open(SolidBmp(400, 300, 0xFFFFFFFF));
+    if (!e) return CHECK(false);
+    const RECT one = e->Canvas();
+    CHECK(!e->Tray() && e->StripH() == 0 && one.bottom == e->client_.bottom - e->S(kStatusH));  // exactly as before
+    int part = 0;
+    CHECK_EQ(e->StripHit({one.right / 2, one.bottom - 4}, &part), -1);
+    e->Key(VK_TAB, true, false);
+    CHECK_EQ(e->cur_, 0);
+
+    CHECK(e->AddPicture(SolidBmp(320, 240, 0xFF3366CC), {}));
+    CHECK(e->Tray() && e->Canvas().bottom == one.bottom - e->S(kStripH));
+    POINT p = Center(e->ThumbRect(0));
+    e->OnLButtonDown(p.x, p.y, false);
+    e->OnLButtonUp(p.x, p.y);
+    CHECK_EQ(e->cur_, 0);
+    p = Center(e->TickRect(1));
+    e->OnLButtonDown(p.x, p.y, false);
+    CHECK(!e->tray_[1].keep && e->cur_ == 0);
+    e->OnLButtonDown(p.x, p.y, false);
+    CHECK(e->tray_[1].keep);
+
+    CHECK(e->AddPicture(SolidBmp(200, 400, 0xFFCC6633), {}));
+    CHECK_EQ(e->cur_, 2);
+    e->Key(VK_TAB, true, false);
+    CHECK_EQ(e->cur_, 0);
+    e->Key(VK_TAB, true, true);
+    CHECK_EQ(e->cur_, 2);
+    e->Key(VK_NEXT, true, false);
+    CHECK_EQ(e->cur_, 0);
+    e->Key(VK_PRIOR, true, false);
+    CHECK_EQ(e->cur_, 2);
+
+    // ×: shown under the mouse; a picture without changes goes at once.
+    p = Center(e->RemoveRect(0));
+    e->OnMouseMove(p.x, p.y);
+    CHECK(e->hoverThumb_ == 0 && e->hoverPart_ == 2);
+    e->OnLButtonDown(p.x, p.y, false);
+    CHECK(e->tray_.size() == 2 && e->cur_ == 1);
+    // One with changes asks first.
+    Drag(e, Tool::Rect, {20, 20}, {150, 150});
+    int asks = 0;
+    bool discard = false;
+    e->answerDiscard_ = [&] {
+        ++asks;
+        return discard;
+    };
+    p = Center(e->RemoveRect(1));
+    e->OnLButtonDown(p.x, p.y, false);
+    CHECK(asks == 1 && e->tray_.size() == 2);
+    discard = true;
+    e->OnLButtonDown(p.x, p.y, false);
+    CHECK(asks == 2 && e->tray_.size() == 1 && e->cur_ == 0);
+    CHECK(!e->Tray() && e->Canvas().bottom == one.bottom);  // one picture left: no strip
+    CHECK(e->base_->Width() == 320);
+
+    // Twenty pictures overflow the strip: the newest is scrolled into view, and the wheel over the strip scrolls
+    // it sideways instead of changing the size.
+    for (int i = 0; i < 19; ++i) e->AddPicture(SolidBmp(160, 90, 0xFF000000 | (uint32_t)(i * 0x0A1B2C)), {});
+    CHECK(e->tray_.size() == 20 && e->cur_ == 19 && e->stripScroll_ > 0);
+    const RECT v = e->StripView(), last = e->ThumbBox(19);
+    CHECK(last.right <= v.right);
+    e->stripScroll_ = 0;
+    const int level = e->level_;
+    POINT sp = Center(e->StripView());
+    ClientToScreen(e->hwnd, &sp);
+    e->Proc(WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)(short)-WHEEL_DELTA), MAKELPARAM(sp.x, sp.y));
+    CHECK(e->stripScroll_ == e->S(kThumbW) + e->S(kThumbGap) && e->level_ == level);
+    e->Proc(WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)(short)WHEEL_DELTA), MAKELPARAM(sp.x, sp.y));
+    CHECK_EQ(e->stripScroll_, 0);
+    e->level_ = 1;
+    POINT cp = Center(e->Canvas());
+    ClientToScreen(e->hwnd, &cp);
+    e->Proc(WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)(short)WHEEL_DELTA), MAKELPARAM(cp.x, cp.y));
+    CHECK_EQ(e->level_, 2);  // over the picture the wheel still sets the size
+    DestroyWindow(e->hwnd);
+}
+
+// A4: a tray holds 100 pictures; the 101st capture opens a window of its own instead of being lost.
+void EditorTest::TrayLimit() {
+    TrayTestScope scope(test::TempDir());
+    const int before = EditorCount();
+    Editor* e = Open(SolidBmp(64, 48, 0xFFFFFFFF));
+    if (!e) return CHECK(false);
+    for (int i = 1; i < kTrayMax; ++i) e->AddPicture(SolidBmp(64, 48, 0xFF000000 | (uint32_t)i), {});
+    CHECK_EQ((int)e->tray_.size(), kTrayMax);
+    CHECK(!e->AddPicture(SolidBmp(64, 48, 0xFF00FF00), {}));
+    Editor* other = Editor::Route(SolidBmp(64, 48, 0xFFFF0000), {});
+    CHECK(other != nullptr && other != e);
+    CHECK_EQ((int)e->tray_.size(), kTrayMax);
+    CHECK_EQ(EditorCount(), before + 2);
+    if (other) DestroyWindow(other->hwnd);
+    DestroyWindow(e->hwnd);
+}
+
+// A4 / D6: 40 captures of 2560 × 1440 in one tray keep the process's private bytes under about 1.5 GB. Only the
+// current picture keeps its composed bitmaps; the others hold their screenshot and a thumbnail.
+void EditorTest::TrayMemory() {
+    TrayTestScope scope(test::TempDir());
+    auto privateBytes = [] {
+        PROCESS_MEMORY_COUNTERS_EX m{};
+        m.cb = sizeof(m);
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&m), sizeof(m));
+        return (double)m.PrivateUsage;
+    };
+    const double before = privateBytes();
+    Editor* e = Open(SolidBmp(2560, 1440, 0xFF336699));
+    if (!e) return CHECK(false);
+    for (int i = 1; i < 40; ++i) CHECK(e->AddPicture(SolidBmp(2560, 1440, 0xFF000000 | (uint32_t)(i * 0x050607)), {}));
+    const double after = privateBytes(), raw = 40.0 * 2560 * 1440 * 4;
+    char line[160];
+    sprintf_s(line, "  (40 pictures of 2560 x 1440 in one tray: private bytes %.0f MB, %.0f MB more than before)\n", after / 1048576,
+              (after - before) / 1048576);
+    test::Out(line);
+    CHECK_EQ(e->tray_.size(), 40u);
+    CHECK(after < 1.5e9);
+    CHECK(after - before > raw * 0.9);  // the measure sees the screenshots (a sanity check of the test itself)
+    int stored = 0, thumbs = 0;
+    for (const auto& p : e->tray_) {
+        stored += p.base != nullptr;
+        thumbs += p.thumb != nullptr;
+    }
+    CHECK_EQ(stored, 39);  // the current picture's screenshot is in the editor itself
+    CHECK_EQ(thumbs, 39);
     DestroyWindow(e->hwnd);
 }
 

@@ -292,7 +292,7 @@ void ShowHotkeyErrors() {
 }
 
 void ApplyEditorDefaults() {
-    SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile});
+    SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile, g_settings.editorTray});
     SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
     SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
         g_settings.noteAuthor = name;
@@ -419,7 +419,7 @@ void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = 
     }
 
     if (after == After::Edit || (after == After::Default && g_settings.afterCapture == L"edit")) {
-        OpenEditor(img, {L"", g_nameInfo.app, g_nameInfo.window});  // the editor copies/saves the annotated result on Done
+        OpenCaptureInEditor(img, {L"", g_nameInfo.app, g_nameInfo.window});  // the editor copies/saves the annotated result on Done
         return;
     }
 

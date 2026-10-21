@@ -8,6 +8,7 @@ struct EditorOptions {
     HICON icon = nullptr;
     bool styledExport = false;  // padding + gradient background + rounded corners + shadow
     bool saveToFile = true;     // Done also saves (Settings › Save to file)
+    bool tray = true;           // captures for the editor collect in one window ([Editor] Tray)
 };
 
 // Call once at startup (needs GDI+ to be running) and whenever settings change.
@@ -25,6 +26,10 @@ struct EditorSource {
 // spotlight, magnifier, crop, canvas (add space around the screenshot) and image layers. Undo/redo,
 // Ctrl+C copy, Ctrl+S save, Enter = copy + save + close, Ctrl+K opens a palette with every editor command.
 void OpenEditor(BitmapPtr img, const EditorSource& source = {});
+// A capture headed for the editor (Capture and annotate, After capture = Open in editor). With trays on it joins
+// the most recently used editor that holds captures, as a new picture in the strip along its bottom edge;
+// otherwise, or when no such editor is open, it opens a window like OpenEditor.
+void OpenCaptureInEditor(BitmapPtr img, const EditorSource& source = {});
 bool OpenEditorFile(const std::wstring& path);
 // A collage: an empty canvas with one image layer per screenshot, laid out automatically.
 bool OpenCollage(const std::vector<std::wstring>& paths);

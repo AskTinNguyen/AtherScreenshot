@@ -160,6 +160,8 @@ void Window::Build() {
         r->choices = {{L"none", L"Nothing else"}, {L"pin", L"Pin to screen"}, {L"edit", L"Open in editor"},
                       {L"open", L"Open the file"}, {L"upload", L"Upload and copy link"}};
     }
+    add(Kind::Toggle, L"Editor", L"Tray", L"Collect captures in one editor",
+        L"Captures for the editor join the open one, in a strip of thumbnails", L"1");
     add(Kind::Toggle, L"Capture", L"CaptureCursor", L"Include mouse cursor", L"Full-screen and window captures", L"0");
     add(Kind::Number, L"Capture", L"DelaySeconds", L"Delayed capture", L"Seconds to wait for the delayed commands", L"3", 1, 30);
     add(Kind::Toggle, L"Capture", L"AutoRedact", L"Auto-redact every capture",
