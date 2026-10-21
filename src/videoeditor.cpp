@@ -4219,6 +4219,7 @@ BitmapPtr Snapshot(VideoEditor* e) {
 }  // namespace
 
 int VideoEditorSnapshots(const std::wstring& outDir) {
+    SHCreateDirectoryExW(nullptr, outDir.c_str(), nullptr);  // as the other snapshot tools do (CI hands it a new folder)
     const std::wstring clip = outDir + L"\\snapshot-clip.mp4";
     if (!WriteTestClip(clip, 1280, 720, 30, 3, false)) return 1;  // silent: snapshots never make a sound
     VideoEditor* e = OpenHidden(clip, 1180, 760);
@@ -5623,6 +5624,12 @@ int PixelsDiffer(const Bitmap& a, const Bitmap& b) {
     for (size_t i = 0, k = (size_t)a.Width() * a.Height(); i < k; ++i) n += (a.Bits()[i] & 0xFFFFFF) != (b.Bits()[i] & 0xFFFFFF);
     return n;
 }
+// ShownFrame, allowing for a slow first decode (a runner without a GPU can take over two seconds for it).
+std::pair<int, bool> FrameOnScreen(VideoEditor* e) {
+    auto r = ShownFrame(e);
+    for (int i = 0; i < 3 && r.first < 0; ++i) r = ShownFrame(e);
+    return r;
+}
 int MiddleNumber(const Bitmap& f) { return NumberOf(f.Bits()[(size_t)(f.Height() / 2) * f.Width() + f.Width() / 2]); }
 // Every frame of an MP4, in order, by the number painted on it (WriteNumberedClip), and whether it has blue.
 std::vector<std::pair<int, bool>> FrameNumbers(const std::wstring& path) {
@@ -5795,9 +5802,9 @@ ATHER_TEST(video_editor_copies_the_marked_range_as_a_clip) {
     if (e->tframes.size() < 200) return DestroyWindow(e->hwnd), void();
     const VideoEdit before = e->edit;
     e->GoToFrame(159);
-    const auto last = ShownFrame(e);
+    const auto last = FrameOnScreen(e);
     e->GoToFrame(40);
-    const auto first = ShownFrame(e);
+    const auto first = FrameOnScreen(e);
     e->Key('I', {false, true, false});
     e->GoToFrame(160);
     e->Key('O', {false, true, false});
@@ -5875,9 +5882,9 @@ ATHER_TEST(video_editor_copies_the_selected_clip) {
     CHECK(!e->marked && e->CanCopyClip());
     const size_t f0 = e->tframes.clipFirst[1], f1 = e->tframes.At(e->edit.trimEnd - 1e-3);
     e->GoToFrame(f1);
-    const auto last = ShownFrame(e);
+    const auto last = FrameOnScreen(e);
     e->GoToFrame(f0);
-    const auto first = ShownFrame(e);
+    const auto first = FrameOnScreen(e);
     CHECK(first.second && last.second);  // both from b
     e->Key('C', {true, false, false});
     for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
@@ -5910,7 +5917,7 @@ ATHER_TEST(video_editor_copies_the_frame_on_screen) {
     CHECK(e->tframes.size() >= 100);
     if (e->tframes.size() < 100) return DestroyWindow(e->hwnd), void();
     e->GoToFrame(60);
-    ShownFrame(e);
+    FrameOnScreen(e);
     e->AddCaption();
     e->edit.captions.back().text = L"Copied frame";
     const uint64_t caption = e->edit.captions.back().id;
@@ -5937,7 +5944,7 @@ ATHER_TEST(video_editor_copies_the_frame_on_screen) {
         CHECK(dib && PixelsDiffer(*dib, *want) == 0);
         CHECK(png && PixelsDiffer(*png, *want) == 0);
         if (!dib) return;
-        CHECK_EQ(MiddleNumber(*dib), ShownFrame(e).first);  // the frame on screen
+        CHECK_EQ(MiddleNumber(*dib), FrameOnScreen(e).first);  // the frame on screen
         VideoEdit plain = e->edit;
         plain.captions.clear();
         plain.marks.clear();
