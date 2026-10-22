@@ -400,37 +400,22 @@ std::vector<Marker>& CurrentMarkers() {
     return g_rec.markers;
 }
 
-// Writes `text` to `path` only if nothing is there yet, all at once (a temp file moved into place).
-bool WriteNewFileUtf8(const std::wstring& path, const std::string& text) {
-    const std::wstring tmp = path + L".tmp";
-    if (!WriteUtf8File(tmp, text)) return false;
-    if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) return true;  // fails if `path` exists
-    DeleteFileW(tmp.c_str());
-    return false;
-}
-
-// Markers become the video's review notes ("<video>.notes.json"), where the video editor shows them on their frames.
-// Never over notes that are already there. Written before anyone is told about the video, so an editor opened
-// from the notification finds them.
+// Markers become the video's review notes ("<video>.notes.json"), where the video editor shows them on their frames,
+// next to any notes already there (bug reports' Issue notes). Written before anyone is told about the video, so an editor
+// opened from the notification finds them.
 bool WriteMarkers(const std::wstring& video, const std::vector<Marker>& markers, const std::wstring& author, int fps) {
     if (markers.empty() || MediaTypeOf(video) != MediaType::Video) return false;
-    const std::vector<double> times = FrameTimes(video);
     std::vector<Note> notes;
     for (const auto& m : markers) {
         Note n;
-        n.path = video;
         n.src = m.seconds;
-        if (!times.empty()) {  // the frame on screen at that moment
-            auto it = std::upper_bound(times.begin(), times.end(), m.seconds + 1e-6);
-            n.src = it == times.begin() ? times.front() : *(it - 1);
-        }
         n.text = m.label;
         n.author = author;
         n.kind = m.kind;
         n.created = (int64_t)time(nullptr);
         notes.push_back(std::move(n));
     }
-    return WriteNewFileUtf8(NotesPath(video), NotesJson(video, notes, times, fps));
+    return AddVideoNotes(video, std::move(notes), fps);
 }
 
 Json MarkersJson(const std::vector<Marker>& ms) {
@@ -1272,18 +1257,40 @@ ATHER_TEST(agent_configure_checks_before_writing) {
 
 ATHER_TEST(agent_notes_never_overwrite) {
     const std::wstring dir = test::TempDir();
-    const std::wstring path = dir + L"\\a.mp4.notes.json";
-    CHECK(WriteNewFileUtf8(path, "first"));
-    CHECK(!WriteNewFileUtf8(path, "second"));  // the editor's own notes stay
-    std::string text;
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    char buf[16] = {};
-    DWORD n = 0;
-    ReadFile(f, buf, sizeof(buf), &n, nullptr);
-    CloseHandle(f);
-    CHECK_EQ(std::string(buf, n), std::string("first"));
-    CHECK(GetFileAttributesW((path + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
-    CHECK(!WriteMarkers(dir + L"\\b.gif", {{1, L"x", NoteKind::Issue}}, L"t", 15));  // GIFs have no notes
+    auto read = [](const std::wstring& path) {
+        std::string text;
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        char buf[4096];
+        DWORD n = 0;
+        while (f != INVALID_HANDLE_VALUE && ReadFile(f, buf, sizeof(buf), &n, nullptr) && n) text.append(buf, n);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        return text;
+    };
+    // The editor's own note is already there: the markers join it.
+    const std::wstring a = dir + L"\\a.mp4";
+    CHECK(WriteTestClip(a, 160, 90, 30, 2, false));
+    Note mine;
+    mine.path = a;
+    mine.src = 0.5;
+    mine.text = L"mine";
+    CHECK(WriteUtf8File(NotesPath(a), NotesJson(a, {mine}, {}, 30)));
+    CHECK(WriteMarkers(a, {{1.02, L"marker", NoteKind::Issue}}, L"t", 30));
+    std::vector<Note> back;
+    CHECK(ParseNotes(read(NotesPath(a)), a, {}, 30, &back));
+    CHECK_EQ(back.size(), 2u);
+    if (back.size() == 2) {
+        CHECK(back[0].text == L"mine" && back[0].kind == NoteKind::Note);
+        CHECK(back[1].text == L"marker" && back[1].kind == NoteKind::Issue && back[1].author == L"t");
+        CHECK(back[1].src <= 1.02 && back[1].src > 1.02 - 1 / 30.0 - 1e-3);  // the frame on screen at that moment
+    }
+    CHECK(GetFileAttributesW((NotesPath(a) + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+    // A sidecar that can't be read stays as it is.
+    const std::wstring b = dir + L"\\b.mp4";
+    CHECK(WriteTestClip(b, 160, 90, 30, 1, false));
+    CHECK(WriteUtf8File(NotesPath(b), "first"));
+    CHECK(!WriteMarkers(b, {{0.5, L"x", NoteKind::Issue}}, L"t", 30));
+    CHECK_EQ(read(NotesPath(b)), std::string("first"));
+    CHECK(!WriteMarkers(dir + L"\\c.gif", {{1, L"x", NoteKind::Issue}}, L"t", 15));  // GIFs have no notes
 }
 
 }  // namespace ather

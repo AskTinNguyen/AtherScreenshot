@@ -23,5 +23,8 @@ struct SettingsUiHost {
 // Native settings window: search, toggles, choices, inline text/number fields, folder picker and a
 // shortcut recorder. Every change is saved immediately (settings.ini stays the storage format).
 void ShowSettingsWindow(const SettingsUiHost& host);
+// The settings window searched for `query`, painted into a picture without showing it (tests and snapshots), and the
+// rows it shows (headers too). Null while the window is open.
+BitmapPtr SettingsSnapshot(const SettingsUiHost& host, const std::wstring& query, std::vector<std::wstring>* shown = nullptr);
 
 }  // namespace ather

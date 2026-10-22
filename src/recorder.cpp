@@ -666,4 +666,12 @@ double RecordingSeconds() {
     return g_session->clock.Active(RecClock::Now()) / (double)g_session->clock.freq;
 }
 
+bool RecordingTarget(RECT* area, RecordFormat* format, std::wstring* path) {
+    if (!g_session || g_state != State::Recording) return false;
+    if (area && !(g_session->opt.window && GetWindowFrame(g_session->opt.window, area))) *area = g_session->opt.rect;
+    if (format) *format = g_session->opt.format;
+    if (path) *path = g_session->opt.path;
+    return true;
+}
+
 }  // namespace ather

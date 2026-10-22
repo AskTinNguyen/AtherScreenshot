@@ -22,6 +22,10 @@
 - **Saving:** tick the pictures to keep and press **Save selected**. Each is saved as its own PNG in your captures folder and shows up in the gallery. Done saves the ticked ones and closes. Closing with pictures that aren't saved asks first.
 - **Every capture:** set After capture to "Open in editor" to collect every capture this way. Settings › **Collect captures in one editor** turns it off.
 
+### Bug reports by voice: "bug start" … "bug stop"
+- **What:** while you playtest with the screen recorded, say "bug start", describe the bug, then say "bug stop" (or press `Ctrl+Alt+B` / `⌃⌥B` to start and again to stop). You get one folder per bug: the screenshot with what you said written on it, a clip from 10 seconds before the bug with captions (cut when the recording stops), your narration as `voice.wav`, the game's logs from the paths you set, and `bug.md` / `bug.json`. "Copy last bug report" puts it on the clipboard for Slack.
+- **Privacy:** listening is off until you turn on Settings › Bug reports › Listen for "bug start" / "bug stop". Speech is recognized on your computer. On the Mac, "Transcribe Vietnamese with Apple's servers" is a separate opt-in: it writes the narration down on the Mac when the Mac knows Vietnamese, and sends only the narration to Apple when it doesn't.
+
 ## What's new in this update (Windows and macOS, build 0.0.2.4)
 
 ### AI agents can take screenshots and record for you

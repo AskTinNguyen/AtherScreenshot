@@ -59,6 +59,14 @@ private let rows: [Row] = {
         Row(key: "GamepadCorner", title: "Controller corner", section: "Recording", keywords: "gamepad position",
             kind: .choice(PadCorner.allCases.map { ($0.rawValue, $0.title) }), shownWhen: "ShowGamepad"),
         Row(key: "GamepadOpacity", title: "Controller opacity", section: "Recording", keywords: "gamepad transparent", kind: .number(10...100, 10, "%"), shownWhen: "ShowGamepad"),
+        Row(key: "VoiceCommands", title: "Listen for “bug start” / “bug stop”: then describe the bug and say “bug stop”. Keeps the microphone open; recognized on this Mac",
+            section: "Bug reports", keywords: "voice speech microphone playtest", kind: .toggle),
+        Row(key: "LogPaths", title: "Game log paths", section: "Bug reports", keywords: "logs files folders wildcards",
+            kind: .text("~/Library/Logs/MyGame/*.log; another path", secure: false)),
+        Row(key: "PreRollSeconds", title: "Clip starts before “bug start”", section: "Bug reports", keywords: "pre-roll recording seconds", kind: .number(0...120, 1, "s")),
+        Row(key: "LogMaxMB", title: "Largest log copied (a bigger one keeps its end)", section: "Bug reports", keywords: "size logs", kind: .number(1...1024, 1, "MB")),
+        Row(key: "CloudVietnamese", title: "Transcribe Vietnamese with Apple's servers: at “bug stop”, the narration (voice.wav) is written down on this Mac when it can, and sent to Apple only when it can't",
+            section: "Bug reports", keywords: "vietnamese tiếng việt vi-VN cloud server speech dictation", kind: .toggle),
         Row(key: "AllowAgents", title: "Allow AI agents (MCP): Claude Code, Codex and other agents on this Mac can take screenshots, record and search the gallery",
             section: "AI agents", keywords: "mcp claude codex agent automation llm", kind: .toggle),
         Row(key: "AgentPort", title: "Agent port (127.0.0.1 only)", section: "AI agents", keywords: "mcp", kind: .number(1024...65535, 1, ""), shownWhen: "AllowAgents"),
@@ -81,13 +89,15 @@ private let rows: [Row] = {
     return r
 }()
 
-private let sections = ["General", "Capture", "Recording", "Editor", "Gallery", "Upload", "AI agents", "Updates", "Shortcuts"]
+private let sections = ["General", "Capture", "Recording", "Bug reports", "Editor", "Gallery", "Upload", "AI agents", "Updates", "Shortcuts"]
 
 struct SettingsView: View {
     @ObservedObject var s = Settings.shared
     @ObservedObject var status = HotkeyStatus.shared
     @State private var query = ""
     @State private var login = SMAppService.mainApp.status == .enabled
+
+    init(query: String = "") { _query = State(initialValue: query) }  // a search to start with (snapshots)
 
     private var visible: [Row] {
         let w = query.lowercased().split(separator: " ").map(String.init)

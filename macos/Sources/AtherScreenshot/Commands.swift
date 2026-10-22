@@ -9,6 +9,9 @@ enum Cmd: String, CaseIterable {
     case stopRecording = "StopRecording"
     case recordWindow = "RecordWindow"
     case pauseRecording = "PauseRecording"
+    case bugReport = "BugReport"
+    case copyLastBug = "CopyLastBugReport"
+    case openBugsFolder = "OpenBugReportsFolder"
     case ruler = "ScreenRuler"
     case toggleSystemAudio = "ToggleSystemAudio"
     case toggleMic = "ToggleMicrophone"
@@ -71,6 +74,9 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .stopRecording, title: "Stop recording", keywords: "finish end save video gif", icon: "stop.circle", hotkey: "", capture: false),
     CmdDef(cmd: .recordWindow, title: "Record a window (follows it)", keywords: "video mp4 app track follow", icon: "macwindow.badge.plus", hotkey: "", capture: true),
     CmdDef(cmd: .pauseRecording, title: "Pause / resume recording", keywords: "break hold continue", icon: "pause.circle", hotkey: "", capture: false),
+    CmdDef(cmd: .bugReport, title: "Bug report: start / stop", keywords: "bug issue playtest report voice clip logs game qa", icon: "ladybug", hotkey: "Ctrl+Alt+B", capture: true),
+    CmdDef(cmd: .copyLastBug, title: "Copy last bug report", keywords: "bug clipboard paste slack files clip logs", icon: "doc.on.doc", hotkey: "", capture: false),
+    CmdDef(cmd: .openBugsFolder, title: "Open bug reports folder", keywords: "bug finder directory files bundles", icon: "folder", hotkey: "", capture: false),
     CmdDef(cmd: .ruler, title: "Screen ruler", keywords: "measure pixels distance size length angle", icon: "ruler", hotkey: "", capture: true),
     CmdDef(cmd: .toggleSystemAudio, title: "Record system audio", keywords: "toggle sound speaker loopback", icon: "speaker.wave.2", hotkey: "", capture: false),
     CmdDef(cmd: .toggleMic, title: "Record microphone", keywords: "toggle mic voice", icon: "mic", hotkey: "", capture: false),

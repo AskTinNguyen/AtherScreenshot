@@ -24,6 +24,7 @@ final class Settings: ObservableObject {
             "CustomResponseUrl": "", "S3Endpoint": "", "S3Bucket": "", "S3Region": "auto", "S3AccessKey": "",
             "S3SecretKey": "", "S3PublicUrl": "",
             "CompressVideoMB": Compress.defaultVideoMB, "CompressPictureMB": Compress.defaultPictureMB,   // the last "under N MB" used
+            "VoiceCommands": false, "LogPaths": "", "PreRollSeconds": 10, "LogMaxMB": 20, "CloudVietnamese": false,  // bug reports
         ]
         for c in kCmds { m["Hotkey." + c.cmd.rawValue] = c.hotkey }
         return m

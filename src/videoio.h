@@ -5,6 +5,8 @@
 #include "common.h"
 #include "videoedit.h"
 
+struct ISpRecognizer;  // <sapi.h>
+
 namespace ather {
 
 // Video in and out for the video editor: Media Foundation decoding (Source Reader, on the GPU where it can), export
@@ -70,6 +72,10 @@ Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
 // The time of every frame of a file's video in order (source seconds; decoding gives the frames these same times),
 // read from the file without decoding it. Empty when they can't be read.
 std::vector<double> FrameTimes(const std::wstring& path);
+// Review notes the app adds to a video's sidecar ("<video>.notes.json", see videoedit.h) by itself: AI agents' markers
+// and bug reports. Each time (and range end) moves to the frame on screen at that moment. Notes already there stay; a
+// sidecar that can't be read is left as it is (false).
+bool AddVideoNotes(const std::wstring& video, std::vector<Note> notes, double fps);
 
 // Reads a sequence like one video: frames in order with timeline times (Fit puts one into the sequence frame).
 class SequenceReader {
@@ -156,6 +162,11 @@ std::vector<BitmapPtr> VideoThumbnails(const Sequence& s, int count, int maxSide
 // Speech in [from, to) of the video as caption-sized chunks with word times, on this PC. Blocking: call from
 // a worker thread with COM initialized.
 bool Transcribe(const Sequence& s, double from, double to, std::vector<Caption>* out, std::wstring* error);
+// Windows speech recognition (SAPI): an in-process recognizer with the default engine, for Transcribe and the bug
+// reports' voice commands (bugreport.cpp). Null when none is installed, with `error` saying how to add one. AddRef'd.
+ISpRecognizer* NewSpeechRecognizer(std::wstring* error);
+// 16-bit mono PCM as a WAV file.
+bool WriteWav16(const std::wstring& path, const std::vector<int16_t>& pcm, int rate, bool temporary = true);
 
 // Playback for the editor preview. Frames come out through NewFrame, so the window can run them through the
 // frame renderer before showing them. Events are posted to `notify` as `msg` (wParam = MF_MEDIA_ENGINE_EVENT).

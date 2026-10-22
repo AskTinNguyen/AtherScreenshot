@@ -208,6 +208,15 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"; know the private token in the settings folder can connect.\r\n"
         L"AllowAgents=0\r\n"
         L"AgentPort=47821\r\n"
+        L"\r\n[Bugs]\r\n"
+        L"; Bug reports: listen for \"bug start\" / \"bug stop\" (keeps the microphone open while on)\r\n"
+        L"VoiceCommands=0\r\n"
+        L"; Game logs copied into each bug: files, folders or wildcards separated by ;, e.g. %LOCALAPPDATA%\\MyGame\\Saved\\Logs\\*.log\r\n"
+        L"LogPaths=\r\n"
+        L"; The clip starts this many seconds before \"bug start\"\r\n"
+        L"PreRollSeconds=10\r\n"
+        L"; A log bigger than this (MB) keeps only its end\r\n"
+        L"LogMaxMB=20\r\n"
         L"\r\n[Gallery]\r\n"
         L"; Add suggested tags (chat, code, error, receipt...) to captures automatically\r\n"
         L"AutoTag=0\r\n"
@@ -272,6 +281,10 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Scrolling", L"MaxFrames", L"60"},
         {L"Editor", L"StyledExport", L"0"},
         {L"Editor", L"Tray", L"1"},
+        {L"Bugs", L"VoiceCommands", L"0"},
+        {L"Bugs", L"LogPaths", L""},
+        {L"Bugs", L"PreRollSeconds", L"10"},
+        {L"Bugs", L"LogMaxMB", L"20"},
         {L"Gallery", L"AutoTag", L"0"},
         {L"Updates", L"CheckAutomatically", L"1"},
         {L"AiAgents", L"AllowAgents", L"0"},
@@ -323,6 +336,10 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     compressVideoMB = std::clamp(_wtof(Get(L"Compress", L"CompressVideoMB", L"30").c_str()), 0.1, 4096.0);
     compressPictureMB = std::clamp(_wtof(Get(L"Compress", L"CompressPictureMB", L"2").c_str()), 0.1, 4096.0);
 
+    bugVoice = GetBool(L"Bugs", L"VoiceCommands", false);
+    bugLogPaths = Get(L"Bugs", L"LogPaths", L"");
+    bugPreRollSeconds = std::clamp(_wtoi(Get(L"Bugs", L"PreRollSeconds", L"10").c_str()), 0, 120);
+    bugLogMaxMB = std::clamp(_wtoi(Get(L"Bugs", L"LogMaxMB", L"20").c_str()), 1, 1024);
     autoTag = GetBool(L"Gallery", L"AutoTag", false);
     checkUpdates = GetBool(L"Updates", L"CheckAutomatically", true);
     agentsEnabled = GetBool(L"AiAgents", L"AllowAgents", false);
