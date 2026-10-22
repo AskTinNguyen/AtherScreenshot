@@ -169,8 +169,8 @@ VRect OverlayRect(const Overlay& o, SIZE out);
 // The other half of a split screen, where the timeline's video goes.
 VRect MainHalf(const Overlay& o, SIZE out);
 
-// Composition guides drawn over the editor's preview (never saved): golden section (1/φ² and 1/φ), rule of thirds, phi
-// grid (1 : φ : 1) and diagonals (both diagonals, and from each corner the line square to the other diagonal).
+// Composition guides drawn over the editor's preview (never saved): golden section (0.317 / 0.683), rule of thirds, phi
+// grid (0.24 / 0.76) and diagonals (both diagonals, and from each corner the line square to the other diagonal).
 enum class GuideKind { Golden, Thirds, Phi, Diagonal };
 constexpr int kGuideKinds = 4;
 const wchar_t* GuideLabel(GuideKind k);

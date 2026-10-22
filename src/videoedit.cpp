@@ -244,11 +244,12 @@ std::vector<std::pair<VPoint, VPoint>> GuideLines(GuideKind k, VRect r) {
             out.push_back({{r.x, r.y + r.h * x}, {r.MaxX(), r.y + r.h * x}});
         }
     };
-    const double phi = (1 + std::sqrt(5.0)) / 2;
+    // The golden section and the phi grid sit where the user marked them on a 16:9 frame (2026-10-22): 0.317 / 0.683
+    // and 0.24 / 0.76 of the width and the height.
     switch (k) {
-        case GuideKind::Golden: at(1 / (phi * phi)); break;  // 0.382 and 0.618
+        case GuideKind::Golden: at(0.317); break;
         case GuideKind::Thirds: at(1.0 / 3); break;
-        case GuideKind::Phi: at(1 / (2 + phi)); break;       // 1 : φ : 1, so 0.276 and 0.724
+        case GuideKind::Phi: at(0.24); break;
         case GuideKind::Diagonal: {
             if (r.w <= 0 || r.h <= 0) break;
             const VPoint tl{r.x, r.y}, tr{r.MaxX(), r.y}, bl{r.x, r.MaxY()}, br{r.MaxX(), r.MaxY()};
@@ -2018,8 +2019,8 @@ ATHER_TEST(video_composition_guide_lines) {
     };
     const auto thirds = xs(GuideKind::Thirds), golden = xs(GuideKind::Golden), phi = xs(GuideKind::Phi);
     CHECK(thirds.size() == 2 && std::fabs(thirds[0] - 1.0 / 3) < 1e-9 && std::fabs(thirds[1] - 2.0 / 3) < 1e-9);
-    CHECK(golden.size() == 2 && std::fabs(golden[0] - 0.381966) < 1e-5 && std::fabs(golden[1] - 0.618034) < 1e-5);
-    CHECK(phi.size() == 2 && std::fabs(phi[0] - 0.276393) < 1e-5 && std::fabs(phi[1] - 0.723607) < 1e-5);
+    CHECK(golden.size() == 2 && std::fabs(golden[0] - 0.317) < 1e-9 && std::fabs(golden[1] - 0.683) < 1e-9);
+    CHECK(phi.size() == 2 && std::fabs(phi[0] - 0.24) < 1e-9 && std::fabs(phi[1] - 0.76) < 1e-9);
     CHECK_EQ(GuideLines(GuideKind::Thirds, r).size(), 4u);  // two across, two down
     for (const VRect box : {r, VRect{0, 0, 600, 1000}}) {
         const auto d = GuideLines(GuideKind::Diagonal, box);
