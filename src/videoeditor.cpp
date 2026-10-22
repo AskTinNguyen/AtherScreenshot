@@ -673,10 +673,7 @@ public:
         FrameRenderer r(edit, videoSize, true);
         r.zoomInPreview = playing;
         if (!playing && selected) r.settled = *selected;  // a new item shows at the playhead, not faded out at its first frame
-        r.overlayFrame = [this](const Overlay& o, double) -> BitmapPtr {
-            const auto it = overlayPics.find(o.id);
-            return it != overlayPics.end() ? it->second : nullptr;
-        };
+        r.overlayFrame = OverlayPictures();
         shown = r.Render(*raw, playing ? rawT : paused);
         if (mono && shown) Grayscale(*shown);
     }
@@ -800,6 +797,13 @@ public:
     std::unique_ptr<OverlayFetcher> overlayFetcher;
     std::map<uint64_t, BitmapPtr> overlayPics;  // each overlay's picture at the frame on screen (as last decoded)
     double overlayPicsT = -1;                   // the time they're for
+    // For a FrameRenderer drawing the frame on screen: each overlay's picture as last decoded.
+    std::function<BitmapPtr(const Overlay&, double)> OverlayPictures() const {
+        return [this](const Overlay& o, double) -> BitmapPtr {
+            const auto it = overlayPics.find(o.id);
+            return it != overlayPics.end() ? it->second : nullptr;
+        };
+    }
 
     // Asks for the overlays' pictures at timeline time `t` (they come as WM_OVERLAYS).
     void RequestOverlays(double t) {
@@ -3832,15 +3836,16 @@ public:
             case DragKind::OverlayItem: {
                 const Overlay& o0 = drag.overlay;
                 const double len = o0.clip.Duration(), most = std::max(o0.clip.length, o0.clip.out) - o0.clip.in;  // footage after its in point
+                const double shortest = std::min(0.2, len);  // a piece already shorter than that keeps its length
                 for (auto& o : edit.overlays) {
                     if (o.id != drag.id) continue;
                     if (drag.edge == -1) {  // its start and in point move together
-                        const double d = std::clamp(now - o0.start, std::max(-o0.clip.in, -o0.start), len - 0.2);
+                        const double d = std::clamp(now - o0.start, std::max(-o0.clip.in, -o0.start), len - shortest);
                         o.start = o0.start + d;
                         o.clip.in = o0.clip.in + d;
                         Seek(o.start);
                     } else if (drag.edge == 1) {
-                        const double end = std::clamp(now, o0.start + 0.2, o0.start + most);
+                        const double end = std::clamp(now, o0.start + shortest, o0.start + most);
                         o.clip.out = o0.clip.in + (end - o0.start);
                         Seek(end - 0.01);
                     } else {
@@ -4462,8 +4467,9 @@ public:
     }
 
     // Copy frame (Ctrl+Shift+C, or Ctrl+C with nothing picked): the frame on screen as the export draws it (crop,
-    // captions and markup at that time), at the export's full size, as a picture on the clipboard (CF_DIB and PNG). Not
-    // saved to a file. Right after a step it waits for that frame to be decoded, so it's the one the readout names.
+    // captions, markup and videos on top at that time), at the export's full size, as a picture on the clipboard (CF_DIB
+    // and PNG). Not saved to a file. Right after a step it waits for that frame (and its overlays' pictures) to be
+    // decoded, so it's the one the readout names.
     bool frameCopyPending = false;
     BitmapPtr lastCopiedFrame;  // tests
     void CopyFrame() {
@@ -4472,8 +4478,16 @@ public:
             frameCopyPending = true;  // WM_FETCHED comes back here
             return;
         }
+        const double t = playing ? rawT : paused;
+        const bool overlayShows = std::any_of(edit.overlays.begin(), edit.overlays.end(), [t](const Overlay& o) { return o.Active(t); });
+        if (!playing && overlayShows && overlayPicsT != rawT) {
+            frameCopyPending = true;  // the overlays' pictures for this frame: WM_OVERLAYS comes back here
+            return;
+        }
         frameCopyPending = false;
-        const BitmapPtr f = FrameRenderer(edit, videoSize, false).Render(*raw, playing ? rawT : paused);
+        FrameRenderer r(edit, videoSize, false);
+        r.overlayFrame = OverlayPictures();
+        const BitmapPtr f = r.Render(*raw, t);
         if (!f) return;
         if (!CopyImageToClipboard(hwnd, *f, true)) {
             ShowToast(L"Couldn't copy the frame", L"The clipboard is busy. Try again.", nullptr, nullptr, 3000);
@@ -4649,6 +4663,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             overlayPicsT = r->t;
             Rerender();
             Invalidate();
+            if (frameCopyPending) CopyFrame();
             if (onOverlays) onOverlays();
             return 0;
         }
@@ -6650,6 +6665,17 @@ ATHER_TEST(video_editor_overlay_videos) {
         CHECK(((in >> 16) & 255) > 150 && ((in >> 8) & 255) < 100);
         CHECK(((out >> 8) & 255) > 150 && ((out >> 16) & 255) < 100);
     }
+    // Copy frame draws it too, waiting for its picture at that frame: at 2.2 the video is blue and the overlay green.
+    e->Seek(2.2);
+    e->lastCopiedFrame.reset();
+    e->CopyFrame();  // right away: neither the frame nor the overlay's picture is decoded yet
+    for (int i = 0; i < 300 && !e->lastCopiedFrame; ++i) Pump(10);
+    CHECK(e->lastCopiedFrame != nullptr);
+    if (e->lastCopiedFrame) {
+        const uint32_t in = e->lastCopiedFrame->Pixel((int)box.MidX(), (int)box.MidY()), out = e->lastCopiedFrame->Pixel(40, 40);
+        CHECK(((in >> 8) & 255) > 150 && ((in >> 16) & 255) < 100 && (in & 255) < 100);
+        CHECK((out & 255) > 150 && ((out >> 8) & 255) < 100);
+    }
     // Its bar on the bottom lane moves 0.3 s later.
     const RECT ol = e->OverlayLaneRect();
     const int laneY = (ol.top + ol.bottom) / 2;
@@ -6715,6 +6741,45 @@ ATHER_TEST(video_editor_overlay_videos) {
     e->OnMouseUp();
     CHECK(e->edit.overlays.size() == 1 && e->edit.bin.empty());
     if (!e->edit.overlays.empty()) CHECK_NEAR(e->edit.overlays[0].start, 1.0, 0.05);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// An overlay shorter than the 0.2 s a trim leaves (a 0.15 s split piece) keeps its footage when its ends are dragged:
+// its in point never goes before the file's start, nor its out point past the file's end.
+ATHER_TEST(video_editor_short_overlay_trims_stay_in_its_footage) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, false));
+    CHECK(WriteTestClip(b, 320, 180, 30, 3, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const auto bc = ClipOf(b);
+    CHECK(bc.has_value());
+    if (!bc) return;
+    const RECT ol = e->OverlayLaneRect();
+    const int laneY = (ol.top + ol.bottom) / 2;
+    auto trim = [&](double in, double out, bool left, double to) {
+        Clip c = *bc;
+        c.in = in;
+        c.out = out;
+        e->edit.overlays.clear();
+        e->AddOverlay(c, 1.0, OverlayLayout::Pip);
+        const Overlay& o = e->edit.overlays[0];
+        const int x = left ? (int)e->TX(o.start) + 1 : (int)e->TX(o.End()) - 1;
+        e->OnMouseDown({x, laneY}, false);
+        CHECK(e->drag.kind == VideoEditor::DragKind::OverlayItem && e->drag.edge == (left ? -1 : 1));
+        e->OnMouseMove({(int)e->TX(to), laneY}, MK_LBUTTON);
+        e->OnMouseUp();
+        return e->edit.overlays[0];
+    };
+    const Overlay first = trim(0, 0.15, true, 1.5);  // the file's first 0.15 s: its left edge dragged right
+    CHECK(first.clip.in >= 0 && first.start >= 1.0 - 1e-9);
+    CHECK_NEAR(first.clip.Duration(), 0.15, 1e-6);
+    const Overlay last = trim(2.85, 3.0, false, 1.05);  // the file's last 0.15 s: its right edge dragged left
+    CHECK(last.clip.out <= last.clip.length + 1e-9);
+    CHECK_NEAR(last.clip.Duration(), 0.15, 1e-6);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
