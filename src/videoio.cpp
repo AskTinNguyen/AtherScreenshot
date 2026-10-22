@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -1204,6 +1205,58 @@ void TimeStretch::Run(bool final, std::vector<float>& out) {
     }
 }
 
+// ---------- overlay videos ----------
+
+struct OverlayFrames::Feed {
+    std::wstring path;
+    VideoReader reader;
+    bool ok = false, started = false;
+    VideoFrame cur, next;  // the newest frame read up to the time asked, and the one after it
+    double curT = -1e300, nextT = 1e300;
+
+    void Advance(double skipTo) {
+        double t = 0;
+        if (!reader.ReadFrame(&next, &t, {}, skipTo)) next = {}, nextT = 1e300;
+        else nextT = t;
+    }
+};
+
+OverlayFrames::OverlayFrames() = default;
+OverlayFrames::~OverlayFrames() = default;
+
+std::vector<std::pair<uint64_t, VideoFrame>> OverlayFrames::At(double t, const std::vector<Overlay>& overlays) {
+    std::vector<std::pair<uint64_t, VideoFrame>> out;
+    std::set<uint64_t> showing;
+    for (const auto& o : overlays) {
+        if (!o.Active(t)) continue;
+        showing.insert(o.id);
+        auto& slot = feeds_[o.id];
+        if (!slot || slot->path != o.clip.path) {
+            slot = std::make_unique<Feed>();
+            slot->path = o.clip.path;
+            slot->ok = slot->reader.Open(o.clip.path);
+        }
+        Feed& f = *slot;
+        if (!f.ok) continue;
+        const double s = o.clip.in + (t - o.start);  // its time in the file
+        if (!f.started || s < f.curT - 1e-3 || s > f.nextT + 1.0) {  // back, far ahead, or new: seek
+            f.reader.Seek(s);
+            f.started = true;
+            f.cur = {};
+            f.curT = -1e300;
+            f.Advance(s + 1e-3);
+        }
+        while (f.next && f.nextT <= s + 1e-3) {  // frames that a later one up to here replaces needn't be copied off the GPU
+            f.cur = f.next;
+            f.curT = f.nextT;
+            f.Advance(s + 1e-3);
+        }
+        if (const VideoFrame& show = f.cur ? f.cur : f.next) out.push_back({o.id, show});  // before its first frame: that one
+    }
+    std::erase_if(feeds_, [&](const auto& kv) { return !showing.count(kv.first); });
+    return out;
+}
+
 // ---------- export ----------
 
 namespace {
@@ -1225,6 +1278,10 @@ public:
         fps_ = fps;
         times_ = times && !times->empty() ? times : nullptr;
         renderer_ = std::make_unique<FrameRenderer>(e, reader_.Size(), false);
+        if (!e.overlays.empty()) {
+            overlays_ = std::make_unique<OverlayFrames>();
+            renderer_->overlayFrame = [this](const Overlay& o, double t) { return OverlayAt(o.id, t); };
+        }
         reader_.Seek(std::max(e.trimStart, StAt(first) - 1.0));
         Advance();
         return true;
@@ -1252,6 +1309,12 @@ public:
             Advance(*st + 1e-3);  // frames that a later one up to here replaces needn't be copied off the GPU
         }
         *src = cur_ ? cur_ : next_;  // before the first frame (a seek that landed late): the first one
+        if (overlays_ && (overlayAt_.empty() || overlayAt_.back().first != *st)) {  // the overlays' frames too, in order
+            auto got = overlays_->At(*st, e_.overlays);
+            std::lock_guard l(overlayMu_);
+            overlayAt_.emplace_back(*st, std::move(got));
+            if (overlayAt_.size() > 600) overlayAt_.pop_front();  // well past the frames in flight
+        }
         // Not the previous output frame's, and the next output frame shows a later one.
         *alone = *src != shown_ && next_ && *src != next_ && nextT_ <= (times_ && i + 1 >= (int)times_->size() ? -1e300 : StAt(i + 1)) + 1e-3;
         shown_ = *src;
@@ -1318,6 +1381,22 @@ private:
         nextT_ = t;
     }
 
+    // Overlay `id`'s picture for the output frame at source time `st`, as Next picked it (from any thread).
+    BitmapPtr OverlayAt(uint64_t id, double st) const {
+        VideoFrame f;
+        {
+            std::lock_guard l(overlayMu_);
+            for (auto it = overlayAt_.rbegin(); it != overlayAt_.rend() && !f; ++it)
+                if (it->first == st)
+                    for (const auto& [oid, vf] : it->second)
+                        if (oid == id) f = vf;
+        }
+        return f ? f.Bgra() : nullptr;
+    }
+
+    std::unique_ptr<OverlayFrames> overlays_;
+    mutable std::mutex overlayMu_;
+    std::deque<std::pair<double, std::vector<std::pair<uint64_t, VideoFrame>>>> overlayAt_;  // by source time, oldest first
     SequenceReader reader_;
     VideoEdit e_;
     double fps_ = 30;
@@ -1888,8 +1967,16 @@ std::vector<BitmapPtr> NoteFrames(const std::wstring& source, const VideoEdit& e
     const Sequence seq = SequenceOf(source, e);
     SequenceReader r;
     if (!r.Open(seq)) return out;
-    const FrameRenderer renderer(e, seq.size, false);
+    FrameRenderer renderer(e, seq.size, false);
+    OverlayFrames overlays;
+    std::vector<std::pair<uint64_t, VideoFrame>> showing;  // the overlays' frames at the note being made
+    renderer.overlayFrame = [&showing](const Overlay& o, double) -> BitmapPtr {
+        for (const auto& [id, f] : showing)
+            if (id == o.id) return f.Bgra();
+        return nullptr;
+    };
     for (const ReviewNote& n : plan.notes) {
+        showing = overlays.At(n.t, e.overlays);
         // As the export picks it: the newest frame at or before the note's time.
         r.Seek(n.t);
         VideoFrame f, kept;
@@ -2739,6 +2826,49 @@ ATHER_TEST(video_export_trim_speed_crop_captions) {
     CHECK_NEAR(GifDuration(gif), 1.0, 0.02);
     int gw = 0, gh = 0;
     CHECK(ImageSize(gif, &gw, &gh) && gw == 320 && gh == 200);
+}
+
+// An overlay video in an export: the second video in its box over the first while it shows, its own frames from its in
+// point on; the first alone before and after. No sound of its own: the export's is the first video's.
+ATHER_TEST(video_export_with_overlay_video) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring base = dir + L"\\base.mp4", over = dir + L"\\over.mp4", out = dir + L"\\out.mp4";
+    CHECK(WriteTestClip(base, 640, 360, 30, 3, true));  // red, green, blue: a second each
+    CHECK(WriteTestClip(over, 320, 180, 30, 3, false));
+    const auto oc = ClipOf(over);
+    CHECK(oc.has_value());
+    if (!oc) return;
+    VideoEdit e;
+    e.trimEnd = 3;
+    Overlay o;
+    o.clip = *oc;
+    o.clip.in = 2;  // its blue second
+    o.clip.out = 3;
+    o.start = 0.5;  // on top from 0.5 to 1.5
+    o.pos = {0.5, 0.5};
+    o.width = 0.25;  // 160 × 90 at (320, 180)
+    e.overlays = {o};
+    std::wstring err;
+    CHECK(ExportMp4(base, e, out, &err));
+    test::Note("export error: " + ToUtf8(err));
+    VideoInfo vi;
+    CHECK(ProbeVideo(out, &vi) && vi.hasAudio && std::fabs(vi.duration - 3) < 0.1);
+    auto rgb = [](const BitmapPtr& b, int x, int y) {
+        const uint32_t p = b->Bits()[(size_t)y * b->Width() + x];
+        return std::array<int, 3>{(int)((p >> 16) & 255), (int)((p >> 8) & 255), (int)(p & 255)};
+    };
+    auto isRed = [](std::array<int, 3> c) { return c[0] > 150 && c[1] < 100 && c[2] < 100; };
+    auto isGreen = [](std::array<int, 3> c) { return c[1] > 150 && c[0] < 100 && c[2] < 100; };
+    auto isBlue = [](std::array<int, 3> c) { return c[2] > 150 && c[0] < 100 && c[1] < 100; };
+    BitmapPtr before, during, later, after;
+    CHECK(ProbeVideo(out, nullptr, 0.2, 0, &before) && before);
+    CHECK(ProbeVideo(out, nullptr, 0.8, 0, &during) && during);
+    CHECK(ProbeVideo(out, nullptr, 1.3, 0, &later) && later);
+    CHECK(ProbeVideo(out, nullptr, 1.8, 0, &after) && after);
+    if (before) CHECK(isRed(rgb(before, 400, 225)));
+    if (during) CHECK(isBlue(rgb(during, 400, 225)) && isRed(rgb(during, 100, 100)));
+    if (later) CHECK(isBlue(rgb(later, 400, 225)) && isGreen(rgb(later, 100, 100)));
+    if (after) CHECK(isGreen(rgb(after, 400, 225)));
 }
 
 // A longer export is made in pieces on several encoders at once (where the GPU has them) and comes out joined in

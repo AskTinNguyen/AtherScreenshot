@@ -10,10 +10,12 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <list>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -33,6 +35,7 @@ using std::min;
 #include "palette.h"
 #include "pin.h"
 #include "smart.h"
+#include "selftest.h"
 #include "toast.h"
 
 #pragma comment(lib, "comctl32")
@@ -44,7 +47,7 @@ namespace gp = Gdiplus;
 
 constexpr wchar_t kClass[] = L"AtherScreenshotGallery";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
-constexpr UINT WM_THUMB = WM_APP + 30, WM_LIBCHANGED = WM_APP + 31;
+constexpr UINT WM_THUMB = WM_APP + 30, WM_LIBCHANGED = WM_APP + 31, WM_SCRUB = WM_APP + 32;
 enum : UINT_PTR { kTimerLib = 1, kTimerSearch, kTimerTip, kTimerSlide, kTimerGif, kTimerSpin, kTimerVideo };
 enum : int { kSearchId = 100, kTagEditId, kCommentId };
 
@@ -325,6 +328,154 @@ private:
     uint64_t clock_ = 0;
 };
 
+// ---------- scrubbing a video tile: its frames along its timeline ----------
+
+// Frames spread over one video, for scrubbing its tile: frame k shows time (k + 0.5) / kScrubFrames of it.
+constexpr int kScrubFrames = 48;
+
+// Frame k of `reader`'s video (of `duration` seconds), at most `side` pixels: the newest frame at or before its time.
+BitmapPtr ScrubFrameAt(VideoReader& reader, double duration, int k, int side) {
+    const double t = (k + 0.5) / kScrubFrames * duration;
+    reader.Seek(t);
+    VideoFrame f, kept;
+    double ft = 0;
+    while (reader.ReadFrame(&f, &ft, {}, t + 1e-3)) {  // frames a later one up to `t` replaces come without pictures
+        if (ft > t + 1e-3) {
+            if (!kept) kept = f;  // a seek that landed past it: the first frame there
+            break;
+        }
+        kept = f;
+    }
+    BitmapPtr b = kept ? kept.Bgra() : nullptr;
+    if (b && std::max(b->Width(), b->Height()) > side) {
+        const double s = (double)side / std::max(b->Width(), b->Height());
+        b = Resample(*b, std::max(1, (int)std::lround(b->Width() * s)), std::max(1, (int)std::lround(b->Height() * s)));
+    }
+    return b;
+}
+
+// The order frames are decoded in: coarse to fine (the middle, then the quarters…), so a scrub has something near
+// every spot early on.
+std::vector<int> ScrubOrder() {
+    std::vector<int> order;
+    std::vector<bool> seen(kScrubFrames);
+    for (int step = 64; step >= 1; step /= 2)
+        for (int k = step / 2; k < kScrubFrames; k += step)
+            if (!seen[k]) seen[k] = true, order.push_back(k);
+    for (int k = 0; k < kScrubFrames; ++k)
+        if (!seen[k]) order.push_back(k);
+    return order;
+}
+
+struct ScrubDone {
+    uint64_t gen;
+    int index;
+    BitmapPtr bmp;
+    double duration;
+};
+struct ScrubShared {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::wstring path;
+    int side = 0, want = -1;
+    uint64_t gen = 0;
+    bool alive = true;
+    HWND notify = nullptr;
+};
+
+// Decodes the frames of the video being scrubbed on a worker thread (the one under the mouse first, then coarse to
+// fine) and posts each as WM_SCRUB. Asking for another video drops the rest of the last one's.
+class ScrubFrames {
+public:
+    void Start(HWND notify) {
+        sh_ = std::make_shared<ScrubShared>();
+        sh_->notify = notify;
+        std::thread(Work, sh_).detach();
+    }
+    void Stop() {
+        if (!sh_) return;
+        {
+            std::lock_guard lock(sh_->mu);
+            sh_->alive = false;
+        }
+        sh_->cv.notify_all();
+        sh_.reset();
+    }
+    // Frame `index` of `path`'s, next. Returns the generation its frames come with (a new one for a new video).
+    uint64_t Want(const std::wstring& path, int side, int index) {
+        if (!sh_) return 0;
+        uint64_t gen;
+        {
+            std::lock_guard lock(sh_->mu);
+            if (path != sh_->path || side > sh_->side) {
+                sh_->path = path;
+                sh_->side = side;
+                ++sh_->gen;
+            }
+            sh_->want = index;
+            gen = sh_->gen;
+        }
+        sh_->cv.notify_one();
+        return gen;
+    }
+
+private:
+    static void Work(std::shared_ptr<ScrubShared> sh) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const std::vector<int> order = ScrubOrder();
+        std::unique_ptr<VideoReader> reader;
+        std::vector<bool> done;
+        uint64_t gen = 0;
+        int side = 0;
+        double duration = 0;
+        size_t next = 0;
+        for (;;) {
+            int want = -1;
+            std::wstring open;  // a new video to start on
+            {
+                std::unique_lock lock(sh->mu);
+                sh->cv.wait(lock, [&] {
+                    if (!sh->alive || sh->gen != gen) return true;
+                    if (!reader) return false;
+                    if (sh->want >= 0 && sh->want < kScrubFrames && !done[sh->want]) return true;
+                    while (next < order.size() && done[order[next]]) ++next;
+                    return next < order.size();
+                });
+                if (!sh->alive) break;
+                if (sh->gen != gen) {
+                    gen = sh->gen;
+                    side = sh->side;
+                    open = sh->path;
+                }
+                want = sh->want;
+            }
+            if (!open.empty()) {
+                reader = std::make_unique<VideoReader>();
+                done.assign(kScrubFrames, false);
+                next = 0;
+                duration = reader->Open(open) ? reader->Duration() : 0;
+                if (duration <= 0) {
+                    reader.reset();
+                    continue;
+                }
+            }
+            if (!reader) continue;
+            const int k = want >= 0 && want < kScrubFrames && !done[want] ? want : order[next];
+            done[k] = true;
+            auto* d = new ScrubDone{gen, k, ScrubFrameAt(*reader, duration, k, side), duration};
+            bool posted = false;
+            {
+                std::lock_guard lock(sh->mu);
+                posted = sh->alive && sh->gen == gen && PostMessageW(sh->notify, WM_SCRUB, 0, (LPARAM)d);
+            }
+            if (!posted) delete d;
+        }
+        CoUninitialize();
+    }
+    std::shared_ptr<ScrubShared> sh_;
+};
+
 // Scaled, rounded tiles ready to blit (the gallery background is solid, so corners are baked in).
 class TileCache {
 public:
@@ -595,6 +746,16 @@ public:
     POINT pvLast{}, pvDown{};
     RECT lastHoverRect{};
     int lastHoverTile = -1;
+    // scrubbing a video tile: the mouse along the timeline at its bottom shows the frame there
+    ScrubFrames scrubber;
+    std::wstring scrubPath;            // the video scrubPics are of
+    std::vector<BitmapPtr> scrubPics;  // its frames (kScrubFrames), as they come
+    uint64_t scrubGen = 0;
+    double scrubDuration = 0;
+    int scrubTile = -1;                // the tile being scrubbed, or -1
+    double scrubAt = -1;               // 0…1 along its timeline, or -1 (the mouse is off it)
+    bool scrubDragging = false;
+    RECT scrubRect{};                  // that tile, on screen
     // compare
     BitmapPtr cmpA, cmpB;
     std::wstring cmpKey;
@@ -702,6 +863,16 @@ public:
         hots.push_back(std::move(h));
     }
     BitmapPtr TileBitmap(const std::wstring& path, int w, int h, bool fill);
+
+    // scrubbing
+    RECT ScrubZone(const RECT& tile) const { return {tile.left, tile.bottom - S(18), tile.right, tile.bottom}; }
+    bool ScrubbableTile(int tile) const {
+        return tile >= 0 && tile < (int)model.visible.size() && MediaTypeOf(model.visible[tile]) == MediaType::Video &&
+               !(model.layout == GalleryLayout::List && model.scope().kind != ScopeKind::Duplicates);
+    }
+    void Scrub(int tile, const RECT& r, double at);
+    void EndScrub();
+    BitmapPtr ScrubPicture() const;  // the decoded frame nearest the scrub spot
 
     // input
     bool OverlayUp() const { return showShortcuts || model.compare.has_value() || !model.preview.empty(); }
@@ -918,6 +1089,44 @@ BitmapPtr Gallery::TileBitmap(const std::wstring& path, int w, int h, bool fill)
     return t;
 }
 
+// The mouse at `at` (0…1) along video tile `tile`'s timeline (`r`: the tile on screen): its frame there shows, and
+// the decoder gets to that frame next.
+void Gallery::Scrub(int tile, const RECT& r, double at) {
+    if (!ScrubbableTile(tile)) return EndScrub();
+    const std::wstring& u = model.visible[tile];
+    if (u != scrubPath) {
+        scrubPath = u;
+        scrubPics.assign(kScrubFrames, nullptr);
+        const ItemMeta& m = model.lib.Meta(u);
+        scrubDuration = m.duration ? *m.duration : 0;
+    }
+    at = std::clamp(at, 0.0, 1.0);
+    const int x0 = (int)std::lround(scrubAt * RectW(scrubRect)), x1 = (int)std::lround(at * RectW(r));
+    const bool moved = scrubTile != tile || scrubAt < 0 || std::abs(x1 - x0) >= 2 || !EqualRect(&scrubRect, &r);
+    scrubTile = tile;
+    scrubRect = r;
+    scrubAt = at;
+    scrubGen = scrubber.Want(u, Thumbs::Bucket(std::max(RectW(r), RectH(r))), std::min(kScrubFrames - 1, (int)(at * kScrubFrames)));
+    if (moved) InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void Gallery::EndScrub() {
+    if (scrubTile < 0 && !scrubDragging) return;
+    scrubTile = -1;
+    scrubAt = -1;
+    scrubDragging = false;
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+BitmapPtr Gallery::ScrubPicture() const {
+    if (scrubAt < 0 || scrubPics.empty()) return nullptr;
+    const int k = std::min(kScrubFrames - 1, (int)(scrubAt * kScrubFrames));
+    for (int d = 0; d < kScrubFrames; ++d)  // the nearest one there is, while the rest are still coming
+        for (int j : {k - d, k + d})
+            if (j >= 0 && j < kScrubFrames && scrubPics[j]) return scrubPics[j];
+    return nullptr;
+}
+
 void Gallery::PaintTile(HDC dc, const TileRect& t, int dy) {
     const std::wstring& u = model.visible[t.index];
     const ItemMeta& m = model.lib.Meta(u);
@@ -956,23 +1165,29 @@ void Gallery::PaintTile(HDC dc, const TileRect& t, int dy) {
         hots.back().tile = t.index;
         return;
     }
-    if (auto b = TileBitmap(u, RectW(r), RectH(r), t.fill)) {
+    // A video being scrubbed shows its frame at the mouse instead of its poster.
+    const bool scrubbing = t.index == scrubTile && scrubAt >= 0 && u == scrubPath;
+    const BitmapPtr frame = scrubbing ? ScrubPicture() : nullptr;
+    if (auto b = frame ? RenderTile(*frame, RectW(r), RectH(r), t.fill, Sf(8), theme::kBg) : TileBitmap(u, RectW(r), RectH(r), t.fill)) {
         MemDC md(b->Handle(), dc);
         BitBlt(dc, r.left, r.top, RectW(r), RectH(r), md, 0, 0, SRCCOPY);
     } else {
         FillRR(dc, r, Sf(8), A(theme::kBgRaised));
     }
-    // Badges, bottom left: type or duration, stars, similarity, and the name on hover.
+    // Badges, bottom left: type or duration (while scrubbing, the time there too), stars, similarity, and the name on hover.
     std::vector<std::pair<std::wstring, HFONT>> badges;
     const MediaType mt = MediaTypeOf(u);
+    const double length = m.duration ? *m.duration : scrubbing ? scrubDuration : 0;
     if (mt == MediaType::Gif) badges.push_back({L"GIF", fBadge});
+    else if (mt == MediaType::Video && scrubbing && length > 0) badges.push_back({Duration(std::floor(scrubAt * length)) + L" / " + Duration(length), fBadge});  // the second it's in
     else if (mt == MediaType::Video) badges.push_back({m.duration ? Duration(*m.duration) : L"MP4", fBadge});
     if (m.rating > 0) badges.push_back({std::wstring(m.rating, (wchar_t)0xE735), fStar});  // the icon font's star measures right
     if (auto d = model.distances.find(u); d != model.distances.end())
         badges.push_back({std::to_wstring(Library::SimilarityPercent(d->second)) + L"%", fBadge});
     const bool showName = t.index == hover && !t.caption;
     int bx = r.left + S(6);
-    const int bh = S(17), by = r.bottom - S(6) - bh;
+    const bool timeline = mt == MediaType::Video && (t.index == hover || t.index == scrubTile) && RectW(r) > S(60);
+    const int bh = S(17), by = r.bottom - S(timeline ? 13 : 6) - bh;  // above the timeline when it shows
     auto badge = [&](const std::wstring& text, HFONT f, int maxW) {
         SIZE sz = Measure(dc, f, text);
         const int bw = std::min(maxW, (int)sz.cx + S(12));
@@ -985,7 +1200,17 @@ void Gallery::PaintTile(HDC dc, const TileRect& t, int dy) {
         bx = br.right + S(4);
     };
     for (const auto& [text, font] : badges) badge(text, font, RectW(r) - S(12));
-    if (showName) badge(Stem(u), fTiny, r.right - bx - S(6));
+    if (showName && !scrubbing) badge(Stem(u), fTiny, r.right - bx - S(6));
+    // A video under the mouse: its timeline along the bottom, to scrub through it (hover or drag along it).
+    if (timeline) {
+        const RECT track{r.left + S(8), r.bottom - S(7), r.right - S(8), r.bottom - S(4)};
+        FillRR(dc, track, Sf(1.5f), gp::Color(150, 255, 255, 255));
+        if (scrubbing) {
+            const int x = track.left + (int)std::lround(scrubAt * RectW(track));
+            FillRR(dc, {track.left, track.top, std::max(x, (int)track.left + S(3)), track.bottom}, Sf(1.5f), A(theme::kAccent));
+            FillRR(dc, {x - S(5), track.top - S(4), x + S(5), track.bottom + S(4)}, Sf(5), A(theme::kAccent));
+        }
+    }
     // Selection is the only use of the accent colour; focus gets a faint ring.
     RECT ring = r;
     InflateRect(&ring, S(2), S(2));
@@ -2600,6 +2825,13 @@ void Gallery::OnMouseDown(POINT p, bool dbl) {
         EndTyping();
         const std::wstring u = model.visible[h.tile];
         if (dbl) return Open(u);
+        const RECT zone = ScrubZone(h.r);
+        if (ScrubbableTile(h.tile) && PtInRect(&zone, p)) {  // on a video's timeline: drag along it (not the file)
+            scrubDragging = true;
+            SetCapture(hwnd);
+            Scrub(h.tile, h.r, (double)(p.x - h.r.left) / std::max(1L, (LONG)RectW(h.r)));
+            return;
+        }
         const bool mods = GetKeyState(VK_SHIFT) < 0 || GetKeyState(VK_CONTROL) < 0;
         // A tile that's already selected waits for mouse up, so a multi-selection can be dragged together.
         if (mods || !model.selection.count(u)) {
@@ -2649,6 +2881,12 @@ void Gallery::OnMouseUp(POINT p) {
     g_pressed = Hot{};
     if (GetCapture() == hwnd) ReleaseCapture();
     draggingScroll = g_panning = g_splitting = false;
+    if (scrubDragging) {  // let go of a timeline: the frame stays while the mouse is still on it
+        scrubDragging = false;
+        const RECT zone = ScrubZone(scrubRect);
+        if (!PtInRect(&zone, p)) EndScrub();
+        return;
+    }
     if (pressTile >= 0 && pressTile < (int)model.visible.size() && !g_dragStarted) {
         const std::wstring u = model.visible[pressTile];
         const bool mods = GetKeyState(VK_SHIFT) < 0 || GetKeyState(VK_CONTROL) < 0;
@@ -2686,6 +2924,11 @@ void Gallery::OnMouseMove(POINT p, WPARAM keys) {
         Changed(false);
         return;
     }
+    if (scrubDragging) {  // anywhere, while the button is down: along the timeline it was pressed on
+        if (!(keys & MK_LBUTTON)) return EndScrub();
+        Scrub(scrubTile, scrubRect, (double)(p.x - scrubRect.left) / std::max(1L, (LONG)RectW(scrubRect)));
+        return;
+    }
     if (pressTile >= 0 && (keys & MK_LBUTTON) && !g_dragStarted &&
         (std::abs(p.x - pressPt.x) > S(6) || std::abs(p.y - pressPt.y) > S(6))) {
         g_dragStarted = true;
@@ -2696,6 +2939,10 @@ void Gallery::OnMouseMove(POINT p, WPARAM keys) {
     const int hi = HotAt(p);
     const int tile = hi >= 0 ? hots[hi].tile : -1;
     if (tile != hover) hover = tile >= 0 ? tile : -1;
+    // Over a video's timeline (the bottom of its tile), the frame at the mouse shows; off it, its poster again.
+    if (const RECT zone = tile >= 0 ? ScrubZone(hots[hi].r) : RECT{}; ScrubbableTile(tile) && PtInRect(&zone, p))
+        Scrub(tile, hots[hi].r, (double)(p.x - hots[hi].r.left) / std::max(1L, (LONG)RectW(hots[hi].r)));
+    else if (scrubTile >= 0) EndScrub();
     // Tooltip after a short hover.
     const std::wstring tip = hi >= 0 ? hots[hi].tip : L"";
     if (tip != tipText || std::abs(p.x - tipAt.x) > S(3) || std::abs(p.y - tipAt.y) > S(3)) {
@@ -2736,6 +2983,7 @@ void Gallery::OnRightClick(POINT p) {
 }
 
 void Gallery::OnWheel(POINT p, int delta, bool ctrl) {
+    if (!scrubDragging) EndScrub();  // the tiles move
     if (!model.preview.empty()) {
         if (!previewImg) return;
         const RECT area{S(16), S(60), client.right - S(16), client.bottom - S(16)};
@@ -3472,6 +3720,14 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
+        case WM_SCRUB: {
+            std::unique_ptr<ScrubDone> d(reinterpret_cast<ScrubDone*>(l));
+            if (d->gen != scrubGen || d->index < 0 || d->index >= (int)scrubPics.size()) return 0;  // another video's
+            scrubPics[(size_t)d->index] = d->bmp;
+            if (d->duration > 0) scrubDuration = d->duration;
+            if (scrubTile >= 0) InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case WM_LIBCHANGED:
             SetTimer(hwnd, kTimerLib, 120, nullptr);  // coalesce bursts (indexing, saves)
             return 0;
@@ -3562,6 +3818,7 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_RBUTTONUP: OnRightClick({GET_X_LPARAM(l), GET_Y_LPARAM(l)}); return 0;
         case WM_MOUSEMOVE: OnMouseMove({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, w); return 0;
         case WM_MOUSELEAVE:
+            if (!scrubDragging) EndScrub();
             hover = -1;
             lastHoverRect = {};
             lastHoverTile = -1;
@@ -3588,7 +3845,9 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
                 GetCursorPos(&p);
                 ScreenToClient(hwnd, &p);
                 const int hi = HotAt(p);
-                SetCursor(LoadCursorW(nullptr, hi >= 0 ? (hots[hi].tile >= 0 ? IDC_ARROW : hots[hi].cursor) : IDC_ARROW));
+                const RECT zone = hi >= 0 ? ScrubZone(hots[hi].r) : RECT{};
+                const bool onTimeline = scrubDragging || (hi >= 0 && ScrubbableTile(hots[hi].tile) && PtInRect(&zone, p));
+                SetCursor(LoadCursorW(nullptr, onTimeline ? IDC_SIZEWE : hi >= 0 ? (hots[hi].tile >= 0 ? IDC_ARROW : hots[hi].cursor) : IDC_ARROW));
                 return TRUE;
             }
             break;
@@ -3636,6 +3895,7 @@ LRESULT Gallery::Proc(UINT m, WPARAM w, LPARAM l) {
             }
             model.lib.Unsubscribe(libListener);
             thumbs.Stop();
+            scrubber.Stop();
             previewVideo.reset();
             g_havePressed = false;  // holds a click bound to this window
             g_pressed = Hot{};
@@ -3725,6 +3985,7 @@ bool Gallery::Create() {
     SendMessageW(tagEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Add tags, comma-separated");
     SendMessageW(commentEdit, EM_SETLIMITTEXT, 4000, 0);
     thumbs.Start(hwnd);
+    scrubber.Start(hwnd);
     HWND self = hwnd;
     libListener = model.lib.Subscribe([self] { PostMessageW(self, WM_LIBCHANGED, 0, 0); });
     model.Recompute();
@@ -3768,6 +4029,34 @@ bool GalleryVisible() { return g_gallery && IsWindowVisible(g_gallery->hwnd); }
 
 namespace ather {
 namespace {
+
+// Scrubbing a video tile: frame k is the one on screen at its time (a test clip changes colour each second), whichever
+// order they're asked in, and tile-sized; every frame gets decoded once, the timeline covered coarsely first.
+ATHER_TEST(gallery_scrub_frames) {
+    const std::wstring dir = test::TempDir(), clip = dir + L"\\clip.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 3, false));  // red, green, blue
+    VideoReader r;
+    CHECK(r.Open(clip));
+    const double d = r.Duration();
+    CHECK_NEAR(d, 3, 0.1);
+    auto rgb = [](const BitmapPtr& b) {
+        const uint32_t p = b ? b->Pixel(b->Width() / 2, b->Height() / 2) : 0;
+        return std::array<int, 3>{(int)((p >> 16) & 255), (int)((p >> 8) & 255), (int)(p & 255)};
+    };
+    const BitmapPtr blue = ScrubFrameAt(r, d, 40, 256), red = ScrubFrameAt(r, d, 7, 256), green = ScrubFrameAt(r, d, 24, 256);  // back and forth
+    CHECK(blue && red && green);
+    if (blue && red && green) {
+        CHECK(rgb(red)[0] > 150 && rgb(red)[1] < 100);
+        CHECK(rgb(green)[1] > 150 && rgb(green)[0] < 100);
+        CHECK(rgb(blue)[2] > 150 && rgb(blue)[0] < 100);
+        CHECK(red->Width() == 256 && red->Height() == 144);
+    }
+    const std::vector<int> order = ScrubOrder();
+    CHECK_EQ(order.size(), (size_t)kScrubFrames);
+    CHECK_EQ(std::set<int>(order.begin(), order.end()).size(), (size_t)kScrubFrames);
+    std::set<int> firstFew(order.begin(), order.begin() + 6);
+    CHECK(*firstFew.begin() < kScrubFrames / 4 && *firstFew.rbegin() > kScrubFrames * 3 / 4);  // spread over it
+}
 
 // ---------- developer snapshots ----------
 
@@ -3994,6 +4283,26 @@ int GallerySnapshots(const std::wstring& outDir) {
     m.compare = std::make_pair(url(L"Dashboard"), edited);
     snap(L"gallery-compare");
     m.compare.reset();
+    {  // a video's tile scrubbed: the mouse 90% along its timeline (its blue last second; the poster is green)
+        const std::wstring video = month + L"\\Screen recording.mp4";
+        if (WriteTestClip(video, 1280, 720, 30, 3, false)) {
+            SetMtime(video, -0.05);
+            bool rescanned = false;
+            lib.Refresh([&] { rescanned = true; });
+            for (int i = 0; i < 400 && !(rescanned && lib.Has(video) && lib.Meta(video).indexed > 0); ++i) Pump(25);
+            g->Recompute();
+            snap(L"gallery-video");  // lays the tiles out
+            for (const auto& h : std::vector<Hot>(g->hots))
+                if (h.tile >= 0 && h.tile < (int)m.visible.size() && m.visible[h.tile] == video) {
+                    g->hover = h.tile;  // as the mouse on its timeline would (a hidden window gets no real mouse)
+                    g->Scrub(h.tile, h.r, 0.9);
+                    break;
+                }
+            Pump(1500);  // its frames
+            snap(L"gallery-scrub");
+            g->EndScrub();
+        }
+    }
     SetWindowPos(g->hwnd, nullptr, 0, 0, 720, 640, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
     g->Changed();
     snap(L"gallery-narrow");

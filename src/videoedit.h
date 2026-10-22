@@ -137,9 +137,45 @@ struct Clip {
     int w = 0, h = 0;   // upright size
     double fps = 0;
     bool hasAudio = false;
+    // Its picture mirrored left–right and/or upside down (before anything is drawn on it). Pieces split from it keep it.
+    bool flipH = false, flipV = false;
     double Duration() const { return std::max(0.0, out - in); }
+    bool Flipped() const { return flipH || flipV; }
+    bool SameFootage(const Clip& o) const;  // the same but for the flip: what the decoders and thumbnails care about
     bool operator==(const Clip&) const = default;
 };
+bool SameFootage(const std::vector<Clip>& a, const std::vector<Clip>& b);
+
+// A second video shown together with the timeline's, without its sound: in a box over the picture (picture in
+// picture), or in one half of a split screen with the timeline's video in the other half. It sits at a timeline time,
+// not on footage: moving clips around leaves it where it is.
+enum class OverlayLayout { Pip, SplitLeft, SplitRight, SplitTop, SplitBottom };  // split: the half the overlay takes
+const wchar_t* OverlayLayoutLabel(OverlayLayout l);
+struct Overlay {
+    uint64_t id = NewItemId();
+    Clip clip;          // its footage: [in, out) of a file
+    double start = 0;   // where it begins on the timeline
+    OverlayLayout layout = OverlayLayout::Pip;
+    VPoint pos{0.62, 0.6};  // picture in picture: the box's top-left, as fractions of the output frame
+    double width = 0.34;    // and its width, as a fraction of the frame's (its height follows the video's shape)
+    bool fill = false;      // split: fills its half (cut to fit) instead of showing all of the picture
+    double End() const { return start + clip.Duration(); }
+    bool Active(double t) const { return t >= start && t < End(); }
+    bool IsSplit() const { return layout != OverlayLayout::Pip; }
+    bool operator==(const Overlay&) const = default;
+};
+// Where an overlay's picture goes in an output frame of `out` pixels: the box, or its half.
+VRect OverlayRect(const Overlay& o, SIZE out);
+// The other half of a split screen, where the timeline's video goes.
+VRect MainHalf(const Overlay& o, SIZE out);
+
+// Composition guides drawn over the editor's preview (never saved): golden section (1/φ² and 1/φ), rule of thirds, phi
+// grid (1 : φ : 1) and diagonals (both diagonals, and from each corner the line square to the other diagonal).
+enum class GuideKind { Golden, Thirds, Phi, Diagonal };
+constexpr int kGuideKinds = 4;
+const wchar_t* GuideLabel(GuideKind k);
+// The guide's lines over `r` (any coordinates), each from `first` to `second`, ending on r's edges.
+std::vector<std::pair<VPoint, VPoint>> GuideLines(GuideKind k, VRect r);
 
 double ClipsDuration(const std::vector<Clip>& clips);
 double ClipStart(const std::vector<Clip>& clips, size_t i);  // where clip i begins on the timeline
@@ -148,6 +184,8 @@ std::optional<std::pair<size_t, double>> LocateClip(const std::vector<Clip>& cli
 
 struct VideoEdit {
     std::vector<Clip> clips;  // empty = the whole source file
+    std::vector<Clip> bin;    // pieces taken off the timeline, kept to put back: not played or saved
+    std::vector<Overlay> overlays;  // second videos on top, in the order they're drawn
     int frameW = 0, frameH = 0;  // the sequence frame; 0 = the first clip's size
     double trimStart = 0, trimEnd = 0;
     std::optional<VRect> crop;
@@ -251,6 +289,11 @@ public:
     std::optional<std::vector<RECT>> EditAreas(double t) const;
     void DrawEdits(Bitmap& area, POINT at, double t) const;
 
+    // The frame of an overlay video (see VideoEdit::overlays) at timeline time `t`, upright at its own size; null when
+    // it isn't there (yet), and then that overlay isn't drawn. Called from the threads Render runs on.
+    std::function<BitmapPtr(const Overlay&, double t)> overlayFrame;
+    bool HasOverlay(double t) const;  // an overlay video shows at `t`
+
     VRect ViewRect(double t) const;  // the crop, or a zoom into it
     static VRect ZoomTarget(VRect r, VRect view);
     Motion MotionOf(const Mark& m, double t) const;
@@ -268,7 +311,9 @@ public:
     uint64_t settled = 0;        // preview while paused: the selected item shows fully, not mid-animation
 
 private:
-    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;
+    const Clip* FlippedAt(double t) const;  // the clip showing at `t`, when it's flipped
+    BitmapPtr Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;     // flips, then Compose
+    BitmapPtr Compose(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const;  // steps 1–4
     // Draw's steps, on `img` holding the part of the frame from `at` on (source pixels for 1–2, output for 4).
     struct Effect {
         RECT rc{};  // the pixels a blur or pixelate changes
@@ -279,7 +324,10 @@ private:
     std::optional<Effect> EffectOf(const Mark& m, double t) const;
     void DrawRegions(Bitmap& img, POINT at, double t) const;  // 1. blur and pixelate
     void DrawMarks(Bitmap& img, POINT at, double t) const;    // 2. markup on the video
-    void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4. captions, title cards
+    // 4a. Overlay videos on the output frame: a split screen makes a new frame with `framed` in its half.
+    BitmapPtr DrawVideos(const BitmapPtr& framed, double t) const;
+    BitmapPtr OverlayPicture(const Overlay& o, double t) const;  // overlayFrame's, flipped as its clip is
+    void DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const;  // 4b. captions, title cards
     std::optional<Placed> StrokeOn(const Mark& m, double p) const;
     std::optional<Placed> RingImage(VRect r) const;
 

@@ -225,6 +225,64 @@ Motion Motion::Between(AnimStyle inS, AnimStyle outS, double start, double end, 
 
 // ---------- captions from words ----------
 
+// ---------- composition guides ----------
+
+const wchar_t* GuideLabel(GuideKind k) {
+    switch (k) {
+        case GuideKind::Golden: return L"Golden section";
+        case GuideKind::Thirds: return L"Rule of thirds";
+        case GuideKind::Phi: return L"Phi grid";
+        default: return L"Diagonals";
+    }
+}
+
+std::vector<std::pair<VPoint, VPoint>> GuideLines(GuideKind k, VRect r) {
+    std::vector<std::pair<VPoint, VPoint>> out;
+    auto at = [&](double f) {  // a vertical and a horizontal line at fraction f, and at 1 − f
+        for (double x : {f, 1 - f}) {
+            out.push_back({{r.x + r.w * x, r.y}, {r.x + r.w * x, r.MaxY()}});
+            out.push_back({{r.x, r.y + r.h * x}, {r.MaxX(), r.y + r.h * x}});
+        }
+    };
+    const double phi = (1 + std::sqrt(5.0)) / 2;
+    switch (k) {
+        case GuideKind::Golden: at(1 / (phi * phi)); break;  // 0.382 and 0.618
+        case GuideKind::Thirds: at(1.0 / 3); break;
+        case GuideKind::Phi: at(1 / (2 + phi)); break;       // 1 : φ : 1, so 0.276 and 0.724
+        case GuideKind::Diagonal: {
+            if (r.w <= 0 || r.h <= 0) break;
+            const VPoint tl{r.x, r.y}, tr{r.MaxX(), r.y}, bl{r.x, r.MaxY()}, br{r.MaxX(), r.MaxY()};
+            out.push_back({tl, br});
+            out.push_back({tr, bl});
+            // From a corner along `d` to where it leaves the rectangle.
+            auto toEdge = [&](VPoint c, double dx, double dy) {
+                double t = 1e300;
+                if (dx > 0) t = std::min(t, (r.MaxX() - c.x) / dx);
+                if (dx < 0) t = std::min(t, (r.x - c.x) / dx);
+                if (dy > 0) t = std::min(t, (r.MaxY() - c.y) / dy);
+                if (dy < 0) t = std::min(t, (r.y - c.y) / dy);
+                out.push_back({c, {c.x + dx * t, c.y + dy * t}});
+            };
+            toEdge(tl, r.h, r.w);    // square to tr–bl, which runs along (−w, h)
+            toEdge(br, -r.h, -r.w);
+            toEdge(tr, -r.h, r.w);   // square to tl–br, which runs along (w, h)
+            toEdge(bl, r.h, -r.w);
+            break;
+        }
+    }
+    return out;
+}
+
+bool Clip::SameFootage(const Clip& o) const {
+    Clip a = *this, b = o;
+    a.flipH = a.flipV = b.flipH = b.flipV = false;
+    return a == b;
+}
+
+bool SameFootage(const std::vector<Clip>& a, const std::vector<Clip>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const Clip& x, const Clip& y) { return x.SameFootage(y); });
+}
+
 double ClipsDuration(const std::vector<Clip>& clips) {
     double d = 0;
     for (const auto& c : clips) d += c.Duration();
@@ -309,7 +367,49 @@ void ApplyClips(VideoEdit& e, std::vector<Clip> clips) {
     e.trimStart = wholeStart || !ts.t ? 0 : *ts.t;
     e.trimEnd = wholeEnd || !te.t ? newTotal : std::min(newTotal, *te.t + (te.side ? 0 : 1e-6));  // looked up just before itself
     if (e.trimEnd - e.trimStart < 0.1) e.trimStart = 0, e.trimEnd = newTotal;
+    for (auto& o : e.overlays) o.start = std::min(o.start, std::max(0.0, newTotal - 0.1));  // overlays keep their time, on the timeline
     e.clips = std::move(clips);
+}
+
+// ---------- overlay videos ----------
+
+const wchar_t* OverlayLayoutLabel(OverlayLayout l) {
+    switch (l) {
+        case OverlayLayout::SplitLeft: return L"Split: left half";
+        case OverlayLayout::SplitRight: return L"Split: right half";
+        case OverlayLayout::SplitTop: return L"Split: top half";
+        case OverlayLayout::SplitBottom: return L"Split: bottom half";
+        default: return L"Picture in picture";
+    }
+}
+
+VRect OverlayRect(const Overlay& o, SIZE out) {
+    const double W = out.cx, H = out.cy, hw = std::floor(W / 2), hh = std::floor(H / 2);
+    switch (o.layout) {
+        case OverlayLayout::SplitLeft: return {0, 0, hw, H};
+        case OverlayLayout::SplitRight: return {hw, 0, W - hw, H};
+        case OverlayLayout::SplitTop: return {0, 0, W, hh};
+        case OverlayLayout::SplitBottom: return {0, hh, W, H - hh};
+        default: break;
+    }
+    const double aspect = o.clip.w > 0 && o.clip.h > 0 ? (double)o.clip.h / o.clip.w : 9.0 / 16;
+    double w = std::clamp(o.width, 0.08, 1.0) * W, h = w * aspect;
+    if (h > H) h = H, w = h / aspect;
+    w = std::max(2.0, std::round(w));
+    h = std::max(2.0, std::round(h));
+    return {std::round(std::clamp(o.pos.x * W, 0.0, std::max(0.0, W - w))), std::round(std::clamp(o.pos.y * H, 0.0, std::max(0.0, H - h))), w, h};
+}
+
+VRect MainHalf(const Overlay& o, SIZE out) {
+    const VRect r = OverlayRect(o, out);
+    const double W = out.cx, H = out.cy;
+    switch (o.layout) {
+        case OverlayLayout::SplitLeft: return {r.w, 0, W - r.w, H};
+        case OverlayLayout::SplitRight: return {0, 0, r.x, H};
+        case OverlayLayout::SplitTop: return {0, r.h, W, H - r.h};
+        case OverlayLayout::SplitBottom: return {0, 0, W, r.y};
+        default: return {0, 0, W, H};
+    }
 }
 
 // ---------- notes ----------
@@ -664,6 +764,21 @@ BitmapPtr Copy(const Bitmap& src) {
     auto b = Bitmap::CreateRecycled(src.Width(), src.Height());
     if (b) memcpy(b->Bits(), src.Bits(), (size_t)src.Width() * src.Height() * 4);
     return b;
+}
+
+// `src` mirrored left–right (`h`) and/or top–bottom (`v`), as a bitmap of its own.
+BitmapPtr Flipped(const Bitmap& src, bool h, bool v) {
+    const int W = src.Width(), H = src.Height();
+    auto out = Bitmap::CreateRecycled(W, H);
+    if (!out) return nullptr;
+    for (int y = 0; y < H; ++y) {
+        const uint32_t* s = src.Bits() + (size_t)(v ? H - 1 - y : y) * W;
+        uint32_t* d = out->Bits() + (size_t)y * W;
+        if (h)
+            for (int x = 0; x < W; ++x) d[x] = s[W - 1 - x];
+        else memcpy(d, s, (size_t)W * 4);
+    }
+    return out;
 }
 
 BitmapPtr Blank(int w, int h) {
@@ -1030,7 +1145,21 @@ BitmapPtr FrameRenderer::Render(const Bitmap& src, double t) const { return Draw
 
 BitmapPtr FrameRenderer::Render(const BitmapPtr& src, double t, bool owned) const { return src ? Draw(*src, &src, t, owned) : nullptr; }
 
+const Clip* FrameRenderer::FlippedAt(double t) const {
+    const auto spot = LocateClip(edit_.clips, t);
+    return spot && edit_.clips[spot->first].Flipped() ? &edit_.clips[spot->first] : nullptr;
+}
+
 BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
+    const Clip* c = FlippedAt(t);
+    if (!c) return Compose(src, shared, t, owned);
+    // 0. The clip's flip, first: everything else is placed on the flipped picture. (The frame is fitted into the
+    // sequence frame centered, so its bars mirror onto themselves.)
+    const BitmapPtr f = Flipped(src, c->flipH, c->flipV);
+    return f ? Compose(*f, &f, t, true) : nullptr;
+}
+
+BitmapPtr FrameRenderer::Compose(const Bitmap& src, const BitmapPtr* shared, double t, bool owned) const {
     if (!preview_) {  // an export frame under a title card that is fully shown and still: just the card (it's opaque)
         const Mark* top = nullptr;
         for (const auto& m : edit_.marks)
@@ -1056,16 +1185,20 @@ BitmapPtr FrameRenderer::Draw(const Bitmap& src, const BitmapPtr* shared, double
     const VRect r = ViewRect(t);
     const SIZE tsize = preview_ ? SIZE{(LONG)view_.w, (LONG)view_.h} : out_;
     const Bitmap& video = img ? *img : src;
-    bool overlays = false;  // anything for step 4 to draw
+    const bool videos = overlayFrame && HasOverlay(t);  // step 4a: on the output frame, so not in place
+    bool overlays = videos;  // anything for step 4 to draw
     for (const auto& c : edit_.captions) overlays = overlays || (c.Active(t) && (preview_ || !Trimmed(c.text).empty()));
     for (const auto& m : edit_.marks) overlays = overlays || (m.kind == MarkKind::Title && m.Active(t));
+    const bool inPlace = preview_ && r == view_ && !videos;
     BitmapPtr framed;
-    if (preview_ && r == view_) framed = nullptr;  // drawn in place
+    if (inPlace) framed = nullptr;  // drawn in place
     else if (!preview_ && r == extent && tsize.cx == src.Width() && tsize.cy == src.Height())  // the whole frame, unscaled
         framed = img ? img : shared && (!overlays || owned) ? *shared : Copy(src);
     else framed = SampleRect(video, r, tsize.cx, tsize.cy);
-    if (!framed && !(preview_ && r == view_)) return nullptr;
-    // 4. Captions and title cards stay put on screen.
+    if (!framed && !inPlace) return nullptr;
+    // 4a. Overlay videos: a box over the picture, or a split screen.
+    if (videos && !(framed = DrawVideos(framed, t))) return nullptr;
+    // 4b. Captions and title cards stay put on screen.
     Bitmap& target = framed ? *framed : *img;
     DrawOverlays(target, framed ? 0 : view_.x, framed ? 0 : view_.y, {}, tsize, t);
     if (!framed) return img;
@@ -1135,6 +1268,59 @@ void FrameRenderer::DrawMarks(Bitmap& img, POINT at, double t) const {
     }
 }
 
+bool FrameRenderer::HasOverlay(double t) const {
+    for (const auto& o : edit_.overlays)
+        if (o.Active(t)) return true;
+    return false;
+}
+
+// `src` into `to` (whole pixels of `dst`): all of it centered on what's there, or (`fill`) filling it, cut to fit.
+static void PutPicture(Bitmap& dst, const Bitmap& src, VRect to, bool fill) {
+    const RECT d{(LONG)std::max(0.0, to.x), (LONG)std::max(0.0, to.y), (LONG)std::min((double)dst.Width(), to.MaxX()), (LONG)std::min((double)dst.Height(), to.MaxY())};
+    const int dw = RectW(d), dh = RectH(d);
+    const double sw = src.Width(), sh = src.Height();
+    if (dw < 1 || dh < 1 || sw < 1 || sh < 1) return;
+    const double k = fill ? std::max(dw / sw, dh / sh) : std::min(dw / sw, dh / sh);
+    VRect from{0, 0, sw, sh};
+    RECT at = d;
+    if (fill) {
+        const double fw = dw / k, fh = dh / k;
+        from = {(sw - fw) / 2, (sh - fh) / 2, fw, fh};
+    } else {
+        const int w = std::clamp((int)std::lround(sw * k), 1, dw), h = std::clamp((int)std::lround(sh * k), 1, dh);
+        at = {d.left + (dw - w) / 2, d.top + (dh - h) / 2, d.left + (dw - w) / 2 + w, d.top + (dh - h) / 2 + h};
+    }
+    const BitmapPtr pic = SampleRect(src, from, RectW(at), RectH(at));
+    if (!pic) return;
+    for (int y = 0; y < RectH(at); ++y)
+        memcpy(dst.Bits() + (size_t)(at.top + y) * dst.Width() + at.left, pic->Bits() + (size_t)y * pic->Width(), (size_t)RectW(at) * 4);
+}
+
+BitmapPtr FrameRenderer::OverlayPicture(const Overlay& o, double t) const {
+    BitmapPtr f = overlayFrame(o, t);
+    if (f && o.clip.Flipped()) f = Flipped(*f, o.clip.flipH, o.clip.flipV);
+    return f;
+}
+
+BitmapPtr FrameRenderer::DrawVideos(const BitmapPtr& framed, double t) const {
+    if (!framed) return nullptr;
+    const SIZE size{framed->Width(), framed->Height()};
+    BitmapPtr out = framed;
+    for (const auto& o : edit_.overlays)  // the first split showing: a new frame, the video in its half and the overlay in the other
+        if (o.IsSplit() && o.Active(t)) {
+            out = Bitmap::CreateRecycled(size.cx, size.cy);
+            if (!out) return nullptr;
+            std::fill_n(out->Bits(), (size_t)size.cx * size.cy, 0xFF000000u);
+            PutPicture(*out, *framed, MainHalf(o, size), o.fill);
+            if (const BitmapPtr f = OverlayPicture(o, t)) PutPicture(*out, *f, OverlayRect(o, size), o.fill);
+            break;
+        }
+    for (const auto& o : edit_.overlays)
+        if (!o.IsSplit() && o.Active(t))
+            if (const BitmapPtr f = OverlayPicture(o, t)) PutPicture(*out, *f, OverlayRect(o, size), true);
+    return out;
+}
+
 void FrameRenderer::DrawOverlays(Bitmap& target, double ox, double oy, POINT at, SIZE tsize, double t) const {
     for (const auto& c : edit_.captions) {
         if (!c.Active(t) || (!preview_ && Trimmed(c.text).empty())) continue;
@@ -1150,7 +1336,7 @@ void FrameRenderer::DrawOverlays(Bitmap& target, double ox, double oy, POINT at,
 }
 
 bool FrameRenderer::Untouched(double t) const {
-    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy) return false;
+    if (preview_ || out_.cx != full_.cx || out_.cy != full_.cy || FlippedAt(t) || HasOverlay(t)) return false;
     for (const auto& m : edit_.marks)
         if (m.Active(t) && m.kind != MarkKind::Zoom) return false;
     for (const auto& c : edit_.captions)
@@ -1160,7 +1346,8 @@ bool FrameRenderer::Untouched(double t) const {
 
 std::optional<std::vector<RECT>> FrameRenderer::EditAreas(double t) const {
     const int vx = (int)view_.x, vy = (int)view_.y;
-    if (preview_ || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_)) return std::nullopt;
+    if (preview_ || FlippedAt(t) || (full_.cx & 1) || (full_.cy & 1) || (vx & 1) || (vy & 1) || !(ViewRect(t) == view_) || HasOverlay(t))
+        return std::nullopt;  // flipped: no part is as decoded
     std::vector<RECT> areas;
     auto add = [&](double x0, double y0, double x1, double y1) {  // source pixels: whole 2 × 2 blocks, in the frame
         const RECT r{(LONG)std::max(0.0, std::floor(x0)) & ~1L, (LONG)std::max(0.0, std::floor(y0)) & ~1L,
@@ -1723,6 +1910,130 @@ ATHER_TEST(video_blur_only_while_active) {
     CHECK(Px(*RenderAt(e, 0.5), 296, 180).g < 0.05);  // before: pure red
     CHECK(Px(*RenderAt(e, 2), 296, 180).g > 0.15);    // during: red mixed with the white bar
     CHECK(Px(*RenderAt(e, 3.5), 296, 180).g < 0.05);  // after
+}
+
+// Overlay videos: a box over the picture while one shows, and a split screen with the video in the other half (fitted,
+// or filling it), in the preview and the export alike; nothing drawn while its picture isn't there yet.
+ATHER_TEST(video_overlay_box_and_split_screen) {
+    const auto green = Bitmap::Create(320, 180);
+    std::fill_n(green->Bits(), (size_t)320 * 180, 0xFF00FF00u);
+    Overlay o;
+    o.clip.w = 320, o.clip.h = 180, o.clip.out = 2, o.clip.length = 2;
+    o.start = 1;
+    o.pos = {0.5, 0.5};
+    o.width = 0.25;  // 160 × 90 at (320, 180)
+    VideoEdit e = EditWith({});
+    e.overlays = {o};
+    const BitmapPtr frame = TestFrame();
+    auto render = [&](const VideoEdit& ed, double t, bool preview, bool picture = true) {
+        FrameRenderer r(ed, kSize, preview);
+        if (picture) r.overlayFrame = [&](const Overlay&, double) { return green; };
+        return r.Render(*frame, t);
+    };
+    for (bool preview : {false, true}) {
+        const auto f = render(e, 2, preview);
+        CHECK(Px(*f, 400, 220).g > 0.9 && Px(*f, 400, 220).b < 0.1);  // the box
+        CHECK(Px(*f, 400, 170).b > 0.9);                               // the video just above it
+        CHECK(Px(*render(e, 0.5, preview), 400, 220).b > 0.9);         // not showing yet
+    }
+    CHECK(Px(*render(e, 2, false, false), 400, 220).b > 0.9);  // no picture yet: no box
+    CHECK(!FrameRenderer(e, kSize, false).Untouched(2));
+    CHECK(FrameRenderer(e, kSize, false).Untouched(0.5));
+    // Split, the overlay on the left: each picture fitted into its half, on black.
+    e.overlays[0].layout = OverlayLayout::SplitLeft;
+    auto s = render(e, 2, false);
+    CHECK(Px(*s, 160, 180).g > 0.9);
+    CHECK(Px(*s, 160, 40).Brightness() < 0.05);
+    CHECK(Px(*s, 330, 180).r > 0.9 && Px(*s, 330, 180).b < 0.1);  // the video, squeezed into 320 × 180: red, then blue
+    CHECK(Px(*s, 630, 180).b > 0.9);
+    CHECK(Px(*s, 480, 40).Brightness() < 0.05);
+    // Fill: each half filled, cut to fit (the video's middle: red, the white bar, blue).
+    e.overlays[0].fill = true;
+    s = render(e, 2, true);
+    CHECK(Px(*s, 160, 40).g > 0.9);
+    CHECK(Px(*s, 330, 40).r > 0.9 && Px(*s, 330, 40).g < 0.1);
+    CHECK(Px(*s, 630, 40).b > 0.9);
+}
+
+// A flip mirrors the whole picture first, in the preview and the export alike; the crop is taken from the flipped
+// picture; and an export never uses the as-decoded shortcuts while flipped.
+ATHER_TEST(video_flip_mirrors_the_picture) {
+    // Two clips of the timeline, 0–1 s as it is and 1–10 s flipped left–right: only the second one's frames mirror.
+    Clip a;
+    a.w = 640, a.h = 360, a.out = 1, a.length = 10;
+    Clip b = a;
+    b.in = 1, b.out = 10;
+    b.flipH = true;
+    VideoEdit e = EditWith({});
+    e.clips = {a, b};
+    for (bool preview : {false, true}) {
+        const auto f = RenderAt(e, 2, preview);
+        CHECK(Px(*f, 10, 10).b > 0.9 && Px(*f, 10, 10).r < 0.1);  // the blue right half, now on the left
+        CHECK(Px(*f, 630, 10).r > 0.9 && Px(*f, 630, 10).b < 0.1);
+        CHECK(Px(*RenderAt(e, 0.5, preview), 10, 10).r > 0.9);  // the first clip: as it is
+    }
+    const FrameRenderer r(e, kSize, false);
+    CHECK(!r.Untouched(2) && !r.EditAreas(2).has_value());
+    CHECK(r.Untouched(0.5));
+    e.crop = VRect{0, 0, 300, 360};  // the left of the flipped picture: blue
+    const auto c = RenderAt(e, 2);
+    CHECK(c->Width() == 300 && Px(*c, 150, 180).b > 0.9);
+    // Upside down: a frame green on top, black below.
+    const auto tb = Bitmap::Create(640, 360);
+    for (int y = 0; y < 360; ++y) std::fill_n(tb->Bits() + (size_t)y * 640, 640, y < 180 ? 0xFF00FF00u : 0xFF000000u);
+    VideoEdit v = EditWith({});
+    b.flipH = false, b.flipV = true;
+    v.clips = {a, b};
+    const auto u = FrameRenderer(v, kSize, false).Render(*tb, 2);
+    CHECK(Px(*u, 10, 10).Brightness() < 0.05);
+    CHECK(Px(*u, 10, 350).g > 0.9);
+    // A flipped video on top: its picture is mirrored in its box.
+    const auto lr = Bitmap::Create(320, 180);  // green left, black right
+    for (int y = 0; y < 180; ++y)
+        for (int x = 0; x < 320; ++x) lr->Bits()[(size_t)y * 320 + x] = x < 160 ? 0xFF00FF00u : 0xFF000000u;
+    Overlay o;
+    o.clip.w = 320, o.clip.h = 180, o.clip.out = 5, o.clip.length = 5;
+    o.clip.flipH = true;
+    o.pos = {0.5, 0.5};
+    o.width = 0.25;  // 160 × 90 at (320, 180)
+    VideoEdit w = EditWith({});
+    w.overlays = {o};
+    FrameRenderer wr(w, kSize, false);
+    wr.overlayFrame = [&](const Overlay&, double) { return lr; };
+    const auto boxed = wr.Render(*TestFrame(), 2);
+    CHECK(Px(*boxed, 330, 220).Brightness() < 0.05);  // its left: the black right half
+    CHECK(Px(*boxed, 470, 220).g > 0.9);
+}
+
+// Composition guides: each kind's lines sit at its fractions of the picture, end on its edges, and the diagonal
+// guide's corner lines are square to the other diagonal, in a wide picture and a tall one.
+ATHER_TEST(video_composition_guide_lines) {
+    const VRect r{100, 50, 1600, 900};
+    auto xs = [&](GuideKind k) {  // where the vertical lines are, as fractions of the width
+        std::vector<double> f;
+        for (const auto& [p, q] : GuideLines(k, r))
+            if (p.x == q.x) f.push_back((p.x - r.x) / r.w);
+        std::sort(f.begin(), f.end());
+        return f;
+    };
+    const auto thirds = xs(GuideKind::Thirds), golden = xs(GuideKind::Golden), phi = xs(GuideKind::Phi);
+    CHECK(thirds.size() == 2 && std::fabs(thirds[0] - 1.0 / 3) < 1e-9 && std::fabs(thirds[1] - 2.0 / 3) < 1e-9);
+    CHECK(golden.size() == 2 && std::fabs(golden[0] - 0.381966) < 1e-5 && std::fabs(golden[1] - 0.618034) < 1e-5);
+    CHECK(phi.size() == 2 && std::fabs(phi[0] - 0.276393) < 1e-5 && std::fabs(phi[1] - 0.723607) < 1e-5);
+    CHECK_EQ(GuideLines(GuideKind::Thirds, r).size(), 4u);  // two across, two down
+    for (const VRect box : {r, VRect{0, 0, 600, 1000}}) {
+        const auto d = GuideLines(GuideKind::Diagonal, box);
+        CHECK_EQ(d.size(), 6u);
+        auto onEdge = [&](VPoint p) {
+            return std::fabs(p.x - box.x) < 1e-6 || std::fabs(p.x - box.MaxX()) < 1e-6 || std::fabs(p.y - box.y) < 1e-6 ||
+                   std::fabs(p.y - box.MaxY()) < 1e-6;
+        };
+        for (const auto& [p, q] : d) CHECK(onEdge(p) && onEdge(q) && (p.x != q.x || p.y != q.y));
+        // The line from the top-left corner (third) is square to the top-right → bottom-left diagonal (second).
+        const auto& [a, b] = d[2];
+        const auto& [c, e] = d[1];
+        CHECK(std::fabs((b.x - a.x) * (e.x - c.x) + (b.y - a.y) * (e.y - c.y)) < 1e-6);
+    }
 }
 
 ATHER_TEST(video_arrow_emoji_and_title) {

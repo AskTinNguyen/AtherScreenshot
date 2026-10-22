@@ -12,6 +12,7 @@
 #pragma comment(lib, "secur32")
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 
@@ -54,7 +55,7 @@ namespace gp = Gdiplus;
 constexpr wchar_t kClass[] = L"AtherScreenshotVideoEditor";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
 constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44,
-               WM_FRAMES = WM_APP + 45, WM_STRIP = WM_APP + 46;
+               WM_FRAMES = WM_APP + 45, WM_STRIP = WM_APP + 46, WM_OVERLAYS = WM_APP + 47;
 enum : UINT_PTR { kTimerFrame = 1 };
 enum : int { kField1 = 200, kField2 };
 
@@ -337,6 +338,64 @@ private:
     std::thread worker_;
 };
 
+// The overlay videos' pictures for the preview: decodes each overlay's frame at the time asked for (the newest request
+// replacing the rest) on a worker thread and posts them back as WM_OVERLAYS. Playback asks in order, so it reads on.
+class OverlayFetcher {
+public:
+    struct Result {
+        double t;
+        std::vector<std::pair<uint64_t, BitmapPtr>> pictures;  // by overlay id
+    };
+    explicit OverlayFetcher(HWND hwnd) : hwnd_(hwnd), worker_([this] { Work(); }) {}
+    ~OverlayFetcher() {
+        {
+            std::lock_guard l(mu_);
+            quit_ = true;
+        }
+        cv_.notify_one();
+        worker_.join();
+    }
+    void Request(double t, std::vector<Overlay> overlays) {
+        {
+            std::lock_guard l(mu_);
+            want_ = t;
+            overlays_ = std::move(overlays);
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void Work() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        OverlayFrames frames;
+        for (;;) {
+            double t;
+            std::vector<Overlay> overlays;
+            {
+                std::unique_lock l(mu_);
+                cv_.wait(l, [&] { return quit_ || want_ >= 0; });
+                if (quit_) break;
+                t = want_;
+                overlays = overlays_;
+                want_ = -1;
+            }
+            auto* res = new Result{t, {}};
+            for (const auto& [id, f] : frames.At(t, overlays))
+                if (BitmapPtr b = f.Bgra()) res->pictures.push_back({id, b});
+            if (!PostMessageW(hwnd_, WM_OVERLAYS, 0, (LPARAM)res)) delete res;
+        }
+        CoUninitialize();
+    }
+
+    HWND hwnd_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    double want_ = -1;
+    std::vector<Overlay> overlays_;
+    bool quit_ = false;
+    std::thread worker_;
+};
+
 // The zoomed-in filmstrip's pictures: decodes the frames asked for (in timeline order, the newest request replacing the
 // rest) on a worker thread, scales each to `thumb` and posts it back as WM_STRIP. Reads on from one frame to the next,
 // so a view's worth of frames a few apart costs one seek.
@@ -505,7 +564,7 @@ public:
     };
     std::optional<Span> marked;
 
-    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan, Range };
+    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan, Range, BinMove, OverlayItem, OverlayBox };
     struct Drag {
         DragKind kind = DragKind::None;
         VPoint from;
@@ -516,10 +575,15 @@ public:
         bool isCaption = false;
         int edge = 0;
         double grab = 0, s0 = 0, e0 = 0;
-        size_t clip = 0;      // clip drags: which clip
+        size_t clip = 0;      // clip drags: which clip (bin drags: which bin piece)
         double value = 0;     // the new in or out point
-        int target = -1;      // where a moved clip goes (-1 = it hasn't moved)
-        int downX = 0;
+        int target = -1;      // where a moved clip goes (-1 = it hasn't moved, or isn't over the clip lane)
+        bool toBin = false;   // a clip dragged up over the bin: it goes there
+        bool toOverlay = false;  // a bin piece over the overlay lane: it goes on top, at `value`
+        Overlay overlay;      // overlay drags: the overlay as it was
+        bool moved = false;   // a clip or bin piece dragged far enough to be a move, not a click
+        int downX = 0, downY = 0;
+        POINT at{};           // the mouse, for the piece carried along
         std::optional<Span> before;  // range drags: the marked range before it (Esc puts it back)
     } drag;
 
@@ -546,6 +610,12 @@ public:
             if (edit.notes[i].id == *selected) return i;
         return std::nullopt;
     }
+    std::optional<size_t> SelOverlay() const {
+        if (!selected) return std::nullopt;
+        for (size_t i = 0; i < edit.overlays.size(); ++i)
+            if (edit.overlays[i].id == *selected) return i;
+        return std::nullopt;
+    }
     VRect ViewRect() const {
         const VRect f{0, 0, (double)videoSize.cx, (double)videoSize.cy};
         if (!edit.crop) return f;
@@ -565,14 +635,17 @@ public:
         if (undoStack.empty()) return;
         edit = undoStack.back();
         undoStack.pop_back();
-        if (selected && !SelCaption() && !SelMark() && !SelNote()) selected.reset();
+        if (selected && !SelCaption() && !SelMark() && !SelNote() && !SelOverlay()) selected.reset();
+        if (selClip && !SelClipIndex() && !SelBinIndex()) selClip.reset();
         Changed();
     }
 
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
-        if (edit.clips != builtClips) RebuildSequence();
+        if (!SameFootage(edit.clips, builtClips)) RebuildSequence();
+        else builtClips = edit.clips;  // only a flip: the players and thumbnails stay (the renderer and strip flip)
         if (marked) SetMarked(marked->start, marked->end);  // still inside the trim
+        RequestOverlays(playing ? rawT : paused);
         LoadNotes();
         PlaceNotes();
         NotesChanged();
@@ -600,7 +673,142 @@ public:
         FrameRenderer r(edit, videoSize, true);
         r.zoomInPreview = playing;
         if (!playing && selected) r.settled = *selected;  // a new item shows at the playhead, not faded out at its first frame
+        r.overlayFrame = [this](const Overlay& o, double) -> BitmapPtr {
+            const auto it = overlayPics.find(o.id);
+            return it != overlayPics.end() ? it->second : nullptr;
+        };
         shown = r.Render(*raw, playing ? rawT : paused);
+        if (mono && shown) Grayscale(*shown);
+    }
+
+    // ---- composition guides and the monochrome view ----
+    // Lines over the preview to check framing (golden section, thirds, phi grid, diagonals), on the part the saved video
+    // shows (the crop), and a black-and-white view to check values. The preview's only: never saved. They stay as set for
+    // the next video opened.
+    static inline std::array<bool, kGuideKinds> lastGuides{};
+    static inline bool lastGuidesOn = false, lastMono = false;
+    std::array<bool, kGuideKinds> guides = lastGuides;
+    bool guidesOn = lastGuidesOn;  // Hide guides (G) keeps which ones were on
+    bool mono = lastMono;
+    bool GuideShown(GuideKind k) const { return guidesOn && guides[(size_t)k]; }
+    bool AnyGuide() const {
+        for (int k = 0; k < kGuideKinds; ++k)
+            if (GuideShown((GuideKind)k)) return true;
+        return false;
+    }
+    void GuidesChanged() {
+        lastGuides = guides;
+        lastGuidesOn = guidesOn;
+        lastMono = mono;
+        Invalidate();
+    }
+    void ToggleGuide(GuideKind k) {
+        bool& on = guides[(size_t)k];
+        if (!guidesOn) guidesOn = on = true;  // from hidden: just this one comes back on
+        else on = !on;
+        GuidesChanged();
+    }
+    void ShowAllGuides() {
+        guides.fill(true);
+        guidesOn = true;
+        GuidesChanged();
+    }
+    void HideGuides() {
+        guidesOn = false;
+        GuidesChanged();
+    }
+    // G: hides the guides, or shows them again (the rule of thirds when none was picked yet).
+    void ToggleGuides() {
+        if (AnyGuide()) return HideGuides();
+        guidesOn = true;
+        if (!AnyGuide()) guides[(size_t)GuideKind::Thirds] = true;
+        GuidesChanged();
+    }
+    void ToggleMono() {
+        mono = !mono;
+        Rerender();
+        GuidesChanged();
+    }
+    static gp::Color GuideColor(GuideKind k) {
+        switch (k) {
+            case GuideKind::Golden: return gp::Color(235, 235, 40, 40);    // red
+            case GuideKind::Thirds: return gp::Color(235, 50, 90, 255);    // blue
+            case GuideKind::Phi: return gp::Color(235, 235, 215, 40);      // yellow
+            default: return gp::Color(220, 255, 236, 120);                // pale yellow
+        }
+    }
+    static const wchar_t* GuideColorName(GuideKind k) {
+        switch (k) {
+            case GuideKind::Golden: return L"red";
+            case GuideKind::Thirds: return L"blue";
+            case GuideKind::Phi: return L"yellow";
+            default: return L"pale yellow";
+        }
+    }
+    std::vector<MenuItem> GuidesMenu() {
+        std::vector<MenuItem> v;
+        MenuItem all;
+        all.label = L"Show all guides";
+        all.run = [this] { ShowAllGuides(); };
+        v.push_back(all);
+        MenuItem none;
+        none.label = L"Hide guides\tG";
+        none.enabled = AnyGuide();
+        none.run = [this] { HideGuides(); };
+        v.push_back(none);
+        v.push_back(MenuItem::Sep());
+        for (int k = 0; k < kGuideKinds; ++k) {
+            const GuideKind kind = (GuideKind)k;
+            MenuItem it;
+            it.label = std::wstring(GuideLabel(kind)) + L" (" + GuideColorName(kind) + L")";
+            it.checked = GuideShown(kind);
+            it.run = [this, kind] { ToggleGuide(kind); };
+            v.push_back(it);
+        }
+        v.push_back(MenuItem::Sep());
+        MenuItem bw;
+        bw.label = L"Monochrome view";
+        bw.checked = mono;
+        bw.run = [this] { ToggleMono(); };
+        v.push_back(bw);
+        return v;
+    }
+    static void Grayscale(Bitmap& b) {
+        uint32_t* p = b.Bits();
+        for (size_t i = 0, n = (size_t)b.Width() * b.Height(); i < n; ++i) {
+            const uint32_t c = p[i];
+            const uint32_t y = (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;  // Rec. 601 luma
+            p[i] = (c & 0xFF000000u) | y << 16 | y << 8 | y;
+        }
+    }
+    void PaintGuides(gp::Graphics& g) {
+        if (!AnyGuide()) return;
+        const gp::RectF a = ToView(ViewRect());  // what the saved video shows
+        gp::Pen shade(gp::Color(110, 0, 0, 0), 3.25f * s);  // a dark edge under each line, so it reads on any picture
+        for (int pass = 0; pass < 2; ++pass)
+            for (int k = 0; k < kGuideKinds; ++k) {
+                const GuideKind kind = (GuideKind)k;
+                if (!GuideShown(kind)) continue;
+                gp::Pen pen(GuideColor(kind), 1.25f * s);
+                for (const auto& [p, q] : GuideLines(kind, {a.X, a.Y, a.Width, a.Height}))
+                    g.DrawLine(pass ? &pen : &shade, (float)p.x, (float)p.y, (float)q.x, (float)q.y);
+            }
+    }
+    POINT rDown{};  // where a right click started (a click without a drag opens the guides menu)
+
+    // ---- overlay videos in the preview ----
+    std::unique_ptr<OverlayFetcher> overlayFetcher;
+    std::map<uint64_t, BitmapPtr> overlayPics;  // each overlay's picture at the frame on screen (as last decoded)
+    double overlayPicsT = -1;                   // the time they're for
+
+    // Asks for the overlays' pictures at timeline time `t` (they come as WM_OVERLAYS).
+    void RequestOverlays(double t) {
+        if (edit.overlays.empty() || !hwnd) {
+            overlayPics.clear();
+            return;
+        }
+        if (!overlayFetcher) overlayFetcher = std::make_unique<OverlayFetcher>(hwnd);
+        overlayFetcher->Request(t, edit.overlays);
     }
 
     // ---- playback ----
@@ -709,9 +917,30 @@ public:
         if (n < tframes.size()) Seek(tframes.frames[n].t);
     }
 
+    // ---- loop ----
+    // On, playback goes back to the start of the loop at its end instead of stopping: the selected clip (as much of it as
+    // is in the trim), else the trim. Review playback (J/L) wraps the same way. A preview setting, not part of the edit;
+    // it stays on for the next video opened.
+    static inline bool lastLoop = false;
+    bool loop = lastLoop;
+    int loops = 0;  // tests: times playback went round
+    std::pair<double, double> LoopRange() const {
+        double a = edit.trimStart, b = edit.trimEnd;
+        if (const auto i = SelClipIndex()) {
+            const double c0 = ClipStart(edit.clips, *i), c1 = c0 + edit.clips[*i].Duration();
+            if (std::max(a, c0) < std::min(b, c1) - 0.05) a = std::max(a, c0), b = std::min(b, c1);
+        }
+        return {a, b};
+    }
+    void ToggleLoop() {
+        lastLoop = loop = !loop;
+        Invalidate();
+    }
+
     void Play() {
         if (!player) return;
-        if (Now() < edit.trimStart || Now() >= edit.trimEnd - 0.05) Seek(edit.trimStart);
+        const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
+        if (Now() < from || Now() >= to - 0.05) Seek(from);
         player->Seek(paused);
         player->SetRate(edit.speed);
         player->SetMuted(edit.muted);
@@ -788,15 +1017,21 @@ public:
         const double now = Seconds();
         if (now < reviewDue) return;
         const size_t n = tframes.Nearest(paused);
-        const size_t first = tframes.At(edit.trimStart + 1e-3), last = tframes.At(edit.trimEnd - 1e-3);
-        if ((reviewDir > 0 && n >= last) || (reviewDir < 0 && n <= first)) return StopReview();  // at the trim's end
-        const size_t next = reviewDir > 0 ? n + 1 : n - 1;
+        const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
+        const size_t first = tframes.At(from + 1e-3), last = tframes.At(to - 1e-3);
+        size_t next = reviewDir > 0 ? n + 1 : n - 1;
+        if ((reviewDir > 0 && n >= last) || (reviewDir < 0 && n <= first)) {  // at the end: round again, or stop
+            if (!loop) return StopReview();
+            next = reviewDir > 0 ? first : last;
+            ++loops;
+        }
         GoToFrame(next);
         reviewDue = std::max(reviewDue + FrameStep(n, reviewDir), now);  // no catching up by skipping
         ++reviewFrames;
     }
     int reviewFrames = 0;  // tests: frames shown by review playback
     std::function<void()> onFetched;  // tests: each paused frame as it's shown
+    std::function<void()> onOverlays;  // tests: each time the overlays' pictures come
 
 
     // ←/→: `frames` frames at the rate of the clip they're in, landing on each frame's own time.
@@ -835,11 +1070,19 @@ public:
             if (auto f = player->NewFrame(&t)) {
                 raw = f;  // already fitted into the sequence frame
                 rawT = t;
+                RequestOverlays(t);
                 KeepOnView(t);
                 Rerender();
                 Invalidate();  // only when there's a new frame (the playhead moves with it)
             }
-            if (player->Now() >= edit.trimEnd - 0.01 || !player->Playing()) {
+            const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
+            const bool atEnd = player->Now() >= to - 0.01;
+            if (loop && atEnd) {  // round again, still playing
+                player->Seek(from);
+                if (!player->Playing()) player->Play();
+                KeepOnView(from);
+                ++loops;
+            } else if (atEnd || !player->Playing()) {
                 Pause();
                 Seek(edit.trimStart);
             }
@@ -854,6 +1097,12 @@ public:
     std::optional<size_t> SelClipIndex() const {
         for (size_t i = 0; selClip && i < edit.clips.size(); ++i)
             if (edit.clips[i].id == *selClip) return i;
+        return std::nullopt;
+    }
+    // A selected bin piece (selClip names it: a clip keeps its id going to the bin and back).
+    std::optional<size_t> SelBinIndex() const {
+        for (size_t i = 0; selClip && i < edit.bin.size(); ++i)
+            if (edit.bin[i].id == *selClip) return i;
         return std::nullopt;
     }
 
@@ -885,7 +1134,7 @@ public:
             LoadThumbs();
             LoadFrameTimes();
         }
-        if (selClip && !SelClipIndex()) selClip.reset();
+        if (selClip && !SelClipIndex() && !SelBinIndex()) selClip.reset();
         ClampTimeline();
     }
 
@@ -930,6 +1179,24 @@ public:
         Seek(ClipStart(edit.clips, at));
     }
 
+    // Files dropped at `at`: on the bottom lane they go on top from that time, on a box on the video they go on top from
+    // the playhead (each in a box of its own); anywhere else they join the sequence.
+    void DropFiles(const std::vector<std::wstring>& files, POINT at) {
+        const RECT ol = OverlayLaneRect(), st = StageRect();
+        const bool onLane = at.y >= ol.top - S(4) && at.y <= ol.bottom + S(4) && at.x >= ol.left - S(10);
+        const bool onBox = PtInRect(&st, at) && OverlayAt(at).has_value();
+        if (!onLane && !onBox) return AddClips(files);
+        double t = onLane ? SnapToFrame(TT(at.x)) : InsertTime();
+        for (const auto& p : files) {
+            if (auto c = IsVideoFile(p) ? ClipOf(p) : std::nullopt) {
+                AddOverlay(*c, t, OverlayLayout::Pip);
+                t += c->Duration();  // several: one after another
+            } else {
+                ShowToast(L"Can't add that as a video", FileNameOf(p), nullptr, nullptr, 4000);
+            }
+        }
+    }
+
     void AddClipDialog() {
         const auto files = PickFiles(hwnd, MediaFilter(false, true), true, L"Add videos after this one");
         if (!files.empty()) AddClips(files);
@@ -966,13 +1233,122 @@ public:
         Seek(ClipStart(edit.clips, to));
     }
 
-    void RemoveClip(size_t i) {
-        if (i >= edit.clips.size() || edit.clips.size() < 2) return;
-        std::vector<Clip> clips = edit.clips;
+    // One undo step for the clips and the bin together (a piece going from one to the other).
+    void SetClipsAndBin(std::vector<Clip> clips, std::vector<Clip> bin) {
+        if (clips.empty() || (clips == edit.clips && bin == edit.bin)) return;
+        Pause();
+        PushUndo();
+        edit.bin = std::move(bin);
+        ApplyClips(edit, std::move(clips));
+        Changed();
+    }
+
+    // Takes a clip off the timeline into the bin, to put back later or delete there. The last clip stays.
+    // Markup and captions on it go, as when a clip is cut shorter.
+    void MoveToBin(size_t i) {
+        if (i >= edit.clips.size()) return;
+        if (edit.clips.size() < 2) {
+            ShowToast(L"The last clip stays on the timeline", L"", nullptr, nullptr, 2000);
+            return;
+        }
+        std::vector<Clip> clips = edit.clips, bin = edit.bin;
+        bin.push_back(clips[i]);
         clips.erase(clips.begin() + i);
-        SetClips(clips);
+        SetClipsAndBin(clips, bin);
         SelectClip(std::nullopt);
         Seek(ClipStart(edit.clips, std::min(i, edit.clips.size() - 1)));
+    }
+
+    // Puts bin piece `i` back on the timeline as clip `at`.
+    void PlaceFromBin(size_t i, size_t at) {
+        if (i >= edit.bin.size()) return;
+        std::vector<Clip> clips = edit.clips, bin = edit.bin;
+        const Clip c = bin[i];
+        bin.erase(bin.begin() + i);
+        at = std::min(at, clips.size());
+        clips.insert(clips.begin() + at, c);
+        SetClipsAndBin(clips, bin);
+        SelectClip(c.id);
+        Seek(ClipStart(edit.clips, at));
+    }
+
+    // ---- overlay videos ----
+
+    // Puts `clip` on top from timeline time `at` (picture in picture, or one half of a split screen), selected.
+    void AddOverlay(const Clip& clip, double at, OverlayLayout layout) {
+        Overlay o;
+        o.clip = clip;
+        o.start = std::clamp(at, 0.0, std::max(0.0, duration - 0.1));
+        o.layout = layout;
+        Pause();
+        PushUndo();
+        cropping = false;  // so the next drag on the video moves the box
+        edit.overlays.push_back(o);
+        Select(o.id);
+        Changed();
+    }
+    void AddOverlayDialog(OverlayLayout layout) {
+        const auto files = PickFiles(hwnd, MediaFilter(false, true), false,
+                                     layout == OverlayLayout::Pip ? L"Video to show in a box on top" : L"Video to show side by side");
+        if (files.empty()) return;
+        if (auto c = IsVideoFile(files[0]) ? ClipOf(files[0]) : std::nullopt) AddOverlay(*c, InsertTime(), layout);
+        else ShowToast(L"Can't add that as a video", FileNameOf(files[0]), nullptr, nullptr, 4000);
+    }
+    // Bin piece `i` goes on top from `at` (one undo step with taking it from the bin).
+    void BinToOverlay(size_t i, double at) {
+        if (i >= edit.bin.size()) return;
+        Overlay o;
+        o.clip = edit.bin[i];
+        o.start = std::clamp(at, 0.0, std::max(0.0, duration - 0.1));
+        Pause();
+        PushUndo();
+        cropping = false;
+        edit.bin.erase(edit.bin.begin() + i);
+        edit.overlays.push_back(o);
+        Select(o.id);
+        Changed();
+    }
+    // One undo step changing the selected overlay.
+    void UpdateOverlay(const std::function<void(Overlay&)>& fn) {
+        const auto i = SelOverlay();
+        if (!i) return;
+        PushUndo();
+        fn(edit.overlays[*i]);
+        Changed();
+    }
+    // The wheel over a box: `factor` times as wide, about its middle (a run of wheel turns is one undo step).
+    uint64_t lastWheelScale = 0;  // GetTickCount64 of the last one
+    void ScaleOverlay(size_t i, double factor) {
+        if (i >= edit.overlays.size()) return;
+        const uint64_t now = GetTickCount64();
+        if (selected != edit.overlays[i].id || now - lastWheelScale > 800) PushUndo();
+        lastWheelScale = now;
+        Select(edit.overlays[i].id);
+        Overlay& o = edit.overlays[i];
+        const VRect v = ViewRect();
+        const SIZE out{(LONG)v.w, (LONG)v.h};
+        const VRect r0 = OverlayRect(o, out);
+        o.width = std::clamp(o.width * factor, 0.08, 1.0);
+        const VRect r1 = OverlayRect(o, out);
+        o.pos = {(r0.MidX() - r1.w / 2) / v.w, (r0.MidY() - r1.h / 2) / v.h};
+        const VRect r = OverlayRect(o, out);  // kept on the frame
+        o.pos = {r.x / v.w, r.y / v.h};
+        Changed();
+    }
+
+    // Where an overlay shows on the video (video coordinates), in the preview's frame.
+    VRect OverlayOnVideo(const Overlay& o) const {
+        const VRect v = ViewRect();
+        return OverlayRect(o, {(LONG)v.w, (LONG)v.h}).Offset(v.x, v.y);
+    }
+
+    // Deletes bin piece `i` for good (undo brings it back).
+    void DeleteFromBin(size_t i) {
+        if (i >= edit.bin.size()) return;
+        PushUndo();
+        edit.bin.erase(edit.bin.begin() + i);
+        SelectClip(std::nullopt);
+        Changed();
     }
 
     void TrimClip(size_t i, std::optional<double> in, std::optional<double> out) {
@@ -1115,6 +1491,13 @@ public:
         if (!selected) return;
         PushUndo();
         const uint64_t id = *selected;
+        for (const auto& o : edit.overlays)  // an overlay video's footage goes to the bin, like a clip's
+            if (o.id == id) {
+                Clip c = o.clip;
+                c.id = NewItemId();
+                edit.bin.push_back(c);
+            }
+        std::erase_if(edit.overlays, [&](const Overlay& o) { return o.id == id; });
         std::erase_if(edit.captions, [&](const Caption& c) { return c.id == id; });
         std::erase_if(edit.marks, [&](const Mark& m) { return m.id == id; });
         std::erase_if(edit.notes, [&](const Note& n) { return n.id == id; });
@@ -1348,9 +1731,13 @@ public:
     std::optional<VPoint> PinOnVideo(const Note& n) const {
         const auto f = NoteFrame(n);
         if (!n.pin || !f || tframes.frames[*f].clip >= edit.clips.size()) return std::nullopt;
-        const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
-        return VPoint{r.x + n.pin->x * r.w, r.y + n.pin->y * r.h};
+        const Clip& c = edit.clips[tframes.frames[*f].clip];
+        const VRect r = ClipFit(c);
+        const VPoint at = FlipPin(*n.pin, c);  // the pin is on the footage, so on a flipped clip it's mirrored too
+        return VPoint{r.x + at.x * r.w, r.y + at.y * r.h};
     }
+    // A pin (fractions of the clip's picture) as it shows on the clip's flipped picture, or the other way round.
+    static VPoint FlipPin(VPoint p, const Clip& c) { return {c.flipH ? 1 - p.x : p.x, c.flipV ? 1 - p.y : p.y}; }
 
     void SetCrop(std::optional<VRect> r) {
         const VRect full{0, 0, (double)videoSize.cx, (double)videoSize.cy};
@@ -1509,12 +1896,86 @@ public:
         return v;
     }
 
+    // ---- flip ----
+
+    // What Flip flips: the selected video on top, else the selected clip, else the clip at the playhead.
+    struct FlipTarget {
+        int overlay = -1, clip = -1;
+    };
+    FlipTarget FlipWhat() const {
+        if (const auto oi = SelOverlay()) return {(int)*oi, -1};
+        if (const auto ci = SelClipIndex()) return {-1, (int)*ci};
+        if (const auto spot = LocateClip(edit.clips, Now())) return {-1, (int)spot->first};
+        return {};
+    }
+    const Clip* FlipClip() const {
+        const FlipTarget w = FlipWhat();
+        return w.overlay >= 0 ? &edit.overlays[(size_t)w.overlay].clip : w.clip >= 0 ? &edit.clips[(size_t)w.clip] : nullptr;
+    }
+    std::wstring FlipLabel() const {
+        const Clip* c = FlipClip();
+        return !c ? L"Flip" : c->flipH && c->flipV ? L"Flipped ↔ ↕" : c->flipH ? L"Flipped ↔" : c->flipV ? L"Flipped ↕" : L"Flip";
+    }
+    std::wstring FlipTip() const {
+        const FlipTarget w = FlipWhat();
+        if (w.overlay >= 0) return L"Mirror the selected video on top";
+        if (SelClipIndex()) return L"Mirror the selected clip (left–right or upside down)";
+        return edit.clips.size() > 1 ? L"Mirror the clip at the playhead (select a clip to pick another)" : L"Mirror the video (left–right or upside down)";
+    }
+    std::vector<MenuItem> FlipMenu() {
+        const Clip* c = FlipClip();
+        MenuItem h;
+        h.label = L"Flip horizontally (mirror left–right)";
+        h.checked = c && c->flipH;
+        h.enabled = c != nullptr;
+        h.run = [this] { ToggleFlip(true); };
+        MenuItem v;
+        v.label = L"Flip vertically (upside down)";
+        v.checked = c && c->flipV;
+        v.enabled = c != nullptr;
+        v.run = [this] { ToggleFlip(false); };
+        return {h, v};
+    }
+    // One undo step: one clip's (or video on top's) picture mirrored one way. On a clip, the markup that sits wholly
+    // on it is mirrored with it, so it stays on the same footage; the crop (all clips share it) and captions stay put;
+    // notes keep their spot on the footage (PinOnVideo mirrors it).
+    void ToggleFlip(bool horizontal) {
+        const FlipTarget w = FlipWhat();
+        if (w.overlay < 0 && w.clip < 0) return;
+        PushUndo();
+        if (w.overlay >= 0) {
+            Clip& c = edit.overlays[(size_t)w.overlay].clip;
+            (horizontal ? c.flipH : c.flipV) ^= true;
+            return Changed();
+        }
+        const size_t i = (size_t)w.clip;
+        const double t0 = ClipStart(edit.clips, i), t1 = t0 + edit.clips[i].Duration();
+        const double W = videoSize.cx, H = videoSize.cy;
+        auto mirror = [&](VPoint& p) { (horizontal ? p.x : p.y) = (horizontal ? W - p.x : H - p.y); };
+        for (auto& m : edit.marks)
+            if (m.start >= t0 - 1e-6 && m.end <= t1 + 1e-6) {
+                mirror(m.a);
+                mirror(m.b);
+            }
+        Clip& c = edit.clips[i];
+        (horizontal ? c.flipH : c.flipV) ^= true;
+        Changed();
+    }
+
     std::vector<MenuItem> AddMenu() {
         std::vector<MenuItem> v;
         MenuItem clip;
         clip.label = L"Video clip…\tCtrl+O";
         clip.run = [this] { AddClipDialog(); };
         v.push_back(clip);
+        MenuItem pip;
+        pip.label = L"Video on top (picture in picture)…";
+        pip.run = [this] { AddOverlayDialog(OverlayLayout::Pip); };
+        v.push_back(pip);
+        MenuItem split;
+        split.label = L"Video side by side (split screen)…";
+        split.run = [this] { AddOverlayDialog(OverlayLayout::SplitRight); };
+        v.push_back(split);
         v.push_back(MenuItem::Sep());
         MenuItem cap;
         cap.label = L"Caption\tT";
@@ -1673,17 +2134,62 @@ public:
         }
         return out;
     }
-    // The clip lane shows once there's more than one clip.
-    int LaneH() const { return edit.clips.size() > 1 ? S(24) : 0; }
+    // The clip lane, and the bin lane above the timeline, show once there's more than one clip or anything in the bin.
+    bool ClipLanesShown() const { return edit.clips.size() > 1 || !edit.bin.empty(); }
+    int LaneH() const { return ClipLanesShown() ? S(24) : 0; }
+    int BinH() const { return ClipLanesShown() ? S(30) : 0; }
     RECT TimelineRect() const {
         const RECT c = Client();
-        const int h = S(90) + RowCount() * S(18) + LaneH();
+        const int h = S(90) + RowCount() * S(18) + LaneH() + OverlayLaneH();
         return {S(100), c.bottom - S(14) - h, c.right - S(14), c.bottom - S(14)};
     }
-    RECT InspectorRect() const {
+    // The overlay videos' lane, at the bottom of the timeline under the markup's rows.
+    int OverlayLaneH() const { return S(26); }
+    RECT OverlayLaneRect() const {
         const RECT t = TimelineRect();
+        return {t.left, t.bottom - S(22), t.right, t.bottom};
+    }
+    // Clear of the playhead knob, which pokes above the timeline.
+    RECT BinRect() const {
+        const RECT t = TimelineRect();
+        return {t.left, t.top - S(12) - BinH(), t.right, t.top - S(12)};
+    }
+    RECT InspectorRect() const {
+        const int top = BinH() ? BinRect().top : TimelineRect().top;
         const RECT c = Client();
-        return {S(14), t.top - S(8) - S(30), c.right - S(14), t.top - S(8)};
+        return {S(14), top - S(8) - S(30), c.right - S(14), top - S(8)};
+    }
+    // Each bin piece's chip, left to right: as long as on the timeline, shorter when they don't all fit.
+    std::vector<RECT> BinChips() const {
+        std::vector<RECT> out;
+        const RECT r = BinRect();
+        if (edit.bin.empty() || RectW(r) <= 0) return out;
+        const int n = (int)edit.bin.size(), gap = S(4), minW = S(64);
+        const int avail = std::max(n, RectW(r) - gap * (n + 1));
+        double total = 0;
+        for (const auto& c : edit.bin) total += c.Duration();
+        const double k = std::min(RectW(r) / std::max(0.001, duration), avail / std::max(0.001, total));
+        std::vector<int> w;
+        int sum = 0;
+        for (const auto& c : edit.bin) {
+            w.push_back(std::max(minW, (int)(c.Duration() * k)));
+            sum += w.back();
+        }
+        if (sum > avail)
+            for (auto& x : w) x = avail / n;
+        int x = r.left + gap;
+        for (int wi : w) {
+            out.push_back({x, r.top + S(3), x + wi, r.bottom - S(3)});
+            x += wi + gap;
+        }
+        return out;
+    }
+    // Where a clip dropped at `x` lands on the timeline: how many clips (other than `skip`) end up before it.
+    int InsertIndex(int x, size_t skip) const {
+        int target = 0;
+        for (size_t i = 0; i < edit.clips.size(); ++i)
+            if (i != skip && TX(ClipStart(edit.clips, i) + edit.clips[i].Duration() / 2) < x) ++target;
+        return target;
     }
     // The frame readout under the video.
     RECT ReadoutRect() const {
@@ -1958,6 +2464,20 @@ public:
             };
             x = r.right + S(4);
         }
+        const Clip* flipping = FlipClip();
+        r = Button(dc, g, x, y, h, 0, FlipLabel(), true, flipping && flipping->Flipped(), [] {}, FlipTip());
+        {
+            const RECT fr = r;
+            hots.back().click = [this, fr] { Popup(fr, FlipMenu()); };
+        }
+        x = r.right + S(4);
+        r = Button(dc, g, x, y, h, 0, L"Guides", true, AnyGuide() || mono, [] {},
+                   L"Composition guides over the preview (G), or a black-and-white view: never saved. Right-click the video for them too");
+        {
+            const RECT gr = r;
+            hots.back().click = [this, gr] { Popup(gr, GuidesMenu()); };
+        }
+        x = r.right + S(4);
         Separator(dc, x, y, h);
         int si = 1;
         for (int i = 0; i < 5; ++i)
@@ -2080,6 +2600,7 @@ public:
         // Guides and handles are drawn above the video, so they show while it plays too.
         g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
         if (magZoom > 1) g.SetClip(v);
+        PaintGuides(g);
         const COLORREF accent = theme::kAccent;
         if (edit.crop) {
             const gp::RectF r = ToView(*edit.crop);
@@ -2138,6 +2659,21 @@ public:
             RoundPath(p, r.X, r.Y, r.Width, r.Height, 8 * s);
             gp::Pen pen(A(accent), 1.5f * s);
             g.DrawPath(&pen, &p);
+        }
+        if (auto oi = SelOverlay(); oi && edit.overlays[*oi].Active(now)) {  // the overlay: its box (and corner to size it) or its half
+            const Overlay& o = edit.overlays[*oi];
+            const gp::RectF r = ToView(OverlayOnVideo(o));
+            gp::Pen pen(A(accent), 2.f * s);
+            g.DrawRectangle(&pen, r);
+            if (!o.IsSplit()) {  // a handle on each corner, to size it from there
+                gp::SolidBrush white(gp::Color(255, 255, 255, 255));
+                gp::Pen ring(A(accent), 1.5f * s);
+                for (const float cx : {r.GetLeft(), r.GetRight()})
+                    for (const float cy : {r.GetTop(), r.GetBottom()}) {
+                        g.FillEllipse(&white, cx - 6 * s, cy - 6 * s, 12 * s, 12 * s);
+                        g.DrawEllipse(&ring, cx - 6 * s, cy - 6 * s, 12 * s, 12 * s);
+                    }
+            }
         }
         // Pins of the notes on the frame on screen.
         if (!playing && !tframes.empty()) {
@@ -2441,6 +2977,31 @@ public:
             }
         }
         if (ci || mi || ni) button(0xE74D, L"Delete", false, [this](RECT) { DeleteSelected(); }, L"Delete (Del)");
+        if (const auto oi = goingTo ? std::nullopt : SelOverlay()) {
+            const Overlay o = edit.overlays[*oi];
+            label(L"Video on top:  " + FileNameOf(o.clip.path) + L"  ·  " + Clock(o.clip.Duration()) + L"  ·  no sound");
+            std::vector<std::wstring> layouts;
+            for (int k = 0; k <= (int)OverlayLayout::SplitBottom; ++k) layouts.push_back(OverlayLayoutLabel((OverlayLayout)k));
+            button(0, OverlayLayoutLabel(o.layout), true, [this, layouts, o](RECT r) {
+                Popup(r, ListMenu(layouts, (int)o.layout, [this](int k) { UpdateOverlay([k](Overlay& x) { x.layout = (OverlayLayout)k; }); }));
+            }, L"In a box on top, or side by side with the video");
+            if (o.IsSplit()) {
+                button(0, o.fill ? L"Fill halves" : L"Fit halves", true, [this, o](RECT r) {
+                    Popup(r, ListMenu({L"Fit: all of each picture, with bars", L"Fill: each half filled, cut to fit"}, o.fill ? 1 : 0,
+                                      [this](int k) { UpdateOverlay([k](Overlay& x) { x.fill = k == 1; }); }));
+                });
+            } else {
+                static const double sizes[] = {0.22, 0.34, 0.5};
+                const std::vector<std::wstring> names = {L"Small", L"Medium", L"Large"};
+                int cur = 0;
+                for (int k = 1; k < 3; ++k)
+                    if (std::fabs(o.width - sizes[k]) < std::fabs(o.width - sizes[cur])) cur = k;
+                button(0, names[cur], true, [this, names, cur](RECT r) {
+                    Popup(r, ListMenu(names, cur, [this](int k) { UpdateOverlay([k](Overlay& x) { x.width = sizes[k]; }); }));
+                }, L"Its size (or drag its corner on the video)");
+            }
+            button(0xE70E, L"To bin", false, [this](RECT) { DeleteSelected(); }, L"Take it off into the bin (Del)");
+        }
         if (const auto k = SelClipIndex(); k && !ci && !mi && !ni && !goingTo) {
             const size_t i = *k;
             const Clip& c = edit.clips[i];
@@ -2448,11 +3009,20 @@ public:
             button(0xE8C6, L"Split at playhead", false, [this](RECT) { SplitAtPlayhead(); }, L"Cut this clip in two at the playhead (S)");
             if (i > 0) button(0xE760, L"Earlier", false, [this, i](RECT) { MoveClip(i, i - 1); }, L"Play this clip before the one on its left");
             if (i + 1 < edit.clips.size()) button(0xE761, L"Later", false, [this, i](RECT) { MoveClip(i, i + 1); }, L"Play this clip after the one on its right");
-            if (edit.clips.size() > 1) button(0xE74D, L"Remove", false, [this, i](RECT) { RemoveClip(i); }, L"Take this clip out (Del)");
+            if (edit.clips.size() > 1) button(0xE70E, L"To bin", false, [this, i](RECT) { MoveToBin(i); }, L"Take this clip out into the bin, to put back later (Del, or drag it up)");
+        }
+        if (const auto k = SelBinIndex(); k && !ci && !mi && !ni && !goingTo) {
+            const size_t i = *k;
+            const Clip& c = edit.bin[i];
+            label(L"In the bin:  " + FileNameOf(c.path) + L"  ·  " + Clock(c.in) + L"–" + Clock(c.out) + L"  ·  " + Clock(c.Duration()));
+            button(0xE710, L"Add at end", false, [this, i](RECT) { PlaceFromBin(i, edit.clips.size()); }, L"Put it back at the end of the video (or drag it onto the timeline)");
+            button(0, L"On top", false, [this, i](RECT) { BinToOverlay(i, InsertTime()); },
+                   L"Show it on top from the playhead, in a box or side by side (or drag it to the bottom lane)");
+            button(0xE74D, L"Delete", false, [this, i](RECT) { DeleteFromBin(i); }, L"Delete this piece for good (Del)");
         }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · S split · Shift+drag mark · Ctrl+C copy · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · Shift+drag mark · Ctrl+C copy · G guides · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -2488,6 +3058,19 @@ public:
         (void)w2;
     }
 
+    // A timeline picture stretched into place, mirrored as its clip `c` is flipped (the frames are decoded as they are).
+    void PutThumb(HDC dc, int x, int y, int w, int h, HDC src, int sw, int sh, const Clip* c) const {
+        const bool fh = c && c->flipH, fv = c && c->flipV;
+        StretchBlt(dc, fh ? x + w - 1 : x, fv ? y + h - 1 : y, fh ? -w : w, fv ? -h : h, src, 0, 0, sw, sh, SRCCOPY);
+    }
+    const Clip* ClipAt(double t) const {
+        const auto spot = LocateClip(edit.clips, t);
+        return spot ? &edit.clips[spot->first] : nullptr;
+    }
+    const Clip* ClipOfFrame(size_t n) const {
+        return n < tframes.size() && tframes.frames[n].clip < edit.clips.size() ? &edit.clips[tframes.frames[n].clip] : nullptr;
+    }
+
     void PaintTimeline(HDC dc, gp::Graphics& g) {
         const RECT tr = TimelineRect();
         const int top = tr.top + LaneH();
@@ -2508,7 +3091,7 @@ public:
                 const auto it = stripThumbs.find(tile.frame);
                 if (it == stripThumbs.end() || !it->second) continue;  // still coming: the strip's own color meanwhile
                 MemDC src(it->second->Handle());
-                StretchBlt(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, 0, 0, it->second->Width(), it->second->Height(), SRCCOPY);
+                PutThumb(dc, x0, strip.top, std::max(1, x1 - x0), RectH(strip), src, it->second->Width(), it->second->Height(), ClipOfFrame(tile.frame));
             }
             for (const auto& tile : tiles) {  // a hairline between tiles
                 const int x = (int)std::lround(TX(tile.t0));
@@ -2531,14 +3114,14 @@ public:
                 HRGN cr = CreateRectRgnIndirect(&cell);
                 ExtSelectClipRgn(dc, cr, RGN_AND);
                 MemDC src(img->Handle());  // fitted: each of the 16 shows the frame at its middle
-                StretchBlt(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, 0, 0, img->Width(), img->Height(), SRCCOPY);
+                PutThumb(dc, (cell.left + cell.right) / 2 - dw / 2, (cell.top + cell.bottom) / 2 - dh / 2, dw, dh, src, img->Width(), img->Height(), ClipAt(D * (i + 0.5) / thumbs.size()));
                 SelectClipRgn(dc, clip);
                 DeleteObject(cr);
             }
             SelectClipRgn(dc, nullptr);
             DeleteObject(clip);
         }
-        if (edit.clips.size() > 1) PaintClips(dc, g, tr, strip);
+        if (LaneH()) PaintClips(dc, g, tr, strip);
         PaintRuler(dc, g, strip);
         const int xs = (int)TX(edit.trimStart), xe = (int)TX(edit.trimEnd);
         gp::SolidBrush dim(gp::Color(166, 0, 0, 0));
@@ -2583,6 +3166,22 @@ public:
             const std::wstring label = KindHasText(m.kind) && !m.text.empty() ? m.text : m.kind == MarkKind::Step ? L"Step " + std::to_wstring(m.step) : KindLabel(m.kind);
             bar(barRect(m.start, m.end, markY + row * rowH + S(1), rowH - S(2)), label, KindGlyph(m.kind), selected == m.id);
         }
+        {  // overlay videos: a bar each; it lights up while a bin piece is carried over it
+            const RECT ol = OverlayLaneRect();
+            const bool taking = drag.kind == DragKind::BinMove && drag.toOverlay;
+            lane(ol, L"Videos on top: Add ▾ › Video on top or side by side, or drag a piece here from the bin", edit.overlays.empty() && !taking);
+            if (taking) {
+                gp::GraphicsPath p;
+                RoundPath(p, ol.left + 0.5f, ol.top + 0.5f, RectW(ol) - 1.f, RectH(ol) - 1.f, (float)S(5));
+                gp::Pen pen(A(theme::kAccent), 1.5f * s);
+                g.DrawPath(&pen, &p);
+                gp::SolidBrush mark(A(theme::kAccent));
+                g.FillRectangle(&mark, (float)TX(drag.value) - 1.5f * s, (float)ol.top, 3 * s, (float)RectH(ol));
+            }
+            for (const auto& o : edit.overlays)
+                bar(barRect(o.start, o.End(), ol.top + S(2), RectH(ol) - S(4)), (o.IsSplit() ? L"Split · " : L"On top · ") + FileNameOf(o.clip.path), 0,
+                    selected == o.id);
+        }
         // Notes: a flag at the top of the strip and a line down it, in the kind's color (faint once resolved); a range
         // gets a band along the bottom.
         for (const auto& [f, i] : placed) {
@@ -2617,6 +3216,12 @@ public:
         if (EqualRect(&play, &hoverRect)) FillRR(g, play, (float)S(6), A(theme::kBgRaised));
         Text(dc, fIcon, playing || reviewDir ? L"" : L"", play, theme::kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         Hotspot(play, [this] { TogglePlay(); }, L"Play / pause (Space)");
+        const RECT loopBtn{play.right + S(4), play.top, play.right + S(4) + S(34), play.bottom};  // round and round
+        if (loop) FillRR(g, loopBtn, (float)S(6), A(theme::kSelected));
+        else if (EqualRect(&loopBtn, &hoverRect)) FillRR(g, loopBtn, (float)S(6), A(theme::kBgRaised));
+        Text(dc, fIcon, L"\xE8EE", loopBtn, loop ? theme::kAccent : theme::kTextDim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Hotspot(loopBtn, [this] { ToggleLoop(); },
+                loop ? L"Loop is on (Ctrl+L): plays the selected clip, or the trim, over and over" : L"Loop (Ctrl+L): play the selected clip, or the trim, over and over");
         Text(dc, fMono, tframes.empty() ? Clock(Now()) : tframes.Timecode(FrameNow()), {S(12), play.bottom + S(8), tr.left - S(4), play.bottom + S(24)},
              theme::kTextDim);
         Text(dc, fMono, Clock(edit.OutputDuration()) + L" out", {S(12), play.bottom + S(24), tr.left - S(4), play.bottom + S(40)}, theme::kMuted);
@@ -2690,13 +3295,8 @@ public:
                 else r.right = (LONG)TX(t0 + drag.value - c.in);
             }
             const bool sel = selClip == c.id;
-            const bool lifted = drag.kind == DragKind::ClipMove && drag.target >= 0 && drag.clip == i;
-            FillRR(g, r, (float)S(4), sel ? A(theme::kAccent, lifted ? 120 : 255) : gp::Color(lifted ? 20 : 46, 255, 255, 255));
-            HRGN clip = CreateRectRgn(r.left + S(3), r.top, r.right - S(3), r.bottom);
-            SelectClipRgn(dc, clip);
-            Text(dc, fSmall, FileNameOf(c.path) + L"  " + Clock(c.Duration()), {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
-            SelectClipRgn(dc, nullptr);
-            DeleteObject(clip);
+            const bool lifted = drag.kind == DragKind::ClipMove && drag.moved && drag.clip == i;
+            PaintClipChip(dc, g, r, c, sel, lifted ? 120 : 255);
             if (sel)  // trim grips
                 for (LONG hx : {r.left, r.right}) FillRR(g, {hx - S(2), r.top + S(4), hx + S(2), r.bottom - S(4)}, (float)S(2), A(theme::kOnAccent));
             if (i > 0) {
@@ -2710,6 +3310,53 @@ public:
             const float x = (float)TX(ClipStart(order, (size_t)drag.target));
             gp::SolidBrush mark(A(theme::kAccent));
             g.FillRectangle(&mark, x - 1.5f * s, (float)y - S(2), 3 * s, (float)(strip.bottom - y + S(2)));
+        }
+        if (drag.kind == DragKind::BinMove && drag.target >= 0) {  // where the bin piece would go
+            const float x = (float)TX(ClipStart(edit.clips, (size_t)drag.target));
+            gp::SolidBrush mark(A(theme::kAccent));
+            g.FillRectangle(&mark, x - 1.5f * s, (float)y - S(2), 3 * s, (float)(strip.bottom - y + S(2)));
+        }
+    }
+
+    // A clip's bar: its name and length, clipped to the bar.
+    void PaintClipChip(HDC dc, gp::Graphics& g, const RECT& r, const Clip& c, bool sel, BYTE alpha) {
+        FillRR(g, r, (float)S(4), sel ? A(theme::kAccent, alpha) : gp::Color((BYTE)(46 * alpha / 255), 255, 255, 255));
+        HRGN clip = CreateRectRgn(r.left + S(3), r.top, r.right - S(3), r.bottom);
+        SelectClipRgn(dc, clip);
+        const std::wstring flips = std::wstring(c.flipH ? L"  ↔" : L"") + (c.flipV ? L"  ↕" : L"");  // flipped, at a glance
+        Text(dc, fSmall, FileNameOf(c.path) + L"  " + Clock(c.Duration()) + flips, {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(clip);
+    }
+
+    // The bin lane: a chip per piece taken off the timeline. It lights up while a clip is dragged up to it, and a bin
+    // piece being dragged follows the mouse.
+    void PaintBin(HDC dc, gp::Graphics& g) {
+        if (!BinH()) return;
+        const RECT r = BinRect();
+        const bool taking = drag.kind == DragKind::ClipMove && drag.toBin;
+        FillRR(g, r, (float)S(5), taking ? A(theme::kAccent, 50) : gp::Color(10, 255, 255, 255));
+        if (taking) {
+            gp::GraphicsPath p;
+            RoundPath(p, r.left + 0.5f, r.top + 0.5f, RectW(r) - 1.f, RectH(r) - 1.f, (float)S(5));
+            gp::Pen pen(A(theme::kAccent), 1.5f * s);
+            g.DrawPath(&pen, &p);
+        }
+        Text(dc, fSmall, L"Bin", {S(14), r.top, r.left - S(8), r.bottom}, theme::kTextDim);
+        if (edit.bin.empty()) {
+            Text(dc, fSmall, L"Clips taken out go here: Del, or drag a clip up · drag them back down to use them again", {r.left + S(8), r.top, r.right - S(8), r.bottom},
+                 theme::kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            return;
+        }
+        const auto chips = BinChips();
+        const bool carrying = drag.kind == DragKind::BinMove && drag.moved && drag.clip < edit.bin.size();
+        for (size_t i = 0; i < chips.size(); ++i)
+            PaintClipChip(dc, g, chips[i], edit.bin[i], selClip == edit.bin[i].id, carrying && drag.clip == i ? 90 : 255);
+        if (carrying) {  // the piece beside the mouse, short, so the insertion mark under the mouse shows
+            const RECT& from = chips[drag.clip];
+            const int w = std::min((int)RectW(from), S(180)), h = RectH(from);
+            const RECT at{drag.at.x + S(10), drag.at.y - h / 2, drag.at.x + S(10) + w, drag.at.y - h / 2 + h};
+            PaintClipChip(dc, g, at, edit.bin[drag.clip], true, 200);
         }
     }
 
@@ -2746,6 +3393,7 @@ public:
             PaintReadout(dc, g);
             PaintInspector(dc, g);
             PaintTimeline(dc, g);
+            PaintBin(dc, g);
             if (tipShown) PaintTooltip(dc, g);
         }
         MemDC src(back->Handle());
@@ -2826,14 +3474,51 @@ public:
         if (OnHot(p)) return;
         const RECT tr = TimelineRect();
         const RECT st = StageRect();
+        const RECT br = BinRect();
+        if (BinH() && PtInRect(&br, p)) return BinDown(p, dbl);
         if (PtInRect(&tr, p) || (p.y >= tr.top - S(6) && p.x >= tr.left && p.x <= tr.right)) return TimelineDown(p, dbl, shift);
         if (PtInRect(&st, p)) return StageDown(p, dbl);
+    }
+
+    // An overlay under `pt` on the video, topmost first: a corner of the selected box (1 top-left, 2 top-right,
+    // 3 bottom-left, 4 bottom-right: to size it), or a box or a split's half (0: to move or select it).
+    std::optional<std::pair<size_t, int>> OverlayAt(POINT pt) const {
+        const VPoint vp = ToVideo(pt);
+        const double slop = 12 * s / std::max(0.01, ViewScale()), t = Now();
+        if (const auto oi = SelOverlay(); oi && edit.overlays[*oi].Active(t) && !edit.overlays[*oi].IsSplit()) {
+            const VRect r = OverlayOnVideo(edit.overlays[*oi]);
+            const VPoint corners[] = {{r.x, r.y}, {r.MaxX(), r.y}, {r.x, r.MaxY()}, {r.MaxX(), r.MaxY()}};
+            for (int k = 0; k < 4; ++k)
+                if (std::hypot(corners[k].x - vp.x, corners[k].y - vp.y) <= slop) return std::pair{*oi, k + 1};
+        }
+        for (size_t i = edit.overlays.size(); i-- > 0;)
+            if (edit.overlays[i].Active(t) && OverlayOnVideo(edit.overlays[i]).Contains(vp)) return std::pair{i, 0};
+        return std::nullopt;
     }
 
     void StageDown(POINT pt, bool dbl) {
         const VPoint vp = ToVideo(pt);
         const double slop = 8 * s / std::max(0.01, ViewScale());
         SetCapture(hwnd);
+        // Overlay videos are drawn over the markup, so they're picked first; cropping still goes on around them (and
+        // over one that isn't selected).
+        if (const auto hit = OverlayAt(pt); hit && (!cropping || SelOverlay() == hit->first)) {
+            const Overlay& o = edit.overlays[hit->first];
+            cropping = false;
+            Select(o.id);
+            if (o.IsSplit()) {
+                ReleaseCapture();
+                return;
+            }
+            PushUndo();
+            drag = {};
+            drag.kind = DragKind::OverlayBox;
+            drag.id = o.id;
+            drag.overlay = o;
+            drag.handle = hit->second;
+            drag.from = vp;
+            return;
+        }
         if (cropping) {
             PushUndo();
             drag = {};
@@ -2845,8 +3530,9 @@ public:
             const Note& n = edit.notes[*ni];
             if (const auto f = NoteFrame(n); f && tframes.frames[*f].clip < edit.clips.size()) {
                 ReleaseCapture();
-                const VRect r = ClipFit(edit.clips[tframes.frames[*f].clip]);
-                const VPoint pin{std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)};
+                const Clip& c = edit.clips[tframes.frames[*f].clip];
+                const VRect r = ClipFit(c);
+                const VPoint pin = FlipPin({std::clamp((vp.x - r.x) / std::max(1.0, r.w), 0.0, 1.0), std::clamp((vp.y - r.y) / std::max(1.0, r.h), 0.0, 1.0)}, c);
                 UpdateNote([pin](Note& x) { x.pin = pin; });
                 if (FrameNow() != *f) GoToFrame(*f);
                 return;
@@ -2928,6 +3614,7 @@ public:
                 drag.kind = kind;
                 drag.clip = i;
                 drag.downX = p.x;
+                drag.downY = p.y;
                 drag.grab = TT(p.x);
                 drag.value = kind == DragKind::ClipIn ? edit.clips[i].in : edit.clips[i].out;
             };
@@ -2971,6 +3658,25 @@ public:
                 FocusField();
             }
         };
+        if (const RECT ol = OverlayLaneRect(); p.y >= ol.top - S(2)) {  // the overlay lane: move a bar, or drag its ends to trim it
+            for (auto it = edit.overlays.rbegin(); it != edit.overlays.rend(); ++it) {
+                const double s0 = it->start, e0 = it->End();
+                if (p.x < TX(s0) - S(4) || p.x > std::max(TX(s0) + S(6), TX(e0)) + S(4)) continue;
+                Select(it->id);
+                drag = {};
+                drag.kind = DragKind::OverlayItem;
+                drag.id = it->id;
+                drag.overlay = *it;
+                drag.edge = std::abs(p.x - TX(s0)) < S(6) ? -1 : std::abs(p.x - TX(e0)) < S(6) ? 1 : 0;
+                drag.grab = TT(p.x);
+                PushUndo();
+                if (dbl) Seek(s0);
+                return;
+            }
+            Select(std::nullopt);
+            BeginPan(p);
+            return;
+        }
         if (p.y >= markY) {
             const auto rows = Rows();
             for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
@@ -3012,6 +3718,25 @@ public:
         Pause();
         Seek(SnapToFrame(TT(p.x)));
     }
+    // The bin lane: a click selects a piece, a drag carries it onto the timeline, a double-click puts it back at the end.
+    void BinDown(POINT p, bool dbl) {
+        const auto chips = BinChips();
+        for (size_t i = 0; i < chips.size(); ++i)
+            if (PtInRect(&chips[i], p)) {
+                if (dbl) return PlaceFromBin(i, edit.clips.size());
+                SetCapture(hwnd);
+                drag = {};
+                drag.kind = DragKind::BinMove;
+                drag.clip = i;
+                drag.downX = p.x;
+                drag.downY = p.y;
+                drag.at = p;
+                SelectClip(edit.bin[i].id);
+                return;
+            }
+        SelectClip(std::nullopt);
+    }
+
     // An empty lane: a drag pans the timeline (zoomed in), a click goes to that time.
     void BeginPan(POINT p) {
         drag = {};
@@ -3084,12 +3809,71 @@ public:
                 break;
             }
             case DragKind::ClipMove: {
-                if (drag.clip >= edit.clips.size() || (drag.target < 0 && std::abs(p.x - drag.downX) < S(5))) break;
-                int target = 0;  // how many of the other clips end up before it
-                for (size_t i = 0; i < edit.clips.size(); ++i)
-                    if (i != drag.clip && TX(ClipStart(edit.clips, i) + edit.clips[i].Duration() / 2) < p.x) ++target;
-                drag.target = target;
+                if (drag.clip >= edit.clips.size() || (!drag.moved && std::abs(p.x - drag.downX) < S(5) && std::abs(p.y - drag.downY) < S(5))) break;
+                drag.moved = true;
+                drag.at = p;
+                drag.toBin = p.y < BinRect().bottom + S(4);  // up over the bin
+                drag.target = drag.toBin ? -1 : InsertIndex(p.x, drag.clip);
                 Invalidate();
+                break;
+            }
+            case DragKind::BinMove: {
+                if (drag.clip >= edit.bin.size() || (!drag.moved && std::abs(p.x - drag.downX) < S(5) && std::abs(p.y - drag.downY) < S(5))) break;
+                drag.moved = true;
+                drag.at = p;
+                const RECT tr = TimelineRect(), ol = OverlayLaneRect();
+                const bool overClips = p.y >= BinRect().bottom + S(4) && p.y <= tr.top + LaneH() + S(52);  // the clip lane or the strip under it
+                drag.target = overClips ? InsertIndex(p.x, SIZE_MAX) : -1;
+                drag.toOverlay = p.y >= ol.top - S(6) && p.y <= ol.bottom + S(10);
+                drag.value = SnapToFrame(TT(p.x));
+                Invalidate();
+                break;
+            }
+            case DragKind::OverlayItem: {
+                const Overlay& o0 = drag.overlay;
+                const double len = o0.clip.Duration(), most = std::max(o0.clip.length, o0.clip.out) - o0.clip.in;  // footage after its in point
+                for (auto& o : edit.overlays) {
+                    if (o.id != drag.id) continue;
+                    if (drag.edge == -1) {  // its start and in point move together
+                        const double d = std::clamp(now - o0.start, std::max(-o0.clip.in, -o0.start), len - 0.2);
+                        o.start = o0.start + d;
+                        o.clip.in = o0.clip.in + d;
+                        Seek(o.start);
+                    } else if (drag.edge == 1) {
+                        const double end = std::clamp(now, o0.start + 0.2, o0.start + most);
+                        o.clip.out = o0.clip.in + (end - o0.start);
+                        Seek(end - 0.01);
+                    } else {
+                        o.start = std::clamp(o0.start + now - drag.grab, 0.0, std::max(0.0, duration - 0.1));
+                        Seek(o.start);
+                    }
+                }
+                Changed();
+                break;
+            }
+            case DragKind::OverlayBox: {  // picture in picture: the box moves, or (its corner) grows and shrinks
+                const VRect v = ViewRect();
+                const SIZE out{(LONG)v.w, (LONG)v.h};
+                const double dx = vp.x - drag.from.x, dy = vp.y - drag.from.y;
+                for (auto& o : edit.overlays) {
+                    if (o.id != drag.id) continue;
+                    if (drag.handle == 0) {
+                        o.pos = {drag.overlay.pos.x + dx / v.w, drag.overlay.pos.y + dy / v.h};
+                    } else {  // a corner: the opposite one stays put, the shape stays the video's
+                        const VRect r0 = OverlayRect(drag.overlay, out);
+                        const bool left = drag.handle == 1 || drag.handle == 3, top = drag.handle <= 2;
+                        const double ax = left ? r0.MaxX() : r0.x, ay = top ? r0.MaxY() : r0.y;  // the anchor, in output pixels
+                        const double shape = r0.h / std::max(1.0, r0.w);
+                        const double px = vp.x - v.x, py = vp.y - v.y;
+                        double w = std::max(left ? ax - px : px - ax, (top ? ay - py : py - ay) / shape);
+                        w = std::max(0.08 * v.w, std::min(w, std::min(left ? ax : v.w - ax, (top ? ay : v.h - ay) / shape)));  // stays on the frame
+                        o.width = w / v.w;
+                        o.pos = {(left ? ax - w : ax) / v.w, (top ? ay - w * shape : ay) / v.h};
+                    }
+                    const VRect r = OverlayRect(o, out);  // kept on the frame
+                    o.pos = {r.x / v.w, r.y / v.h};
+                }
+                Changed();
                 break;
             }
             case DragKind::Item: {
@@ -3171,6 +3955,8 @@ public:
     void OnWheel(POINT p, int delta, WPARAM keys) {
         const RECT st = StageRect();
         if (PtInRect(&st, p)) {
+            if (const auto hit = OverlayAt(p); hit && !edit.overlays[hit->first].IsSplit())  // over a box: it grows or shrinks
+                return ScaleOverlay(hit->first, std::pow(1.1, delta / (double)WHEEL_DELTA));
             Magnify(std::pow(1.25, delta / (double)WHEEL_DELTA), p);
             return;
         }
@@ -3202,11 +3988,15 @@ public:
             Invalidate();
             return;
         }
-        if (d.kind == DragKind::ClipIn || d.kind == DragKind::ClipOut || d.kind == DragKind::ClipMove) {
+        if (d.kind == DragKind::ClipIn || d.kind == DragKind::ClipOut || d.kind == DragKind::ClipMove || d.kind == DragKind::BinMove) {
             drag = {};
             ReleaseCapture();
             if (d.kind == DragKind::ClipIn) TrimClip(d.clip, d.value, std::nullopt);
             else if (d.kind == DragKind::ClipOut) TrimClip(d.clip, std::nullopt, d.value);
+            else if (d.kind == DragKind::BinMove) {
+                if (d.toOverlay) BinToOverlay(d.clip, d.value);
+                else if (d.target >= 0) PlaceFromBin(d.clip, (size_t)d.target);
+            } else if (d.toBin) MoveToBin(d.clip);
             else if (d.target >= 0) MoveClip(d.clip, (size_t)d.target);
             Invalidate();
             return;
@@ -3252,6 +4042,7 @@ public:
                 case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
                 case 'G': BeginGoTo(); return true;
+                case 'L': ToggleLoop(); return true;
                 case VK_OEM_PLUS:
                 case VK_ADD: ZoomTimeline(1.5); return true;
                 case VK_OEM_MINUS:
@@ -3286,11 +4077,13 @@ public:
             case 'C': cropping = !cropping; Invalidate(); break;
             case 'M': AddNote(); break;
             case 'F': FitMagnifier(); break;
+            case 'G': ToggleGuides(); break;
             case VK_OEM_4: JumpNote(-1); break;  // [
             case VK_OEM_6: JumpNote(1); break;   // ]
             case VK_DELETE:
             case VK_BACK:
-                if (SelClipIndex() && !selected) RemoveClip(*SelClipIndex());
+                if (SelClipIndex() && !selected) MoveToBin(*SelClipIndex());
+                else if (SelBinIndex() && !selected) DeleteFromBin(*SelBinIndex());
                 else DeleteSelected();
                 break;
             case VK_ESCAPE:
@@ -3789,18 +4582,28 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_RBUTTONDOWN: {
             const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             const RECT st = StageRect();
+            rDown = p;
             if (PtInRect(&st, p) && magZoom > 1) {
                 magDrag = p;
                 SetCapture(hwnd);
             }
             return 0;
         }
-        case WM_RBUTTONUP:
+        case WM_RBUTTONUP: {
+            const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             if (magDrag) {
                 magDrag.reset();
                 ReleaseCapture();
             }
+            // A right click on the video (not a magnifier pan): the guides menu there.
+            const RECT st = StageRect();
+            if (PtInRect(&st, p) && std::abs(p.x - rDown.x) + std::abs(p.y - rDown.y) <= S(4)) {
+                POINT sp = p;
+                ClientToScreen(hwnd, &sp);
+                RunMenu(hwnd, GuidesMenu(), sp);
+            }
             return 0;
+        }
         case WM_MOUSEWHEEL: {
 
             POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -3831,11 +4634,22 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             if (!playing) {
                 raw = r->frame;
                 rawT = r->t;
+                RequestOverlays(r->t);
                 Rerender();
                 Invalidate();
                 if (frameCopyPending) CopyFrame();
                 if (onFetched) onFetched();
             }
+            return 0;
+        }
+        case WM_OVERLAYS: {
+            std::unique_ptr<OverlayFetcher::Result> r(reinterpret_cast<OverlayFetcher::Result*>(l));
+            overlayPics.clear();
+            for (auto& [id, b] : r->pictures) overlayPics[id] = b;
+            overlayPicsT = r->t;
+            Rerender();
+            Invalidate();
+            if (onOverlays) onOverlays();
             return 0;
         }
         case WM_STRIP: {
@@ -3867,14 +4681,29 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             Invalidate();
             return 0;
         }
-        case WM_DROPFILES: {  // videos dropped on the editor join the sequence
+        case WM_DROPFILES: {  // videos dropped on the editor join the sequence; on the bottom lane or a box, they go on top
             HDROP drop = (HDROP)w;
             const std::vector<std::wstring> files = DroppedFiles(drop);
+            POINT at{};
+            DragQueryPoint(drop, &at);
             DragFinish(drop);
             ForceForeground(hwnd);
-            AddClips(files);
+            DropFiles(files, at);
             return 0;
         }
+        case WM_SETCURSOR:
+            if (LOWORD(l) == HTCLIENT && drag.kind == DragKind::None) {  // over a box on the video: move, or size from a corner
+                POINT p;
+                GetCursorPos(&p);
+                ScreenToClient(hwnd, &p);
+                const RECT st = StageRect();
+                if (const auto hit = PtInRect(&st, p) && !cropping ? OverlayAt(p) : std::nullopt; hit && !edit.overlays[hit->first].IsSplit()) {
+                    const int k = hit->second;
+                    SetCursor(LoadCursorW(nullptr, k == 0 ? IDC_SIZEALL : k == 1 || k == 4 ? IDC_SIZENWSE : IDC_SIZENESW));
+                    return TRUE;
+                }
+            }
+            break;
         case WM_TRANSCRIBED: {
             std::unique_ptr<TranscribeResult> r(reinterpret_cast<TranscribeResult*>(l));
             Transcribed(r->ok, std::move(r->caps), r->err);
@@ -4302,6 +5131,29 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         for (int i = 0; i < 50 && e->thumbs.empty(); ++i) Pump(100);
         Pump(300);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-clips.png");
+        // The bin: the square video taken out and selected, then carried back down over the clip lane.
+        e->MoveToBin(e->edit.clips.size() - 1);
+        e->SelectClip(e->edit.bin[0].id);
+        Pump(300);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-bin.png");
+        const RECT chip = e->BinChips()[0], tr = e->TimelineRect();
+        e->OnMouseDown({(chip.left + chip.right) / 2, (chip.top + chip.bottom) / 2}, false);
+        e->OnMouseMove({(chip.left + chip.right) / 2 + 40, chip.bottom + 20}, MK_LBUTTON);
+        e->OnMouseMove({(int)e->TX(0.5), tr.top + e->LaneH() / 2}, MK_LBUTTON);  // before the first clip
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-bin-drag.png");
+        e->CancelDrag();
+        // The square video on top: in a box, then side by side.
+        if (const auto sq = ClipOf(square)) {
+            e->AddOverlay(*sq, 0.5, OverlayLayout::Pip);
+            e->Seek(1.4);
+            for (int i = 0; i < 60 && e->overlayPics.empty(); ++i) Pump(50);
+            Pump(300);
+            SavePng(*Snapshot(e), outDir + L"\\video-editor-overlay.png");
+            e->UpdateOverlay([](Overlay& o) { o.layout = OverlayLayout::SplitRight; });
+            Pump(300);
+            SavePng(*Snapshot(e), outDir + L"\\video-editor-split.png");
+        }
     }
     e->dirty = false;
     DestroyWindow(e->hwnd);
@@ -4313,6 +5165,25 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         e->GoToFrame(757);
         Pump(800);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-readout.png");
+        e->ToggleFlip(true);  // the same frame mirrored, filmstrip too
+        Pump(300);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-flip.png");
+        e->Undo();
+        e->ToggleLoop();  // the Loop button, on
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-loop.png");
+        e->ToggleLoop();
+        e->ShowAllGuides();  // every composition guide, then the black-and-white view with the thirds
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-guides.png");
+        e->guides.fill(false);
+        e->ToggleGuide(GuideKind::Thirds);
+        e->ToggleMono();
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-mono.png");
+        e->ToggleMono();
+        e->HideGuides();
+        Pump(300);
         // Notes of every kind, one resolved, the selected one pinned.
         struct Spec {
             size_t frame;
@@ -5395,6 +6266,247 @@ ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
     DestroyWindow(e->hwnd);
 }
 
+// Composition guides and the monochrome view: picked from the menu one by one or all at once, G hides them and brings
+// them back, they're drawn over the preview (on the crop) and never change the edit; monochrome turns the preview grey.
+ATHER_TEST(video_editor_guides) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 2, false));  // red, then green
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const auto keepGuides = VideoEditor::lastGuides;
+    const bool keepOn = VideoEditor::lastGuidesOn, keepMono = VideoEditor::lastMono;
+    e->guides.fill(false);
+    e->guidesOn = e->mono = false;
+    CHECK(!e->AnyGuide());
+    e->Key('G', {});  // nothing picked yet: the rule of thirds
+    CHECK(e->GuideShown(GuideKind::Thirds) && !e->GuideShown(GuideKind::Golden));
+    e->ToggleGuide(GuideKind::Golden);
+    CHECK(e->GuideShown(GuideKind::Golden));
+    e->Key('G', {});  // hide…
+    CHECK(!e->AnyGuide());
+    e->Key('G', {});  // …and back, the same two
+    CHECK(e->GuideShown(GuideKind::Thirds) && e->GuideShown(GuideKind::Golden) && !e->GuideShown(GuideKind::Phi));
+    // The menu: show all; its items are checked for the ones on.
+    e->GuidesMenu()[0].run();
+    CHECK(e->AnyGuide());
+    for (int k = 0; k < kGuideKinds; ++k) CHECK(e->GuideShown((GuideKind)k));
+    const auto menu = e->GuidesMenu();
+    CHECK(menu.size() == 9 && menu[3].checked && menu[6].checked);
+    CHECK(VideoEditor::lastGuidesOn);  // kept for the next video
+    // Drawn over the preview: a thirds line across the middle of the video's left third shows in the window.
+    e->Seek(0.5);
+    for (int i = 0; i < 40 && !e->raw; ++i) Pump(50);
+    const VideoEdit before = e->edit;
+    auto snap = Snapshot(e);
+    const gp::RectF view = e->ToView(e->ViewRect());
+    const int gx = (int)std::lround(view.X + view.Width / 3), gy = (int)std::lround(view.Y + view.Height * 0.15);
+    int blue = 0;
+    for (int dx = -2; dx <= 2; ++dx) {
+        const uint32_t px = snap->Bits()[(size_t)gy * snap->Width() + gx + dx];
+        blue += (px & 255) > 150 && ((px >> 16) & 255) < 150;
+    }
+    CHECK(blue > 0);
+    CHECK(e->edit == before);  // the edit is untouched
+    // Monochrome: the preview turns grey (red footage reads as grey).
+    e->ToggleMono();
+    CHECK(e->mono && e->shown);
+    if (e->shown) {
+        const uint32_t p = e->shown->Pixel(320, 180);
+        CHECK(((p >> 16) & 255) == (p & 255) && ((p >> 8) & 255) == (p & 255));
+    }
+    e->ToggleMono();
+    if (e->shown) CHECK(((e->shown->Pixel(320, 180) >> 16) & 255) > 150);  // red again
+    e->HideGuides();
+    CHECK(!e->AnyGuide());
+    VideoEditor::lastGuides = keepGuides;
+    VideoEditor::lastGuidesOn = keepOn;
+    VideoEditor::lastMono = keepMono;
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Loop: playback goes round the trim (or the selected clip) instead of stopping at its end, still playing; review
+// playback (L at a slower speed) wraps too; off, playback stops at the end as before. Ctrl+L toggles it.
+ATHER_TEST(video_editor_loop) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 2, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const bool before = VideoEditor::lastLoop;
+    if (e->loop) e->ToggleLoop();
+    e->Key('L', {true, false, false});  // Ctrl+L
+    CHECK(e->loop);
+    // Waits for `done` (up to 10 s: a runner without a GPU starts playing slowly, more so after the clips change),
+    // then a moment more so a round in progress settles.
+    auto waitFor = [&](const std::function<bool()>& done) {
+        for (int i = 0; i < 200 && !done(); ++i) Pump(50);
+        Pump(150);
+        test::Note("loops " + std::to_string(e->loops) + ", now " + std::to_string(e->Now()) + ", playing " + std::to_string(e->playing));
+    };
+    // Round the trim 0.3–0.9.
+    e->edit.trimStart = 0.3;
+    e->edit.trimEnd = 0.9;
+    e->Changed();
+    e->Seek(0.3);
+    e->Play();
+    waitFor([&] { return e->loops >= 1; });
+    CHECK(e->loops >= 1);
+    CHECK(e->playing);
+    CHECK(e->Now() >= 0.25 && e->Now() <= 0.95);
+    e->Pause();
+    // Round the selected clip: the second half of a split.
+    e->edit.trimStart = 0;
+    e->edit.trimEnd = e->duration;
+    e->Seek(1.0);
+    e->SplitAtPlayhead();  // [0, 1) and [1, 2), the second selected
+    CHECK(e->SelClipIndex() == 1u);
+    CHECK_NEAR(e->LoopRange().first, 1.0, 0.02);
+    e->loops = 0;
+    e->Seek(1.5);
+    e->Play();
+    waitFor([&] { return e->loops >= 1; });
+    CHECK(e->loops >= 1);
+    CHECK(e->playing);
+    CHECK(e->Now() >= 0.95);  // still in that clip
+    e->Pause();
+    // Review playback at a slower speed wraps too.
+    e->SelectClip(std::nullopt);
+    e->edit.trimStart = 0;
+    e->edit.trimEnd = 0.3;
+    e->Changed();
+    e->loops = 0;
+    e->Seek(0.2);
+    e->previewRate = 0.5;
+    e->Review(1);
+    waitFor([&] { return e->loops >= 1; });
+    CHECK(e->loops >= 1 && e->reviewDir == 1);
+    e->Pause();
+    // Off: it stops at the end.
+    e->Key('L', {true, false, false});
+    CHECK(!e->loop);
+    e->edit.trimEnd = e->duration;
+    e->Changed();
+    e->loops = 0;
+    e->Seek(1.6);
+    e->Play();
+    waitFor([&] { return !e->playing; });
+    CHECK(!e->playing);
+    CHECK_EQ(e->loops, 0);
+    if (VideoEditor::lastLoop != before) VideoEditor::lastLoop = before;
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Flip flips one clip: the selected one, else the one at the playhead; one undo step each way. Markup that sits wholly
+// on that clip is mirrored with it, the crop (every clip shares it) isn't; a note's pin stays on its spot of the
+// footage; a selected video on top flips by itself. Saved, that clip's frames are mirror images, the others as they were.
+ATHER_TEST(video_editor_flip) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"/numbers.mp4";
+    CHECK(WriteFrameNumberClip(clip, 640, 360, 30, 45));  // lopsided pictures: a number, a grid and a moving bar
+    VideoEditor* e = OpenHidden(clip, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->Seek(0.75);
+    e->SplitAtPlayhead();  // [0, 0.75) and [0.75, 1.5), the second selected
+    CHECK(e->edit.clips.size() == 2);
+    auto box = [&](double s0, double e0) {
+        e->Seek(s0);
+        e->AddMark(MarkKind::Box);
+        Mark& m = e->edit.marks.back();
+        m.start = s0, m.end = e0, m.a = {20, 30}, m.b = {120, 90};
+    };
+    box(0.9, 1.3);  // on the second clip
+    box(0.1, 0.5);  // on the first
+    e->edit.crop = VRect{0, 0, 400, 300};
+    e->SelectClip(e->edit.clips[1].id);
+    CHECK(e->FlipLabel() == L"Flip");
+    e->ToggleFlip(true);
+    CHECK(!e->edit.clips[0].flipH && e->edit.clips[1].flipH);
+    CHECK(e->FlipLabel() == L"Flipped ↔");
+    CHECK_NEAR(e->edit.marks[0].a.x, 620, 1e-9);
+    CHECK_NEAR(e->edit.marks[1].a.x, 20, 1e-9);
+    CHECK_NEAR(e->edit.crop->x, 0, 1e-9);
+    e->ToggleFlip(false);
+    CHECK(e->edit.clips[1].flipH && e->edit.clips[1].flipV);
+    CHECK_NEAR(e->edit.marks[0].a.y, 330, 1e-9);
+    e->Undo();
+    e->Undo();
+    CHECK(!e->edit.clips[1].Flipped() && e->edit.marks[0].a == (VPoint{20, 30}));
+    // Nothing selected: the clip at the playhead.
+    e->SelectClip(std::nullopt);
+    e->Seek(0.3);
+    e->ToggleFlip(true);
+    CHECK(e->edit.clips[0].flipH && !e->edit.clips[1].flipH);
+    e->Undo();
+    // A pin a quarter in from the left of the footage shows a quarter in from the right once its clip is flipped.
+    e->Seek(1.0);
+    e->AddNote();
+    e->edit.notes.back().pin = VPoint{0.25, 0.5};
+    e->SelectClip(e->edit.clips[1].id);
+    e->ToggleFlip(true);
+    if (const auto p = e->PinOnVideo(e->edit.notes.back())) CHECK_NEAR(p->x, 480, 1);
+    else CHECK(false);
+    // A selected video on top flips by itself.
+    if (const auto oc = ClipOf(clip)) {
+        e->AddOverlay(*oc, 0, OverlayLayout::Pip);
+        e->ToggleFlip(true);
+        CHECK(e->edit.overlays.size() == 1 && e->edit.overlays[0].clip.flipH && e->edit.clips[1].flipH && !e->edit.clips[0].flipH);
+        e->Undo();
+        e->Undo();
+    }
+    CHECK(e->edit.overlays.empty());
+    // Saved: the second clip's frames mirror the unflipped save's, the first clip's match them.
+    e->edit.marks.clear();
+    e->edit.crop.reset();
+    e->edit.notes.clear();
+    auto frames = [&](const VideoEdit& ed, const wchar_t* name) {
+        std::pair<BitmapPtr, BitmapPtr> f;
+        const std::wstring out = dir + name;
+        if (ExportMp4(clip, ed, out, nullptr)) {
+            ProbeVideo(out, nullptr, 0.4, 0, &f.first);
+            ProbeVideo(out, nullptr, 1.1, 0, &f.second);
+        }
+        return f;
+    };
+    VideoEdit plainEdit = e->edit;
+    for (auto& c : plainEdit.clips) c.flipH = c.flipV = false;
+    const auto plain = frames(plainEdit, L"/plain.mp4"), flipped = frames(e->edit, L"/flipped.mp4");
+    // Of a grid of points on `a`: how many match `b` at the same spot, and at the mirrored one.
+    auto compare = [](const BitmapPtr& a, const BitmapPtr& b, int* same, int* mirrored) {
+        *same = *mirrored = 0;
+        auto close = [](uint32_t p, uint32_t q) {
+            for (int sh : {0, 8, 16})
+                if (std::abs((int)((p >> sh) & 255) - (int)((q >> sh) & 255)) > 40) return false;
+            return true;
+        };
+        int n = 0;
+        for (int y = 8; y < 360; y += 16)
+            for (int x = 4; x < 640; x += 12, ++n) {
+                *same += close(a->Pixel(x, y), b->Pixel(x, y));
+                *mirrored += close(a->Pixel(x, y), b->Pixel(639 - x, y));
+            }
+        return n;
+    };
+    CHECK(plain.first && plain.second && flipped.first && flipped.second);
+    if (plain.first && plain.second && flipped.first && flipped.second && plain.first->Width() == 640 && flipped.first->Width() == 640) {
+        int same = 0, mirrored = 0;
+        const int n = compare(flipped.first, plain.first, &same, &mirrored);
+        test::Note("first clip: same " + std::to_string(same) + ", mirrored " + std::to_string(mirrored) + " of " + std::to_string(n));
+        CHECK(same > n * 9 / 10);
+        compare(flipped.second, plain.second, &same, &mirrored);
+        test::Note("second clip: same " + std::to_string(same) + ", mirrored " + std::to_string(mirrored) + " of " + std::to_string(n));
+        CHECK(mirrored > n * 9 / 10);
+        CHECK(same < mirrored);
+    }
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
 // Several videos as one: add (any shape), split, reorder, remove, undo; playback crosses the cuts; save joins them.
 ATHER_TEST(video_editor_joins_splits_and_reorders_clips) {
     const std::wstring dir = test::TempDir();
@@ -5425,12 +6537,14 @@ ATHER_TEST(video_editor_joins_splits_and_reorders_clips) {
     e->MoveClip(2, 0);
     CHECK(e->edit.clips[0].path == b);
     CHECK_NEAR(e->edit.captions.back().start, capAt - aLen, 1e-6);
-    // Remove the middle clip, undo it.
-    e->RemoveClip(1);
+    // Take the middle clip out into the bin, undo it.
+    e->MoveToBin(1);
     CHECK_EQ(e->edit.clips.size(), 2u);
+    CHECK_EQ(e->edit.bin.size(), 1u);
     CHECK_NEAR(e->duration, 3.5, 0.1);
     e->Undo();
     CHECK_EQ(e->edit.clips.size(), 3u);
+    CHECK(e->edit.bin.empty());
     CHECK_NEAR(e->duration, 5, 0.1);
     // Playback runs on over a cut instead of stopping at it.
     e->Seek(1.4);
@@ -5494,13 +6608,188 @@ ATHER_TEST(video_editor_clip_lane_mouse) {
     CHECK_NEAR(e->duration, ClipsDuration(e->edit.clips), 1e-9);
     e->Undo();
     CHECK_NEAR(e->edit.clips[0].out, before, 1e-9);
-    // Delete removes the selected clip; the last one can't go.
+    // Delete takes the selected clip out into the bin; the last one can't go. Delete in the bin deletes for good.
     e->OnKey(VK_DELETE);
     CHECK_EQ(e->edit.clips.size(), 1u);
+    CHECK_EQ(e->edit.bin.size(), 1u);
     e->SelectClip(e->edit.clips[0].id);
     e->OnKey(VK_DELETE);
     CHECK_EQ(e->edit.clips.size(), 1u);
+    CHECK(e->LaneH() > 0);  // the bin holds a piece: both lanes stay
+    e->SelectClip(e->edit.bin[0].id);
+    e->OnKey(VK_DELETE);
+    CHECK(e->edit.bin.empty());
     CHECK_EQ(e->LaneH(), 0);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Overlay videos in the editor: one added shows in the preview once decoded; its bar moves on the bottom lane, its box
+// on the video; a split takes half the frame; Del takes it into the bin (undo puts it back), and a bin piece dragged to
+// the lane goes on top there.
+ATHER_TEST(video_editor_overlay_videos) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, false));  // red, green, blue
+    CHECK(WriteTestClip(b, 320, 180, 30, 3, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const auto bc = ClipOf(b);
+    CHECK(bc.has_value());
+    if (!bc) return;
+    e->AddOverlay(*bc, 0.5, OverlayLayout::Pip);
+    CHECK(e->edit.overlays.size() == 1 && e->SelOverlay() == 0u);
+    // The preview: at 1.3 the video is green and the overlay (0.8 into b) red.
+    e->Seek(1.3);
+    for (int i = 0; i < 60 && (e->overlayPics.empty() || std::fabs(e->overlayPicsT - e->rawT) > 1e-3 || std::fabs(e->rawT - 1.3) > 0.05); ++i) Pump(50);
+    CHECK(!e->overlayPics.empty());
+    const VRect box = e->OverlayOnVideo(e->edit.overlays[0]);
+    if (e->shown) {
+        const uint32_t in = e->shown->Pixel((int)box.MidX(), (int)box.MidY()), out = e->shown->Pixel(40, 40);
+        CHECK(((in >> 16) & 255) > 150 && ((in >> 8) & 255) < 100);
+        CHECK(((out >> 8) & 255) > 150 && ((out >> 16) & 255) < 100);
+    }
+    // Its bar on the bottom lane moves 0.3 s later.
+    const RECT ol = e->OverlayLaneRect();
+    const int laneY = (ol.top + ol.bottom) / 2;
+    e->OnMouseDown({(int)e->TX(1.5), laneY}, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::OverlayItem);
+    e->OnMouseMove({(int)e->TX(1.8), laneY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK_NEAR(e->edit.overlays[0].start, 0.8, 0.06);
+    // Its box moves left when dragged on the video.
+    e->Seek(1.3);
+    const VPoint mid{e->OverlayOnVideo(e->edit.overlays[0]).MidX(), e->OverlayOnVideo(e->edit.overlays[0]).MidY()};
+    const gp::PointF at = e->ToView(mid);
+    const double x0 = e->edit.overlays[0].pos.x;
+    e->OnMouseDown({(LONG)at.X, (LONG)at.Y}, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::OverlayBox);
+    e->OnMouseMove({(LONG)at.X - 60, (LONG)at.Y}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(e->edit.overlays[0].pos.x < x0 - 0.05);
+    // Its top-left corner sizes it, the bottom-right corner staying put; even with Crop on.
+    const VRect before = e->OverlayOnVideo(e->edit.overlays[0]);
+    const gp::PointF tl = e->ToView(VPoint{before.x, before.y});
+    e->cropping = true;
+    e->OnMouseDown({(LONG)tl.X, (LONG)tl.Y}, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::OverlayBox && e->drag.handle == 1 && !e->cropping);
+    e->OnMouseMove({(LONG)tl.X - 40, (LONG)tl.Y - 40}, MK_LBUTTON);
+    e->OnMouseUp();
+    const VRect bigger = e->OverlayOnVideo(e->edit.overlays[0]);
+    CHECK(bigger.w > before.w + 20);
+    CHECK_NEAR(bigger.MaxX(), before.MaxX(), 2);
+    CHECK_NEAR(bigger.MaxY(), before.MaxY(), 2);
+    CHECK_NEAR(bigger.h / bigger.w, 180.0 / 320, 0.02);  // the video's shape
+    CHECK(!e->edit.crop.has_value());
+    // The wheel over it: 10% wider a notch, about its middle.
+    const gp::PointF c = e->ToView(VPoint{bigger.MidX(), bigger.MidY()});
+    e->OnWheel({(LONG)c.X, (LONG)c.Y}, WHEEL_DELTA, 0);
+    const VRect wheeled = e->OverlayOnVideo(e->edit.overlays[0]);
+    CHECK_NEAR(wheeled.w, bigger.w * 1.1, 2);
+    CHECK_NEAR(wheeled.MidX(), bigger.MidX(), 2);
+    // A file dropped on the bottom lane goes on top from there.
+    e->DropFiles({b}, {(int)e->TX(2.0), laneY});
+    CHECK_EQ(e->edit.overlays.size(), 2u);
+    if (e->edit.overlays.size() == 2) CHECK_NEAR(e->edit.overlays[1].start, 2.0, 0.05);
+    e->Undo();
+    CHECK_EQ(e->edit.overlays.size(), 1u);
+    e->Select(e->edit.overlays[0].id);
+    // Side by side: it takes the left half.
+    e->UpdateOverlay([](Overlay& o) { o.layout = OverlayLayout::SplitLeft; });
+    CHECK_NEAR(e->OverlayOnVideo(e->edit.overlays[0]).w, 320, 1);
+    // Del: into the bin; undo puts it back.
+    CHECK(e->SelOverlay() == 0u);
+    e->OnKey(VK_DELETE);
+    CHECK(e->edit.overlays.empty() && e->edit.bin.size() == 1);
+    e->Undo();
+    CHECK(e->edit.overlays.size() == 1 && e->edit.bin.empty());
+    // From the bin onto the bottom lane: on top from where it's dropped.
+    e->Select(e->edit.overlays[0].id);
+    e->OnKey(VK_DELETE);
+    const RECT chip = e->BinChips()[0];
+    e->OnMouseDown({(chip.left + chip.right) / 2, (chip.top + chip.bottom) / 2}, false);
+    e->OnMouseMove({(chip.left + chip.right) / 2 + 30, chip.bottom + 30}, MK_LBUTTON);
+    e->OnMouseMove({(int)e->TX(1.0), laneY}, MK_LBUTTON);
+    CHECK(e->drag.toOverlay);
+    e->OnMouseUp();
+    CHECK(e->edit.overlays.size() == 1 && e->edit.bin.empty());
+    if (!e->edit.overlays.empty()) CHECK_NEAR(e->edit.overlays[0].start, 1.0, 0.05);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// The bin by mouse and keys: Del and dragging a clip up take it out; dragging a piece down puts it back where it's
+// dropped; a double-click puts it back at the end; Del in the bin deletes it for good; undo brings each step back.
+ATHER_TEST(video_editor_clip_bin) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4", b = dir + L"/b.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 3, false));
+    CHECK(WriteTestClip(b, 640, 360, 30, 2, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    CHECK_EQ(e->BinH(), 0);
+    e->AddClips({b});
+    e->Seek(1.5);
+    e->SplitAtPlayhead();  // [a1, a2, b], a2 selected
+    CHECK_EQ(e->edit.clips.size(), 3u);
+    CHECK(e->BinH() > 0);
+    const uint64_t a2 = e->edit.clips[1].id;
+    CHECK(e->selClip == a2);
+    // Del: a2 goes to the bin; the video is shorter. Undo puts it back, Del again takes it out.
+    e->OnKey(VK_DELETE);
+    CHECK_EQ(e->edit.clips.size(), 2u);
+    CHECK(e->edit.bin.size() == 1 && e->edit.bin[0].id == a2);
+    CHECK_NEAR(e->duration, 3.5, 0.1);
+    e->Undo();
+    CHECK(e->edit.clips.size() == 3 && e->edit.bin.empty());
+    e->SelectClip(a2);
+    e->OnKey(VK_DELETE);
+    CHECK_EQ(e->edit.bin.size(), 1u);
+    // Drag it from the bin to the start of the timeline.
+    auto chipMid = [&](size_t i) {
+        const RECT r = e->BinChips()[i];
+        return POINT{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+    };
+    const RECT tr = e->TimelineRect();
+    const int laneY = tr.top + e->LaneH() / 2;
+    POINT c = chipMid(0);
+    e->OnMouseDown(c, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::BinMove && e->SelBinIndex() == 0u);
+    e->OnMouseMove({c.x + 30, c.y + 20}, MK_LBUTTON);
+    e->OnMouseMove({(int)e->TX(0.1), laneY}, MK_LBUTTON);
+    CHECK_EQ(e->drag.target, 0);
+    e->OnMouseUp();
+    CHECK(e->edit.clips.size() == 3 && e->edit.clips[0].id == a2 && e->edit.bin.empty());
+    CHECK(e->selClip == a2 && e->SelClipIndex() == 0u);
+    CHECK_NEAR(e->duration, 5, 0.1);
+    e->Undo();
+    CHECK(e->edit.clips.size() == 2 && e->edit.bin.size() == 1);
+    // Drag b (the last clip) up onto the bin.
+    const uint64_t bId = e->edit.clips[1].id;
+    const int bMid = (int)e->TX(ClipStart(e->edit.clips, 1) + e->edit.clips[1].Duration() / 2);
+    const RECT br = e->BinRect();
+    e->OnMouseDown({bMid, laneY}, false);
+    e->OnMouseMove({bMid, laneY - 30}, MK_LBUTTON);
+    e->OnMouseMove({bMid, (br.top + br.bottom) / 2}, MK_LBUTTON);
+    CHECK(e->drag.toBin);
+    e->OnMouseUp();
+    CHECK(e->edit.clips.size() == 1 && e->edit.bin.size() == 2 && e->edit.bin[1].id == bId);
+    // A click on a piece selects it without moving anything; a double-click puts it back at the end.
+    c = chipMid(1);
+    e->OnMouseDown(c, false);
+    e->OnMouseUp();
+    CHECK(e->SelBinIndex() == 1u && e->edit.bin.size() == 2);
+    e->OnMouseDown(c, true);
+    e->OnMouseUp();
+    CHECK(e->edit.clips.size() == 2 && e->edit.clips[1].id == bId && e->edit.bin.size() == 1);
+    // Del in the bin deletes for good; undo brings it back.
+    e->SelectClip(e->edit.bin[0].id);
+    e->OnKey(VK_DELETE);
+    CHECK(e->edit.bin.empty() && e->edit.clips.size() == 2);
+    e->Undo();
+    CHECK(e->edit.bin.size() == 1 && e->edit.bin[0].id == a2);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

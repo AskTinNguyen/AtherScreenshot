@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <map>
 #include <memory>
 
 #include "common.h"
@@ -97,6 +98,20 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;
+};
+
+// The pictures of an edit's overlay videos (VideoEdit::overlays), decoded as it goes: for a timeline time, the frame
+// each overlay showing then has on screen. Times asked in order read on; going back, or far ahead, seeks. A file is
+// open only while its overlay shows. One thread at a time.
+class OverlayFrames {
+public:
+    OverlayFrames();
+    ~OverlayFrames();
+    std::vector<std::pair<uint64_t, VideoFrame>> At(double t, const std::vector<Overlay>& overlays);  // by overlay id
+
+private:
+    struct Feed;
+    std::map<uint64_t, std::unique_ptr<Feed>> feeds_;
 };
 
 // Changes the speed of audio without changing its pitch (WSOLA: overlapping windows, each placed where it
