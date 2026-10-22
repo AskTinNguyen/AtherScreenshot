@@ -1,7 +1,7 @@
 # Capture Tray: Captures Collect in a Thumbnail Strip in the Editor; Save the Ones You Pick Together
 
 - Rev: 1
-- Status: active
+- Status: completed
 - Area: Editor
 - Owner: AskTinNguyen
 - Issue: #9
@@ -127,5 +127,7 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording and keys 
   - Most of the work is in `src/editor.cpp` / `Editor.swift`, which no other intent touches.
 
 ## Changelog
+
+- completed (2026-10-22): merged into `main` and released in build 0.0.2.5 on the owner's word (L-3). The `owner` acceptance row (real-PC/Mac check) was not run before release; it stays for the owner.
 
 - rev 1 (2026-10-21): created from L-1 (issue #9), with the orchestrator's proposed defaults D1–D8.

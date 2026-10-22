@@ -47,3 +47,12 @@ Rev 2: D10 (opt-in Mac cloud transcription for Vietnamese narration), F-2 (d) ac
 - **A8 (docs):** passes.
 - **A1–A5 gate lines:** the runner's 11–12 failures are the baseline video tests. They're caused by Windows' software H.264 encoder writing B-frames one frame late, and fixed in `intent/runner-video-tests`. The items stay met on the evidence that every bug-report test passes and the failures equal the baseline set. A Check run with that fix merged in should read `0 failed`.
 - **F-4:** accepted as D11 (on-device `vi-VN` first), since it only reduces what is sent.
+
+## L-3 (2026-10-22) | class: decision | -> completed
+
+> Do the following at the same time:
+>
+> 1. merge and release new version
+> 2. create a short 30s marketing video with real recordings of the new features
+
+Merged into `main` (with #13's fix) and released as build 0.0.2.5. The owner's real-device acceptance row wasn't run before the release; it stays the owner's.

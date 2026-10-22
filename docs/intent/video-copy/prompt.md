@@ -1,7 +1,7 @@
 # Video Copy: Ctrl+C Copies the Marked Part as a Clip, or the Frame on Screen
 
 - Rev: 1
-- Status: active
+- Status: completed
 - Area: Video
 - Owner: AskTinNguyen
 - Issue: #6, #7
@@ -125,5 +125,7 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording and keys 
 - `src/main.cpp`, `src/settings*` and `macos/.../App.swift` belong to the other intents' changes. Touch them only if you must, in small hunks.
 
 ## Changelog
+
+- completed (2026-10-22): merged into `main` and released in build 0.0.2.5 on the owner's word (L-3). The `owner` acceptance row (real-PC/Mac check) was not run before release; it stays for the owner.
 
 - rev 1 (2026-10-21): created from L-1 (issues #6 and #7), with the orchestrator's proposed defaults D1–D7.

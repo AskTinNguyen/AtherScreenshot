@@ -1,7 +1,7 @@
 # Bug Report: "Bug Start" / "Bug Stop" Make One Bug Bundle (Picture with What Was Said, Clip, Game Logs)
 
 - Rev: 3
-- Status: active
+- Status: completed
 - Area: Recording
 - Owner: AskTinNguyen
 - Issue: #8
@@ -165,6 +165,8 @@ These are the orchestrator's proposed defaults (rev 1). Looks, wording, saved fi
   - Put the feature in new files: `src/bugreport.*`, and on the Mac `BugReport.swift`.
 
 ## Changelog
+
+- completed (2026-10-22): merged into `main` and released in build 0.0.2.5 on the owner's word (L-3). The `owner` acceptance row (real-PC/Mac check) was not run before release; it stays for the owner.
 
 - rev 3 (2026-10-21): from R-1. F-4 accepted as D11: on-device `vi-VN` first, servers only as the fallback. Runner baseline failures are fixed separately (`intent/runner-video-tests`).
 

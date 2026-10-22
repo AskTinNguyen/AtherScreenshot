@@ -10,7 +10,7 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## Coming in the next update (Windows and macOS)
+## What's new in this update (Windows and macOS, build 0.0.2.5)
 
 ### Copy a clip or a frame, then paste it into Slack
 - **Clip:** in the video editor, Shift+drag on the timeline (or press Shift+I and Shift+O) to mark the part you want, then press Ctrl+C (⌘C on the Mac). It's saved as an MP4 in your captures and put on the clipboard, so Ctrl+V in Slack, Teams or Discord attaches it. No more Save, find the file, drag it in. With nothing marked, Ctrl+C copies the clip selected in the clip lane.
@@ -26,7 +26,10 @@
 - **What:** while you playtest with the screen recorded, say "bug start", describe the bug, then say "bug stop" (or press `Ctrl+Alt+B` / `⌃⌥B` to start and again to stop). You get one folder per bug: the screenshot with what you said written on it, a clip from 10 seconds before the bug with captions (cut when the recording stops), your narration as `voice.wav`, the game's logs from the paths you set, and `bug.md` / `bug.json`. "Copy last bug report" puts it on the clipboard for Slack.
 - **Privacy:** listening is off until you turn on Settings › Bug reports › Listen for "bug start" / "bug stop". Speech is recognized on your computer. On the Mac, "Transcribe Vietnamese with Apple's servers" is a separate opt-in: it writes the narration down on the Mac when the Mac knows Vietnamese, and sends only the narration to Apple when it doesn't.
 
-## What's new in this update (Windows and macOS, build 0.0.2.4)
+### Fixed
+- **Windows, PCs without a graphics card that encodes video:** recordings and saved videos showed every frame one frame late (the picture a frame behind the sound, and the last frame out of reach in frame review). New files are right; recordings made before keep the offset.
+
+## Earlier update (Windows and macOS, build 0.0.2.4)
 
 ### AI agents can take screenshots and record for you
 - **What:** Claude Code, Codex and other AI agents that speak MCP can now use Ather Screenshot: take screenshots of the screen, a display, a window or a region; record gameplay to MP4 or GIF and mark moments while it runs; look back through a recording frame by frame or as one contact sheet; read text on screen; and find, tag and rate captures in the gallery. They can also change capture settings and run any palette command.
