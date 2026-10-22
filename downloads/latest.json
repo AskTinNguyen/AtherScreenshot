@@ -1,16 +1,16 @@
 {
-    "windows": {
-        "version": "0.0.2.5",
-        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-        "sha256": "c34e5c150c3288224994843d42836e4dba3f5e87a2abd565550a5372befeb6f8",
-        "size": 4478976,
-        "notes": "Ctrl+C copies a clip or frame from the video editor, captures collect in one editor tray, and \"bug start\" / \"bug stop\" make bug reports."
-    },
-    "macos": {
-        "version": "0.0.2.5",
-        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-        "sha256": "09258a828089284686c9073938de109524fc2e45ecd9a7cbe227f03c0846c2e7",
-        "size": 4258241,
-        "notes": "Copy a clip or frame from the video editor with \u2318C, collect captures in one editor tray, and make bug reports by saying \"bug start\" / \"bug stop\"."
-    }
+    "windows":  {
+                    "version":  "0.0.2.6",
+                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+                    "sha256":  "3ac2a34f4ad0ff318f5c21035808b2108c994558f709c8cc057356d43bb853e3",
+                    "size":  4602368,
+                    "notes":  "Clip bin, picture in picture, split screen, flip, loop, framing guides in the video editor, and scrubbing videos in the gallery."
+                },
+    "macos":  {
+                  "version":  "0.0.2.5",
+                  "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+                  "sha256":  "09258a828089284686c9073938de109524fc2e45ecd9a7cbe227f03c0846c2e7",
+                  "size":  4258241,
+                  "notes":  "Copy a clip or frame from the video editor with ⌘C, collect captures in one editor tray, and make bug reports by saying \"bug start\" / \"bug stop\"."
+              }
 }
