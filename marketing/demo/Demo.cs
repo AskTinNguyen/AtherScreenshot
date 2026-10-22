@@ -148,13 +148,20 @@ public static class Demo {
     static volatile bool capturing;
     static Thread capThread;
     static System.Diagnostics.Process capProc;
+    static System.IO.Stream capPipe;
     public static int CapturedFrames, RepeatedFrames;
     public static void StartCapture(string ffmpeg, string outFile) {
         int w = GetSystemMetrics(0), h = GetSystemMetrics(1);
         var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg, "-y -loglevel warning -use_wallclock_as_timestamps 1 -f rawvideo -pix_fmt bgr0 -s " + w + "x" + h +
             " -i - -fps_mode cfr -r 30 -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \"" + outFile + "\"");
-        psi.UseShellExecute = false; psi.RedirectStandardInput = true;
+        psi.UseShellExecute = false;
+        // A named pipe, not stdin: .NET Framework's redirected stdin writes a UTF-8 BOM first, which shifts every pixel.
+        string pipeName = "atherdemo" + System.Diagnostics.Process.GetCurrentProcess().Id;
+        psi.Arguments = psi.Arguments.Replace(" -i - ", " -i \\\\.\\pipe\\" + pipeName + " ");
+        var pipe = new System.IO.Pipes.NamedPipeServerStream(pipeName, System.IO.Pipes.PipeDirection.Out, 1, System.IO.Pipes.PipeTransmissionMode.Byte, System.IO.Pipes.PipeOptions.None, 0, 1 << 24);
         capProc = System.Diagnostics.Process.Start(psi);
+        pipe.WaitForConnection();
+        capPipe = pipe;
         capturing = true;
         capThread = new Thread(() => {
             IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen);
@@ -162,7 +169,7 @@ public static class Demo {
             IntPtr bits; IntPtr dib = CreateDIBSection(screen, ref bi, 0, out bits, IntPtr.Zero, 0);
             SelectObject(mem, dib);
             byte[] frame = new byte[w * h * 4];
-            var stdin = capProc.StandardInput.BaseStream;
+            var stdin = capPipe;
             var clock = System.Diagnostics.Stopwatch.StartNew();
             long written = 0;
             while (capturing) {
@@ -188,7 +195,7 @@ public static class Demo {
     public static int StopCapture() {
         capturing = false;
         capThread.Join(10000);
-        capProc.StandardInput.Close();
+        try { capPipe.Close(); } catch { }
         capProc.WaitForExit(120000);
         return capProc.ExitCode;
     }
@@ -217,7 +224,7 @@ public static class Demo {
                             bmp.Save(dir + "\\toast" + n + "-print.png");
                         }
                         using (var bmp = new System.Drawing.Bitmap(Math.Max(1, w), Math.Max(1, hh))) {
-                            using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(r.Left, r.Top, 0, 0, bmp.Size, System.Drawing.CopyPixelOperation.SourceCopy | System.Drawing.CopyPixelOperation.CaptureBlt);
+                            using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(r.Left, r.Top, 0, 0, bmp.Size, System.Drawing.CopyPixelOperation.SourceCopy);
                             bmp.Save(dir + "\\toast" + n + "-screen.png");
                         }
                     } catch (Exception e) { System.IO.File.AppendAllText(dir + "\\toasts.log", e.Message + "\r\n"); }

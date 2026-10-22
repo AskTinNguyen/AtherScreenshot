@@ -7,7 +7,7 @@
 param([string]$Exe, [string]$Out)
 $ErrorActionPreference = 'Continue'
 New-Item -ItemType Directory -Force $Out | Out-Null
-Add-Type -Path "$PSScriptRoot\Demo.cs" -ReferencedAssemblies System.Drawing
+Add-Type -Path "$PSScriptRoot\Demo.cs" -ReferencedAssemblies System.Drawing, System.Core
 $log = "$Out\demo.log"
 $sw = [Diagnostics.Stopwatch]::StartNew()
 function Log($m) { $line = '{0,8:N2}  {1}' -f $sw.Elapsed.TotalSeconds, $m; $line | Add-Content $log; Write-Host $line }
@@ -64,6 +64,7 @@ $voice.AudioOutputStream = $stream; $voice.Rate = -1
 $stream.Close()
 Log "narration: $((Get-Item $wav).Length) bytes"
 $env:ATHER_DEMO_VOICE_WAV = $wav
+$env:ATHER_DEMO_OPAQUE_TOASTS = '1'
 
 # The game's log, as a game would write it.
 $logJob = Start-Job -ArgumentList "$demo\game\logs\SkyLedge.log" -ScriptBlock {

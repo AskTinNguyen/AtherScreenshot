@@ -161,7 +161,10 @@ void EnsureWindow() {
     wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
-    g.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE, kClass, L"", WS_POPUP,
+    // MARKETING DEMO ONLY (branch intent/marketing-0.0.2.5, never merged): GitHub's runner leaves layered windows out of
+    // screen grabs, so the demo recording asks for a plain (opaque) toast window: same look, no fade.
+    const DWORD layered = GetEnvironmentVariableW(L"ATHER_DEMO_OPAQUE_TOASTS", nullptr, 0) ? 0 : WS_EX_LAYERED;
+    g.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | layered | WS_EX_NOACTIVATE, kClass, L"", WS_POPUP,
                              0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
     PrepareChromeless(g.hwnd, true);
     ExcludeFromCapture(g.hwnd);
