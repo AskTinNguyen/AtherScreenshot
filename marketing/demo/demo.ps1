@@ -64,7 +64,7 @@ $voice.AudioOutputStream = $stream; $voice.Rate = -1
 $stream.Close()
 Log "narration: $((Get-Item $wav).Length) bytes"
 $env:ATHER_DEMO_VOICE_WAV = $wav
-$env:ATHER_DEMO_OPAQUE_TOASTS = '1'
+$env:ATHER_DEMO_SHOW_UI_IN_RECORDING = '1'  # toasts and the recording frame show in our desktop recording
 
 # The game's log, as a game would write it.
 $logJob = Start-Job -ArgumentList "$demo\game\logs\SkyLedge.log" -ScriptBlock {
@@ -83,7 +83,6 @@ $logJob = Start-Job -ArgumentList "$demo\game\logs\SkyLedge.log" -ScriptBlock {
 # Desktop recording: our own BitBlt grabber (Demo.cs), piped to ffmpeg at 30 fps.
 $ff = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
 [Demo]::StartCapture($ff, "$Out\desktop.mkv")
-[Demo]::WatchToasts($Out)
 Wait 1
 Log 'recording desktop'
 
@@ -103,7 +102,7 @@ Log 'scene: record'
 [Demo]::Move(1500, 700, 600)
 CtrlAlt 'R'
 Wait 1.2
-[Demo]::Drag(160, 120, 1760, 1020, 1300)   # the region to record
+[Demo]::Drag(120, 250, 1496, 1024, 1300)    # the region to record (clear of the toasts' corner)
 Wait 3.5                                   # countdown
 Log 'recording the game'
 # The game drops the runner through the floor at 10 s, 30 s, 50 s… after it loads: speak right as it happens.

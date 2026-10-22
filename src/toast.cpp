@@ -161,10 +161,7 @@ void EnsureWindow() {
     wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
-    // MARKETING DEMO ONLY (branch intent/marketing-0.0.2.5, never merged): GitHub's runner leaves layered windows out of
-    // screen grabs, so the demo recording asks for a plain (opaque) toast window: same look, no fade.
-    const DWORD layered = GetEnvironmentVariableW(L"ATHER_DEMO_OPAQUE_TOASTS", nullptr, 0) ? 0 : WS_EX_LAYERED;
-    g.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | layered | WS_EX_NOACTIVATE, kClass, L"", WS_POPUP,
+    g.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE, kClass, L"", WS_POPUP,
                              0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
     PrepareChromeless(g.hwnd, true);
     ExcludeFromCapture(g.hwnd);
@@ -191,7 +188,6 @@ uint64_t ShowToast(const std::wstring& title, const std::wstring& body, BitmapPt
     SetTimer(g.hwnd, kHideTimer, durationMs, nullptr);
     InvalidateRect(g.hwnd, nullptr, FALSE);
     if (IsWindowVisible(g.hwnd)) UpdateWindow(g.hwnd);
-    else if (GetEnvironmentVariableW(L"ATHER_DEMO_OPAQUE_TOASTS", nullptr, 0)) ShowWindow(g.hwnd, SW_SHOWNOACTIVATE);  // MARKETING DEMO ONLY: no DWM cloak dance
     else ShowWithoutFlash(g.hwnd, false);
     return ++g.token;
 }

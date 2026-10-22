@@ -124,6 +124,9 @@ void ForceForeground(HWND hwnd);
 // Test builds define ATHER_TEST_CAPTURABLE_UI so that UI can itself be screenshotted.
 inline void ExcludeFromCapture(HWND hwnd) {
 #ifndef ATHER_TEST_CAPTURABLE_UI
+    // MARKETING DEMO ONLY (branch intent/marketing-0.0.2.5, never merged): the desktop recording of the demo shows the
+    // toasts and recording frame the person at the screen sees.
+    if (GetEnvironmentVariableW(L"ATHER_DEMO_SHOW_UI_IN_RECORDING", nullptr, 0)) return;
     SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
 #else
     (void)hwnd;
