@@ -50,6 +50,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
 | 🔍 **Review video** | Step 60 fps recordings frame by frame, leave notes on exact frames, and save a review video with the notes in it for another team (Windows) |
+| 📋 **Copy a clip** | Mark part of a video and press `Ctrl+C` (`⌘C`): it's saved as an MP4 and put on the clipboard, ready to paste into Slack. Or copy the frame on screen as a picture |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3), and compress a video or picture to under 8, 25 or 50 MB (or any size) for chat apps and email |
@@ -188,13 +189,19 @@ Opening a video (from the gallery, the "Recording saved" notification, Open rece
   - Notes are kept next to the video as you go, in `<video file name>.notes.json` (plain JSON other tools can read), so they're there next time you open it, also when the video is joined with others or trimmed. The video itself is never changed, and notes are never part of Save.
   - **Copy** in the notes list copies them as text, one line each: `0:12:37 (frame 757), Tin: [Issue] Muzzle flash missing`.
 - **Review video:** Save ▾ › **Save review video** (`Ctrl+Alt+S`) writes `<video> review.mp4` for the other team: a 3-second summary card, then your edit with the timecode and frame number in the corner, and at each note its frame held for 3 seconds (silent) under a card with the note, its kind, author and frame, and its pin. Next to it come `<video> review notes.md` (the same lines as Copy) and `<video> review sheet.png`, a contact sheet with one picture per note to post in a chat.
+- **Copy a clip or a frame (to paste into Slack):**
+  - Shift+drag on the timeline marks a range: a lime band with its length, `6.2 s · Ctrl+C copies`. Or press Shift+I and Shift+O at the playhead (I and O alone still set the trim). It sits on whole frames inside the trim; drag its edges to change it; Esc or a click outside it clears it. It's only a selection: it isn't undone, saved or part of Save.
+  - **Ctrl+C** saves the marked part of your edit (crop, speed, captions and markup, as Save would write it) as an MP4 in your captures, stacked with the original in the gallery, and puts the file on the clipboard. Ctrl+V in Slack, Teams, Discord or Explorer attaches it. A toast says how long and how big it is; click it to see the file.
+  - With nothing marked, Ctrl+C copies the clip selected in the clip lane (from its in to its out, inside the trim), or else the frame on screen.
+  - **Ctrl+Shift+C** always copies the frame on screen as a picture, at the video's full size (cropped, with its captions and markup), not saved to a file.
+  - Both are in Save ▾ too: Copy clip and Copy frame. While you type in a caption or note, Ctrl+C copies that text as usual.
 - **Saving:**
   - **Save** (`Ctrl+S`) writes a new MP4 (H.264 + AAC).
   - **Save GIF** (`Ctrl+Shift+S`) writes a GIF (12 fps, at most 960 px).
   - Saving is quick: the video is decoded on the graphics card, frames are drawn on all cores (only the parts your edits change), and longer videos are encoded in two or three pieces at once and joined.
   - The original stays untouched, and the result stacks with it in the gallery.
 
-Space plays, ←/→ step a frame (`Shift`: a second), `Home`/`End` go to the trim's ends, `J`/`K`/`L` play backward, pause and play forward (again: 0.25×, 0.5×, 1×), `Ctrl+G` goes to a frame or time, `M` adds a note, `[`/`]` go to the previous and next note, `Ctrl+wheel` or `Ctrl+=`/`Ctrl+−` zoom the timeline (`Ctrl+0` fits the trim), the wheel over the video magnifies it (`F` fits), `Del` deletes the selected item, `Ctrl+Z` undoes, `Ctrl+S` saves, `Ctrl+Shift+S` saves a GIF, `Ctrl+Alt+S` saves a review video (in the editor it wins over the scrolling-capture shortcut), `Esc` leaves crop, then deselects, then closes.
+Space plays, ←/→ step a frame (`Shift`: a second), `Home`/`End` go to the trim's ends, `J`/`K`/`L` play backward, pause and play forward (again: 0.25×, 0.5×, 1×), `Ctrl+G` goes to a frame or time, `M` adds a note, `[`/`]` go to the previous and next note, `Ctrl+wheel` or `Ctrl+=`/`Ctrl+−` zoom the timeline (`Ctrl+0` fits the trim), the wheel over the video magnifies it (`F` fits), `Del` deletes the selected item, `Ctrl+Z` undoes, `Ctrl+S` saves, `Ctrl+Shift+S` saves a GIF, `Ctrl+Alt+S` saves a review video (in the editor it wins over the scrolling-capture shortcut), `Shift`+drag on the timeline or `Shift+I`/`Shift+O` mark a range, `Ctrl+C` copies it as a clip (with no range: the selected clip, else the frame), `Ctrl+Shift+C` copies the frame, `Esc` clears the range, then leaves crop, then deselects, then closes.
 
 ### Compress to a smaller file
 
@@ -341,6 +348,7 @@ How the Windows app differs from the Mac app:
   - The emoji field uses Win+. for the full picker.
   - The selected item shows fully while paused (the Mac version shows its first, faded frame).
   - Frame review (exact frame stepping, the frame readout, J/K/L, timeline zoom, the magnifier, review notes and the review video) is on Windows only for now.
+  - Copy clip and Copy frame are in Save ▾ on Windows and in a Copy menu next to Save on the Mac. The Mac's copied clip is H.264 (its Save writes HEVC), and its range snaps to the first clip's frame rate rather than each frame's own time.
 - **Recording:**
   - System audio and microphone are mixed into one AAC track (two tracks on the Mac).
   - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.

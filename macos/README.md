@@ -65,6 +65,7 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Captions ▾** sets captions for the whole video: look (pill, outline or bar), animation, size (five steps), text color, box or outline color, and highlighting the spoken word (auto captions). The same style controls show when a caption is selected.
 - Drag a caption on the video to place it anywhere; Top, Middle and Bottom snap it back to a preset.
 - The preview and the export use the same frame renderer, so what you see is what's saved.
+- **Copy a clip or a frame:** ⇧-drag on the timeline (or ⇧I and ⇧O at the playhead) marks a range: a lime band with its length, on whole frames inside the trim; drag its edges to change it, Esc or a click outside clears it. ⌘C saves that part of the edit as an H.264 + AAC MP4 in your captures (stacked with the original) and puts the file on the clipboard, so ⌘V in Slack attaches it. With nothing marked, ⌘C copies the clip selected in the clip lane, or else the frame on screen; ⌘⇧C always copies the frame (PNG and TIFF, at the video's size, with crop, captions and markup). The Copy menu next to Save has both.
 - **Save** (⌘S) writes a new MP4 (HEVC, which plays in QuickTime, Safari and current browsers; Windows needs the free HEVC extension); **Save GIF** (⌘⇧S) writes a GIF. The original stays untouched, and the result stacks with it in the gallery.
 
 - **Any video:** open MP4, MOV, M4V or anything else AVFoundation reads (Open With in Finder, the palette's "Open a picture or video to edit…", or `AtherScreenshot edit <file>`). Phone videos stored sideways play, export and show in the gallery upright. A file whose frames this Mac can't decode is refused instead of opening blank.
@@ -72,7 +73,7 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Compress:** right-click a video or picture in the gallery › Compress › Under 30 / 8 / 25 / 50 MB (pictures: 2 / 1 / 5 MB) or Other size…, or the palette's "Compress a picture or video…". It writes `<name>_small.mp4` (H.264 + AAC, at a bit rate worked out from the size and the length, scaled to at most 1920 px) or `<name>_small.jpg` next to the original, and tries again smaller if it came out over. See "Compress to a smaller file" in the main README.
 - **Join videos:** Add ▾ › Video clip… (⌘O) or drop videos on the editor to add them after the selected clip. Any shape works: each clip is fitted into the first video's frame with black bars. With two or more clips a clip lane appears above the thumbnails: click selects a clip, drag reorders it, and drag a selected clip's edge to trim it. The clip row offers Split at playhead (S), Earlier, Later and Remove. Captions and markup stay on their footage when clips move, split or go.
 
-Space plays, ←/→ step a frame (⇧ a second), S splits, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag.
+Space plays, ←/→ step a frame (⇧ a second), S splits, ⇧-drag or ⇧I/⇧O mark a range, ⌘C copies it (or the selected clip, or the frame), ⌘⇧C copies the frame, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag, then clears the range.
 
 ## Game controller in recordings
 

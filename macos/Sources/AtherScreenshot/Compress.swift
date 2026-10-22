@@ -183,6 +183,32 @@ enum Compress {
         }
     }
 
+    // The video editor's "Copy clip": the edit (its marked part) rendered the way Save renders it, frame for frame, as H.264
+    // + AAC rather than Save's HEVC, so it plays inline in chat apps and on PCs without the HEVC extension. Full size (scaled
+    // down only past H.264's 4096 × 2304), at a rate that keeps screen text sharp (as the Windows export picks it). One
+    // encode, no cap. Returns the temporary file.
+    static func clip(_ e: VideoEdit, progress: ((Double) -> Void)? = nil) async throws -> URL {
+        let prepared = try await VideoExport.prepare(e)
+        let size = prepared.size
+        guard prepared.composition.duration.seconds > 0, size.width >= 2, size.height >= 2 else { throw Failure.failed("Can't read this video.") }
+        let audio = prepared.composition.tracks(withMediaType: .audio)
+        let k = min(1, 4096 / size.width, 2304 / size.height)
+        let fps = min(60, max(1, 1 / prepared.video.frameDuration.seconds))
+        var p = VideoPlan(fits: true)
+        p.w = max(2, Int((size.width * k / 2).rounded(.down)) * 2)
+        p.h = max(2, Int((size.height * k / 2).rounded(.down)) * 2)
+        p.videoBps = min(50e6, max(2e6, Double(p.w * p.h) * fps * 0.12))
+        p.audioBps = audio.isEmpty ? 0 : audioBps
+        let tmp = tempURL("mp4")
+        do {
+            try await encodeEdit(prepared, audio: audio, plan: p, to: tmp) { progress?($0) }
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
+        return tmp
+    }
+
     // The plan for the length, frame and sound, encoded by `encode` into a temporary file, then up to two smaller tries
     // when it comes out over the cap. The result's `tmp` is the file; `out` isn't set.
     private static func underCap(seconds: Double, w: Int, h: Int, audio: Bool, cap: Double, progress: ((Double, Int) -> Void)?,

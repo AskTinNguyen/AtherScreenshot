@@ -91,13 +91,15 @@ std::vector<BYTE> EncodePng(const Bitmap& img) {
     return out;
 }
 
-bool CopyImageToClipboard(HWND owner, const Bitmap& source) {
+bool CopyImageToClipboard(HWND owner, const Bitmap& source, bool withPng) {
     BitmapPtr flat;
     std::vector<BYTE> png;
     if (HasAlpha(source)) {
         flat = Flatten(source);
         png = EncodePng(source);
         if (!flat) return false;
+    } else if (withPng) {
+        png = EncodePng(source);
     }
     const Bitmap& img = flat ? *flat : source;
     const int w = img.Width(), h = img.Height();

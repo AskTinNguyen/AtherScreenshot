@@ -10,6 +10,13 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## Coming in the next update
+
+### Copy a clip or a frame, then paste it into Slack
+- **Clip:** in the video editor, Shift+drag on the timeline (or press Shift+I and Shift+O) to mark the part you want, then press Ctrl+C (⌘C on the Mac). It's saved as an MP4 in your captures and put on the clipboard, so Ctrl+V in Slack, Teams or Discord attaches it. No more Save, find the file, drag it in. With nothing marked, Ctrl+C copies the clip selected in the clip lane.
+- **Frame:** Ctrl+Shift+C (⌘⇧C) copies the frame on screen as a picture, with your crop, captions and markup; so does Ctrl+C when nothing is marked or selected.
+- **Plays everywhere:** copied clips are H.264 + AAC MP4s, which play right in Slack and on any PC. Save, Save GIF and Save smaller write what they did before.
+
 ## What's new in this update (Windows and macOS, build 0.0.2.4)
 
 ### AI agents can take screenshots and record for you
