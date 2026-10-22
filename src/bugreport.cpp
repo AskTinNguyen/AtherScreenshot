@@ -828,11 +828,48 @@ private:
     bool file_ = false, autoPause_ = false, dictation_ = false, ended_ = false;
 };
 
+// ---- MARKETING DEMO ONLY (branch intent/marketing-0.0.2.5, never merged) ----
+// The GitHub runner that records the marketing video has no microphone. With ATHER_DEMO_VOICE_WAV set to a 16 kHz mono
+// WAV (made with Windows text-to-speech), the listener hears that file instead of the microphone, as if it were played
+// into it when "<wav>.go" appears: the same recognizer, grammar and dictation as the microphone path, results handed on
+// at the moment each phrase ends in the file. voice.wav is cut from the same file.
+std::wstring DemoVoiceWav() {
+    wchar_t buf[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"ATHER_DEMO_VOICE_WAV", buf, MAX_PATH);
+    return n && n < MAX_PATH ? std::wstring(buf) : std::wstring();
+}
+std::atomic<double> g_demoVoiceT0{-1};  // BugClock() when the file "plays"
+std::vector<int16_t> DemoVoicePcm() {
+    std::vector<int16_t> pcm;
+    HANDLE f = CreateFileW(DemoVoiceWav().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return pcm;
+    std::string d;
+    char chunk[65536];
+    DWORD got = 0;
+    while (ReadFile(f, chunk, sizeof chunk, &got, nullptr) && got) d.append(chunk, got);
+    CloseHandle(f);
+    for (size_t i = 12; i + 8 <= d.size();) {  // RIFF chunks: find "data"
+        const uint32_t len = *(const uint32_t*)(d.data() + i + 4);
+        if (d.compare(i, 4, "data") == 0) {
+            const size_t n = std::min<size_t>(len, d.size() - i - 8) / 2;
+            pcm.assign((const int16_t*)(d.data() + i + 8), (const int16_t*)(d.data() + i + 8) + n);
+            break;
+        }
+        i += 8 + len + (len & 1);
+    }
+    return pcm;
+}
+
 // What the microphone hears while a bug is open, for voice.wav: WASAPI (as recordings use) at 16 kHz mono.
 class VoiceTape {
 public:
     ~VoiceTape() { Stop(); }
     bool Start() {
+        if (!DemoVoiceWav().empty()) {  // MARKETING DEMO ONLY: the tape is cut from the demo file
+            demoStart_ = BugClock();
+            running_ = true;
+            return true;
+        }
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         clock_.freq = f.QuadPart;
@@ -852,6 +889,19 @@ public:
         return true;
     }
     std::vector<int16_t> Stop() {
+        if (demoStart_ >= 0) {  // MARKETING DEMO ONLY
+            std::vector<int16_t> out;
+            const double t0 = g_demoVoiceT0;
+            if (running_ && t0 >= 0) {
+                const std::vector<int16_t> all = DemoVoicePcm();
+                const size_t a = (size_t)std::clamp((demoStart_ - t0) * 16000, 0.0, (double)all.size());
+                const size_t b = (size_t)std::clamp((BugClock() - t0) * 16000, (double)a, (double)all.size());
+                out.assign(all.begin() + a, all.begin() + b);
+            }
+            running_ = false;
+            demoStart_ = -1;
+            return out;
+        }
         if (running_) cap_.Stop();
         running_ = false;
         return std::move(pcm_);
@@ -864,6 +914,7 @@ private:
     std::vector<int16_t> pcm_;
     int sum_ = 0, n_ = 0;
     bool running_ = false;
+    double demoStart_ = -1;  // MARKETING DEMO ONLY
 };
 
 // ---- the app's side ----
@@ -1118,6 +1169,36 @@ void StartListening() {
     BugApp& a = App();
     a.listener = std::make_unique<Listener>();
     Listener* l = a.listener.get();
+    if (const std::wstring wav = DemoVoiceWav(); !wav.empty()) {  // MARKETING DEMO ONLY: see DemoVoiceWav
+        l->thread = std::thread([l, wav] {
+            const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            RunOnUi([l] { ListenerStarted(l, true, L""); });
+            const std::wstring go = wav + L".go";
+            while (GetFileAttributesW(go.c_str()) == INVALID_FILE_ATTRIBUTES)
+                if (WaitForSingleObject(l->stop, 100) == WAIT_OBJECT_0) return;
+            const double t0 = BugClock();
+            g_demoVoiceT0 = t0;
+            VoiceCommands vc;
+            std::wstring err;
+            std::vector<VoiceCommands::Heard> all;
+            if (vc.Open(wav, &err))
+                for (const ULONGLONG end = GetTickCount64() + 120000; GetTickCount64() < end;)
+                    if (!vc.Next(2000, &all)) break;
+            for (auto& h : all) {
+                double last = 0;
+                for (auto& w : h.words) {
+                    w.start += t0;
+                    w.end += t0;
+                    last = std::max(last, w.end);
+                }
+                const double wait = last + 0.35 - BugClock();
+                if (wait > 0 && WaitForSingleObject(l->stop, (DWORD)(wait * 1000)) == WAIT_OBJECT_0) break;
+                RunOnUi([l, h] { OnHeard(l, {h}); });
+            }
+            if (SUCCEEDED(co)) CoUninitialize();
+        });
+        return;
+    }
     l->thread = std::thread([l] {
         const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         {

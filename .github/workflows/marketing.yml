@@ -1,0 +1,39 @@
+# MARKETING DEMO ONLY (branch intent/marketing-0.0.2.5, never merged): builds the app and records the desktop of
+# GitHub's Windows runner while marketing/demo/demo.ps1 uses the 0.0.2.5 features in the real app. Nothing is
+# published: the recording is kept as the run's artifact for a few days.
+name: Marketing demo
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['intent/marketing-0.0.2.5']
+
+concurrency:
+  group: marketing-demo
+  cancel-in-progress: true
+
+jobs:
+  record:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        run: call build.bat
+      - name: ffmpeg
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg -y --no-progress }
+          ffmpeg -version | Select-Object -First 1
+      - name: Record the demo
+        shell: powershell
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + $env:Path
+          & marketing\demo\demo.ps1 -Exe "$PWD\build\AtherScreenshot.exe" -Out "$PWD\demo-out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marketing-demo
+          retention-days: 5
+          path: demo-out/
