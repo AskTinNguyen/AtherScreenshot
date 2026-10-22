@@ -151,8 +151,8 @@ public static class Demo {
     public static int CapturedFrames, RepeatedFrames;
     public static void StartCapture(string ffmpeg, string outFile) {
         int w = GetSystemMetrics(0), h = GetSystemMetrics(1);
-        var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg, "-y -loglevel warning -f rawvideo -pix_fmt bgra -s " + w + "x" + h +
-            " -framerate 30 -i - -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \"" + outFile + "\"");
+        var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg, "-y -loglevel warning -use_wallclock_as_timestamps 1 -f rawvideo -pix_fmt bgr0 -s " + w + "x" + h +
+            " -i - -fps_mode cfr -r 30 -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \"" + outFile + "\"");
         psi.UseShellExecute = false; psi.RedirectStandardInput = true;
         capProc = System.Diagnostics.Process.Start(psi);
         capturing = true;
@@ -175,14 +175,8 @@ public static class Demo {
                 }
                 Marshal.Copy(bits, frame, 0, frame.Length);
                 CapturedFrames++;
-                long due = (long)(clock.Elapsed.TotalSeconds * 30) + 1;
-                bool first = true;
-                while (written < due) {  // keep 30 fps: a slow grab repeats the frame
-                    try { stdin.Write(frame, 0, frame.Length); } catch { capturing = false; break; }
-                    written++;
-                    if (!first) RepeatedFrames++;
-                    first = false;
-                }
+                try { stdin.Write(frame, 0, frame.Length); stdin.Flush(); } catch { capturing = false; break; }
+                written++;
                 int ahead = (int)(written * 1000 / 30 - clock.ElapsedMilliseconds);
                 if (ahead > 0) Thread.Sleep(ahead);
             }
@@ -197,5 +191,42 @@ public static class Demo {
         capProc.StandardInput.Close();
         capProc.WaitForExit(120000);
         return capProc.ExitCode;
+    }
+
+    // Diagnostics: logs every appearance of the app's toast (rect, cloaked, ex-style) and saves what PrintWindow and a
+    // screen grab of its rect see.
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+    public static void WatchToasts(string dir) {
+        Thread t = new Thread(() => {
+            bool shown = false; int n = 0;
+            while (true) {
+                IntPtr h = FindWindow("AtherScreenshotToast", null);
+                bool vis = h != IntPtr.Zero && IsWindowVisible(h);
+                if (vis && !shown && n < 12) {
+                    Thread.Sleep(400);
+                    int cloaked; DwmGetWindowAttribute(h, 14, out cloaked, 4);
+                    RECT r; GetWindowRect(h, out r);
+                    int w = r.Right - r.Left, hh = r.Bottom - r.Top;
+                    System.IO.File.AppendAllText(dir + "\\toasts.log", DateTime.Now.ToString("HH:mm:ss.fff") + " toast " + r.Left + "," + r.Top + " " + w + "x" + hh +
+                        " cloaked=" + cloaked + " exstyle=0x" + GetWindowLong(h, -20).ToString("X") + "\r\n");
+                    try {
+                        using (var bmp = new System.Drawing.Bitmap(Math.Max(1, w), Math.Max(1, hh))) {
+                            using (var g = System.Drawing.Graphics.FromImage(bmp)) { IntPtr dc = g.GetHdc(); PrintWindow(h, dc, 2); g.ReleaseHdc(dc); }
+                            bmp.Save(dir + "\\toast" + n + "-print.png");
+                        }
+                        using (var bmp = new System.Drawing.Bitmap(Math.Max(1, w), Math.Max(1, hh))) {
+                            using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(r.Left, r.Top, 0, 0, bmp.Size, System.Drawing.CopyPixelOperation.SourceCopy | System.Drawing.CopyPixelOperation.CaptureBlt);
+                            bmp.Save(dir + "\\toast" + n + "-screen.png");
+                        }
+                    } catch (Exception e) { System.IO.File.AppendAllText(dir + "\\toasts.log", e.Message + "\r\n"); }
+                    n++;
+                }
+                shown = vis;
+                Thread.Sleep(100);
+            }
+        });
+        t.IsBackground = true; t.Start();
     }
 }

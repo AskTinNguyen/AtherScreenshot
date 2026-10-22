@@ -7,7 +7,7 @@
 param([string]$Exe, [string]$Out)
 $ErrorActionPreference = 'Continue'
 New-Item -ItemType Directory -Force $Out | Out-Null
-Add-Type -Path "$PSScriptRoot\Demo.cs"
+Add-Type -Path "$PSScriptRoot\Demo.cs" -ReferencedAssemblies System.Drawing
 $log = "$Out\demo.log"
 $sw = [Diagnostics.Stopwatch]::StartNew()
 function Log($m) { $line = '{0,8:N2}  {1}' -f $sw.Elapsed.TotalSeconds, $m; $line | Add-Content $log; Write-Host $line }
@@ -82,6 +82,7 @@ $logJob = Start-Job -ArgumentList "$demo\game\logs\SkyLedge.log" -ScriptBlock {
 # Desktop recording: our own BitBlt grabber (Demo.cs), piped to ffmpeg at 30 fps.
 $ff = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
 [Demo]::StartCapture($ff, "$Out\desktop.mkv")
+[Demo]::WatchToasts($Out)
 Wait 1
 Log 'recording desktop'
 
@@ -230,7 +231,7 @@ Log ([Demo]::List())
 
 # ---- done ----
 $code = [Demo]::StopCapture()
-Log "ffmpeg exit $code, frames grabbed $([Demo]::CapturedFrames), repeated $([Demo]::RepeatedFrames)"
+Log "ffmpeg exit $code, frames grabbed $([Demo]::CapturedFrames)"
 Stop-Job $logJob
 New-Item -ItemType Directory -Force "$Out\captures" | Out-Null
 Copy-Item -Recurse "$captures\*" "$Out\captures" -ErrorAction SilentlyContinue
