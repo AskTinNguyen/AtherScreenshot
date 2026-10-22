@@ -10,7 +10,35 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new in this update (Windows and macOS, build 0.0.2.5)
+## What's new in this update (Windows, build 0.0.2.6)
+
+The video editor on Windows can now build a new video out of pieces, put a second video on top or beside it, and flip
+clips. The Mac app stays at build 0.0.2.5 for now.
+
+### Clip bin: keep the pieces you cut, then arrange them into a new video
+- **What:** a **Bin** lane above the clip lane holds clips taken out of the video, so you can put them back or rearrange them instead of losing them. It shows once there's more than one clip, or anything in the bin.
+- **Taking out:** press Del on a clip in the clip lane, or drag it up onto the bin. The last clip stays.
+- **Putting back:** drag a piece from the bin down to where it should play; a marker shows where it goes. Double-click a piece (or **Add at end**) to put it at the end.
+- **For good:** Del on a piece in the bin deletes it. Ctrl+Z undoes every step. The bin is never part of the saved video.
+
+### Picture in picture and split screen
+- **Adding:** **Add ▾ › Video on top (picture in picture)…** or **Video side by side (split screen)…**. You can also drag a bin piece to the bottom lane, or drop a video file there.
+- **Picture in picture:** drag the box on the video to move it; drag a corner, or use the mouse wheel over it, to resize it. Small, Medium and Large presets.
+- **Split screen:** pick the half (left, right, top or bottom); **Fit** shows all of each picture, **Fill** fills each half.
+- **On the timeline:** a bar on the bottom lane for each one: drag it to move it in time, drag its ends to trim it.
+- **Sound:** videos on top are silent; you hear the main video. Save, Save GIF, Copy frame and the preview all show them the same way.
+
+### Flip a clip
+- **Flip ▾** next to Crop flips the selected clip (or video on top) left–right, upside down, or both. Flipped clips show ↔ / ↕ on the clip lane. Markup lying wholly on that clip is flipped with it; the crop stays as it is.
+
+### Loop, guides and a black-and-white view
+- **Loop** (next to Play, or Ctrl+L) plays the trim, or the selected clip, over and over.
+- **Guides ▾** (or a right click on the video) draws the golden section, rule of thirds, phi grid or diagonals over the preview to check framing; G hides them. **Monochrome view** shows the preview in black and white. Neither is ever saved.
+
+### Gallery: scrub a video without opening it
+- Move along the thin timeline at the bottom of a video tile to see its frames; the badge shows where you are (`0:12 / 0:34`).
+
+## Earlier update (Windows and macOS, build 0.0.2.5)
 
 ### Copy a clip or a frame, then paste it into Slack
 - **Clip:** in the video editor, Shift+drag on the timeline (or press Shift+I and Shift+O) to mark the part you want, then press Ctrl+C (⌘C on the Mac). It's saved as an MP4 in your captures and put on the clipboard, so Ctrl+V in Slack, Teams or Discord attaches it. No more Save, find the file, drag it in. With nothing marked, Ctrl+C copies the clip selected in the clip lane.
