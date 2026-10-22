@@ -18,13 +18,14 @@ xcrun swift test      # unit tests; ATHER_TEST_OUT=<dir> also renders the editor
 
 Saving speed: `AtherScreenshot --bench-export <outDir> [tap] <clips…>` exports each clip in the same scenarios as the Windows bench (plain, edits, speed2, captions, light, long, gif) and prints time, frames and how each export ran; `tap` keeps frame hashes for `AtherScreenshot --bench-compare <dirA> <dirB>`. `ATHER_BENCH_ONLY=<scenario>`, `ATHER_ENCODERS=n` and `ATHER_GIF_PARTS=n` narrow or change a run.
 
-Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.4), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
+Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.5), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
 
 ## Permissions
 
 - **Screen & System Audio Recording** (required): macOS asks on first capture. Ad-hoc builds get a new signature on every rebuild, so macOS may ask again after rebuilding. Sign with a stable identity to avoid that.
 - **Accessibility**: only for scrolling capture (it posts scroll events) and for showing keystrokes in recordings.
-- **Microphone**: only when "Record microphone" is on (macOS 15 or later).
+- **Microphone**: only when "Record microphone" is on (macOS 15 or later), or for bug reports' voice commands.
+- **Speech Recognition**: for Auto captions, and for bug reports' voice commands when you turn them on.
 
 ## Default shortcuts
 
@@ -42,6 +43,7 @@ macOS reserves ⌘⇧3/4/5, so the defaults use ⌃⌥:
 | ⌃⌥T | Capture text (OCR) |
 | ⌃⌥H | Capture history |
 | ⌃⌥5 / ⌃⌥G | Record MP4 / GIF (press again to stop) |
+| ⌃⌥B | Bug report: start / stop |
 
 All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.ather.screenshot`) under the same key names as `settings.ini`, so `defaults write com.ather.screenshot Uploader s3` works.
 
@@ -51,6 +53,13 @@ All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.at
 - **Canvas (K):** drag any edge to add space around the screenshot (⌥ moves both sides), or use Space below, Space right and Even margin. The space is filled with the screenshot's edge color, white, black or transparent. Text wraps at the canvas edge, so notes in the margin stay on the image.
 - **Collage (⌘G in the gallery):** select two or more screenshots and press Collage. Choose a layout (auto, grid, row, column, feature), gap, margin, background, corners, shadow and size (fit, 1920 px wide, square). Drag one screenshot onto another to swap them; everything else in the editor works on top.
 - Saved results join the gallery: edits are tagged "edited" and keep the original's metadata; collages are tagged "collage" and keep the tags and collections their screenshots share. Both list the screenshots they include.
+- **Capture tray:** captures for the editor (⌃⌥E, or After capture = Open the editor) collect in one editor instead of opening a window each. From two pictures on, a strip of thumbnails runs along the bottom.
+  - **Switching:** click a thumbnail, or press ⌃⇥ / ⌃⇧⇥ (⌘} / ⌘{) for the next or previous picture.
+  - **Each picture keeps its own notes:** annotations, crop, added space and undo stay with their picture.
+  - **Ticks:** new captures come ticked. **Save selected (n)** saves the ticked ones that aren't saved yet. Done saves them, copies the current picture and closes.
+  - **Closing:** with pictures that aren't saved it asks: Save Selected and Close, Close Without Saving or Cancel.
+  - **Marks:** a white dot means unsaved changes, "✓ Saved" means saved, and × (on hover) removes a picture.
+  - **Limits and setting:** up to 100 pictures. Settings › General › **Collect captures in one editor** (`Tray`) turns it off. To collect every capture, set After capture to Open the editor. Files opened from the gallery or Finder, and collages, keep their own windows.
 
 ## Video editor
 
@@ -65,6 +74,7 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Captions ▾** sets captions for the whole video: look (pill, outline or bar), animation, size (five steps), text color, box or outline color, and highlighting the spoken word (auto captions). The same style controls show when a caption is selected.
 - Drag a caption on the video to place it anywhere; Top, Middle and Bottom snap it back to a preset.
 - The preview and the export use the same frame renderer, so what you see is what's saved.
+- **Copy a clip or a frame:** ⇧-drag on the timeline (or ⇧I and ⇧O at the playhead) marks a range: a lime band with its length, on whole frames inside the trim; drag its edges to change it, Esc or a click outside clears it. ⌘C saves that part of the edit as an H.264 + AAC MP4 in your captures (stacked with the original) and puts the file on the clipboard, so ⌘V in Slack attaches it. With nothing marked, ⌘C copies the clip selected in the clip lane, or else the frame on screen; ⌘⇧C always copies the frame (PNG and TIFF, at the video's size, with crop, captions and markup). The Copy menu next to Save has both.
 - **Save** (⌘S) writes a new MP4 (HEVC, which plays in QuickTime, Safari and current browsers; Windows needs the free HEVC extension); **Save GIF** (⌘⇧S) writes a GIF. The original stays untouched, and the result stacks with it in the gallery.
 
 - **Any video:** open MP4, MOV, M4V or anything else AVFoundation reads (Open With in Finder, the palette's "Open a picture or video to edit…", or `AtherScreenshot edit <file>`). Phone videos stored sideways play, export and show in the gallery upright. A file whose frames this Mac can't decode is refused instead of opening blank.
@@ -72,7 +82,15 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Compress:** right-click a video or picture in the gallery › Compress › Under 30 / 8 / 25 / 50 MB (pictures: 2 / 1 / 5 MB) or Other size…, or the palette's "Compress a picture or video…". It writes `<name>_small.mp4` (H.264 + AAC, at a bit rate worked out from the size and the length, scaled to at most 1920 px) or `<name>_small.jpg` next to the original, and tries again smaller if it came out over. See "Compress to a smaller file" in the main README.
 - **Join videos:** Add ▾ › Video clip… (⌘O) or drop videos on the editor to add them after the selected clip. Any shape works: each clip is fitted into the first video's frame with black bars. With two or more clips a clip lane appears above the thumbnails: click selects a clip, drag reorders it, and drag a selected clip's edge to trim it. The clip row offers Split at playhead (S), Earlier, Later and Remove. Captions and markup stay on their footage when clips move, split or go.
 
-Space plays, ←/→ step a frame (⇧ a second), S splits, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag.
+Space plays, ←/→ step a frame (⇧ a second), S splits, ⇧-drag or ⇧I/⇧O mark a range, ⌘C copies it (or the selected clip, or the frame), ⌘⇧C copies the frame, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag, then clears the range.
+
+## Bug reports
+
+For playtests, as on Windows (see "Bug reports" in the main README): say "bug start", describe the bug, say "bug stop", or press ⌃⌥B to start and again to stop. Each bug becomes a folder in `Bugs` in your captures: `bug.png` (the screenshot with what you said on a bar), `screenshot.png`, `clip.mp4` from 10 s before "bug start" (cut when the recording stops, H.264, with captions), `voice.wav`, the game's logs, `bug.md` and `bug.json`. "Copy last bug report" and "Open bug reports folder" are in the palette.
+
+- **Listening** (Settings › Bug reports › Listen for "bug start" / "bug stop", `VoiceCommands`) is off by default. It asks for the Microphone and Speech Recognition once, recognizes on this Mac only, and the menu-bar menu says "Listening for “bug start”" while it's on. A Mac without on-device recognition says so, and ⌃⌥B still works.
+- **Game log paths** (`LogPaths`): files, folders or wildcards separated by `;`, e.g. `~/Library/Logs/MyGame/*.log`. `~`, `$NAME` and `%NAME%` are expanded.
+- **Transcribe Vietnamese with Apple's servers** (`CloudVietnamese`, off by default, Mac only): at "bug stop", `voice.wav` is transcribed as Vietnamese on this Mac when it can do that on the device, and only otherwise sent to Apple's speech recognition (just `voice.wav`). What comes back becomes the description and the captions. If that fails, the bug keeps what was recognized on the Mac, and `bug.json` says why. With it off, nothing is ever sent.
 
 ## Game controller in recordings
 
@@ -112,11 +130,12 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 
 ## Differences from Windows
 
-- In the editor, ⌘ replaces Ctrl (⌘Z, ⌘C, ⌘S, ⌘P, ⌘R redact, ⌘E styled export, ⌘K commands). Single-key tools, 1–8 colors, `[` `]` sizes and ↩ Done are unchanged.
+- In the editor, ⌘ replaces Ctrl (⌘Z, ⌘C, ⌘S, ⌘P, ⌘R redact, ⌘E styled export, ⌘K commands). Single-key tools, 1–8 colors, `[` `]` sizes and ↩ Done are unchanged. The capture tray switches pictures with ⌃⇥ / ⌃⇧⇥ (as on Windows) or ⌘} / ⌘{ (Ctrl+PageDown / Ctrl+PageUp on Windows).
 - History became the capture gallery above (⌘⌫ moves to Trash, ⌘O shows in Finder).
 - System audio and microphone are recorded as two AAC tracks instead of one mixed track.
 - A recorded region that spans displays is clamped to the display under its center.
 - The game controller overlay reads Xbox, PlayStation and MFi pads directly (Windows uses XInput: Xbox and compatible pads).
+- Bug reports listen with on-device speech recognition (Windows uses Windows speech recognition), transcribe the narration as Vietnamese when you allow it (on the Mac when it can, otherwise with Apple's servers), and save the bug's Issue note with the recording for the Windows video editor.
 - Updates replace the app bundle (Windows replaces the exe).
 - There is no installer: drag the app to /Applications. "Launch at login" uses SMAppService.
 
@@ -145,4 +164,4 @@ claude mcp add ather-screenshot -- "/Applications/Ather Screenshot.app/Contents/
 
 ## Layout (`Sources/AtherScreenshot`)
 
-`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, markup and clip lane UI) · `VideoSequence` (clips, the one list of media types, the sequence composition and its compositor) · `VideoRender` (frame renderer for preview and export) · `Gamepad` (controller input and drawing) · `Updater` (manifest, download, verify, swap) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key and controller overlays) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.
+`App` (commands, menu bar, hotkeys, capture pipeline, CLI) · `Capture` (ScreenCaptureKit snapshots, window list) · `Overlay` (region, window, color, ruler) · `Editor` + `Annotations` · `Collage` (layouts) · `VideoEditor` (trim, crop, speed, captions, markup and clip lane UI) · `VideoSequence` (clips, the one list of media types, the sequence composition and its compositor) · `VideoRender` (frame renderer for preview and export) · `Gamepad` (controller input and drawing) · `Updater` (manifest, download, verify, swap) · `Smart` (suggested tags, related-word search) · `Library` (gallery metadata, indexer, filters) · `Gallery` · `Recorder` (MP4/GIF, countdown, control bar, click/key and controller overlays) · `BugReport` (bug reports: the bug logic, voice commands, bundle, logs, clip) · `Scroll` · `OCR` (Vision, redaction) · `Upload` (Imgur, custom, S3 SigV4) · `Palette` · `Pin` · `Toast` · `SettingsWindow` · `Hotkeys` · `Logo` · `Output`.

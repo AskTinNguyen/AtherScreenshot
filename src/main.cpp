@@ -4,6 +4,7 @@
 #include <objbase.h>
 #include <ole2.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include <commdlg.h>
 #include <objidl.h>
@@ -18,6 +19,7 @@ using std::min;
 #include <gdiplus.h>
 
 #include "agent.h"
+#include "bugreport.h"
 #include "capture.h"
 #include "compress.h"
 #include "editor.h"
@@ -111,6 +113,9 @@ enum Cmd : int {
     CmdCheckUpdates,
     CmdToggleAgents,
     CmdCopyAgentSetup,
+    CmdBugReport,
+    CmdCopyLastBug,
+    CmdOpenBugsFolder,
     CmdInstallUpdate,  // tray and notification only: never from a link or the command line
     CmdExit,
     CmdRecentBase = 1000,
@@ -135,6 +140,9 @@ const CmdDef kCmds[] = {
     {CmdStopRecording, L"StopRecording", L"Stop recording", L"finish end save video gif", 0xE71A, L"", false},
     {CmdRecordWindow, L"RecordWindow", L"Record a window (follows it)", L"video mp4 app track follow", 0xE8A7, L"", true},
     {CmdPauseRecording, L"PauseRecording", L"Pause / resume recording", L"break hold continue", 0xE769, L"", false},
+    {CmdBugReport, L"BugReport", L"Bug report: start / stop", L"bug issue playtest report voice clip logs game qa", 0xEBE8, L"Ctrl+Alt+B", true},
+    {CmdCopyLastBug, L"CopyLastBugReport", L"Copy last bug report", L"bug clipboard paste slack files clip logs", 0xE8C8, L"", false},
+    {CmdOpenBugsFolder, L"OpenBugReportsFolder", L"Open bug reports folder", L"bug explorer directory files bundles", 0xE838, L"", false},
     {CmdRuler, L"ScreenRuler", L"Screen ruler", L"measure pixels distance size length angle", 0xECC6, L"", true},
     {CmdToggleSystemAudio, L"ToggleSystemAudio", L"Record system audio", L"toggle sound speaker loopback", 0xE767, L"", false},
     {CmdToggleMic, L"ToggleMicrophone", L"Record microphone", L"toggle mic voice", 0xE720, L"", false},
@@ -213,6 +221,7 @@ void ApplyAgents();
 void CopyAgentSetup();
 void CheckForUpdates(bool manual);
 void InstallUpdate();
+void UpdateTrayTip();
 
 const CmdDef* FindCmd(int id) {
     for (const auto& c : kCmds)
@@ -292,7 +301,7 @@ void ShowHotkeyErrors() {
 }
 
 void ApplyEditorDefaults() {
-    SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile});
+    SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile, g_settings.editorTray});
     SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
     SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
         g_settings.noteAuthor = name;
@@ -309,6 +318,9 @@ void ApplyEditorDefaults() {
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);
     ApplyAgents();  // start or stop the MCP server to match
+    ConfigureBugReports({g_settings.CapturesFolder(), g_settings.bugVoice, g_settings.bugLogPaths, g_settings.bugPreRollSeconds,
+                         g_settings.bugLogMaxMB, g_settings.captureCursor, g_settings.Hotkey(L"BugReport")},
+                        {g_hwnd, [](const std::wstring& path) { OpenPath(path); }, [] { UpdateTrayTip(); }});
 }
 
 void ReloadSettings(bool notify) {
@@ -419,7 +431,7 @@ void Deliver(BitmapPtr img, const RECT& where, After after, int redactedCount = 
     }
 
     if (after == After::Edit || (after == After::Default && g_settings.afterCapture == L"edit")) {
-        OpenEditor(img, {L"", g_nameInfo.app, g_nameInfo.window});  // the editor copies/saves the annotated result on Done
+        OpenCaptureInEditor(img, {L"", g_nameInfo.app, g_nameInfo.window});  // the editor copies/saves the annotated result on Done
         return;
     }
 
@@ -959,6 +971,9 @@ void Execute(int id, bool deferCapture, bool untrusted) {
                           [] { CopyAgentSetup(); }, g_settings.toastMs + 4000);
             break;
         case CmdCopyAgentSetup: CopyAgentSetup(); break;
+        case CmdBugReport: ToggleBugReport(); break;
+        case CmdCopyLastBug: CopyLastBugReport(); break;
+        case CmdOpenBugsFolder: OpenBugReportsFolder(); break;
         case CmdExit: DestroyWindow(g_hwnd); break;
     }
 }
@@ -1327,6 +1342,20 @@ int RunAgentBridge() {
 
 // ---- tray ----
 
+std::wstring TrayTip() {  // says when the microphone is open for "bug start"
+    return std::wstring(kProductName) + L"\nCommands: " + g_settings.Hotkey(L"CommandPalette") +
+           (BugVoiceListening() ? L"\nListening for “bug start”" : L"");
+}
+
+void UpdateTrayTip() {
+    NOTIFYICONDATAW nid{sizeof(nid)};
+    nid.hWnd = g_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    wcsncpy_s(nid.szTip, TrayTip().c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
 void AddTrayIcon() {
     NOTIFYICONDATAW nid{sizeof(nid)};
     nid.hWnd = g_hwnd;
@@ -1334,8 +1363,7 @@ void AddTrayIcon() {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = g_icon;
-    std::wstring tip = std::wstring(kProductName) + L"\nCommands: " + g_settings.Hotkey(L"CommandPalette");
-    wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+    wcsncpy_s(nid.szTip, TrayTip().c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &nid);
     nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &nid);
@@ -1598,6 +1626,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     mcp::StopHttp();
+    StopBugReports();
     // Let an in-flight recording finalize so the file isn't left truncated, and let video exports finish
     // (their completion registers the saved file with the library). Work posted back meanwhile still runs:
     // the dispatcher window outlives g_hwnd.
@@ -1609,7 +1638,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         pump();
         Sleep(10);
     }
-    for (ULONGLONG end = GetTickCount64() + 120000; VideoEditorsBusy() && GetTickCount64() < end;) {
+    for (ULONGLONG end = GetTickCount64() + 120000; (VideoEditorsBusy() || BugReportsBusy()) && GetTickCount64() < end;) {
         pump();
         Sleep(10);
     }
@@ -1677,4 +1706,84 @@ ATHER_TEST(cli_token_is_private_and_stable) {
                                 nullptr, &sd) == ERROR_SUCCESS);
     CHECK(dacl && dacl->AceCount == 1);
     if (sd) LocalFree(sd);
+}
+// Settings › Bug reports, the BugReport shortcut and the three palette commands (the bugs themselves: bugreport.cpp).
+ATHER_TEST(bug_report_settings_shortcut_and_palette) {
+    Settings s;
+    s.Load(HotkeyDefs());
+    CHECK(!s.bugVoice && s.bugLogPaths.empty() && s.bugPreRollSeconds == 10 && s.bugLogMaxMB == 20);
+    UINT mods = 0, vk = 0;
+    CHECK(s.Hotkey(L"BugReport") == L"Ctrl+Alt+B" && ParseHotkey(s.Hotkey(L"BugReport"), mods, vk) && mods == (MOD_CONTROL | MOD_ALT) && vk == 'B');
+    for (const auto& c : kCmds)  // a shortcut of its own
+        if (c.id != CmdBugReport) CHECK(_wcsicmp(c.defaultHotkey, L"Ctrl+Alt+B") != 0);
+    s.WriteString(L"Hotkeys", L"BugReport", L"Ctrl+Shift+F9");  // rebindable, like every shortcut
+    s.WriteBool(L"Bugs", L"VoiceCommands", true);
+    s.WriteString(L"Bugs", L"LogPaths", L"%TEMP%\\Game\\*.log");
+    s.WriteString(L"Bugs", L"PreRollSeconds", L"500");
+    s.WriteString(L"Bugs", L"LogMaxMB", L"5");
+    s.Load(HotkeyDefs());
+    CHECK(s.Hotkey(L"BugReport") == L"Ctrl+Shift+F9" && s.bugVoice && s.bugLogPaths == L"%TEMP%\\Game\\*.log");
+    CHECK(s.bugPreRollSeconds == 120 && s.bugLogMaxMB == 5);  // clamped
+    s.WriteString(L"Hotkeys", L"BugReport", L"Ctrl+Alt+B");
+    s.WriteBool(L"Bugs", L"VoiceCommands", false);
+    s.WriteString(L"Bugs", L"LogPaths", L"");
+    s.WriteString(L"Bugs", L"PreRollSeconds", L"10");
+    s.WriteString(L"Bugs", L"LogMaxMB", L"20");
+    s.Load(HotkeyDefs());
+
+    // Settings › Bug reports, found by searching "bug": its four settings and the shortcuts.
+    SettingsUiHost h;
+    h.settings = &s;
+    for (const auto& c : kCmds) h.hotkeys.push_back({c.key, c.title, c.defaultHotkey});
+    std::vector<std::wstring> shown;
+    const BitmapPtr img = SettingsSnapshot(h, L"bug", &shown);
+    CHECK(img);
+    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug start” / “bug stop”", L"Game log paths", L"Clip starts before “bug start”",
+                               L"Largest log copied", L"Shortcuts", L"Bug report: start / stop", L"Copy last bug report", L"Open bug reports folder"})
+        CHECK(std::find(shown.begin(), shown.end(), row) != shown.end());
+    wchar_t out[MAX_PATH];
+    if (img && GetEnvironmentVariableW(L"ATHER_TEST_OUT", out, MAX_PATH)) {
+        SHCreateDirectoryExW(nullptr, out, nullptr);
+        CHECK(SavePng(*img, std::wstring(out) + L"\\settings-bug-reports.png"));
+    }
+
+    // The palette offers the three commands, and they run.
+    const auto items = BuildPaletteItems();
+    for (int id : {CmdBugReport, CmdCopyLastBug, CmdOpenBugsFolder})
+        CHECK(std::any_of(items.begin(), items.end(), [&](const PaletteItem& p) { return p.id == id && p.title == FindCmd(id)->title; }));
+    auto pumpUntil = [](const std::function<bool()>& done, int ms) {
+        for (const ULONGLONG end = GetTickCount64() + ms; GetTickCount64() < end && !done();) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+            Sleep(10);
+        }
+        return done();
+    };
+    HWND dispatcher = StartUiDispatcher();
+    HWND owner = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
+    const std::wstring dir = test::TempDir();
+    std::wstring opened;
+    ConfigureBugReports({dir, false, L"", 10, 20, false, L"Ctrl+Alt+B"}, {owner, [&opened](const std::wstring& p) { opened = p; }, nullptr});
+    Execute(CmdBugReport, false);
+    pumpUntil([] { return false; }, 300);
+    Execute(CmdBugReport, false);
+    CHECK(pumpUntil([&] { return Library::IsInside(LastBugReport(), dir + L"\\Bugs") && !BugReportsBusy(); }, 20000));
+    const std::wstring bug = LastBugReport();
+    CHECK(GetFileAttributesW((bug + L"\\bug.md").c_str()) != INVALID_FILE_ATTRIBUTES);
+    Execute(CmdCopyLastBug, false);
+    bool pasted = false;
+    if (OpenClipboard(owner)) {
+        if (HANDLE drop = GetClipboardData(CF_HDROP))
+            for (UINT i = 0, n = DragQueryFileW((HDROP)drop, 0xFFFFFFFF, nullptr, 0); i < n; ++i) {
+                wchar_t f[MAX_PATH];
+                pasted = pasted || (DragQueryFileW((HDROP)drop, i, f, MAX_PATH) && bug + L"\\bug.md" == f);
+            }
+        CloseClipboard();
+    }
+    CHECK(pasted);
+    Execute(CmdOpenBugsFolder, false);
+    CHECK(opened == dir + L"\\Bugs");
+    StopBugReports();
+    DestroyWindow(owner);
+    StopUiDispatcher(dispatcher);
 }

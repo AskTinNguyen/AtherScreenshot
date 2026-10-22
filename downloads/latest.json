@@ -1,16 +1,16 @@
 {
     "windows": {
-        "version": "0.0.2.4",
+        "version": "0.0.2.5",
         "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-        "sha256": "e820d1431c66ef61ca07363a0c0042a17597844ae7f8a41f914567651000682b",
-        "size": 3951104,
-        "notes": "AI agents can take screenshots and record for you (MCP), and you can compress a video or picture to fit a size."
+        "sha256": "c34e5c150c3288224994843d42836e4dba3f5e87a2abd565550a5372befeb6f8",
+        "size": 4478976,
+        "notes": "Ctrl+C copies a clip or frame from the video editor, captures collect in one editor tray, and \"bug start\" / \"bug stop\" make bug reports."
     },
     "macos": {
-        "version": "0.0.2.4",
+        "version": "0.0.2.5",
         "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-        "sha256": "2d00f8832912e2b697fa869c92d99eea5a7b4b3ec5f84f3c4368ac8251662c5d",
-        "size": 3955332,
-        "notes": "AI agents can take screenshots and record for you (MCP), and you can compress a video or picture to fit a size."
+        "sha256": "09258a828089284686c9073938de109524fc2e45ecd9a7cbe227f03c0846c2e7",
+        "size": 4258241,
+        "notes": "Copy a clip or frame from the video editor with \u2318C, collect captures in one editor tray, and make bug reports by saying \"bug start\" / \"bug stop\"."
     }
 }

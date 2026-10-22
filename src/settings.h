@@ -49,10 +49,17 @@ public:
     int scrollMaxFrames = 60;
     // editor
     bool styledExport = false;
+    bool editorTray = true;  // [Editor] Tray: captures for the editor collect in one window, in a strip of thumbnails
     // video editor
     std::wstring noteAuthor;  // [VideoEditor] NoteAuthor: the name on review notes (empty: Windows' display name)
     // compress: the last "under N MB" used, for videos and for pictures ([Compress] CompressVideoMB, CompressPictureMB)
     double compressVideoMB = 30, compressPictureMB = 2;
+
+    // bug reports ([Bugs], see bugreport.h)
+    bool bugVoice = false;       // VoiceCommands: listen for "bug start" / "bug stop" (keeps the microphone open)
+    std::wstring bugLogPaths;    // LogPaths: files, folders or wildcards, separated by ;
+    int bugPreRollSeconds = 10;  // PreRollSeconds: the clip starts this long before "bug start"
+    int bugLogMaxMB = 20;        // LogMaxMB: a bigger log keeps only its end
 
     // gallery
     bool autoTag = false;  // [Gallery] AutoTag: apply suggested tags

@@ -323,18 +323,10 @@ enum Agent {
         return max(0, r.elapsed)
     }
 
-    // Markers become the video's review notes, "<video>.notes.json" (the Windows video editor's format). Never over
-    // notes that are already there.
+    // Markers become the video's review notes, "<video>.notes.json" (the Windows video editor's format), next to any
+    // notes already there (bug reports' Issue notes).
     private static func writeNotes(_ video: URL, _ ms: [Marker], fps: Double, author: String) -> URL? {
-        let u = URL(fileURLWithPath: video.path + ".notes.json")
-        guard !ms.isEmpty, MediaFiles.isVideo(video), !FileManager.default.fileExists(atPath: u.path) else { return nil }
-        let now = ISO8601DateFormatter().string(from: Date())
-        let notes: [JSON] = ms.enumerated().map { i, m in
-            ["id": i + 1, "frame": Int((m.seconds * fps).rounded()), "time": round(m.seconds, 1000), "kind": m.kind, "resolved": false,
-             "author": author, "text": m.label, "created": now]
-        }
-        let doc: JSON = ["app": "Ather Screenshot", "format": 1, "video": video.lastPathComponent, "fps": fps, "notes": notes]
-        return (try? Data(MCP.encode(doc).utf8).write(to: u, options: .atomic)) != nil ? u : nil
+        VideoNotes.add(ms.map { VideoNotes.New(time: $0.seconds, kind: $0.kind, text: $0.label, author: author) }, to: video, fps: fps)
     }
 
     // What stop_recording reports for a finished recording; markers are saved with an MP4.
@@ -888,4 +880,44 @@ enum Agent {
     }
 
     static let instructions = "Ather Screenshot is a screenshot and screen-recording app running on this computer. Use it to see the screen and to record what happens, e.g. while playtesting a game: take_screenshot to look (and keep tagged evidence), start_recording / add_marker / stop_recording for gameplay sessions, get_video_frames to review a recording, read_text to read on-screen text, list_captures to find earlier captures. Coordinates are screen points; get_status lists the displays. Everything is saved in the user's captures folder and gallery."
+}
+
+// Review notes the app adds to a video's sidecar ("<video>.notes.json", the Windows video editor's format) by itself: AI
+// agents' markers and bug reports. Notes already there stay; a sidecar that can't be read is left as it is (nil).
+enum VideoNotes {
+    struct New {
+        var time: Double
+        var end: Double? = nil
+        var kind: String  // note, issue, question, good
+        var text: String
+        var author: String
+    }
+
+    @discardableResult
+    static func add(_ notes: [New], to video: URL, fps: Double) -> URL? {
+        let u = URL(fileURLWithPath: video.path + ".notes.json")
+        guard !notes.isEmpty, MediaFiles.isVideo(video) else { return nil }
+        var kept: [[String: Any]] = []
+        if FileManager.default.fileExists(atPath: u.path) {
+            guard let data = try? Data(contentsOf: u), let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let list = doc["notes"] as? [[String: Any]] else { return nil }
+            kept = list
+        }
+        var next = (kept.compactMap { ($0["id"] as? NSNumber)?.int64Value }.max() ?? 0) + 1
+        let now = ISO8601DateFormatter().string(from: Date())
+        func r(_ v: Double) -> Double { (v * 1000).rounded() / 1000 }
+        for n in notes {
+            var j: [String: Any] = ["id": next, "frame": Int((n.time * fps).rounded()), "time": r(n.time), "kind": n.kind, "resolved": false,
+                                    "author": n.author, "text": n.text, "created": now]
+            if let e = n.end, e > n.time {
+                j["endFrame"] = Int((e * fps).rounded())
+                j["endTime"] = r(e)
+            }
+            kept.append(j)
+            next += 1
+        }
+        kept.sort { (($0["time"] as? NSNumber)?.doubleValue ?? 0) < (($1["time"] as? NSNumber)?.doubleValue ?? 0) }
+        let doc: [String: Any] = ["app": "Ather Screenshot", "format": 1, "video": video.lastPathComponent, "fps": fps, "notes": kept]
+        return (try? Data(MCP.encode(doc).utf8).write(to: u, options: .atomic)) != nil ? u : nil
+    }
 }

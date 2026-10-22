@@ -77,6 +77,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         var discarded: Bool { url == nil && error == nil }
     }
     var onFinish: ((Outcome) -> Void)?
+    var whenFinished: [(Outcome) -> Void] = []  // after onFinish: bug reports cut their clips
     var copiesToClipboard = true
 
     // `configure` runs before anything starts (overrides, onFinish).
@@ -105,6 +106,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("ather-\(UUID().uuidString).\(gif ? "gif" : "mp4")")
         super.init()
     }
+
+    var area: CGRect { regionRect }  // what's recorded, in CG global points (a followed window's frame)
 
     private var regionRect: CGRect {
         switch target {
@@ -479,6 +482,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if let d = gifDir { try? FileManager.default.removeItem(at: d) }
         finishedCleanup()
         onFinish?(Outcome(url: nil, duration: 0, error: error))
+        whenFinished.forEach { $0(Outcome(url: nil, duration: 0, error: error)) }
         if let error { Toast.shared.show("Recording failed", error, ms: 6000) } else if let notice { Toast.shared.show(notice) }
     }
 
@@ -553,6 +557,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         defer {
             finishedCleanup()
             onFinish?(outcome)
+            whenFinished.forEach { $0(outcome) }
         }
         if let error { return Toast.shared.show("Recording failed", error, ms: 6000) }
         guard let tmp else { return Toast.shared.show("Recording discarded") }

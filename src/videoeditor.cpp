@@ -483,6 +483,8 @@ struct SaveResult {
     bool review = false;          // a review video, with its notes list (and sheet) next to it
     std::wstring md, mdText, sheet;
     double underMB = 0;           // "Save smaller": the size it had to fit
+    bool copy = false;            // "Copy clip": the file goes on the clipboard once it's in place
+    double seconds = 0;           // its length
 };
 struct FrameTimesResult {
     std::wstring key;
@@ -553,7 +555,15 @@ public:
     std::vector<Hot> hots;
     RECT hoverRect{};
 
-    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan, BinMove, OverlayItem, OverlayBox };
+    // The marked range (Shift+drag on the timeline, Shift+I / Shift+O): the part Ctrl+C copies as a clip. A selection,
+    // not an edit: on frame boundaries, inside the trim, never in the undo stack or Save. Esc, a plain click outside it
+    // or a change to the clips clears it.
+    struct Span {
+        double start = 0, end = 0;
+    };
+    std::optional<Span> marked;
+
+    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan, Range, BinMove, OverlayItem, OverlayBox };
     struct Drag {
         DragKind kind = DragKind::None;
         VPoint from;
@@ -573,6 +583,7 @@ public:
         bool moved = false;   // a clip or bin piece dragged far enough to be a move, not a click
         int downX = 0, downY = 0;
         POINT at{};           // the mouse, for the piece carried along
+        std::optional<Span> before;  // range drags: the marked range before it (Esc puts it back)
     } drag;
 
     int S(int v) const { return Px(s, v); }
@@ -632,6 +643,7 @@ public:
     void Changed() {
         if (!SameFootage(edit.clips, builtClips)) RebuildSequence();
         else builtClips = edit.clips;  // only a flip: the players and thumbnails stay (the renderer and strip flip)
+        if (marked) SetMarked(marked->start, marked->end);  // still inside the trim
         RequestOverlays(playing ? rawT : paused);
         LoadNotes();
         PlaceNotes();
@@ -817,6 +829,7 @@ public:
         player->SetMuted(edit.muted);
         player->Play();
         playing = true;
+        frameCopyPending = false;  // a Ctrl+C still waiting for its frame doesn't fire later
         Rerender();
         Invalidate();
     }
@@ -987,6 +1000,7 @@ public:
     // The player, the paused-frame decoder and the thumbnails follow the clips (after edits and undo).
     void RebuildSequence() {
         builtClips = edit.clips;
+        marked.reset();  // its times would now show other footage
         if (playing && player) paused = player->Now();  // the playhead stays where playback was
         playing = false;
         duration = ClipsDuration(edit.clips);
@@ -1236,6 +1250,10 @@ public:
         if (start) edit.trimStart = std::min(std::max(0.0, *start), edit.trimEnd - 0.1);
         if (end) edit.trimEnd = std::max(std::min(duration, *end), edit.trimStart + 0.1);
         Changed();
+    }
+    void TrimAtPlayhead(bool start) {  // I and O
+        PushUndo();
+        start ? SetTrim(Now(), std::nullopt) : SetTrim(std::nullopt, Now());
     }
 
     double InsertTime() const { return std::min(std::max(Now(), edit.trimStart), std::max(edit.trimStart, edit.trimEnd - 0.5)); }
@@ -2198,6 +2216,52 @@ public:
         return tframes.frames[tframes.Nearest(t)].t;
     }
 
+    // ---- the marked range ----
+
+    // The frame boundary nearest `t`: where a frame starts, or the end of the last one.
+    double SnapEdge(double t) const {
+        if (tframes.empty()) return t;
+        const double f = tframes.frames[tframes.Nearest(t)].t;
+        return std::fabs(duration - t) < std::fabs(f - t) ? duration : f;
+    }
+    // From `a` to `b` (either way round), inside the trim; none when that leaves less than a frame.
+    void SetMarked(double a, double b) {
+        const double from = std::max(std::min(a, b), edit.trimStart), to = std::min(std::max(a, b), edit.trimEnd);
+        if (to - from < 0.5 / Seq().Fps()) marked.reset();
+        else marked = Span{from, to};
+    }
+    // Shift+I / Shift+O: the range starts or ends at the playhead, as I and O set the trim. The other end stays, or is
+    // the trim's when there's no range yet or it would come out empty.
+    void MarkAtPlayhead(bool start) {
+        const double t = SnapEdge(Now());
+        double from = marked ? marked->start : edit.trimStart, to = marked ? marked->end : edit.trimEnd;
+        if (start) {
+            from = t;
+            if (to <= from) to = edit.trimEnd;
+        } else {
+            to = t;
+            if (to <= from) from = edit.trimStart;
+        }
+        SetMarked(from, to);
+        Invalidate();
+    }
+    // A range drag: from `anchor` (an edge being dragged keeps the other one), or a new range from the press.
+    void BeginMark(POINT p, std::optional<double> anchor) {
+        Pause();
+        const std::optional<Span> before = marked;
+        drag = {};
+        drag.kind = DragKind::Range;
+        drag.before = before;
+        drag.grab = anchor ? *anchor : SnapEdge(std::clamp(TT(p.x), edit.trimStart, edit.trimEnd));
+        if (!anchor) marked.reset();
+        Invalidate();
+    }
+    // "6.2 s · Ctrl+C copies": how long the copied clip runs (at the edit's speed).
+    std::wstring MarkedLabel() const {
+        if (!marked) return L"";
+        return ClipSeconds((marked->end - marked->start) / edit.speed) + L" · Ctrl+C copies";
+    }
+
     // ---- stage geometry ----
 
     std::vector<VPoint> Handles(const Mark& m) const {
@@ -2339,7 +2403,7 @@ public:
         Button(dc, g, save.left, y, h, 0, L"Save", false, false, [this] { Save(false); }, L"Save as a new MP4 in your captures (Ctrl+S)", true, saveW);
         FillRR(g, more, (float)S(7), A(theme::kAccent));
         Text(dc, fSmall, L"▾", more, theme::kOnAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        Hotspot(more, [this, more] { Popup(more, SaveMenu()); }, L"More ways to save: smaller (under 8, 25, 50 MB…), GIF, review video with your notes");
+        Hotspot(more, [this, more] { Popup(more, SaveMenu()); }, L"More ways to save: smaller (under 8, 25, 50 MB…), GIF, review video with your notes; copy a clip or the frame");
     }
     std::vector<MenuItem> SaveMenu() {
         std::vector<MenuItem> v;
@@ -2365,9 +2429,20 @@ public:
         other.label = L"Other size…";
         other.run = [this] { AskSmallerSize(); };
         smaller.sub.push_back(other);
+        // Copy clip ▸ the marked range (or the selected clip) as an MP4 file on the clipboard; Copy frame ▸ the picture.
+        MenuItem clip, frame;
+        clip.label = L"Copy clip\tCtrl+C";
+        clip.run = [this] { Copy(); };
+        clip.enabled = CanCopyClip();
+        frame.label = L"Copy frame\tCtrl+Shift+C";
+        frame.run = [this] { CopyFrame(); };
+        frame.enabled = raw != nullptr;
         v.push_back(mp4);
         v.push_back(smaller);
         v.push_back(gif);
+        v.push_back(MenuItem::Sep());
+        v.push_back(clip);
+        v.push_back(frame);
         v.push_back(MenuItem::Sep());
         v.push_back(review);
         return v;
@@ -2822,7 +2897,7 @@ public:
         }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · Shift+drag mark · Ctrl+C copy · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -3001,6 +3076,7 @@ public:
             gp::Pen outline(selected == n.id ? gp::Color(255, 255, 255, 255) : gp::Color(170, 0, 0, 0), (selected == n.id ? 1.5f : 1.f) * s);
             g.DrawPolygon(&outline, flag, 3);
         }
+        if (marked) PaintMarked(dc, g, tr, strip);
         const float px = (float)TX(Now());
 
         gp::SolidBrush white(gp::Color(255, 255, 255, 255));
@@ -3053,6 +3129,33 @@ public:
                     Text(dc, fSmall, num, {(LONG)x + S(3), band.top, (LONG)x + S(3) + w + S(2), band.bottom - S(4)}, RGB(255, 255, 255));
             }
         }
+    }
+
+    // The marked range: a band down the timeline from the thumbnails, grips on its edges, and a label with its length
+    // and the key that copies it.
+    void PaintMarked(HDC dc, gp::Graphics& g, const RECT& tr, const RECT& strip) {
+        const float x0 = (float)TX(marked->start), x1 = (float)TX(marked->end), h = (float)(tr.bottom - strip.top);
+        if (x1 < tr.left || x0 > tr.right) return;  // zoomed in elsewhere
+        gp::SolidBrush band(A(theme::kAccent, 56)), edge(A(theme::kAccent));
+        g.FillRectangle(&band, x0, (float)strip.top, x1 - x0, h);
+        for (float x : {x0, x1}) {
+            g.FillRectangle(&edge, x - s, (float)strip.top, 2 * s, h);
+            const RECT grip{(LONG)std::lround(x) - S(4), strip.top + S(12), (LONG)std::lround(x) + S(4), strip.bottom - S(12)};
+            FillRR(g, grip, (float)S(3), gp::Color(255, 255, 255, 255));
+            gp::GraphicsPath p;
+            RoundPath(p, (float)grip.left, (float)grip.top, (float)RectW(grip), (float)RectH(grip), (float)S(3));
+            gp::Pen ring(A(theme::kOnAccent), 1.f * s);
+            g.DrawPath(&ring, &p);
+        }
+        // The label sits on the band, or beside it when the band is too narrow, and stays on view.
+        const std::wstring label = MarkedLabel();
+        const int w = Measure(dc, fSmall, label).cx + S(16), lh = S(18);
+        int lx = (int)std::lround((x0 + x1) / 2) - w / 2;
+        if (x1 - x0 < w + S(16)) lx = x1 + S(8) + w <= tr.right ? (int)x1 + S(8) : (int)x0 - S(8) - w;
+        lx = std::clamp(lx, (int)tr.left, std::max((int)tr.left, (int)tr.right - w));
+        const RECT pill{lx, strip.top + (RectH(strip) - lh) / 2, lx + w, strip.top + (RectH(strip) + lh) / 2};
+        FillRR(g, pill, (float)S(5), A(theme::kAccent));
+        Text(dc, fSmall, label, pill, theme::kOnAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     // Clip lane: one bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
@@ -3241,14 +3344,14 @@ public:
         return false;
     }
 
-    void OnMouseDown(POINT p, bool dbl) {
+    void OnMouseDown(POINT p, bool dbl, bool shift = false) {
         SetFocus(hwnd);
         if (OnHot(p)) return;
         const RECT tr = TimelineRect();
         const RECT st = StageRect();
         const RECT br = BinRect();
         if (BinH() && PtInRect(&br, p)) return BinDown(p, dbl);
-        if (PtInRect(&tr, p) || (p.y >= tr.top - S(6) && p.x >= tr.left && p.x <= tr.right)) return TimelineDown(p, dbl);
+        if (PtInRect(&tr, p) || (p.y >= tr.top - S(6) && p.x >= tr.left && p.x <= tr.right)) return TimelineDown(p, dbl, shift);
         if (PtInRect(&st, p)) return StageDown(p, dbl);
     }
 
@@ -3364,11 +3467,20 @@ public:
         else TogglePlay();
     }
 
-    void TimelineDown(POINT p, bool dbl) {
+    void TimelineDown(POINT p, bool dbl, bool shift = false) {
         const RECT tr = TimelineRect();
         const int top = tr.top + LaneH();
         const int capY = top + S(62), markY = top + S(90), rowH = S(18);
         SetCapture(hwnd);
+        if (shift) return BeginMark(p, std::nullopt);  // Shift+drag anywhere on the timeline marks a range
+        if (marked) {
+            const double d0 = std::abs(p.x - TX(marked->start)), d1 = std::abs(p.x - TX(marked->end));
+            if (p.y >= top && p.y < capY && std::min(d0, d1) < S(6)) return BeginMark(p, d0 <= d1 ? marked->end : marked->start);  // its grips
+            if (const double t = TT(p.x); t < marked->start || t >= marked->end) {  // a plain click outside it clears it
+                marked.reset();
+                Invalidate();
+            }
+        }
         // The playhead knob sits over the clip lane: it scrubs, whatever is under it.
         const bool onKnob = std::abs(p.x - TX(Now())) <= S(7) && p.y < tr.top + S(8);
         if (LaneH() && p.y < top && !onKnob) {  // the clip lane: grab the selected clip's edge to trim, or a clip to move
@@ -3543,6 +3655,14 @@ public:
                 Seek(edit.trimEnd);
                 break;
             case DragKind::Playhead: Seek(SnapToFrame(now)); break;
+            case DragKind::Range: {
+                const double t = SnapEdge(std::clamp(now, edit.trimStart, edit.trimEnd));
+                SetMarked(drag.grab, t);
+                // Shows the frame at the edge that moves: the range's first frame, or its last.
+                if (marked && !tframes.empty()) GoToFrame(t < drag.grab ? tframes.At(marked->start + 1e-4) : tframes.At(marked->end - 1e-4));
+                Invalidate();
+                break;
+            }
             case DragKind::Pan:
                 if (drag.target < 0 && std::abs(p.x - drag.downX) < S(4)) break;
                 drag.target = 1;  // moved: a pan, not a click
@@ -3769,6 +3889,7 @@ public:
     // far (it's one undo step); clip drags only apply on release, so nothing changes.
     void CancelDrag() {
         if (drag.kind == DragKind::None) return;
+        if (drag.kind == DragKind::Range) marked = drag.before;
         drag = {};
         if (GetCapture() == hwnd) ReleaseCapture();
         Invalidate();
@@ -3792,6 +3913,7 @@ public:
         if (ctrl) {
             switch (vk) {
                 case 'S': Save(shift); return true;
+                case 'C': shift ? CopyFrame() : Copy(); return true;
                 case 'O': AddClipDialog(); return true;
                 case 'Z': Undo(); return true;
                 case 'G': BeginGoTo(); return true;
@@ -3818,8 +3940,8 @@ public:
             case VK_HOME: GoTrimEnd(false); break;
             case VK_END: GoTrimEnd(true); break;
             case 'S': SplitAtPlayhead(); break;
-            case 'I': PushUndo(); SetTrim(Now(), std::nullopt); break;
-            case 'O': PushUndo(); SetTrim(std::nullopt, Now()); break;
+            case 'I': shift ? MarkAtPlayhead(true) : TrimAtPlayhead(true); break;  // Shift: the marked range, not the trim
+            case 'O': shift ? MarkAtPlayhead(false) : TrimAtPlayhead(false); break;
             case 'T': AddCaption(); break;
             case 'A': AddMark(MarkKind::Arrow); break;
             case 'R': AddMark(MarkKind::Box); break;
@@ -3839,7 +3961,8 @@ public:
                 else DeleteSelected();
                 break;
             case VK_ESCAPE:
-                if (cropping) cropping = false;
+                if (marked) marked.reset();
+                else if (cropping) cropping = false;
                 else if (selected) Select(std::nullopt);
                 else if (selClip) SelectClip(std::nullopt);
                 else PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -4105,6 +4228,136 @@ public:
                   [out] { RevealInExplorer({out}); }, 5000);
     }
 
+    // ---- copy (Ctrl+C) ----
+
+    // Ctrl+C: the marked range as a clip; with no range, the clip selected in the clip lane (as edited, inside the trim);
+    // else the frame on screen.
+    bool CanCopyClip() const { return marked || (SelClipIndex() && !selected); }
+    void Copy() {
+        if (marked) return CopyClip(marked->start, marked->end);
+        if (const auto k = SelClipIndex(); k && !selected) {
+            const double t0 = ClipStart(edit.clips, *k);
+            const double a = std::max(t0, edit.trimStart), b = std::min(t0 + edit.clips[*k].Duration(), edit.trimEnd);
+            if (b - a < 0.5 / Seq().Fps()) {
+                ShowToast(L"This clip is outside the trim", L"Nothing of it would be saved. Mark a range with Shift+drag instead.", nullptr, nullptr, 3000);
+                return;
+            }
+            return CopyClip(a, b);
+        }
+        CopyFrame();
+    }
+
+    // Copy clip: the edit over [a, b) saved as Save would write that part (crop, speed, mute, captions and markup; H.264
+    // + AAC) into the captures folder, stacked with the original in the gallery, then the file put on the clipboard, so
+    // Ctrl+V in Slack, Teams or Explorer attaches it.
+    std::wstring lastCopiedClip;  // tests
+    bool lastClipOnClipboard = false;
+    void CopyClip(double a, double b) {
+        if (busy) return;
+        SetFocus(hwnd);  // commits a field being edited
+        busy = saving = true;
+        Pause();
+        VideoEdit e = edit;
+        e.trimStart = a;
+        e.trimEnd = b - 1e-4;  // the frame starting right at `b` stays out, whatever the rounding of frame times
+        const double seconds = (b - a) / e.speed;
+        const std::wstring out = MakeCapturePath(g_folder, L"mp4", {window, app});
+        SHCreateDirectoryExW(nullptr, out.substr(0, out.find_last_of(L'\\')).c_str(), nullptr);
+        wchar_t tdir[MAX_PATH];
+        GetTempPathW(MAX_PATH, tdir);
+        const std::wstring tmp = std::wstring(tdir) + L"ather-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".mp4";
+        const uint64_t toast = ShowToast(L"Copying clip…", ClipSeconds(seconds) + L" long", nullptr, nullptr, 600000);
+        const std::wstring src = path, srcApp = app, srcWindow = window;
+        HWND h = hwnd;
+        std::thread([=] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            std::wstring err;
+            int lastPct = -1;
+            const bool ok = ExportMp4(src, e, tmp, &err, [&](double p) {
+                const int pct = (int)(p * 100);
+                if (pct / 5 != lastPct / 5) {
+                    lastPct = pct;
+                    const std::wstring body = std::to_wstring(pct) + L"%";
+                    RunOnUi([toast, body] { UpdateToastBody(toast, body); });
+                }
+                return true;
+            });
+            CoUninitialize();
+            auto* r = new SaveResult{ok, false, out, tmp, err};
+            r->copy = true;
+            r->seconds = seconds;
+            if (!PostMessageW(h, WM_SAVED, 0, (LPARAM)r)) {  // the editor was closed meanwhile: saved and copied all the same
+                const SaveResult res = *r;
+                delete r;
+                RunOnUi([res, src, srcApp, srcWindow] { PlaceCopiedClip(res, nullptr, src, srcApp, srcWindow); });
+            }
+        }).detach();
+    }
+    static std::wstring ClipSeconds(double secs) {
+        wchar_t b[32];
+        swprintf_s(b, L"%.1f s", secs);
+        return secs < 60 ? std::wstring(b) : Clock(secs);
+    }
+    // Moves a copied clip into the captures folder, puts it on the clipboard and says so. False when that failed.
+    static bool PlaceCopiedClip(const SaveResult& r, HWND owner, const std::wstring& src, const std::wstring& srcApp, const std::wstring& srcWindow,
+                                bool* onClipboard = nullptr) {
+        if (!r.ok) {
+            DeleteFileW(r.tmp.c_str());
+            ShowToast(L"Copy clip failed", r.err, nullptr, nullptr, 8000);
+            return false;
+        }
+        Library::Shared().NoteEdit(r.out, src, srcApp, srcWindow, true);  // stacks with the original in the gallery
+        if (!MoveFileExW(r.tmp.c_str(), r.out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            DeleteFileW(r.tmp.c_str());
+            ShowToast(L"Copy clip failed", r.out, nullptr, nullptr, 8000);
+            return false;
+        }
+        const bool copied = CopyFileToClipboard(owner, r.out);
+        if (onClipboard) *onClipboard = copied;
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        GetFileAttributesExW(r.out.c_str(), GetFileExInfoStandard, &fa);
+        const double mb = ((uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) / 1048576.0;
+        wchar_t size[32];
+        swprintf_s(size, mb >= 1 ? L"%.1f MB" : L"%.0f KB", mb >= 1 ? mb : mb * 1024);
+        const std::wstring out = r.out;
+        if (copied)
+            ShowToast(L"Clip copied · " + ClipSeconds(r.seconds) + L" · " + size, L"Paste it in Slack or anywhere  ·  click to show in Explorer", nullptr,
+                      [out] { RevealInExplorer({out}); }, 6000);
+        else
+            ShowToast(L"Clip saved, but the clipboard was busy", FileNameOf(out) + L"  ·  click to show it in Explorer and drag it in instead", nullptr,
+                      [out] { RevealInExplorer({out}); }, 8000);
+        return true;
+    }
+    void ClipCopied(const SaveResult& r) {
+        busy = saving = false;
+        lastSaveError = r.ok ? L"" : r.err;
+        Invalidate();
+        if (PlaceCopiedClip(r, hwnd, path, app, window, &lastClipOnClipboard)) lastCopiedClip = r.out;
+    }
+
+    // Copy frame (Ctrl+Shift+C, or Ctrl+C with nothing picked): the frame on screen as the export draws it (crop,
+    // captions and markup at that time), at the export's full size, as a picture on the clipboard (CF_DIB and PNG). Not
+    // saved to a file. Right after a step it waits for that frame to be decoded, so it's the one the readout names.
+    bool frameCopyPending = false;
+    BitmapPtr lastCopiedFrame;  // tests
+    void CopyFrame() {
+        if (!raw) return;
+        if (!playing && !tframes.empty() && tframes.Nearest(rawT) != tframes.Nearest(paused)) {
+            frameCopyPending = true;  // WM_FETCHED comes back here
+            return;
+        }
+        frameCopyPending = false;
+        const BitmapPtr f = FrameRenderer(edit, videoSize, false).Render(*raw, playing ? rawT : paused);
+        if (!f) return;
+        if (!CopyImageToClipboard(hwnd, *f, true)) {
+            ShowToast(L"Couldn't copy the frame", L"The clipboard is busy. Try again.", nullptr, nullptr, 3000);
+            return;
+        }
+        lastCopiedFrame = f;
+        const std::wstring at = tframes.empty() ? Clock(Now()) : BurnInText(tframes, FrameNow());
+        ShowToast(L"Frame copied", at + L"  ·  " + std::to_wstring(f->Width()) + L" × " + std::to_wstring(f->Height()), f, nullptr, 2500);
+    }
+
     // ---- window ----
 
     void Fonts() {
@@ -4193,7 +4446,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_LBUTTONDOWN:
-        case WM_LBUTTONDBLCLK: OnMouseDown({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, m == WM_LBUTTONDBLCLK); return 0;
+        case WM_LBUTTONDBLCLK: OnMouseDown({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, m == WM_LBUTTONDBLCLK, (w & MK_SHIFT) != 0); return 0;
         case WM_MOUSEMOVE: OnMouseMove({GET_X_LPARAM(l), GET_Y_LPARAM(l)}, w); return 0;
         case WM_LBUTTONUP: OnMouseUp(); return 0;
         case WM_CAPTURECHANGED:
@@ -4248,6 +4501,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
                 RequestOverlays(r->t);
                 Rerender();
                 Invalidate();
+                if (frameCopyPending) CopyFrame();
                 if (onFetched) onFetched();
             }
             return 0;
@@ -4322,6 +4576,7 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_SAVED: {
             std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(l));
             if (r->review) ReviewSaved(*r);
+            else if (r->copy) ClipCopied(*r);
             else Saved(r->ok, r->gif, r->out, r->tmp, r->err, r->underMB);
             return 0;
         }
@@ -4564,13 +4819,24 @@ bool WriteFrameNumberClip(const std::wstring& path, int w, int h, int fps, int f
     return SUCCEEDED(mw.Finalize());
 }
 
-bool WriteNumberedClip(const std::wstring& path, int w, int h, int fps, int frames, int blue) {
+// `tone`: with a 440 Hz tone, so an export of it has sound.
+bool WriteNumberedClip(const std::wstring& path, int w, int h, int fps, int frames, int blue, bool tone = false) {
     Mp4Writer mw;
-    if (FAILED(mw.Begin(path, w, h, fps))) return false;
+    if (FAILED(mw.Begin(path, w, h, fps, tone ? 48000 : 0, 2))) return false;
     std::vector<uint32_t> px((size_t)w * h);
+    int64_t audio = 0;
+    std::vector<int16_t> pcm;
     for (int i = 0; i < frames; ++i) {
         std::fill(px.begin(), px.end(), 0xFF000000u | (uint32_t)(16 * (i % 16)) << 16 | (uint32_t)(16 * (i / 16)) << 8 | (uint32_t)blue);
         if (FAILED(mw.WriteFrame(px.data(), std::llround(i * 1e7 / fps), std::llround(1e7 / fps)))) return false;
+        if (!tone) continue;
+        pcm.clear();
+        const int64_t from = audio, until = std::llround((i + 1) * 48000.0 / fps);
+        for (; audio < until; ++audio) {
+            const int16_t v = (int16_t)std::lround(std::sin(2 * 3.14159265358979 * 440 * audio / 48000) * 6000);
+            pcm.push_back(v), pcm.push_back(v);
+        }
+        mw.WriteAudio(pcm.data(), (uint32_t)(audio - from), std::llround(from * 1e7 / 48000));
     }
     return SUCCEEDED(mw.Finalize());
 }
@@ -4592,6 +4858,32 @@ std::pair<int, bool> ShownFrame(VideoEditor* e) {
     if (!e->raw || std::fabs(e->rawT - e->paused) >= 1e-3) return {-1, false};
     const uint32_t c = e->raw->Bits()[(size_t)(e->raw->Height() / 2) * e->raw->Width() + e->raw->Width() / 2];
     return {NumberOf(c), BlueOf(c)};
+}
+
+// A menu as Windows draws it: opened for real (as a click on its button opens it) and printed once it's up.
+BitmapPtr g_menuShot;
+void CALLBACK PrintMenu(HWND, UINT, UINT_PTR id, DWORD) {
+    KillTimer(nullptr, id);
+    RECT r{};
+    if (HWND w = FindWindowW(L"#32768", nullptr); w && GetWindowRect(w, &r) && RectW(r) > 0 && RectH(r) > 0 && (g_menuShot = Bitmap::Create(RectW(r), RectH(r)))) {
+        MemDC dc(g_menuShot->Handle());
+        if (!PrintWindow(w, dc, PW_RENDERFULLCONTENT)) {
+            HDC screen = GetDC(nullptr);
+            BitBlt(dc, 0, 0, RectW(r), RectH(r), screen, r.left, r.top, SRCCOPY);
+            ReleaseDC(nullptr, screen);
+        }
+    }
+    EndMenu();
+}
+BitmapPtr MenuShot(HWND owner, const std::vector<MenuItem>& items) {
+    std::vector<const MenuItem*> flat;
+    HMENU m = BuildMenu(items, flat);
+    g_menuShot.reset();
+    const UINT_PTR timer = SetTimer(nullptr, 0, 500, PrintMenu);
+    TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, 200, 200, 0, owner, nullptr);
+    KillTimer(nullptr, timer);
+    DestroyMenu(m);
+    return std::exchange(g_menuShot, nullptr);
 }
 
 BitmapPtr Snapshot(VideoEditor* e) {
@@ -4620,6 +4912,7 @@ BitmapPtr Snapshot(VideoEditor* e) {
 }  // namespace
 
 int VideoEditorSnapshots(const std::wstring& outDir) {
+    SHCreateDirectoryExW(nullptr, outDir.c_str(), nullptr);  // as the other snapshot tools do (CI hands it a new folder)
     const std::wstring clip = outDir + L"\\snapshot-clip.mp4";
     if (!WriteTestClip(clip, 1280, 720, 30, 3, false)) return 1;  // silent: snapshots never make a sound
     VideoEditor* e = OpenHidden(clip, 1180, 760);
@@ -4823,6 +5116,26 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         }
         e->edit.notes.clear();  // its sidecar goes again
         e->Changed();
+
+        // A marked range of 6.2 s (frames 300 to 671), the playhead on its first frame; then the Save menu with Copy clip
+        // and Copy frame, as Windows draws it, pasted under ▾.
+        e->FitTrim();
+        e->Select(std::nullopt);
+        e->GoToFrame(300);
+        e->SetMarked(e->tframes.frames[300].t, e->tframes.frames[672].t);
+        Pump(800);
+        BitmapPtr shot = Snapshot(e);
+        SavePng(*shot, outDir + L"\\video-editor-range.png");
+        if (const BitmapPtr menu = MenuShot(e->hwnd, e->SaveMenu())) {
+            SavePng(*menu, outDir + L"\\video-editor-save-menu-alone.png");
+            const int x = shot->Width() - e->S(14) - menu->Width(), y = e->S(8) + e->S(32) + e->S(2);
+            {
+                MemDC dst(shot->Handle()), src(menu->Handle());
+                BitBlt(dst, x, y, menu->Width(), menu->Height(), src, 0, 0, SRCCOPY);
+            }
+            for (size_t i = 0, n = (size_t)shot->Width() * shot->Height(); i < n; ++i) shot->Bits()[i] |= 0xFF000000u;
+            SavePng(*shot, outDir + L"\\video-editor-save-menu.png");
+        }
 
         e->dirty = false;
         DestroyWindow(e->hwnd);
@@ -6317,6 +6630,460 @@ ATHER_TEST(video_editor_clip_lane_edges_knob_and_keys) {
     CHECK(e->edit.clips[2] == tail);
     CHECK(e->edit.clips[2].out <= e->edit.clips[2].length + 1e-9);
     CHECK_EQ(e->undoStack.size(), undoBefore);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// ---- copy (Ctrl+C): the marked range, the selected clip, the frame on screen ----
+
+namespace {
+
+// What the clipboard holds now (these tests use the real one).
+std::vector<std::wstring> ClipboardFiles() {
+    std::vector<std::wstring> v;
+    if (!OpenClipboard(nullptr)) return v;
+    if (HANDLE h = GetClipboardData(CF_HDROP)) v = DroppedFiles(h);
+    CloseClipboard();
+    return v;
+}
+std::wstring ClipboardText() {
+    std::wstring t;
+    if (!OpenClipboard(nullptr)) return t;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const auto* p = static_cast<const wchar_t*>(GlobalLock(h))) t = p;
+        GlobalUnlock(h);
+    }
+    CloseClipboard();
+    return t;
+}
+// The CF_DIB as top-down pixels (32-bit, as CopyImageToClipboard puts it there).
+BitmapPtr ClipboardDib() {
+    BitmapPtr out;
+    if (!OpenClipboard(nullptr)) return out;
+    if (HANDLE h = GetClipboardData(CF_DIB)) {
+        const auto* bih = static_cast<const BITMAPINFOHEADER*>(GlobalLock(h));
+        if (bih && bih->biBitCount == 32 && bih->biCompression == BI_RGB && (out = Bitmap::Create(bih->biWidth, std::abs(bih->biHeight)))) {
+            const int w = out->Width(), rows = out->Height();
+            const auto* px = reinterpret_cast<const uint32_t*>(reinterpret_cast<const BYTE*>(bih) + bih->biSize);
+            for (int y = 0; y < rows; ++y) memcpy(out->Bits() + (size_t)y * w, px + (size_t)(bih->biHeight > 0 ? rows - 1 - y : y) * w, (size_t)w * 4);
+        }
+        GlobalUnlock(h);
+    }
+    CloseClipboard();
+    return out;
+}
+// The "PNG", decoded.
+BitmapPtr ClipboardPng() {
+    std::string bytes;
+    if (!OpenClipboard(nullptr)) return nullptr;
+    if (HANDLE h = GetClipboardData(RegisterClipboardFormatW(L"PNG"))) {
+        if (const auto* p = static_cast<const char*>(GlobalLock(h))) bytes.assign(p, GlobalSize(h));
+        GlobalUnlock(h);
+    }
+    CloseClipboard();
+    const std::wstring file = test::TempDir() + L"\\clipboard.png";
+    return !bytes.empty() && WriteFileUtf8(file, bytes) ? LoadImageFile(file) : nullptr;
+}
+void EmptyTheClipboard() {
+    if (!OpenClipboard(nullptr)) return;
+    EmptyClipboard();
+    CloseClipboard();
+}
+// Pixels that differ between two pictures (color only), or -1 when their sizes do.
+int PixelsDiffer(const Bitmap& a, const Bitmap& b) {
+    if (a.Width() != b.Width() || a.Height() != b.Height()) return -1;
+    int n = 0;
+    for (size_t i = 0, k = (size_t)a.Width() * a.Height(); i < k; ++i) n += (a.Bits()[i] & 0xFFFFFF) != (b.Bits()[i] & 0xFFFFFF);
+    return n;
+}
+// ShownFrame, allowing for a slow first decode (a runner without a GPU can take over two seconds for it).
+std::pair<int, bool> FrameOnScreen(VideoEditor* e) {
+    auto r = ShownFrame(e);
+    for (int i = 0; i < 3 && r.first < 0; ++i) r = ShownFrame(e);
+    return r;
+}
+int MiddleNumber(const Bitmap& f) { return NumberOf(f.Bits()[(size_t)(f.Height() / 2) * f.Width() + f.Width() / 2]); }
+// Every frame of an MP4, in order, by the number painted on it (WriteNumberedClip), and whether it has blue.
+std::vector<std::pair<int, bool>> FrameNumbers(const std::wstring& path) {
+    std::vector<std::pair<int, bool>> v;
+    VideoReader r;
+    if (!r.Open(path)) return v;
+    BitmapPtr f;
+    double t = 0;
+    while (r.Read(&f, &t)) {
+        const uint32_t c = f->Bits()[(size_t)(f->Height() / 2) * f->Width() + f->Width() / 2];
+        v.push_back({NumberOf(c), BlueOf(c)});
+    }
+    return v;
+}
+// An MP4 with H.264 video and AAC sound has their sample entries ('avc1', 'mp4a').
+bool H264AndAac(const std::wstring& path) {
+    std::string bytes;
+    return ReadFileUtf8(path, &bytes) && bytes.find("avc1") != std::string::npos && bytes.find("mp4a") != std::string::npos;
+}
+
+}  // namespace
+
+// The marked range: Shift+drag on the timeline marks one on frame boundaries (a press a third of a frame off still lands
+// on that frame's edge) at two zooms and either way round; it stays inside the trim; its grips drag (showing the frame at
+// that edge); Shift+I / Shift+O set its ends at the playhead; Esc (before its other meanings), a plain click outside it
+// and a change to the clips clear it, and Esc mid-drag puts it back. The edit and the undo stack never change. It's drawn
+// as a lime band with white grips and its label.
+ATHER_TEST(video_editor_marks_a_range_to_copy) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", b = dir + L"\\b60.mp4";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 240, 0));  // 4 s
+    CHECK(WriteNumberedClip(b, 320, 180, 60, 60, 255));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->FramesKnown() && e->tframes.size() >= 230);
+    if (e->tframes.size() < 230) return DestroyWindow(e->hwnd), void();
+    auto T = [&](size_t n) { return e->tframes.frames[n].t; };
+    auto is = [&](size_t n0, size_t n1) { return e->marked && std::fabs(e->marked->start - T(n0)) < 1e-9 && std::fabs(e->marked->end - T(n1)) < 1e-9; };
+    auto X = [&](double t) { return (int)std::lround(e->TX(t)); };
+    e->edit.trimStart = T(20);
+    e->edit.trimEnd = T(220);
+    e->Changed();
+    const VideoEdit before = e->edit;
+    const size_t undoBefore = e->undoStack.size();
+    const RECT tr = e->TimelineRect();
+    const int top = tr.top + e->LaneH(), stripY = top + e->S(30), laneY = top + e->S(73);  // the thumbnails; the caption lane
+    auto shiftDrag = [&](int x0, int x1) {
+        e->OnMouseDown({x0, stripY}, false, true);
+        e->OnMouseMove({(x0 + x1) / 2, stripY}, MK_LBUTTON | MK_SHIFT);
+        e->OnMouseMove({x1, stripY}, MK_LBUTTON | MK_SHIFT);
+        e->OnMouseUp();
+    };
+    for (double zoom : {1.0, 8.0}) {
+        e->tlZoom = 1;
+        e->tlStart = 0;
+        e->GoToFrame(120);
+        if (zoom > 1) e->ZoomTimeline(zoom);
+        const double pf = e->PxPerFrame();
+        test::Note("zoom " + std::to_string(e->tlZoom) + ": " + std::to_string(pf) + " px a frame");
+        // Pixel to time and back: every frame on view, from its x, snaps to its own edge.
+        int wrong = 0;
+        for (size_t n = 1; n + 1 < e->tframes.size(); ++n)
+            if (const int x = X(T(n)); x > tr.left && x < tr.right) wrong += std::fabs(e->SnapEdge(e->TT(x)) - T(n)) > 1e-9;
+        CHECK_EQ(wrong, 0);
+        const int off = std::max(1, (int)std::floor(pf / 3));
+        shiftDrag(X(T(110)) + off, X(T(130)) - off);
+        CHECK(is(110, 130));
+        shiftDrag(X(T(130)) + off, X(T(110)) - off);  // right to left
+        CHECK(is(110, 130));
+        if (zoom > 1) {  // more than half a frame on: the next frame's edge
+            shiftDrag(X(T(110)) + (int)std::ceil(pf * 0.7), X(T(130)) - off);
+            CHECK(is(111, 130));
+        }
+        CHECK(e->drag.kind == VideoEditor::DragKind::None);
+    }
+    // Inside the trim: a drag over the whole timeline stops at the trim's ends.
+    e->tlZoom = 1;
+    e->tlStart = 0;
+    shiftDrag(tr.left + 1, tr.right - 1);
+    CHECK(is(20, 220));
+    // The grips drag without Shift: the end to frame 150 (the editor shows the range's last frame meanwhile), then the
+    // start to frame 60.
+    shiftDrag(X(T(110)), X(T(130)));
+    e->OnMouseDown({X(e->marked ? e->marked->end : 0) + 1, stripY}, false);
+    CHECK(e->drag.kind == VideoEditor::DragKind::Range);
+    e->OnMouseMove({X(T(150)), stripY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(is(110, 150));
+    CHECK_EQ(e->FrameNow(), 149u);
+    e->OnMouseDown({X(e->marked ? e->marked->start : 0) - 1, stripY}, false);
+    e->OnMouseMove({X(T(60)), stripY}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(is(60, 150));
+    CHECK_EQ(e->FrameNow(), 60u);
+    // Shift+I / Shift+O at the playhead; the trim stays.
+    e->GoToFrame(40);
+    e->Key('I', {false, true, false});
+    CHECK(is(40, 150));
+    e->GoToFrame(90);
+    e->Key('O', {false, true, false});
+    CHECK(is(40, 90));
+    e->GoToFrame(25);
+    e->Key('O', {false, true, false});  // before its start: from the trim's start
+    CHECK(is(20, 25));
+    CHECK(e->edit.trimStart == before.trimStart && e->edit.trimEnd == before.trimEnd);
+    // Esc clears it first; then Esc goes on to its other meanings (here: crop mode off).
+    e->cropping = true;
+    e->Key(VK_ESCAPE, {});
+    CHECK(!e->marked && e->cropping);
+    e->Key(VK_ESCAPE, {});
+    CHECK(!e->cropping);
+    // No range yet: Shift+I runs it to the trim's end.
+    e->GoToFrame(50);
+    e->Key('I', {false, true, false});
+    CHECK(is(50, 220));
+    // A plain click inside it moves the playhead and keeps it; outside it, it goes (on any lane).
+    shiftDrag(X(T(60)), X(T(120)));
+    e->OnMouseDown({X(T(90)) + 1, stripY}, false);
+    e->OnMouseUp();
+    CHECK(is(60, 120));
+    e->OnMouseDown({X(T(150)), laneY}, false);
+    e->OnMouseUp();
+    CHECK(!e->marked);
+    // Esc mid-drag puts it back as it was.
+    shiftDrag(X(T(60)), X(T(120)));
+    e->OnMouseDown({X(T(120)) + 1, stripY}, false);
+    e->OnMouseMove({X(T(170)), stripY}, MK_LBUTTON);
+    CHECK(is(60, 170));
+    e->Key(VK_ESCAPE, {});
+    e->OnMouseUp();
+    CHECK(is(60, 120));
+    CHECK(e->MarkedLabel() == L"1.0 s · Ctrl+C copies");
+    // A selection, not an edit.
+    CHECK(e->edit == before);
+    CHECK_EQ(e->undoStack.size(), undoBefore);
+    // Drawn: the caption lane turns lime inside the band only; a white grip on its end.
+    e->GoToFrame(180);  // the playhead's line out of the way
+    const auto snap = Snapshot(e);
+    auto px = [&](int x, int y) { return snap->Bits()[(size_t)y * snap->Width() + x] & 0xFFFFFF; };
+    const int capMid = top + e->S(62) + e->S(11);
+    const uint32_t in = px(X(T(75)), capMid), out = px(X(T(200)), capMid), grip = px(X(T(120)), top + e->S(20));
+    auto G = [](uint32_t c) { return (int)((c >> 8) & 255); };
+    auto B = [](uint32_t c) { return (int)(c & 255); };
+    test::Note("band " + std::to_string(in) + ", outside " + std::to_string(out) + ", grip " + std::to_string(grip));
+    CHECK(G(in) - B(in) > 25 && std::abs(G(out) - B(out)) < 10);
+    CHECK(G(grip) > 200 && B(grip) > 200 && (int)((grip >> 16) & 255) > 200);
+    // A change to the clips clears it.
+    e->AddClips({b});
+    CHECK(!e->marked);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Copy clip: Ctrl+C with a marked range saves that part of the edit as an MP4 in the captures folder (H.264 + AAC, the
+// range's length, the range's frames in order: compared with the frames the editor shows at its ends) and puts that file,
+// and only it, on the clipboard (CF_HDROP). A second Ctrl+C while it saves is ignored; the edit and the range stay. With
+// the clipboard held by another program the file is still saved, just not on the clipboard.
+ATHER_TEST(video_editor_copies_the_marked_range_as_a_clip) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\shot.mp4", caps = dir + L"\\caps";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 240, 0, true));
+    const CapturesFolderForTest folder(caps);
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->tframes.size() >= 200);
+    if (e->tframes.size() < 200) return DestroyWindow(e->hwnd), void();
+    const VideoEdit before = e->edit;
+    e->GoToFrame(159);
+    const auto last = FrameOnScreen(e);
+    e->GoToFrame(40);
+    const auto first = FrameOnScreen(e);
+    e->Key('I', {false, true, false});
+    e->GoToFrame(160);
+    e->Key('O', {false, true, false});
+    CHECK(e->marked && std::fabs(e->marked->end - e->marked->start - (e->tframes.frames[160].t - e->tframes.frames[40].t)) < 1e-9);
+    const double length = e->marked ? e->marked->end - e->marked->start : 0;
+    EmptyTheClipboard();
+    e->Key('C', {true, false, false});
+    CHECK(e->busy);
+    e->Key('C', {true, false, false});  // ignored while it saves
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    test::Note("copy error: " + ToUtf8(e->lastSaveError) + " → " + ToUtf8(e->lastCopiedClip));
+    CHECK(!e->busy && e->lastSaveError.empty());
+    const std::wstring out = e->lastCopiedClip;
+    const auto files = RecentCaptures(caps, 10, true);
+    CHECK(files.size() == 1 && _wcsicmp(files[0].c_str(), out.c_str()) == 0);
+    CHECK(e->lastClipOnClipboard);
+    const auto copied = ClipboardFiles();
+    CHECK(copied.size() == 1 && _wcsicmp(copied[0].c_str(), out.c_str()) == 0);
+    VideoInfo vi;
+    CHECK(ProbeVideo(out, &vi) && vi.hasAudio && vi.w == 320 && vi.h == 180);
+    CHECK(H264AndAac(out));
+    // As long as the range: its video from the first frame's start to the last one's end (the file as a whole may run
+    // on by the sound's last AAC packet).
+    const std::vector<double> times = FrameTimes(out);
+    const double video = times.empty() ? 0 : times.back() - times.front() + 1 / 60.0;
+    test::Note("video " + std::to_string(video) + " s, file " + std::to_string(vi.duration) + " s, for a range of " + std::to_string(length) + " s");
+    CHECK(std::fabs(video - length) <= 1 / 60.0 + 1e-6);
+    CHECK(std::fabs(vi.duration - length) < 0.05);
+    const auto frames = FrameNumbers(out);
+    test::Note(std::to_string(frames.size()) + " frames, " + (frames.empty() ? std::string("none") : std::to_string(frames.front().first) + "…" + std::to_string(frames.back().first)) +
+               "; the editor shows " + std::to_string(first.first) + "…" + std::to_string(last.first));
+    CHECK_EQ(frames.size(), 120u);
+    CHECK(!frames.empty() && frames.front() == first && frames.back() == last);
+    CHECK(e->edit == before);
+    CHECK(e->marked.has_value());
+    // The clipboard held by another program: saved all the same, not on the clipboard, and nothing else goes wrong.
+    std::atomic<int> held{0};
+    std::thread holder([&] {
+        if (!OpenClipboard(nullptr)) return held.store(-1);
+        held = 1;
+        while (held == 1) Sleep(5);
+        CloseClipboard();
+    });
+    while (held == 0) Sleep(1);
+    CHECK_EQ(held.load(), 1);
+    e->Key('C', {true, false, false});
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    if (held == 1) held = 2;
+    holder.join();
+    CHECK(!e->busy && e->lastSaveError.empty() && !e->lastClipOnClipboard);
+    CHECK_EQ(RecentCaptures(caps, 10, true).size(), 2u);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Copy clip with no range: the clip selected in the clip lane, as edited (from its in point, to the trim's end inside
+// it): its frames, as the editor shows them, and nothing of the clip before it.
+ATHER_TEST(video_editor_copies_the_selected_clip) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a.mp4", b = dir + L"\\b.mp4", caps = dir + L"\\caps";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0, true));
+    CHECK(WriteNumberedClip(b, 320, 180, 60, 120, 255, true));
+    const CapturesFolderForTest folder(caps);
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->AddClips({b});
+    e->TrimClip(1, 0.5, std::nullopt);  // b from half a second in
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    e->edit.trimEnd = e->duration - 0.5;  // and the trim ends half a second before its end
+    e->Changed();
+    CHECK(e->edit.clips.size() == 2 && e->FramesKnown());
+    if (e->edit.clips.size() != 2) return DestroyWindow(e->hwnd), void();
+    e->SelectClip(e->edit.clips[1].id);
+    CHECK(!e->marked && e->CanCopyClip());
+    const size_t f0 = e->tframes.clipFirst[1], f1 = e->tframes.At(e->edit.trimEnd - 1e-3);
+    e->GoToFrame(f1);
+    const auto last = FrameOnScreen(e);
+    e->GoToFrame(f0);
+    const auto first = FrameOnScreen(e);
+    CHECK(first.second && last.second);  // both from b
+    e->Key('C', {true, false, false});
+    for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
+    test::Note("copy error: " + ToUtf8(e->lastSaveError));
+    CHECK(!e->busy && e->lastSaveError.empty());
+    const auto frames = FrameNumbers(e->lastCopiedClip);
+    test::Note(std::to_string(frames.size()) + " frames for timeline frames " + std::to_string(f0) + "…" + std::to_string(f1));
+    CHECK_EQ(frames.size(), f1 - f0 + 1);
+    CHECK(!frames.empty() && frames.front() == first && frames.back() == last);
+    CHECK(std::all_of(frames.begin(), frames.end(), [](const auto& f) { return f.second; }));  // none of a
+    const auto copied = ClipboardFiles();
+    CHECK(copied.size() == 1 && _wcsicmp(copied[0].c_str(), e->lastCopiedClip.c_str()) == 0);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Copy frame: with nothing picked Ctrl+C, and Ctrl+Shift+C at any time (also with a range marked), put the frame on
+// screen on the clipboard as CF_DIB and PNG, pixel for pixel FrameRenderer's frame for the export (here cropped, with a
+// caption and a box on it) at the export's size, and the very frame an export starting there renders. Nothing is saved.
+// Save ▾ lists Copy clip and Copy frame. A text field with focus keeps Ctrl+C for its own text.
+ATHER_TEST(video_editor_copies_the_frame_on_screen) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"\\a60.mp4", caps = dir + L"\\caps";
+    CHECK(WriteNumberedClip(a, 320, 180, 60, 120, 0));
+    const CapturesFolderForTest folder(caps);
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    for (int i = 0; i < 300 && !e->FramesKnown(); ++i) Pump(10);
+    CHECK(e->tframes.size() >= 100);
+    if (e->tframes.size() < 100) return DestroyWindow(e->hwnd), void();
+    e->GoToFrame(60);
+    FrameOnScreen(e);
+    e->AddCaption();
+    e->edit.captions.back().text = L"Copied frame";
+    const uint64_t caption = e->edit.captions.back().id;
+    e->AddMark(MarkKind::Box);
+    e->edit.crop = VRect{40, 20, 240, 140};
+    e->Select(std::nullopt);
+    e->Changed();
+    SetFocus(e->hwnd);
+    auto copyFrame = [&](size_t n, bool shift) {
+        e->GoToFrame(n);  // pressed right away: it waits for that frame
+        e->lastCopiedFrame.reset();
+        EmptyTheClipboard();
+        e->Key('C', {true, shift, false});
+        for (int i = 0; i < 300 && !e->lastCopiedFrame; ++i) Pump(10);
+        return e->lastCopiedFrame;
+    };
+    auto check = [&](size_t n) {
+        CHECK_EQ(e->FrameNow(), n);
+        CHECK(e->raw && e->tframes.Nearest(e->rawT) == n);
+        if (!e->raw) return;
+        const BitmapPtr want = FrameRenderer(e->edit, e->videoSize, false).Render(*e->raw, e->paused);
+        CHECK(want->Width() == 240 && want->Height() == 140);  // the export's size: the crop
+        const BitmapPtr dib = ClipboardDib(), png = ClipboardPng();
+        CHECK(dib && PixelsDiffer(*dib, *want) == 0);
+        CHECK(png && PixelsDiffer(*png, *want) == 0);
+        if (!dib) return;
+        CHECK_EQ(MiddleNumber(*dib), FrameOnScreen(e).first);  // the frame on screen
+        VideoEdit plain = e->edit;
+        plain.captions.clear();
+        plain.marks.clear();
+        const int drawn = PixelsDiffer(*dib, *FrameRenderer(plain, e->videoSize, false).Render(*e->raw, e->paused));
+        test::Note("caption and box: " + std::to_string(drawn) + " pixels");
+        CHECK(drawn > 300);
+    };
+    CHECK(copyFrame(75, false));
+    check(75);
+    // The frame an export starting at that frame renders (before encoding) is that same picture.
+    {
+        VideoEdit one = e->edit;
+        one.trimStart = e->tframes.frames[75].t;
+        one.trimEnd = one.trimStart + 0.05;
+        std::mutex mu;
+        BitmapPtr exported;
+        g_exportTap = [&](int i, const Bitmap& f) {
+            std::lock_guard l(mu);
+            if (i != 0 || !(exported = Bitmap::Create(f.Width(), f.Height()))) return;
+            memcpy(exported->Bits(), f.Bits(), (size_t)f.Width() * f.Height() * 4);
+        };
+        std::wstring err;
+        CHECK(ExportMp4(a, one, dir + L"\\one.mp4", &err));
+        g_exportTap = nullptr;
+        const int d = exported && e->lastCopiedFrame ? PixelsDiffer(*exported, *e->lastCopiedFrame) : -2;
+        test::Note("export's frame vs the copy: " + std::to_string(d) + " pixels differ");
+        CHECK_EQ(d, 0);
+    }
+    // With a range marked, Ctrl+Shift+C still copies the frame (no clip is made).
+    e->GoToFrame(30);
+    e->Key('I', {false, true, false});
+    e->GoToFrame(90);
+    e->Key('O', {false, true, false});
+    CHECK(e->marked.has_value());
+    CHECK(copyFrame(80, true));
+    check(80);
+    CHECK(!e->busy && RecentCaptures(caps, 10, true).empty());
+    // Save ▾: Copy clip (with a range or a selected clip) and Copy frame.
+    auto item = [&](const std::wstring& label) {
+        const auto menu = e->SaveMenu();
+        const auto it = std::find_if(menu.begin(), menu.end(), [&](const MenuItem& m) { return m.label == label; });
+        return it == menu.end() ? -1 : (int)it->enabled;
+    };
+    CHECK_EQ(item(L"Copy clip\tCtrl+C"), 1);
+    CHECK_EQ(item(L"Copy frame\tCtrl+Shift+C"), 1);
+    e->Key(VK_ESCAPE, {});
+    CHECK_EQ(item(L"Copy clip\tCtrl+C"), 0);
+    // The caption's field has focus: Ctrl+C there copies its text, not a frame.
+    e->Select(caption);
+    e->FocusField();
+    SetWindowTextW(e->field1, L"Copied frame");
+    SendMessageW(e->field1, EM_SETSEL, 0, -1);
+    EmptyTheClipboard();
+    e->lastCopiedFrame.reset();
+    BYTE keys[256];
+    GetKeyboardState(keys);
+    const BYTE ctrl = keys[VK_CONTROL];
+    keys[VK_CONTROL] |= 0x80;
+    SetKeyboardState(keys);
+    SendMessageW(e->field1, WM_KEYDOWN, 'C', 0);
+    SendMessageW(e->field1, WM_CHAR, 3, 0);  // Ctrl+C as TranslateMessage hands it to the field
+    keys[VK_CONTROL] = ctrl;
+    SetKeyboardState(keys);
+    Pump(100);
+    CHECK(ClipboardText() == L"Copied frame");
+    CHECK(!e->lastCopiedFrame && !IsClipboardFormatAvailable(CF_DIB));
+    CHECK(!e->busy && RecentCaptures(caps, 10, true).empty());
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

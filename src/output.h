@@ -4,8 +4,8 @@
 namespace ather {
 
 // Pixels are premultiplied BGRA. An image with transparency is copied flattened onto white (CF_DIB) and also
-// as "PNG" with its alpha, which most apps prefer.
-bool CopyImageToClipboard(HWND owner, const Bitmap& img);
+// as "PNG" with its alpha, which most apps prefer. `withPng`: an opaque one goes as "PNG" too.
+bool CopyImageToClipboard(HWND owner, const Bitmap& img, bool withPng = false);
 bool HasAlpha(const Bitmap& img);
 BitmapPtr Flatten(const Bitmap& img, COLORREF bg = RGB(255, 255, 255));
 std::vector<BYTE> EncodePng(const Bitmap& img);

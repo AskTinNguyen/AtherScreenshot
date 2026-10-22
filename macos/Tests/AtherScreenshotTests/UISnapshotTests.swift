@@ -73,6 +73,47 @@ final class UISnapshotTests: XCTestCase {
         e.window.close()
     }
 
+    // The capture tray: five pictures, the third current with notes, the second unticked, the fourth saved, the
+    // fifth with unsaved changes, the mouse over the first (its ×).
+    func testEditorTray() throws {
+        try XCTSkipIf(out == nil)
+        func card(_ w: Int, _ h: Int, _ a: NSColor, _ b: NSColor, _ title: String) -> CGImage {
+            let ctx = makeContext(width: w, height: h)!
+            let g = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: [a.cgColor, b.cgColor] as CFArray, locations: [0, 1])!
+            ctx.drawLinearGradient(g, start: .zero, end: CGPoint(x: w, y: h), options: [])
+            ctx.setFillColor(NSColor.white.withAlphaComponent(0.92).cgColor)
+            ctx.addPath(CGPath(roundedRect: CGRect(x: w / 12, y: h / 6, width: w * 5 / 6, height: h * 2 / 3), cornerWidth: 18, cornerHeight: 18, transform: nil))
+            ctx.fillPath()
+            withNSContext(ctx, flipped: true) {
+                NSAttributedString(string: title, attributes: [.font: NSFont.systemFont(ofSize: CGFloat(h) / 12, weight: .bold), .foregroundColor: NSColor.black])
+                    .draw(at: CGPoint(x: w / 8, y: h / 4))
+            }
+            return ctx.makeImage()!
+        }
+        let e = Editor.capture(card(1600, 900, .systemTeal, .systemBlue, "Weekly revenue"), scale: 2, info: NameInfo(), tray: true)
+        e.window.setContentSize(NSSize(width: 1150, height: 780))
+        e.add(card(1600, 1000, .systemRed, .systemOrange, "Payment failed"))
+        e.add(card(1400, 900, .systemGreen, .systemTeal, "Release notes"))
+        e.add(card(1800, 1000, .systemYellow, .systemOrange, "Build 0.0.2.4"))
+        e.add(card(900, 1400, .systemIndigo, .systemPurple, "Sign in"))
+        e.canvas.pushUndo()   // the fifth: changes not saved yet
+        e.canvas.state.annots.append(Annot(tool: .rect, color: 0, level: 2, unit: 2, pts: [CGPoint(x: 100, y: 260), CGPoint(x: 800, y: 520)]))
+        e.canvas.changed(pixels: false)
+        e.select(2)
+        e.canvas.state.annots += [
+            Annot(tool: .arrow, color: 0, level: 2, unit: 2, pts: [CGPoint(x: 1050, y: 700), CGPoint(x: 800, y: 380)]),
+            Annot(tool: .step, color: 0, level: 2, unit: 2, pts: [CGPoint(x: 140, y: 160)], step: 1),
+            Annot(tool: .text, color: 0, level: 2, unit: 2, pts: [CGPoint(x: 700, y: 730)], text: "New: export to PDF"),
+        ]
+        e.canvas.changed(pixels: false)
+        e.toggleKeep(1)
+        e.tray[3].saved = true
+        e.strip.hover = (0, .picture)
+        snap(e.window.contentView!, "ui-editor-tray")
+        e.dirty = false
+        e.window.close()
+    }
+
     func testCollageEditor() throws {
         try XCTSkipIf(out == nil)
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ather-collage-\(UUID().uuidString)")

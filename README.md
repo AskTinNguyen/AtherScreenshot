@@ -46,10 +46,13 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 |---|---|
 | 📸 **Capture** | Region, window, full screen, scrolling pages, delay timer, screen ruler, color picker, OCR text, and auto-redaction of emails, keys and card numbers |
 | ✏️ **Annotate** | Arrows, shapes, text, steps, highlighter, blur and pixelate, spotlight, magnifier, crop and styled export |
+| 🎞️ **Capture tray** | Keep capturing into one editor: a strip of thumbnails along its bottom, each picture with its own notes and undo, and the ones you tick saved together |
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
+| 🐞 **Bug reports** | Say "bug start", describe the bug, say "bug stop": one folder with the screenshot and what you said on it, a clip of the recording, your narration and the game's logs ([how](#bug-reports)) |
 | 🔍 **Review video** | Step 60 fps recordings frame by frame, leave notes on exact frames, and save a review video with the notes in it for another team (Windows) |
+| 📋 **Copy a clip** | Mark part of a video and press `Ctrl+C` (`⌘C`): it's saved as an MP4 and put on the clipboard, ready to paste into Slack. Or copy the frame on screen as a picture |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3), and compress a video or picture to under 8, 25 or 50 MB (or any size) for chat apps and email |
@@ -71,6 +74,7 @@ OCR, tags and search run on your computer. Upload is off until you set it up. Au
 | Capture and upload | `⌃⌥U` | `Ctrl+Alt+U` |
 | Capture gallery | `⌃⌥H` | `Ctrl+Alt+H` |
 | Record MP4 / GIF (press again to stop) | `⌃⌥5` / `⌃⌥G` | `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` |
+| Bug report: start / stop | `⌃⌥B` | `Ctrl+Alt+B` |
 
 macOS reserves `⌘⇧3/4/5`, so the Mac defaults use `⌃⌥`. In the gallery and editors, `Ctrl` on Windows replaces `⌘` on the Mac.
 
@@ -116,7 +120,23 @@ Other shortcuts:
 - `Ctrl+R` auto-redact (adds editable pixelate boxes).
 - `Ctrl+E` styled export: gradient backdrop, padding, rounded corners and a shadow.
 - `Ctrl+Shift+C` / `Ctrl+Shift+V` copy or paste annotations between editors.
+- `Ctrl+Tab` / `Ctrl+Shift+Tab` (or `Ctrl+PageDown` / `Ctrl+PageUp`) go to the next or previous picture of a capture tray.
 - `Ctrl+K` lists every editor command.
+
+#### Capture tray
+
+Take many screenshots without saving each one: they collect in one editor, in a strip of thumbnails along its bottom edge.
+- **Which captures join:** Capture and annotate (`Ctrl+Alt+E`), and every capture when After capture is "Open in editor". To collect every capture, set Settings › Capture › After capture to **Open in editor**. With an editor open, the next capture joins it instead of opening a new window, and becomes the picture you're editing.
+- **What doesn't join:** a picture opened from the gallery, from Explorer or from the capture notification opens in its own window. So does a collage, and so do recordings.
+- **The strip:** it shows from two pictures on. Click a thumbnail to open that picture; the one you're editing has a lime outline. The wheel scrolls the strip when it's full.
+- **Each picture keeps its own notes:** annotations, step numbers, crop, added space, undo and redo all stay with their picture. Tool, color and size stay with the window.
+- **Ticks:** new captures come ticked. Untick the pictures you don't want to keep.
+- **Marks:** a white dot means the picture has changes that aren't saved. "✓ Saved" means it's in your captures folder. × removes a picture (it asks first if the picture has changes).
+- **Save selected (n):** saves every ticked picture that isn't saved yet, each as its own PNG in your captures folder, with its notes. They join the gallery with the app and window they came from. `Ctrl+S`, `Ctrl+C`, `Ctrl+P` and styled export still act on the picture you're editing.
+- **Done (`Enter`):** saves the ticked pictures, copies the current one and closes. It asks first if a picture that isn't ticked would be lost.
+- **Closing:** closing the window with pictures that aren't saved asks first: **Save selected and close**, **Close without saving** or **Cancel**.
+- **Limits:** a tray holds up to 100 pictures. The next capture opens a new window. Pictures in a tray aren't kept after you quit, so save the ones you want.
+- **Turning it off:** turn off Settings › Capture › **Collect captures in one editor** (`[Editor] Tray=0`) to get one window per capture again.
 
 #### Editor extras
 
@@ -145,6 +165,26 @@ Select a region, or use "Record a window", which follows one window wherever it 
 - **Click and keystroke overlay:** click ripples (`ShowClicks`) and a keystroke pill (`ShowKeys`, off by default because it would show anything you type, including passwords).
 - **Game controller overlay:** with "Show game controller" on (`ShowGamepad`), a connected Xbox-style (XInput) controller is drawn in a corner of the video, like OBS's Input Overlay: a white controller whose sticks move, triggers fill and buttons light up as you use them. Pick the corner with `GamepadCorner` and how visible it is with "Controller opacity" (`GamepadOpacity`, 10–100%). Nothing is drawn while no controller is connected. PlayStation controllers show up when Steam Input or DS4Windows presents them as XInput.
 - When a recording finishes, the file is copied to the clipboard so you can paste it into chats.
+
+### Bug reports
+
+For playtests: while the game is recorded, say "bug start", describe the bug, then say "bug stop". Ather Screenshot makes one folder for the bug, and you keep playing.
+
+- **Start and stop:** say "bug start" and "bug stop", or press `Ctrl+Alt+B` once to start and again to stop ("Bug report: start / stop" in the palette). "Bug cancel" throws the bug away. A bug left open stops itself after 2 minutes. A short "Bug started" / "Bug saved" notification shows each step without taking focus from the game.
+- **Listening is opt-in:** turn on Settings › Bug reports › **Listen for "bug start" / "bug stop"** (`[Bugs] VoiceCommands`). It keeps the microphone open while it's on, and the tray icon's tooltip says so. Windows speech recognition does the listening on this PC; nothing is uploaded. The shortcut works with listening off, but then nothing you say is written down.
+- **What's in the folder** (`<captures>\Bugs\<date time> <first words>\`):
+  - `bug.png`: the screenshot from "bug start" with a bar along the bottom: `BUG · date time · app`, then what you said (up to 6 lines).
+  - `screenshot.png`: the same screenshot without the bar. It shows what's being recorded, or else the monitor with the game.
+  - `clip.mp4`: with a recording running, from 10 s before "bug start" (`[Bugs] PreRollSeconds`) to "bug stop", with what you said as captions. A recording can't be read while it runs, so the clip is made when you stop it; until then `bug.md` says "Clip: when the recording stops". Pauses are left out of the times, as in the recording.
+  - `voice.wav`: what the microphone heard between "bug start" and "bug stop", so nothing is lost, also in a language Windows can't write down.
+  - `logs\`: the game's logs (below).
+  - `bug.md` for people and `bug.json` for tools: the title (the first sentence), time, app and window, what was said with each word's time, the recording and the bug's place in it, and the files.
+- **Game logs:** Settings › Bug reports › **Game log paths** (`[Bugs] LogPaths`) takes files, folders or wildcards separated by `;`, with environment variables, e.g. `%LOCALAPPDATA%\MyGame\Saved\Logs\*.log`.
+  - At "bug stop" each file named is copied, also while the game is still writing it.
+  - From a folder or wildcard come the files changed in the last 30 minutes, or the newest one if none was (at most 20).
+  - A log over `[Bugs] LogMaxMB` (20 MB) keeps only its end, and `bug.json` says so. A path that matches nothing is listed in `bug.md`.
+- **In the recording:** each bug is also an Issue note over its stretch of the recording (`<video>.notes.json`), so the video editor shows it on its frames.
+- **Sharing:** "Copy last bug report" puts `bug.png`, `clip.mp4`, `bug.md` and up to 10 logs on the clipboard as files, ready to paste into Slack. Click "Bug saved" to open the bug's folder, or use "Open bug reports folder". The pictures and the clip show in the gallery tagged `bug`.
 
 ### Video editor
 
@@ -188,13 +228,19 @@ Opening a video (from the gallery, the "Recording saved" notification, Open rece
   - Notes are kept next to the video as you go, in `<video file name>.notes.json` (plain JSON other tools can read), so they're there next time you open it, also when the video is joined with others or trimmed. The video itself is never changed, and notes are never part of Save.
   - **Copy** in the notes list copies them as text, one line each: `0:12:37 (frame 757), Tin: [Issue] Muzzle flash missing`.
 - **Review video:** Save ▾ › **Save review video** (`Ctrl+Alt+S`) writes `<video> review.mp4` for the other team: a 3-second summary card, then your edit with the timecode and frame number in the corner, and at each note its frame held for 3 seconds (silent) under a card with the note, its kind, author and frame, and its pin. Next to it come `<video> review notes.md` (the same lines as Copy) and `<video> review sheet.png`, a contact sheet with one picture per note to post in a chat.
+- **Copy a clip or a frame (to paste into Slack):**
+  - Shift+drag on the timeline marks a range: a lime band with its length, `6.2 s · Ctrl+C copies`. Or press Shift+I and Shift+O at the playhead (I and O alone still set the trim). It sits on whole frames inside the trim; drag its edges to change it; Esc or a click outside it clears it. It's only a selection: it isn't undone, saved or part of Save.
+  - **Ctrl+C** saves the marked part of your edit (crop, speed, captions and markup, as Save would write it) as an MP4 in your captures, stacked with the original in the gallery, and puts the file on the clipboard. Ctrl+V in Slack, Teams, Discord or Explorer attaches it. A toast says how long and how big it is; click it to see the file.
+  - With nothing marked, Ctrl+C copies the clip selected in the clip lane (from its in to its out, inside the trim), or else the frame on screen.
+  - **Ctrl+Shift+C** always copies the frame on screen as a picture, at the video's full size (cropped, with its captions and markup), not saved to a file.
+  - Both are in Save ▾ too: Copy clip and Copy frame. While you type in a caption or note, Ctrl+C copies that text as usual.
 - **Saving:**
   - **Save** (`Ctrl+S`) writes a new MP4 (H.264 + AAC).
   - **Save GIF** (`Ctrl+Shift+S`) writes a GIF (12 fps, at most 960 px).
   - Saving is quick: the video is decoded on the graphics card, frames are drawn on all cores (only the parts your edits change), and longer videos are encoded in two or three pieces at once and joined.
   - The original stays untouched, and the result stacks with it in the gallery.
 
-Space plays, ←/→ step a frame (`Shift`: a second), `Home`/`End` go to the trim's ends, `J`/`K`/`L` play backward, pause and play forward (again: 0.25×, 0.5×, 1×), `Ctrl+G` goes to a frame or time, `M` adds a note, `[`/`]` go to the previous and next note, `Ctrl+wheel` or `Ctrl+=`/`Ctrl+−` zoom the timeline (`Ctrl+0` fits the trim), the wheel over the video magnifies it (`F` fits), `Del` deletes the selected item, `Ctrl+Z` undoes, `Ctrl+S` saves, `Ctrl+Shift+S` saves a GIF, `Ctrl+Alt+S` saves a review video (in the editor it wins over the scrolling-capture shortcut), `Esc` leaves crop, then deselects, then closes.
+Space plays, ←/→ step a frame (`Shift`: a second), `Home`/`End` go to the trim's ends, `J`/`K`/`L` play backward, pause and play forward (again: 0.25×, 0.5×, 1×), `Ctrl+G` goes to a frame or time, `M` adds a note, `[`/`]` go to the previous and next note, `Ctrl+wheel` or `Ctrl+=`/`Ctrl+−` zoom the timeline (`Ctrl+0` fits the trim), the wheel over the video magnifies it (`F` fits), `Del` deletes the selected item, `Ctrl+Z` undoes, `Ctrl+S` saves, `Ctrl+Shift+S` saves a GIF, `Ctrl+Alt+S` saves a review video (in the editor it wins over the scrolling-capture shortcut), `Shift`+drag on the timeline or `Shift+I`/`Shift+O` mark a range, `Ctrl+C` copies it as a clip (with no range: the selected clip, else the frame), `Ctrl+Shift+C` copies the frame, `Esc` clears the range, then leaves crop, then deselects, then closes.
 
 ### Compress to a smaller file
 
@@ -341,9 +387,14 @@ How the Windows app differs from the Mac app:
   - The emoji field uses Win+. for the full picker.
   - The selected item shows fully while paused (the Mac version shows its first, faded frame).
   - Frame review (exact frame stepping, the frame readout, J/K/L, timeline zoom, the magnifier, review notes and the review video) is on Windows only for now.
+  - Copy clip and Copy frame are in Save ▾ on Windows and in a Copy menu next to Save on the Mac. The Mac's copied clip is H.264 (its Save writes HEVC), and its range snaps to the first clip's frame rate rather than each frame's own time.
 - **Recording:**
   - System audio and microphone are mixed into one AAC track (two tracks on the Mac).
   - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.
+- **Bug reports:**
+  - Windows recognizes "bug start" / "bug stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses on-device speech recognition.
+  - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it writes `voice.wav` down as Vietnamese on the Mac when the Mac can, and sends it to Apple only when it can't. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
+  - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 
 ## Build from source

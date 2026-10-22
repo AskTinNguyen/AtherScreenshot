@@ -82,6 +82,16 @@ enum VideoExport {
         return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
 
+    // One frame of the edit as the export draws it (crop, captions and markup at timeline time `t`), at the export's size.
+    static func frame(_ e: VideoEdit, at t: Double) async throws -> CGImage {
+        let b = try await VideoSequence.build(e.clips, frame: e.frame, box: RendererBox(FrameRenderer(edit: e, full: e.frame, preview: false)))
+        let gen = AVAssetImageGenerator(asset: b.composition)
+        gen.videoComposition = b.video
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        return try await gen.image(at: CMTime(seconds: t, preferredTimescale: VideoSequence.timeScale)).image
+    }
+
     static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill,
                                   color: NSColor = .white, edge: NSColor = .black) -> [NSAttributedString.Key: Any] {
         let p = NSMutableParagraphStyle()
@@ -202,6 +212,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private let aspectPopup = NSPopUpButton()
     private let addPopup = NSPopUpButton(frame: .zero, pullsDown: true)
     let smallerMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Save smaller ▸ Under 30 / 8 / 25 / 50 MB, Other size…
+    let copyMenu = NSPopUpButton(frame: .zero, pullsDown: true)      // Copy ▸ Copy clip ⌘C, Copy frame ⌘⇧C
+    var pasteboard = NSPasteboard.general                             // where ⌘C puts things (tests pass their own)
+    // The marked range (⇧-drag on the timeline, ⇧I / ⇧O): the part ⌘C copies as a clip. A selection, not an edit: on frame
+    // boundaries, inside the trim, never in undo or Save. Esc, a plain click outside it or a change to the clips clears it.
+    var marked: Range<Double>? { didSet { timeline.needsDisplay = true } }
+    private(set) var lastCopiedClip: URL?       // tests
+    private(set) var lastCopiedFrame: CGImage?
     private let muteButton = NSButton()
     private let cropButton = NSButton()
     private let inspector = NSStackView()
@@ -356,6 +373,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         smallerMenu.bezelStyle = .recessed
         smallerMenu.toolTip = "Save the edit as an MP4 that fits a size: Discord, email or any limit you type"
         rebuildSmallerMenu()
+        buildCopyMenu()
         let gif = barButton("Save GIF", "photo.stack", "Save as a GIF (⌘⇧S)") { [weak self] in self?.save(gif: true) }
         let save = NSButton(title: "Save", target: nil, action: nil)
         save.bezelStyle = .rounded
@@ -371,13 +389,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
         hint.font = Theme.font(11)
         hint.textColor = Theme.muted
-        hint.stringValue = "Space plays · I and O trim · S split · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · drop videos to join them"
+        hint.stringValue = "Space plays · I and O trim · S split · ⇧-drag mark · ⌘C copy · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · drop videos to join them"
 
         playButton.bezelStyle = .regularSquare
         playButton.isBordered = false
@@ -789,8 +807,10 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         duration = VideoSequence.total(edit.clips)
         if edit.clips != builtClips, !edit.clips.isEmpty {
             builtClips = edit.clips
+            marked = nil   // its times would now show other footage
             Task { @MainActor in await self.rebuildPlayer() }
         }
+        if let m = marked { setMarked(m.lowerBound, m.upperBound) }   // still inside the trim
         if timelineHeight.constant != timeline.wantedHeight { timelineHeight.constant = timeline.wantedHeight }
         player.isMuted = edit.muted
         stage.needsDisplay = true
@@ -1162,6 +1182,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             switch code {
             case kVK_ANSI_O: addClipDialog()
             case kVK_ANSI_S: save(gif: shift)
+            case kVK_ANSI_C: shift ? copyFrame() : copyPicked()
             case kVK_ANSI_Z: undo()
             case kVK_ANSI_W: window.performClose(nil)
             default: return false
@@ -1173,8 +1194,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         case kVK_LeftArrow: step(shift ? -30 : -1)
         case kVK_RightArrow: step(shift ? 30 : 1)
         case kVK_ANSI_S: splitAtPlayhead()
-        case kVK_ANSI_I: pushUndo(); setTrim(start: now)
-        case kVK_ANSI_O: pushUndo(); setTrim(end: now)
+        case kVK_ANSI_I: if shift { markAtPlayhead(start: true) } else { pushUndo(); setTrim(start: now) }   // ⇧: the marked range
+        case kVK_ANSI_O: if shift { markAtPlayhead(start: false) } else { pushUndo(); setTrim(end: now) }
         case kVK_ANSI_T: addCaption()
         case kVK_ANSI_A: addMark(.arrow)
         case kVK_ANSI_R: addMark(.box)
@@ -1185,7 +1206,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         case kVK_ANSI_C: cropping.toggle()
         case kVK_Delete, kVK_ForwardDelete: deleteSelected()
         case kVK_Escape:
-            if cropping { cropping = false } else if selected != nil { selected = nil } else { window.performClose(nil) }
+            if marked != nil { marked = nil } else if cropping { cropping = false } else if selected != nil { selected = nil } else { window.performClose(nil) }
         default: return false
         }
         return true
@@ -1230,6 +1251,139 @@ extension VideoEditor: NSTextFieldDelegate {
             return true
         }
         return false
+    }
+}
+
+// MARK: - Copy (⌘C): the marked range or the selected clip as an H.264 clip, or the frame on screen
+
+extension VideoEditor: NSMenuDelegate {
+    // Copy ▾ next to Save: both copies, so the keys can be found.
+    fileprivate func buildCopyMenu() {
+        copyMenu.bezelStyle = .recessed
+        copyMenu.toolTip = "Copy the marked range (⇧-drag on the timeline) or the selected clip as an MP4 to paste into Slack, or the frame on screen as a picture"
+        let menu = copyMenu.menu!
+        menu.autoenablesItems = false
+        menu.delegate = self
+        menu.addItem(withTitle: "Copy", action: nil, keyEquivalent: "")
+        copyMenu.item(at: 0)?.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy")
+        let entries: [(String, String, () -> Void)] = [("Copy clip    ⌘C", "film", { [weak self] in self?.copyPicked() }),
+                                                       ("Copy frame    ⌘⇧C", "photo", { [weak self] in self?.copyFrame() })]
+        for (title, symbol, run) in entries {
+            let it = NSMenuItem(title: title, action: #selector(MenuAction.fire), keyEquivalent: "")
+            it.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            let a = MenuAction(run)
+            actions.append(a)
+            it.target = a
+            menu.addItem(it)
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === copyMenu.menu { copyMenu.item(at: 1)?.isEnabled = canCopyClip }   // Copy clip: with a range or a selected clip
+    }
+
+    // The timeline's frame rate: the first clip's, as the preview and the export step through it (at most 60).
+    var frameRate: Double { edit.clips.first.map { $0.fps > 1 ? min(60, $0.fps.rounded()) : 30 } ?? 30 }
+
+    // The frame boundary nearest `t` (the end of the timeline counts as one).
+    func snapEdge(_ t: Double) -> Double {
+        let f = min(duration, (t * frameRate).rounded() / frameRate)
+        return abs(duration - t) < abs(f - t) ? duration : f
+    }
+
+    // From `a` to `b` (either way round), inside the trim; none when that leaves less than a frame.
+    func setMarked(_ a: Double, _ b: Double) {
+        let from = max(min(a, b), edit.trimStart), to = min(max(a, b), edit.trimEnd)
+        marked = to - from < 0.5 / frameRate ? nil : from..<to
+    }
+
+    // ⇧I / ⇧O: the range starts or ends at the playhead, as I and O set the trim. The other end stays, or is the trim's
+    // when there's no range yet or it would come out empty.
+    func markAtPlayhead(start: Bool) {
+        let t = snapEdge(now)
+        var from = marked?.lowerBound ?? edit.trimStart, to = marked?.upperBound ?? edit.trimEnd
+        if start {
+            from = t
+            if to <= from { to = edit.trimEnd }
+        } else {
+            to = t
+            if to <= from { from = edit.trimStart }
+        }
+        setMarked(from, to)
+    }
+
+    // "6.2 s · ⌘C copies": how long the copied clip runs (at the edit's speed).
+    var markedLabel: String { marked.map { "\(lengthText(($0.upperBound - $0.lowerBound) / edit.speed)) · ⌘C copies" } ?? "" }
+    func lengthText(_ s: Double) -> String { s < 60 ? String(format: "%.1f s", s) : clock(s) }
+
+    var canCopyClip: Bool { marked != nil || selectedClipIndex != nil }
+
+    // ⌘C: the marked range as a clip; with no range, the clip selected in the clip lane (as edited, inside the trim);
+    // else the frame on screen.
+    func copyPicked() {
+        if let r = marked { return copyClip(r) }
+        if let k = selectedClipIndex {
+            let t0 = VideoSequence.starts(edit.clips)[k]
+            let a = max(t0, edit.trimStart), b = min(t0 + edit.clips[k].duration, edit.trimEnd)
+            guard b - a >= 0.5 / frameRate else {
+                return Toast.shared.show("This clip is outside the trim", "Nothing of it would be saved. Mark a range with ⇧-drag instead.", ms: 3000)
+            }
+            return copyClip(a..<b)
+        }
+        copyFrame()
+    }
+
+    // Copy clip: the edit over the range saved as Save would write that part (crop, speed, mute, captions and markup), but
+    // as H.264 + AAC (Compress.clip), into the captures folder, stacked with the original in the gallery; then the file goes
+    // on the pasteboard, so ⌘V in Slack, Teams or Finder attaches it.
+    func copyClip(_ r: Range<Double>) {
+        guard !busy else { return }
+        window.makeFirstResponder(stage)   // commits a field being edited
+        busy = true
+        player.pause()
+        playStateChanged()
+        let src = Library.shared.meta(url)
+        let info = NameInfo(app: src.app, window: src.window)
+        var e = edit
+        e.trimStart = r.lowerBound
+        e.trimEnd = r.upperBound - 1e-4   // the frame starting right at the end stays out, whatever the rounding
+        let length = lengthText((r.upperBound - r.lowerBound) / e.speed)
+        let toast = Toast.shared.post("Copying clip…", "\(length) long", ms: 600_000)
+        let pb = pasteboard
+        Task { @MainActor in
+            defer { self.busy = false }
+            do {
+                let tmp = try await Compress.clip(e) { f in DispatchQueue.main.async { Toast.shared.update(toast, body: "\(Int(f * 100))%") } }
+                let out = Output.newCaptureURL(ext: "mp4", info: info)
+                Library.shared.noteEdit(out, from: self.url, info: info, edited: true)
+                do { try FileManager.default.moveItem(at: tmp, to: out) } catch { try? FileManager.default.removeItem(at: tmp); throw error }
+                self.lastCopiedClip = out
+                let size = ByteCountFormatter.string(fromByteCount: Int64(Compress.fileBytes(out)), countStyle: .file)
+                if copyFile(out, to: pb) {
+                    Toast.shared.show("Clip copied · \(length) · \(size)", "Paste it in Slack or anywhere  ·  click to show in Finder") { Output.reveal(out) }
+                } else {
+                    Toast.shared.show("Clip saved, but the clipboard was busy", "\(out.lastPathComponent)  ·  click to show it in Finder and drag it in instead", ms: 8000) { Output.reveal(out) }
+                }
+            } catch {
+                Toast.shared.show("Copy clip failed", error.localizedDescription, ms: 8000)
+            }
+        }
+    }
+
+    // Copy frame (⌘⇧C, or ⌘C with nothing picked): the frame on screen as the export draws it (crop, captions and markup at
+    // that time), at the export's size, on the pasteboard as PNG and TIFF. Not saved to a file.
+    func copyFrame() {
+        let e = edit, t = now, pb = pasteboard
+        Task { @MainActor in
+            do {
+                let img = try await VideoExport.frame(e, at: t)
+                guard copyImage(img, to: pb) else { return Toast.shared.show("Couldn't copy the frame", "The clipboard is busy. Try again.", ms: 3000) }
+                self.lastCopiedFrame = img
+                Toast.shared.show("Frame copied", "\(self.clock(t))  ·  \(img.width) × \(img.height)", image: img)
+            } catch {
+                Toast.shared.show("Couldn't copy the frame", error.localizedDescription, ms: 6000)
+            }
+        }
     }
 }
 
@@ -1518,6 +1672,7 @@ final class Timeline: NSView {
         case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double)
         case clipIn(Int, grab: Double, value: Double), clipOut(Int, grab: Double, value: Double)  // applied on mouse-up
         case clipMove(Int, downX: CGFloat, target: Int?)
+        case range(anchor: Double, before: Range<Double>?)   // marking a range (⇧-drag, or a grip): Esc puts `before` back
     }
     private var drag: Drag?
 
@@ -1537,6 +1692,7 @@ final class Timeline: NSView {
     // clip drags only apply on release, so nothing changes.
     func cancelDrag() {
         guard drag != nil else { return }
+        if case .range(_, let before)? = drag { editor?.marked = before }
         drag = nil
         needsDisplay = true
     }
@@ -1607,6 +1763,12 @@ final class Timeline: NSView {
         window?.makeFirstResponder(self)
         guard let e = editor else { return }
         let p = convert(ev.locationInWindow, from: nil)
+        if ev.modifierFlags.contains(.shift) { return beginMark(e, p, anchor: nil) }   // ⇧-drag anywhere on the timeline marks a range
+        if let m = e.marked {
+            let d0 = abs(p.x - x(m.lowerBound)), d1 = abs(p.x - x(m.upperBound))
+            if p.y >= stripY, p.y < stripY + stripH, min(d0, d1) < 6 { return beginMark(e, p, anchor: d0 <= d1 ? m.upperBound : m.lowerBound) }   // its grips
+            if !m.contains(t(p.x)) { e.marked = nil }   // a plain click outside it clears it
+        }
         // The playhead knob sits over the clip lane: it scrubs, whatever is under it.
         let onKnob = abs(p.x - x(e.now)) <= 7 && p.y < 8
         if laneH > 0, p.y < laneH, !onKnob {
@@ -1659,10 +1821,22 @@ final class Timeline: NSView {
         e.seek(t(p.x))
     }
 
+    // A range drag: from `anchor` (a grip being dragged keeps the other end), or a new range from the press.
+    private func beginMark(_ e: VideoEditor, _ p: CGPoint, anchor: Double?) {
+        e.player.pause()
+        drag = .range(anchor: anchor ?? e.snapEdge(min(max(t(p.x), e.edit.trimStart), e.edit.trimEnd)), before: e.marked)
+        if anchor == nil { e.marked = nil }
+        needsDisplay = true
+    }
+
     override func mouseDragged(with ev: NSEvent) {
         guard let e = editor, let d = drag else { return }
         let now = t(convert(ev.locationInWindow, from: nil).x)
         switch d {
+        case .range(let anchor, _):
+            let edge = e.snapEdge(min(max(now, e.edit.trimStart), e.edit.trimEnd))
+            e.setMarked(anchor, edge)
+            if let m = e.marked { e.seek(edge < anchor ? m.lowerBound : m.upperBound - 1 / e.frameRate) }   // shows the frame at the edge that moves
         case .start: e.setTrim(start: now); e.seek(e.edit.trimStart)
         case .end: e.setTrim(end: now); e.seek(e.edit.trimEnd)
         case .playhead: e.seek(now)
@@ -1788,10 +1962,40 @@ final class Timeline: NSView {
             bar(barRect(m.start, m.end, y: markY + CGFloat(row) * rowH + 1, h: rowH - 2), label, m.kind.symbol, selected: m.id == e.selected)
         }
 
+        if let m = e.marked { drawMarked(e, m) }
+
         let px = x(e.now)
         NSColor.white.setFill()
         CGRect(x: px - 1, y: -2, width: 2, height: bounds.height + 2).fill()
         NSBezierPath(ovalIn: CGRect(x: px - 5, y: -4, width: 10, height: 10)).fill()
+    }
+
+    // The marked range: a band down the timeline from the thumbnails, grips on its edges, and a label with its length and
+    // the key that copies it.
+    private func drawMarked(_ e: VideoEditor, _ m: Range<Double>) {
+        let x0 = x(m.lowerBound), x1 = x(m.upperBound), h = bounds.height - stripY
+        Theme.accent.withAlphaComponent(0.22).setFill()
+        CGRect(x: x0, y: stripY, width: x1 - x0, height: h).fill()
+        Theme.accent.setFill()
+        for hx in [x0, x1] { CGRect(x: hx - 1, y: stripY, width: 2, height: h).fill() }
+        for hx in [x0, x1] {
+            let grip = NSBezierPath(roundedRect: CGRect(x: hx - 4, y: stripY + 12, width: 8, height: stripH - 24), xRadius: 3, yRadius: 3)
+            NSColor.white.setFill()
+            grip.fill()
+            Theme.onAccent.setStroke()
+            grip.lineWidth = 1
+            grip.stroke()
+        }
+        // The label sits on the band, or beside it when the band is too narrow, and stays on view.
+        let label = NSAttributedString(string: e.markedLabel, attributes: [.font: Theme.font(10, .semibold), .foregroundColor: Theme.onAccent])
+        let w = label.size().width + 16, lh: CGFloat = 18
+        var lx = (x0 + x1) / 2 - w / 2
+        if x1 - x0 < w + 16 { lx = x1 + 8 + w <= bounds.width ? x1 + 8 : x0 - 8 - w }
+        lx = min(max(0, lx), max(0, bounds.width - w))
+        let pill = CGRect(x: lx, y: stripY + (stripH - lh) / 2, width: w, height: lh)
+        Theme.accent.setFill()
+        NSBezierPath(roundedRect: pill, xRadius: 5, yRadius: 5).fill()
+        label.draw(at: CGPoint(x: pill.minX + 8, y: pill.midY - label.size().height / 2))
     }
 
     // One bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
