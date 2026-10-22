@@ -79,22 +79,10 @@ $logJob = Start-Job -ArgumentList "$demo\game\logs\SkyLedge.log" -ScriptBlock {
     }
 }
 
-# Desktop recording: ddagrab (Desktop Duplication: sees the app's layered windows, like its toasts); gdigrab if it can't.
+# Desktop recording: our own BitBlt grabber (Demo.cs), piped to ffmpeg at 30 fps.
 $ff = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
-function StartRec($src, $file) {
-    $psi = New-Object Diagnostics.ProcessStartInfo $ff, "-y -loglevel warning $src -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p `"$file`""
-    $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true
-    [Diagnostics.Process]::Start($psi)
-}
-$dda = '-f lavfi -i ddagrab=output_idx=0:framerate=30:draw_mouse=1,hwdownload,format=bgra'
-$rec = StartRec $dda "$Out\desktop.mkv"
-Wait 3
-if ($rec.HasExited -or -not (Test-Path "$Out\desktop.mkv") -or (Get-Item "$Out\desktop.mkv").Length -lt 1000) {
-    Log "ddagrab failed (exit $($rec.ExitCode)): gdigrab"
-    if (-not $rec.HasExited) { $rec.Kill() }
-    $rec = StartRec '-f gdigrab -framerate 30 -draw_mouse 1 -i desktop' "$Out\desktop.mkv"
-    Wait 1.5
-}
+[Demo]::StartCapture($ff, "$Out\desktop.mkv")
+Wait 1
 Log 'recording desktop'
 
 # ---- start: the app (tray), the game ----
@@ -241,9 +229,8 @@ Get-ChildItem $captures -File | ForEach-Object { Log "  capture: $($_.Name) $($_
 Log ([Demo]::List())
 
 # ---- done ----
-$rec.StandardInput.Write('q'); $rec.StandardInput.Flush()
-$rec.WaitForExit(60000) | Out-Null
-Log "ffmpeg exit $($rec.ExitCode)"
+$code = [Demo]::StopCapture()
+Log "ffmpeg exit $code, frames grabbed $([Demo]::CapturedFrames), repeated $([Demo]::RepeatedFrames)"
 Stop-Job $logJob
 New-Item -ItemType Directory -Force "$Out\captures" | Out-Null
 Copy-Item -Recurse "$captures\*" "$Out\captures" -ErrorAction SilentlyContinue

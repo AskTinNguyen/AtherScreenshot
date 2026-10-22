@@ -129,4 +129,73 @@ public static class Demo {
         }
         return sb.ToString();
     }
+
+    // ---- desktop recorder: BitBlt with CAPTUREBLT (includes layered windows such as the app's toasts, which ffmpeg's
+    // gdigrab leaves out) plus the cursor, piped to ffmpeg as raw BGRA at a constant 30 fps (late frames repeat).
+    [StructLayout(LayoutKind.Sequential)] struct BITMAPINFOHEADER { public int biSize, biWidth, biHeight; public short biPlanes, biBitCount; public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant; }
+    [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public POINT pt; }
+    [StructLayout(LayoutKind.Sequential)] struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER bi, uint usage, out IntPtr bits, IntPtr sec, uint off);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr d, int x, int y, int w, int h, IntPtr s, int sx, int sy, uint rop);
+    [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO ci);
+    [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr h, out ICONINFO ii);
+    [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr dc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+    static volatile bool capturing;
+    static Thread capThread;
+    static System.Diagnostics.Process capProc;
+    public static int CapturedFrames, RepeatedFrames;
+    public static void StartCapture(string ffmpeg, string outFile) {
+        int w = GetSystemMetrics(0), h = GetSystemMetrics(1);
+        var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg, "-y -loglevel warning -f rawvideo -pix_fmt bgra -s " + w + "x" + h +
+            " -framerate 30 -i - -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \"" + outFile + "\"");
+        psi.UseShellExecute = false; psi.RedirectStandardInput = true;
+        capProc = System.Diagnostics.Process.Start(psi);
+        capturing = true;
+        capThread = new Thread(() => {
+            IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen);
+            BITMAPINFOHEADER bi = new BITMAPINFOHEADER(); bi.biSize = Marshal.SizeOf(typeof(BITMAPINFOHEADER)); bi.biWidth = w; bi.biHeight = -h; bi.biPlanes = 1; bi.biBitCount = 32;
+            IntPtr bits; IntPtr dib = CreateDIBSection(screen, ref bi, 0, out bits, IntPtr.Zero, 0);
+            SelectObject(mem, dib);
+            byte[] frame = new byte[w * h * 4];
+            var stdin = capProc.StandardInput.BaseStream;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            long written = 0;
+            while (capturing) {
+                BitBlt(mem, 0, 0, w, h, screen, 0, 0, 0x00CC0020 | 0x40000000);  // SRCCOPY | CAPTUREBLT
+                CURSORINFO ci = new CURSORINFO(); ci.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
+                if (GetCursorInfo(ref ci) && (ci.flags & 1) != 0) {
+                    ICONINFO ii; int hx = 0, hy = 0;
+                    if (GetIconInfo(ci.hCursor, out ii)) { hx = ii.xHotspot; hy = ii.yHotspot; if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask); if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor); }
+                    DrawIconEx(mem, ci.pt.X - hx, ci.pt.Y - hy, ci.hCursor, 0, 0, 0, IntPtr.Zero, 3);
+                }
+                Marshal.Copy(bits, frame, 0, frame.Length);
+                CapturedFrames++;
+                long due = (long)(clock.Elapsed.TotalSeconds * 30) + 1;
+                bool first = true;
+                while (written < due) {  // keep 30 fps: a slow grab repeats the frame
+                    try { stdin.Write(frame, 0, frame.Length); } catch { capturing = false; break; }
+                    written++;
+                    if (!first) RepeatedFrames++;
+                    first = false;
+                }
+                int ahead = (int)(written * 1000 / 30 - clock.ElapsedMilliseconds);
+                if (ahead > 0) Thread.Sleep(ahead);
+            }
+            DeleteObject(dib); ReleaseDC(IntPtr.Zero, screen);
+        });
+        capThread.IsBackground = true;
+        capThread.Start();
+    }
+    public static int StopCapture() {
+        capturing = false;
+        capThread.Join(10000);
+        capProc.StandardInput.Close();
+        capProc.WaitForExit(120000);
+        return capProc.ExitCode;
+    }
 }
