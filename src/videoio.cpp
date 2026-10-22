@@ -1294,6 +1294,12 @@ public:
     SIZE Out() const { return renderer_->Out(); }
     SIZE Full() const { return renderer_->Full(); }
     const FrameRenderer& Renderer() const { return *renderer_; }
+    // How many output frames' overlay pictures to keep for Render: at least the frames picked and not yet rendered.
+    void KeepOverlays(size_t n) { overlayKeep_ = std::max<size_t>(2, n); }
+    size_t OverlaysKept() const {  // tests
+        std::lock_guard l(overlayMu_);
+        return overlayAt_.size();
+    }
     int Count(bool roundUp) const {
         if (times_) return (int)times_->size();
         const double n = e_.OutputDuration() * fps_;
@@ -1313,7 +1319,7 @@ public:
             auto got = overlays_->At(*st, e_.overlays);
             std::lock_guard l(overlayMu_);
             overlayAt_.emplace_back(*st, std::move(got));
-            if (overlayAt_.size() > 600) overlayAt_.pop_front();  // well past the frames in flight
+            while (overlayAt_.size() > overlayKeep_) overlayAt_.pop_front();  // just the frames in flight: each holds pictures
         }
         // Not the previous output frame's, and the next output frame shows a later one.
         *alone = *src != shown_ && next_ && *src != next_ && nextT_ <= (times_ && i + 1 >= (int)times_->size() ? -1e300 : StAt(i + 1)) + 1e-3;
@@ -1397,6 +1403,7 @@ private:
     std::unique_ptr<OverlayFrames> overlays_;
     mutable std::mutex overlayMu_;
     std::deque<std::pair<double, std::vector<std::pair<uint64_t, VideoFrame>>>> overlayAt_;  // by source time, oldest first
+    size_t overlayKeep_ = 8;
     SequenceReader reader_;
     VideoEdit e_;
     double fps_ = 30;
@@ -1549,7 +1556,9 @@ void ExportFrames(EditFrames& frames, int first, int end, const std::function<T(
     const SIZE full = frames.Full(), out = frames.Out();
     const auto [workers, depth] = ExportWorkers({std::max(full.cx, out.cx), std::max(full.cy, out.cy)});
     std::unique_ptr<WorkerPool> own(shared ? nullptr : new WorkerPool(workers));
-    OrderedWork<T> work(shared ? *shared : *own, std::max<size_t>(2, depth / std::max(1, share)));
+    const size_t inFlight = std::max<size_t>(2, depth / std::max(1, share));
+    OrderedWork<T> work(shared ? *shared : *own, inFlight);
+    frames.KeepOverlays(inFlight + 2);  // those pushed and not taken, and the one being picked
     const int oldPrio = GetThreadPriority(GetCurrentThread());
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     std::thread reader([&] {
@@ -2869,6 +2878,62 @@ ATHER_TEST(video_export_with_overlay_video) {
     if (during) CHECK(isBlue(rgb(during, 400, 225)) && isRed(rgb(during, 100, 100)));
     if (later) CHECK(isBlue(rgb(later, 400, 225)) && isGreen(rgb(later, 100, 100)));
     if (after) CHECK(isGreen(rgb(after, 400, 225)));
+}
+
+// An export keeps an overlay's pictures only for the frames in flight, not for as long as it shows (a long picture in
+// picture at 1080p would hold gigabytes), and every frame still gets its own overlay picture.
+ATHER_TEST(video_export_keeps_only_the_overlay_frames_in_flight) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring base = dir + L"\\base.mp4", over = dir + L"\\over.mp4";
+    CHECK(WriteTestClip(base, 640, 360, 30, 3, false));  // red, green, blue: a second each
+    CHECK(WriteTestClip(over, 320, 180, 30, 3, false));
+    const auto oc = ClipOf(over);
+    CHECK(oc.has_value());
+    if (!oc) return;
+    VideoEdit e;
+    e.trimEnd = 3;
+    Overlay o;
+    o.clip = *oc;
+    o.start = 1;  // on top for the last two seconds, a second behind the video under it
+    o.pos = {0.5, 0.5};
+    o.width = 0.25;  // 160 × 90 at (320, 180)
+    e.overlays = {o};
+    EditFrames frames;
+    CHECK(frames.Open(SequenceOf(base, e), e, 30, nullptr));
+    frames.KeepOverlays(4);
+    std::deque<std::pair<VideoFrame, double>> pending;  // picked and not rendered yet, like the frames in flight
+    size_t most = 0;
+    int checked = 0, wrong = 0;
+    auto render = [&] {
+        const auto [src, st] = pending.front();
+        pending.pop_front();
+        const BitmapPtr f = frames.Render(src, st, false);
+        if (!f) {
+            ++wrong;
+            return;
+        }
+        const double into = st - std::floor(st);
+        if (into < 0.1 || into > 0.9) return;  // near a change of color
+        const int want = st < 1 ? (int)st : (int)st - 1;  // the overlay's color once it shows: 0 red, 1 green, 2 blue
+        const uint32_t p = f->Bits()[(size_t)225 * f->Width() + 400];
+        const int c[3] = {(int)((p >> 16) & 255), (int)((p >> 8) & 255), (int)(p & 255)};
+        ++checked;
+        if (c[want] < 150 || c[(want + 1) % 3] > 100 || c[(want + 2) % 3] > 100) ++wrong;
+    };
+    for (int i = 0; i < frames.Count(true); ++i) {
+        VideoFrame src;
+        double st = 0;
+        bool alone = false;
+        if (!frames.Next(i, &src, &st, &alone)) break;
+        pending.push_back({src, st});
+        most = std::max(most, frames.OverlaysKept());
+        if (pending.size() > 3) render();
+    }
+    while (!pending.empty()) render();
+    test::Note("checked " + std::to_string(checked) + ", wrong " + std::to_string(wrong) + ", most kept " + std::to_string(most));
+    CHECK(checked > 40);
+    CHECK(wrong == 0);
+    CHECK(most <= 4);
 }
 
 // A longer export is made in pieces on several encoders at once (where the GPU has them) and comes out joined in
