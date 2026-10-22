@@ -102,7 +102,7 @@ Log 'scene: record'
 [Demo]::Move(1500, 700, 600)
 CtrlAlt 'R'
 Wait 1.2
-[Demo]::Drag(120, 250, 1496, 1024, 1300)    # the region to record (clear of the toasts' corner)
+[Demo]::Drag(120, 160, 1496, 934, 1300)    # the region to record (clear of the toasts' corner)
 Wait 3.5                                   # countdown
 Log 'recording the game'
 # The game drops the runner through the floor at 10 s, 30 s, 50 s… after it loads: speak right as it happens.
@@ -191,7 +191,7 @@ Log ([Demo]::List())
 Wait 1.5
 CtrlAlt 'E'
 Wait 1.2
-[Demo]::Drag(300, 560, 1100, 1010, 1100)    # picture 1: the runner
+[Demo]::Drag(260, 420, 1060, 870, 1100)     # picture 1: the runner
 $ed = WaitWin 'AtherScreenshotEditor' $null 10
 Wait 0.8
 [Demo]::MoveWindow($ed, 260, 70, 1400, 900, $true) | Out-Null
@@ -210,7 +210,7 @@ Wait 2
 Wait 1
 CtrlAlt 'E'
 Wait 1.2
-[Demo]::Drag(860, 300, 1660, 750, 1000)     # picture 3: the level ahead
+[Demo]::Drag(980, 400, 1780, 850, 1000)     # picture 3: the level ahead
 Wait 2
 $c = [Demo]::Client($ed); Log "editor client $($c -join ',')"
 $st = $c[1] + $c[3] - 26 - 96
