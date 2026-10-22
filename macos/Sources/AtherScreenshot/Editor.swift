@@ -2,11 +2,34 @@ import AppKit
 import Carbon.HIToolbox
 import UniformTypeIdentifiers
 
-final class Editor: NSObject, NSWindowDelegate {
-    static var instances: [Editor] = []
-    static var annotClipboard: [Annot] = []
+// One picture of an editor window. The current picture's document lives in the editor and its canvas (copied back
+// here when it's needed or when switching away); the others' only here, with a thumbnail and no composed bitmaps.
+struct TrayPicture {
+    let id: Int
+    var base: CGImage
+    var source: URL?
+    var info: NameInfo
+    var state = DocState()
+    var undo: [DocState] = [], redo: [DocState] = []
+    var dirty = false
+    var keep = true      // ticked: Save selected saves it (new captures come ticked)
+    var saved = false    // written to a file at least once
+    var thumb: CGImage?
+    var thumbRevision = -1
 
-    let base: CGImage
+    private static var lastID = 0
+    static func nextID() -> Int { lastID += 1; return lastID }
+}
+
+enum CloseAnswer { case save, discard, cancel }
+
+final class Editor: NSObject, NSWindowDelegate {
+    static var instances: [Editor] = []   // most recently used last
+    static var annotClipboard: [Annot] = []
+    static var keepOffscreen = false      // tests: editors they open are never shown
+    static let trayMax = 100
+
+    private(set) var base: CGImage
     let unit: CGFloat
     let window: NSWindow
     private var source: URL?
@@ -21,13 +44,48 @@ final class Editor: NSObject, NSWindowDelegate {
     private let canvasBar = FloatingBar()
     private let collageBar = FloatingBar()
 
+    // The capture tray: every picture of the window, in order. From two on, a strip of thumbnails shows them.
+    var tray: [TrayPicture] = []
+    private(set) var current = 0
+    var takesCaptures = false            // opened for a capture: later captures join it
+    var pasteboard = NSPasteboard.general  // tests use one of their own
+    var library = Library.shared           // and a library of their own
+    // Tests answer the prompts: closing with unsaved pictures, and discarding a picture's changes.
+    var answerClose: ((_ unsaved: Int, _ done: Bool) -> CloseAnswer)?
+    var answerDiscard: (() -> Bool)?
+    let strip = TrayStrip()
+    private var stripHeight: NSLayoutConstraint!
+    var isTray: Bool { tray.count > 1 }
+
     // `source`: the file being edited, if any; `info`: where the image was captured. Both carry over to the saved copy.
     @discardableResult
     static func open(_ img: CGImage, scale: CGFloat? = nil, source: URL? = nil, info: NameInfo = NameInfo()) -> Editor {
         let e = Editor(img, unit: scale ?? Geo.mouseScreen.backingScaleFactor)
         e.source = source
         e.info = info
+        e.tray[0].source = source
+        e.tray[0].info = info
         instances.append(e)
+        return e
+    }
+
+    // A capture headed for the editor (Capture and annotate, After capture = Open in editor). With trays on it joins
+    // the most recently used window opened for a capture, never a collage or a window on a file; otherwise, or
+    // when the tray is full, it opens a window of its own.
+    @discardableResult
+    static func capture(_ img: CGImage, scale: CGFloat, info: NameInfo, tray: Bool = Settings.shared.bool("Tray")) -> Editor {
+        if tray, let e = instances.last(where: { $0.takesCaptures }) {
+            if e.add(img, info: info) {
+                if !keepOffscreen {
+                    activateApp()
+                    e.window.makeKeyAndOrderFront(nil)
+                }
+                return e
+            }
+            Toast.shared.show("The editor holds \(trayMax) pictures", "Save or remove some there. This capture opened in a new window.")
+        }
+        let e = open(img, scale: scale, info: info)
+        e.takesCaptures = true
         return e
     }
 
@@ -81,13 +139,17 @@ final class Editor: NSObject, NSWindowDelegate {
         toolbar.editor = self
         canvas.editor = self
         canvas.state.fill = Render.edgeColor(img)
+        tray = [TrayPicture(id: TrayPicture.nextID(), base: img, info: NameInfo(), state: canvas.state)]
+        strip.editor = self
+        strip.isHidden = true
+        stripHeight = strip.heightAnchor.constraint(equalToConstant: 0)
         status.font = Theme.font(11)
         status.textColor = Theme.muted
         status.lineBreakMode = .byTruncatingTail
         let statusBar = NSView()
         statusBar.wantsLayer = true
         statusBar.layer?.backgroundColor = Theme.surface.cgColor
-        for v in [toolbar, canvas, statusBar, status, canvasBar, collageBar] as [NSView] {
+        for v in [toolbar, canvas, strip, statusBar, status, canvasBar, collageBar] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
         }
@@ -99,7 +161,11 @@ final class Editor: NSObject, NSWindowDelegate {
             canvas.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
             canvas.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             canvas.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            canvas.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            canvas.bottomAnchor.constraint(equalTo: strip.topAnchor),
+            strip.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            strip.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            stripHeight,
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -116,9 +182,11 @@ final class Editor: NSObject, NSWindowDelegate {
         window.contentView = root
         toolbar.build()
         refreshChrome()
-        AppDelegate.shared?.windowOpened(window)
-        activateApp()
-        window.makeKeyAndOrderFront(nil)
+        if !Editor.keepOffscreen {
+            AppDelegate.shared?.windowOpened(window)
+            activateApp()
+            window.makeKeyAndOrderFront(nil)
+        }
         window.makeFirstResponder(canvas)
     }
 
@@ -127,6 +195,8 @@ final class Editor: NSObject, NSWindowDelegate {
         let f = Render.frame(base, canvas.state)
         let size = "\(Int(f.width)) × \(Int(f.height))"
         window.title = collage.map { "Collage — \($0.images.count) screenshots, \(size)" } ?? "Annotate — \(size)"
+        if isTray { window.title = "Annotate — picture \(current + 1) of \(tray.count) — \(size)" }
+        strip.needsDisplay = true
         canvasBar.isHidden = canvas.tool != .canvas
         collageBar.isHidden = collage == nil || canvas.tool == .canvas
         let reserve: CGFloat = canvasBar.isHidden && collageBar.isHidden ? 0 : 52
@@ -145,26 +215,57 @@ final class Editor: NSObject, NSWindowDelegate {
 
     func copy() {
         let img = export()
-        copyImage(img)
+        copyImage(img, to: pasteboard)
         AppDelegate.shared?.setLast(img, url: nil)
         Toast.shared.show("Copied to clipboard", "\(img.width) × \(img.height)")
     }
 
-    func save(close: Bool = false) {
-        let img = export()
-        var info = self.info
+    func save(close: Bool = false) { savePicture(current, close: close) }
+
+    // What Save writes for picture i: the canvas's composition for the current one, the stored document composed
+    // the same way for the others.
+    func exportPicture(_ i: Int) -> CGImage {
+        if i == current { return export() }
+        let img = Render.compose(tray[i].base, tray[i].state)
+        return styled ? Render.styled(img, unit: unit) : img
+    }
+
+    // Saves picture i as a new PNG in the captures folder. `batch`: one of several (Save selected), with one toast.
+    private func savePicture(_ i: Int, close: Bool = false, batch: SaveBatch? = nil) {
+        if i == current {   // the text being typed belongs to what's saved
+            canvas.commitText()
+            syncCurrent()
+        }
+        let img = exportPicture(i), p = tray[i]
+        var info = p.info
         info.w = img.width
         info.h = img.height
         let url = Output.newCaptureURL(ext: "png", info: info)
-        Library.shared.noteEdit(url, from: source, info: info, edited: !canvas.state.annots.isEmpty || img.width != base.width || img.height != base.height,
-                                includes: includes, collage: collage != nil)
-        Output.savePNG(img, to: url) { ok in
-            if ok { AppDelegate.shared?.setLast(img, url: url) }
+        library.noteEdit(url, from: p.source, info: info, edited: !p.state.annots.isEmpty || img.width != p.base.width || img.height != p.base.height,
+                                includes: includes(p), collage: collage != nil)
+        batch?.left += 1
+        Output.savePNG(img, to: url) { [weak self] ok in
+            if ok {
+                AppDelegate.shared?.setLast(img, url: url)
+                if let self, let j = self.tray.firstIndex(where: { $0.id == p.id }) { self.tray[j].saved = true; self.strip.needsDisplay = true }
+            }
+            if let batch {
+                if ok { batch.urls.append(url) } else { Toast.shared.show("Save failed", url.lastPathComponent) }
+                batch.left -= 1
+                if batch.left == 0, !batch.quiet, let first = batch.urls.first {
+                    let n = batch.urls.count, urls = batch.urls
+                    Toast.shared.show(n == 1 ? "Saved 1 picture" : "Saved \(n) pictures", first.lastPathComponent + (n > 1 ? " and \(n - 1) more" : "")) {
+                        NSWorkspace.shared.activateFileViewerSelecting(urls)
+                    }
+                }
+                return
+            }
             Toast.shared.show(ok ? (close ? "Copied and saved" : "Saved") : "Save failed", url.lastPathComponent, image: ok ? img : nil) {
                 Output.reveal(url)
             }
         }
-        dirty = false
+        if i == current { dirty = false }
+        tray[i].dirty = false
     }
 
     func saveAs() {
@@ -174,29 +275,193 @@ final class Editor: NSObject, NSWindowDelegate {
         panel.nameFieldStringValue = Output.makeCaptureURL(base: FileManager.default.temporaryDirectory, ext: "png", info: NameInfo()).deletingPathExtension().lastPathComponent
         panel.beginSheetModal(for: window) { r in
             guard r == .OK, let url = panel.url else { return }
-            Library.shared.noteEdit(url, from: self.source, info: self.info, edited: true, includes: self.includes, collage: self.collage != nil)
+            self.syncCurrent()
+            self.library.noteEdit(url, from: self.source, info: self.info, edited: true, includes: self.includes(self.tray[self.current]), collage: self.collage != nil)
+            let id = self.tray[self.current].id
             Output.savePNG(img, to: url) { ok in
                 Toast.shared.show(ok ? "Saved" : "Save failed", url.lastPathComponent)
-                if ok { self.dirty = false }  // a failed save must still warn before closing
+                guard ok else { return }  // a failed save must still warn before closing
+                self.dirty = false
+                if let j = self.tray.firstIndex(where: { $0.id == id }) { self.tray[j].saved = true }
             }
         }
     }
 
     // Screenshots placed on the canvas, recorded on the saved copy.
-    private var includes: [URL] {
+    private func includes(_ p: TrayPicture) -> [URL] {
         var seen = Set<String>()
-        return canvas.state.annots.compactMap { $0.layer?.source }.filter { seen.insert($0.path).inserted && $0 != source }
+        return p.state.annots.compactMap { $0.layer?.source }.filter { seen.insert($0.path).inserted && $0 != p.source }
     }
 
     func pin() { Pin.show(export(), scale: unit) }
 
     func done() {
+        if isTray { return trayDone() }
         let img = export()
-        copyImage(img)
+        copyImage(img, to: pasteboard)
         if Settings.shared.bool("SaveToFile") { save(close: true) } else { Toast.shared.show("Copied to clipboard", "\(img.width) × \(img.height)") }
         AppDelegate.shared?.setLast(img, url: nil)
         dirty = false
         window.close()
+    }
+
+    // MARK: capture tray
+
+    // A capture joins the tray and becomes the current picture. False when the tray is full (or for a collage).
+    @discardableResult
+    func add(_ img: CGImage, source: URL? = nil, info: NameInfo = NameInfo()) -> Bool {
+        guard collage == nil, tray.count < Editor.trayMax else { return false }
+        canvas.commitText()
+        stash()
+        var p = TrayPicture(id: TrayPicture.nextID(), base: img, source: source, info: info)
+        p.state.fill = Render.edgeColor(img)
+        tray.append(p)
+        current = tray.count - 1
+        loadCurrent()
+        return true
+    }
+
+    // Tool, color and size stay with the window; everything else is the picture's.
+    func select(_ i: Int) {
+        guard tray.indices.contains(i), i != current, !canvas.busy else { return }
+        canvas.commitText()   // an unfinished text box stays with its picture
+        stash()
+        current = i
+        loadCurrent()
+    }
+
+    func cycle(_ step: Int) {
+        let n = tray.count
+        if n > 1 { select(((current + step) % n + n) % n) }
+    }
+
+    // ×: takes a picture out of the tray, asking first when it has changes that aren't saved.
+    func remove(_ i: Int) {
+        guard isTray, tray.indices.contains(i), !canvas.busy else { return }
+        canvas.commitText()
+        let id = tray[i].id
+        let go = { [weak self] in
+            guard let self, self.isTray, let j = self.tray.firstIndex(where: { $0.id == id }) else { return }
+            if j == self.current { self.select(j + 1 < self.tray.count ? j + 1 : j - 1) }
+            self.tray.remove(at: j)
+            if self.current > j { self.current -= 1 }
+            self.layoutTray()
+        }
+        guard isDirty(i) else { return go() }
+        if let answerDiscard { if answerDiscard() { go() }; return }
+        let a = NSAlert()
+        a.messageText = "Remove this picture and discard your changes?"
+        a.addButton(withTitle: "Keep It")
+        a.addButton(withTitle: "Remove")
+        a.beginSheetModal(for: window) { r in if r == .alertSecondButtonReturn { go() } }
+    }
+
+    func isDirty(_ i: Int) -> Bool { i == current ? dirty : tray[i].dirty }
+    func unsaved(_ i: Int) -> Bool { !tray[i].saved || isDirty(i) }
+    var toSaveCount: Int { tray.indices.filter { tray[$0].keep && unsaved($0) }.count }
+    func toggleKeep(_ i: Int) { if tray.indices.contains(i) { tray[i].keep.toggle(); strip.needsDisplay = true } }
+
+    // Saves every ticked picture that isn't saved yet, or changed since, as Save would. Returns how many.
+    @discardableResult
+    func saveSelected(quiet: Bool = false) -> Int {
+        canvas.commitText()
+        let todo = tray.indices.filter { tray[$0].keep && unsaved($0) }
+        if todo.isEmpty, !quiet { Toast.shared.show("Nothing new to save", "Every ticked picture is saved. Tick the ones to save.") }
+        let batch = SaveBatch(quiet: quiet)
+        for i in todo { savePicture(i, batch: batch) }
+        strip.needsDisplay = true
+        return todo.count
+    }
+
+    // Done with a tray: saves the ticked pictures, copies the current one and closes. Asks first when a picture
+    // that isn't ticked would be lost.
+    private func trayDone() {
+        canvas.commitText()
+        let left = tray.indices.filter { !tray[$0].keep && unsaved($0) }.count
+        let finish = { [weak self] (a: CloseAnswer) in
+            guard let self else { return }
+            switch a {
+            case .cancel: return
+            case .discard: self.closeNow()
+            case .save:
+                let n = self.saveSelected(quiet: true)
+                let img = self.export()
+                let copied = copyImage(img, to: self.pasteboard)
+                AppDelegate.shared?.setLast(img, url: nil)
+                if n > 0 { Toast.shared.show(copied ? "Copied and saved" : "Saved", "\(n) picture\(n == 1 ? "" : "s")" + (copied ? "  ·  the current one is on the clipboard" : "")) }
+                else if copied { Toast.shared.show("Copied to clipboard", "\(img.width) × \(img.height)") }
+                self.closeNow()
+            }
+        }
+        if left > 0 { askClose(left, done: true, finish) } else { finish(.save) }
+    }
+
+    // "3 pictures aren't saved": Save Selected and Close (the default), Close Without Saving, or Cancel.
+    private func askClose(_ unsaved: Int, done: Bool, _ then: @escaping (CloseAnswer) -> Void) {
+        if let answerClose { return then(answerClose(unsaved, done)) }
+        let a = NSAlert()
+        a.messageText = "\(unsaved) picture\(unsaved == 1 ? " isn't" : "s aren't") saved"
+        a.informativeText = done ? "They aren't ticked, so Done won't save them. Pictures you don't save are gone once the editor closes."
+            : "Save Selected saves the ticked pictures to your captures folder. Pictures you don't save are gone once the editor closes."
+        a.addButton(withTitle: "Save Selected and Close")
+        a.addButton(withTitle: "Close Without Saving")
+        a.addButton(withTitle: "Cancel")
+        a.beginSheetModal(for: window) { r in
+            then(r == .alertFirstButtonReturn ? .save : r == .alertSecondButtonReturn ? .discard : .cancel)
+        }
+    }
+
+    private func closeNow() {
+        dirty = false
+        for i in tray.indices { tray[i].dirty = false }
+        window.close()
+    }
+
+    // The current picture's document, copied into its slot.
+    private func syncCurrent() {
+        let d = canvas.document
+        tray[current].base = d.base
+        tray[current].state = d.state
+        tray[current].undo = d.undo
+        tray[current].redo = d.redo
+        tray[current].source = source
+        tray[current].info = info
+        tray[current].dirty = dirty
+    }
+
+    // Before switching away: the slot gets the document and a fresh thumbnail.
+    private func stash() {
+        updateThumb()
+        syncCurrent()
+    }
+
+    private func loadCurrent() {
+        let p = tray[current]
+        base = p.base
+        source = p.source
+        info = p.info
+        dirty = p.dirty
+        canvas.load(base: p.base, state: p.state, undo: p.undo, redo: p.redo)
+        layoutTray()
+        strip.scrollTo(current)
+    }
+
+    // A picture's thumbnail from its stored document (its document changed while it wasn't current).
+    func setThumb(_ i: Int) { tray[i].thumb = TrayStrip.thumbnail(Render.compose(tray[i].base, tray[i].state)) }
+
+    // The current picture's thumbnail, made again whenever its document changed.
+    func updateThumb() {
+        guard tray[current].thumbRevision != canvas.revision || tray[current].thumb == nil else { return }
+        tray[current].thumb = TrayStrip.thumbnail(Render.compose(base, canvas.state, pixel: (canvas.pixelCache, canvas.pixelRect)))
+        tray[current].thumbRevision = canvas.revision
+    }
+
+    // The strip shows from two pictures; one picture looks as it always did.
+    private func layoutTray() {
+        strip.isHidden = !isTray
+        stripHeight.constant = isTray ? TrayStrip.height : 0
+        window.contentView?.layoutSubtreeIfNeeded()
+        refreshChrome()
     }
 
     func toggleStyled() {
@@ -211,6 +476,7 @@ final class Editor: NSObject, NSWindowDelegate {
         redacting = true
         Toast.shared.show("Looking for sensitive text…", "Emails, IPs, keys, tokens, card and phone numbers", ms: 8000)
         let (img, f) = Render.raster(base, canvas.state), unit = unit   // includes image layers and added space
+        let id = tray[current].id
         OCR.async({ OCR.findSensitive(try OCR.words(img)).map { $0.offsetBy(dx: f.minX, dy: f.minY) } }) { [weak self] r in
             guard let self else { return }
             self.redacting = false
@@ -218,6 +484,17 @@ final class Editor: NSObject, NSWindowDelegate {
             case .failure(let e): Toast.shared.show("Auto-redact failed", e.localizedDescription)
             case .success(let rects):
                 if rects.isEmpty { Toast.shared.show("Nothing sensitive found", "It can only redact text that OCR can read."); return }
+                if let j = self.tray.firstIndex(where: { $0.id == id }), j != self.current {   // switched to another picture meanwhile
+                    self.tray[j].undo.append(self.tray[j].state)
+                    self.tray[j].redo.removeAll()
+                    for r in rects { self.tray[j].state.annots.append(Annot(tool: .pixelate, color: 0, level: 2, unit: unit, pts: [r.origin, CGPoint(x: r.maxX, y: r.maxY)])) }
+                    self.tray[j].dirty = true
+                    self.setThumb(j)
+                    self.strip.needsDisplay = true
+                    Toast.shared.show("Redacted \(rects.count) item\(rects.count == 1 ? "" : "s") in picture \(j + 1)", "Each box is editable: select it to move or delete. Check important redactions.")
+                    return
+                }
+                guard self.tray.contains(where: { $0.id == id }) else { return }   // removed meanwhile
                 self.canvas.pushUndo()
                 for r in rects {
                     self.canvas.state.annots.append(Annot(tool: .pixelate, color: 0, level: 2, unit: unit, pts: [r.origin, CGPoint(x: r.maxX, y: r.maxY)]))
@@ -270,6 +547,11 @@ final class Editor: NSObject, NSWindowDelegate {
             ("Close editor", "quit", "xmark", "⎋", { [weak self] in self?.window.performClose(nil) }),
         ]
         for (i, a) in acts.enumerated() { items.append(PaletteItem(id: "act.\(i)", title: a.0, keywords: a.1, icon: a.2, hint: a.3, action: a.4)) }
+        if isTray {
+            items.append(PaletteItem(id: "tray.save", title: "Save selected pictures (\(toSaveCount))", keywords: "tray strip ticked all", icon: "square.and.arrow.down.on.square", hint: "") { [weak self] in self?.saveSelected() })
+            items.append(PaletteItem(id: "tray.next", title: "Next picture", keywords: "tray strip switch", icon: "chevron.right", hint: "⌃⇥") { [weak self] in self?.cycle(1) })
+            items.append(PaletteItem(id: "tray.prev", title: "Previous picture", keywords: "tray strip switch", icon: "chevron.left", hint: "⌃⇧⇥") { [weak self] in self?.cycle(-1) })
+        }
         for (i, n) in kColorNames.enumerated() {
             items.append(PaletteItem(id: "color.\(i)", title: "Color: \(n)", keywords: "colour", icon: "paintpalette", hint: "\(i + 1)") { [weak self] in self?.canvas.setColor(i) })
         }
@@ -392,6 +674,16 @@ final class Editor: NSObject, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         canvas.commitText()
+        if isTray {   // asks when a picture would be lost: never saved, or changed since
+            let n = tray.indices.filter { unsaved($0) }.count
+            guard n > 0 else { return true }
+            askClose(n, done: false) { [weak self] a in
+                guard let self, a != .cancel else { return }
+                if a == .save { self.saveSelected() }
+                self.closeNow()
+            }
+            return false
+        }
         guard dirty else { return true }
         let a = NSAlert()
         a.messageText = "Close the editor and discard your changes?"
@@ -410,6 +702,13 @@ final class Editor: NSObject, NSWindowDelegate {
         Editor.instances.removeAll { $0 === self }
     }
 
+    // The most recently used editor comes last (captures and "Add to open editor" go there).
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard Editor.instances.last !== self, Editor.instances.contains(where: { $0 === self }) else { return }
+        Editor.instances.removeAll { $0 === self }
+        Editor.instances.append(self)
+    }
+
     func windowDidResize(_ notification: Notification) { refreshChrome() }
 }
 
@@ -417,13 +716,14 @@ final class Editor: NSObject, NSWindowDelegate {
 
 final class EditorCanvas: NSView {
     weak var editor: Editor?
-    let base: CGImage
+    private(set) var base: CGImage
     let unit: CGFloat
     var state = DocState()
     var pixelCache: CGImage
     var pixelRect: CGRect
     private var undoStack: [DocState] = []
     private var redoStack: [DocState] = []
+    private(set) var revision = 0   // bumped on every change: the tray's thumbnail follows it
 
     var tool: Tool = .arrow
     var color = 0
@@ -490,8 +790,29 @@ final class EditorCanvas: NSView {
 
     func changed(pixels: Bool) {
         if pixels { (pixelCache, pixelRect) = Render.pixelBase(base, state) }
+        revision += 1
         needsDisplay = true
         editor?.refreshChrome()
+    }
+
+    // The capture tray swaps whole documents in and out of the canvas.
+    var document: (base: CGImage, state: DocState, undo: [DocState], redo: [DocState]) { (base, state, undoStack, redoStack) }
+    var undoCount: Int { undoStack.count }
+    var busy: Bool { live != nil || moving != nil || resizing != nil || framing != nil }   // a drag under way
+
+    func load(base: CGImage, state: DocState, undo: [DocState], redo: [DocState]) {
+        live = nil
+        editingText = nil
+        moving = nil
+        resizing = nil
+        framing = nil
+        frozen = nil
+        self.base = base
+        self.state = state
+        undoStack = undo
+        redoStack = redo
+        selected = nil
+        changed(pixels: true)
     }
 
     func undo() {
@@ -921,6 +1242,14 @@ final class EditorCanvas: NSView {
         let f = e.modifierFlags
         let cmd = f.contains(.command), shift = f.contains(.shift)
         let code = Int(e.keyCode)
+        if f.contains(.control) && code == kVK_Tab {   // ⌃⇥ / ⌃⇧⇥: the tray's next / previous picture
+            if !busy { ed.cycle(shift ? -1 : 1) }
+            return
+        }
+        if cmd && shift && (code == kVK_ANSI_RightBracket || code == kVK_ANSI_LeftBracket) {   // ⌘} / ⌘{ likewise
+            if !busy { ed.cycle(code == kVK_ANSI_RightBracket ? 1 : -1) }
+            return
+        }
         if cmd {
             switch code {
             case kVK_ANSI_Z: shift ? redo() : undo()
@@ -1074,6 +1403,221 @@ final class EditorCanvas: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         editor?.refreshChrome()
+    }
+}
+
+// A save of several pictures (Save selected): one toast once they're all written.
+final class SaveBatch {
+    let quiet: Bool
+    var left = 0
+    var urls: [URL] = []
+    init(quiet: Bool) { self.quiet = quiet }
+}
+
+// MARK: - Capture tray strip
+
+// The capture tray along the editor's bottom edge: each picture at its own shape, the current one outlined in lime,
+// a tick for "save this", a dot for unsaved changes, "Saved" once saved and × on hover; then the count and
+// Save selected (n). The wheel scrolls it sideways.
+final class TrayStrip: NSView {
+    weak var editor: Editor?
+    static let height: CGFloat = 96
+    static let box = CGSize(width: 120, height: 68)
+    static let gap: CGFloat = 12, panel: CGFloat = 196
+    private(set) var scroll: CGFloat = 0
+    var hover: (index: Int, part: Part)?   // nil: nothing; index -1: Save selected
+
+    enum Part { case picture, tick, remove }
+
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self))
+    }
+
+    // A thumbnail's size in the box: the picture's own shape, never narrower than half the box or lower than two
+    // thirds of it, so the tick, the × and the badge fit on very tall or wide pictures.
+    static func fit(_ w: CGFloat, _ h: CGFloat) -> CGSize {
+        let k = min(box.width / max(1, w), box.height / max(1, h))
+        return CGSize(width: min(box.width, max(box.width / 2, (w * k).rounded())), height: min(box.height, max((box.height * 2 / 3).rounded(), (h * k).rounded())))
+    }
+
+    // The strip's thumbnail of a composed picture (a very tall or wide one shows its top or left part), at 2× for Retina.
+    static func thumbnail(_ img: CGImage) -> CGImage? {
+        let z = fit(CGFloat(img.width), CGFloat(img.height))
+        let w = Int(z.width * 2), h = Int(z.height * 2)
+        guard let ctx = makeContext(width: w, height: h) else { return nil }
+        let k = max(CGFloat(w) / CGFloat(img.width), CGFloat(h) / CGFloat(img.height))
+        ctx.setFillColor(NSColor(white: 0.85, alpha: 1).cgColor)   // where it's transparent
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        drawImageFlipped(ctx, img, in: CGRect(x: 0, y: 0, width: CGFloat(img.width) * k, height: CGFloat(img.height) * k))
+        return ctx.makeImage()
+    }
+
+    private var view: CGRect { CGRect(x: 8, y: 1, width: max(0, bounds.width - 8 - TrayStrip.panel), height: bounds.height - 1) }
+
+    func boxRect(_ i: Int) -> CGRect {
+        CGRect(x: view.minX + 6 + CGFloat(i) * (TrayStrip.box.width + TrayStrip.gap) - scroll, y: ((bounds.height - TrayStrip.box.height) / 2).rounded(),
+               width: TrayStrip.box.width, height: TrayStrip.box.height)
+    }
+
+    func thumbRect(_ i: Int) -> CGRect {
+        guard let e = editor, e.tray.indices.contains(i) else { return .zero }
+        let b = boxRect(i)
+        let f = i == e.current ? Render.frame(e.base, e.canvas.state) : Render.frame(e.tray[i].base, e.tray[i].state)
+        let z = TrayStrip.fit(f.width, f.height)
+        return CGRect(x: (b.midX - z.width / 2).rounded(), y: (b.midY - z.height / 2).rounded(), width: z.width, height: z.height)
+    }
+
+    func tickRect(_ i: Int) -> CGRect { let r = thumbRect(i); return CGRect(x: r.minX + 5, y: r.minY + 5, width: 18, height: 18) }
+    func removeRect(_ i: Int) -> CGRect { let r = thumbRect(i); return CGRect(x: r.maxX - 23, y: r.minY + 5, width: 18, height: 18) }
+    var saveRect: CGRect { CGRect(x: bounds.width - 14 - TrayStrip.panel + 28, y: bounds.height - 16 - 32, width: TrayStrip.panel - 28, height: 32) }
+
+    // What's at p: a picture (and which part of it), Save selected (index -1), or nothing.
+    func hit(_ p: CGPoint) -> (index: Int, part: Part)? {
+        guard let e = editor, e.isTray else { return nil }
+        if saveRect.contains(p) { return (-1, .picture) }
+        guard view.contains(p) else { return nil }
+        for i in e.tray.indices where boxRect(i).contains(p) {
+            return (i, tickRect(i).contains(p) ? .tick : removeRect(i).contains(p) ? .remove : .picture)
+        }
+        return nil
+    }
+
+    // A click: open a picture, tick or untick it, remove it, or Save selected.
+    func click(_ p: CGPoint) {
+        guard let e = editor, let h = hit(p) else { return }
+        if h.index < 0 { e.saveSelected(); return }
+        switch h.part {
+        case .tick: e.toggleKeep(h.index)
+        case .remove: e.remove(h.index)
+        case .picture: e.select(h.index)
+        }
+        needsDisplay = true
+    }
+
+    private var contentWidth: CGFloat { CGFloat(editor?.tray.count ?? 0) * (TrayStrip.box.width + TrayStrip.gap) - TrayStrip.gap + 12 }
+    func scrollBy(_ dx: CGFloat) {
+        scroll = min(max(0, scroll + dx), max(0, contentWidth - view.width))
+        needsDisplay = true
+    }
+
+    func scrollTo(_ i: Int) {
+        let b = boxRect(i), v = view
+        if b.minX < v.minX { scrollBy(b.minX - v.minX - 6) } else if b.maxX > v.maxX { scrollBy(b.maxX - v.maxX + 6) } else { scrollBy(0) }
+    }
+
+    override func mouseDown(with e: NSEvent) { click(convert(e.locationInWindow, from: nil)) }
+    override func mouseMoved(with e: NSEvent) { setHover(hit(convert(e.locationInWindow, from: nil))) }
+    override func mouseExited(with e: NSEvent) { setHover(nil) }
+    private func setHover(_ h: (index: Int, part: Part)?) {
+        if h?.index != hover?.index || h?.part != hover?.part { hover = h; needsDisplay = true }
+    }
+
+    override func scrollWheel(with e: NSEvent) {
+        let d = abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) ? -e.scrollingDeltaX : -e.scrollingDeltaY
+        scrollBy(e.hasPreciseScrollingDeltas ? d : d * (TrayStrip.box.width + TrayStrip.gap) / 3)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let e = editor, e.isTray, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        Theme.surface.setFill()
+        bounds.fill()
+        Theme.border.setFill()
+        CGRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+        CGRect(x: view.maxX, y: 14, width: 1, height: bounds.height - 28).fill()
+        e.updateThumb()
+        scrollBy(0)
+        ctx.saveGState()
+        ctx.clip(to: view)
+        for i in e.tray.indices {
+            let b = boxRect(i)
+            guard b.maxX + 4 >= view.minX, b.minX - 4 <= view.maxX else { continue }
+            if e.tray[i].thumb == nil, i != e.current { e.setThumb(i) }
+            let r = thumbRect(i), p = e.tray[i], over = hover?.index == i
+            if i == e.current {
+                ctx.setFillColor(Theme.accent.cgColor)
+                ctx.addPath(CGPath(roundedRect: r.insetBy(dx: -3, dy: -3), cornerWidth: 5, cornerHeight: 5, transform: nil))
+                ctx.fillPath()
+            } else {
+                ctx.setStrokeColor((over ? Theme.muted : Theme.border).cgColor)
+                ctx.setLineWidth(1)
+                ctx.stroke(r.insetBy(dx: -0.5, dy: -0.5))
+            }
+            if let t = p.thumb { drawImageFlipped(ctx, t, in: r) } else { ctx.setFillColor(Theme.raised.cgColor); ctx.fill(r) }
+            // tick: lime with a check, or an empty box
+            let t = tickRect(i)
+            let box = CGPath(roundedRect: t, cornerWidth: 4, cornerHeight: 4, transform: nil)
+            if p.keep {
+                ctx.setFillColor(Theme.accent.cgColor)
+                ctx.addPath(box)
+                ctx.fillPath()
+                ctx.setStrokeColor(Theme.onAccent.cgColor)
+                ctx.setLineWidth(2)
+                ctx.setLineCap(.round)
+                ctx.setLineJoin(.round)
+                ctx.addLines(between: [CGPoint(x: t.minX + 4.5, y: t.minY + 9.5), CGPoint(x: t.minX + 7.5, y: t.minY + 12.5), CGPoint(x: t.minX + 13.5, y: t.minY + 5.5)])
+                ctx.strokePath()
+            } else {
+                ctx.setFillColor(Theme.bg.withAlphaComponent(0.55).cgColor)
+                ctx.addPath(box)
+                ctx.fillPath()
+                ctx.setStrokeColor((over && hover?.part == .tick ? Theme.accent : Theme.text.withAlphaComponent(0.92)).cgColor)
+                ctx.setLineWidth(1.5)
+                ctx.addPath(box)
+                ctx.strokePath()
+            }
+            // unsaved changes, or saved
+            if e.isDirty(i) {
+                let c = CGPoint(x: r.maxX - 14.5, y: r.maxY - 14.5)
+                ctx.setFillColor(Theme.bg.cgColor)
+                ctx.fillEllipse(in: CGRect(x: c.x - 6.5, y: c.y - 6.5, width: 13, height: 13))
+                ctx.setFillColor(Theme.text.cgColor)
+                ctx.fillEllipse(in: CGRect(x: c.x - 4.5, y: c.y - 4.5, width: 9, height: 9))
+            } else if p.saved {
+                var label = NSAttributedString(string: "✓ Saved", attributes: [.font: Theme.font(11, .medium), .foregroundColor: Theme.accent])
+                if label.size().width + 12 > r.width - 10 { label = NSAttributedString(string: "✓", attributes: [.font: Theme.font(11, .medium), .foregroundColor: Theme.accent]) }
+                let pill = CGRect(x: r.minX + 5, y: r.maxY - 5 - 17, width: label.size().width + 12, height: 17)
+                ctx.setFillColor(Theme.bg.cgColor)
+                ctx.addPath(CGPath(roundedRect: pill, cornerWidth: 8.5, cornerHeight: 8.5, transform: nil))
+                ctx.fillPath()
+                label.draw(at: CGPoint(x: pill.minX + 6, y: pill.midY - label.size().height / 2))
+            }
+            // ×
+            if over {
+                let x = removeRect(i)
+                ctx.setFillColor((hover?.part == .remove ? NSColor.systemRed : Theme.bg).cgColor)
+                ctx.fillEllipse(in: x)
+                ctx.setStrokeColor(Theme.border.cgColor)
+                ctx.setLineWidth(1)
+                ctx.strokeEllipse(in: x.insetBy(dx: 0.5, dy: 0.5))
+                ctx.setStrokeColor(Theme.text.cgColor)
+                ctx.setLineWidth(1.6)
+                ctx.setLineCap(.round)
+                let k: CGFloat = 3.6
+                ctx.strokeLineSegments(between: [CGPoint(x: x.midX - k, y: x.midY - k), CGPoint(x: x.midX + k, y: x.midY + k),
+                                                 CGPoint(x: x.midX - k, y: x.midY + k), CGPoint(x: x.midX + k, y: x.midY - k)])
+            }
+        }
+        ctx.restoreGState()
+        // the count and Save selected
+        let ticked = e.tray.filter(\.keep).count, n = e.toSaveCount, s = saveRect
+        let count = NSAttributedString(string: "\(e.tray.count) pictures · \(ticked) selected", attributes: [.font: Theme.font(11), .foregroundColor: Theme.muted])
+        count.draw(at: CGPoint(x: s.maxX - count.size().width, y: s.minY - 8 - count.size().height))
+        ctx.setFillColor((n == 0 ? Theme.raised : hover?.index == -1 ? Theme.rgb(226, 255, 110) : Theme.accent).cgColor)
+        ctx.addPath(CGPath(roundedRect: s, cornerWidth: 7, cornerHeight: 7, transform: nil))
+        ctx.fillPath()
+        let label = NSAttributedString(string: "Save selected (\(n))", attributes: [.font: Theme.font(13, .semibold), .foregroundColor: n == 0 ? Theme.muted : Theme.onAccent])
+        label.draw(at: CGPoint(x: s.midX - label.size().width / 2, y: s.midY - label.size().height / 2))
     }
 }
 

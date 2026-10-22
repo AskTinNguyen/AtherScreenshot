@@ -51,6 +51,13 @@ All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.at
 - **Canvas (K):** drag any edge to add space around the screenshot (⌥ moves both sides), or use Space below, Space right and Even margin. The space is filled with the screenshot's edge color, white, black or transparent. Text wraps at the canvas edge, so notes in the margin stay on the image.
 - **Collage (⌘G in the gallery):** select two or more screenshots and press Collage. Choose a layout (auto, grid, row, column, feature), gap, margin, background, corners, shadow and size (fit, 1920 px wide, square). Drag one screenshot onto another to swap them; everything else in the editor works on top.
 - Saved results join the gallery: edits are tagged "edited" and keep the original's metadata; collages are tagged "collage" and keep the tags and collections their screenshots share. Both list the screenshots they include.
+- **Capture tray:** captures for the editor (⌃⌥E, or After capture = Open the editor) collect in one editor instead of opening a window each. From two pictures on, a strip of thumbnails runs along the bottom.
+  - **Switching:** click a thumbnail, or press ⌃⇥ / ⌃⇧⇥ (⌘} / ⌘{) for the next or previous picture.
+  - **Each picture keeps its own notes:** annotations, crop, added space and undo stay with their picture.
+  - **Ticks:** new captures come ticked. **Save selected (n)** saves the ticked ones that aren't saved yet. Done saves them, copies the current picture and closes.
+  - **Closing:** with pictures that aren't saved it asks: Save Selected and Close, Close Without Saving or Cancel.
+  - **Marks:** a white dot means unsaved changes, "✓ Saved" means saved, and × (on hover) removes a picture.
+  - **Limits and setting:** up to 100 pictures. Settings › General › **Collect captures in one editor** (`Tray`) turns it off. To collect every capture, set After capture to Open the editor. Files opened from the gallery or Finder, and collages, keep their own windows.
 
 ## Video editor
 
@@ -113,7 +120,7 @@ An Eagle-style library for everything in the captures folder. Metadata lives in 
 
 ## Differences from Windows
 
-- In the editor, ⌘ replaces Ctrl (⌘Z, ⌘C, ⌘S, ⌘P, ⌘R redact, ⌘E styled export, ⌘K commands). Single-key tools, 1–8 colors, `[` `]` sizes and ↩ Done are unchanged.
+- In the editor, ⌘ replaces Ctrl (⌘Z, ⌘C, ⌘S, ⌘P, ⌘R redact, ⌘E styled export, ⌘K commands). Single-key tools, 1–8 colors, `[` `]` sizes and ↩ Done are unchanged. The capture tray switches pictures with ⌃⇥ / ⌃⇧⇥ (as on Windows) or ⌘} / ⌘{ (Ctrl+PageDown / Ctrl+PageUp on Windows).
 - History became the capture gallery above (⌘⌫ moves to Trash, ⌘O shows in Finder).
 - System audio and microphone are recorded as two AAC tracks instead of one mixed track.
 - A recorded region that spans displays is clamped to the display under its center.

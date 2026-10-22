@@ -46,6 +46,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 |---|---|
 | 📸 **Capture** | Region, window, full screen, scrolling pages, delay timer, screen ruler, color picker, OCR text, and auto-redaction of emails, keys and card numbers |
 | ✏️ **Annotate** | Arrows, shapes, text, steps, highlighter, blur and pixelate, spotlight, magnifier, crop and styled export |
+| 🎞️ **Capture tray** | Keep capturing into one editor: a strip of thumbnails along its bottom, each picture with its own notes and undo, and the ones you tick saved together |
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
@@ -117,7 +118,23 @@ Other shortcuts:
 - `Ctrl+R` auto-redact (adds editable pixelate boxes).
 - `Ctrl+E` styled export: gradient backdrop, padding, rounded corners and a shadow.
 - `Ctrl+Shift+C` / `Ctrl+Shift+V` copy or paste annotations between editors.
+- `Ctrl+Tab` / `Ctrl+Shift+Tab` (or `Ctrl+PageDown` / `Ctrl+PageUp`) go to the next or previous picture of a capture tray.
 - `Ctrl+K` lists every editor command.
+
+#### Capture tray
+
+Take many screenshots without saving each one: they collect in one editor, in a strip of thumbnails along its bottom edge.
+- **Which captures join:** Capture and annotate (`Ctrl+Alt+E`), and every capture when After capture is "Open in editor". To collect every capture, set Settings › Capture › After capture to **Open in editor**. With an editor open, the next capture joins it instead of opening a new window, and becomes the picture you're editing.
+- **What doesn't join:** a picture opened from the gallery, from Explorer or from the capture notification opens in its own window. So does a collage, and so do recordings.
+- **The strip:** it shows from two pictures on. Click a thumbnail to open that picture; the one you're editing has a lime outline. The wheel scrolls the strip when it's full.
+- **Each picture keeps its own notes:** annotations, step numbers, crop, added space, undo and redo all stay with their picture. Tool, color and size stay with the window.
+- **Ticks:** new captures come ticked. Untick the pictures you don't want to keep.
+- **Marks:** a white dot means the picture has changes that aren't saved. "✓ Saved" means it's in your captures folder. × removes a picture (it asks first if the picture has changes).
+- **Save selected (n):** saves every ticked picture that isn't saved yet, each as its own PNG in your captures folder, with its notes. They join the gallery with the app and window they came from. `Ctrl+S`, `Ctrl+C`, `Ctrl+P` and styled export still act on the picture you're editing.
+- **Done (`Enter`):** saves the ticked pictures, copies the current one and closes. It asks first if a picture that isn't ticked would be lost.
+- **Closing:** closing the window with pictures that aren't saved asks first: **Save selected and close**, **Close without saving** or **Cancel**.
+- **Limits:** a tray holds up to 100 pictures. The next capture opens a new window. Pictures in a tray aren't kept after you quit, so save the ones you want.
+- **Turning it off:** turn off Settings › Capture › **Collect captures in one editor** (`[Editor] Tray=0`) to get one window per capture again.
 
 #### Editor extras
 

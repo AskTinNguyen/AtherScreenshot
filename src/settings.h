@@ -49,6 +49,7 @@ public:
     int scrollMaxFrames = 60;
     // editor
     bool styledExport = false;
+    bool editorTray = true;  // [Editor] Tray: captures for the editor collect in one window, in a strip of thumbnails
     // video editor
     std::wstring noteAuthor;  // [VideoEditor] NoteAuthor: the name on review notes (empty: Windows' display name)
     // compress: the last "under N MB" used, for videos and for pictures ([Compress] CompressVideoMB, CompressPictureMB)

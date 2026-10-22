@@ -32,6 +32,8 @@ private let rows: [Row] = {
         Row(key: "SaveFolder", title: "Captures folder", section: "General", keywords: "directory path pictures", kind: .folder),
         Row(key: "AfterCapture", title: "After capture", section: "General", keywords: "action pin open edit upload",
             kind: .choice([("none", "Just copy / save"), ("edit", "Open the editor"), ("pin", "Pin to screen"), ("open", "Open the file"), ("upload", "Upload and copy link")])),
+        Row(key: "Tray", title: "Collect captures in one editor (a strip of thumbnails along its bottom)", section: "General",
+            keywords: "tray strip thumbnails batch session save selected", kind: .toggle),
         Row(key: "FileNameTemplate", title: "File name template", section: "General", keywords: "{yyyy} {MM} {dd} {HH} {mm} {ss} {ms} {app} {window} {w} {h}",
             kind: .text(Output.defaultTemplate, secure: false)),
         Row(key: "AskForName", title: "Ask for a name after each capture", section: "General", keywords: "rename prompt", kind: .toggle),

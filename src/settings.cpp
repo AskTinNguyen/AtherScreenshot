@@ -198,6 +198,8 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"\r\n[Editor]\r\n"
         L"; Export with padding, rounded corners and a shadow\r\n"
         L"StyledExport=0\r\n"
+        L"; Captures headed for the editor join the open one, in a strip of thumbnails. 0 = one window per capture\r\n"
+        L"Tray=1\r\n"
         L"\r\n[Updates]\r\n"
         L"; Look for a new version on GitHub once a day. Updates install only when you click.\r\n"
         L"CheckAutomatically=1\r\n"
@@ -269,6 +271,7 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Scrolling", L"DelayMs", L"400"},
         {L"Scrolling", L"MaxFrames", L"60"},
         {L"Editor", L"StyledExport", L"0"},
+        {L"Editor", L"Tray", L"1"},
         {L"Gallery", L"AutoTag", L"0"},
         {L"Updates", L"CheckAutomatically", L"1"},
         {L"AiAgents", L"AllowAgents", L"0"},
@@ -315,6 +318,7 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     scrollDelayMs = std::clamp(_wtoi(Get(L"Scrolling", L"DelayMs", L"400").c_str()), 100, 3000);
     scrollMaxFrames = std::clamp(_wtoi(Get(L"Scrolling", L"MaxFrames", L"60").c_str()), 2, 400);
     styledExport = GetBool(L"Editor", L"StyledExport", false);
+    editorTray = GetBool(L"Editor", L"Tray", true);
     noteAuthor = Get(L"VideoEditor", L"NoteAuthor", L"");
     compressVideoMB = std::clamp(_wtof(Get(L"Compress", L"CompressVideoMB", L"30").c_str()), 0.1, 4096.0);
     compressPictureMB = std::clamp(_wtof(Get(L"Compress", L"CompressPictureMB", L"2").c_str()), 0.1, 4096.0);
