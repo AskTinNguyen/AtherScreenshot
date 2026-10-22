@@ -191,6 +191,7 @@ uint64_t ShowToast(const std::wstring& title, const std::wstring& body, BitmapPt
     SetTimer(g.hwnd, kHideTimer, durationMs, nullptr);
     InvalidateRect(g.hwnd, nullptr, FALSE);
     if (IsWindowVisible(g.hwnd)) UpdateWindow(g.hwnd);
+    else if (GetEnvironmentVariableW(L"ATHER_DEMO_OPAQUE_TOASTS", nullptr, 0)) ShowWindow(g.hwnd, SW_SHOWNOACTIVATE);  // MARKETING DEMO ONLY: no DWM cloak dance
     else ShowWithoutFlash(g.hwnd, false);
     return ++g.token;
 }

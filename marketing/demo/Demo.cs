@@ -204,6 +204,7 @@ public static class Demo {
     // screen grab of its rect see.
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
     public static void WatchToasts(string dir) {
         Thread t = new Thread(() => {
@@ -217,7 +218,8 @@ public static class Demo {
                     RECT r; GetWindowRect(h, out r);
                     int w = r.Right - r.Left, hh = r.Bottom - r.Top;
                     System.IO.File.AppendAllText(dir + "\\toasts.log", DateTime.Now.ToString("HH:mm:ss.fff") + " toast " + r.Left + "," + r.Top + " " + w + "x" + hh +
-                        " cloaked=" + cloaked + " exstyle=0x" + GetWindowLong(h, -20).ToString("X") + "\r\n");
+                        " cloaked=" + cloaked + " exstyle=0x" + GetWindowLong(h, -20).ToString("X") + " style=0x" + GetWindowLong(h, -16).ToString("X") +
+                        " atCenter=" + Cls(WindowFromPoint(new POINT { X = (r.Left + r.Right) / 2, Y = (r.Top + r.Bottom) / 2 })) + "\r\n");
                     try {
                         using (var bmp = new System.Drawing.Bitmap(Math.Max(1, w), Math.Max(1, hh))) {
                             using (var g = System.Drawing.Graphics.FromImage(bmp)) { IntPtr dc = g.GetHdc(); PrintWindow(h, dc, 2); g.ReleaseHdc(dc); }
@@ -226,6 +228,10 @@ public static class Demo {
                         using (var bmp = new System.Drawing.Bitmap(Math.Max(1, w), Math.Max(1, hh))) {
                             using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(r.Left, r.Top, 0, 0, bmp.Size, System.Drawing.CopyPixelOperation.SourceCopy);
                             bmp.Save(dir + "\\toast" + n + "-screen.png");
+                        }
+                        using (var bmp = new System.Drawing.Bitmap(GetSystemMetrics(0), GetSystemMetrics(1))) {
+                            using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(0, 0, 0, 0, bmp.Size);
+                            bmp.Save(dir + "\\toast" + n + "-full.png");
                         }
                     } catch (Exception e) { System.IO.File.AppendAllText(dir + "\\toasts.log", e.Message + "\r\n"); }
                     n++;
