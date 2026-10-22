@@ -17,6 +17,8 @@
 #include <mutex>
 #include <optional>
 
+#include "selftest.h"
+
 #pragma comment(lib, "mfplat")
 #pragma comment(lib, "mfreadwrite")
 #pragma comment(lib, "mfuuid")
@@ -256,6 +258,16 @@ BitmapPtr FitInto(const Bitmap& src, int w, int h) {
     return out;
 }
 
+// The row stride of a contiguous RGB32 buffer of `len` bytes holding a w × h frame. The decoder can pad its frame to
+// whole 16 × 16 blocks (1636 × 854 comes as 1648 × 864, as region recordings do) while the media type and its default
+// stride still say 1636 wide; taking w × 4 then shears the picture into streaks. The buffer is whole rows, so the stride
+// is its length over the rows it holds: the frame's own, or padded to 16, 32 or 64.
+LONG RgbRowStride(DWORD len, UINT32 w, UINT32 h) {
+    for (UINT32 rows : {h, (h + 15) & ~15u, (h + 31) & ~31u, (h + 63) & ~63u})
+        if (rows && len % rows == 0 && len / rows >= w * 4 && len / rows < w * 4 + 1024) return (LONG)(len / rows);
+    return (LONG)w * 4;
+}
+
 bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at, int maxSide, BitmapPtr* frame) {
     EnsureMediaFoundation();
     ComPtr<IMFAttributes> attr;
@@ -331,7 +343,11 @@ bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at, int maxSid
     if (!twoD) {
         if (FAILED(buf->Lock(&data, nullptr, &len))) return false;
         scan0 = data;
-        pitch = (LONG)cw * 4;
+        pitch = RgbRowStride(len, cw, ch);
+        if ((size_t)pitch * ch > len) {  // not as many rows as it says: don't read past the buffer
+            buf->Unlock();
+            return false;
+        }
     }
     for (UINT32 y = 0; y < h && y < ch; ++y) {
         const uint32_t* row = reinterpret_cast<const uint32_t*>(scan0 + (LONG_PTR)pitch * (LONG)y);
@@ -1184,6 +1200,24 @@ HRESULT GifWriter::Finish() {
     p_->enc.Reset();
     p_->stream.Reset();
     return hr;
+}
+
+}  // namespace ather
+
+namespace ather {
+
+// A thumbnail's row stride from the decoder's buffer, with the sizes region recordings came out of the decoder with
+// (the frame padded to 16 × 16 blocks while the type says the frame's own size): the padded width, never width × 4.
+ATHER_TEST(media_rgb_row_stride_of_padded_frames) {
+    auto bytes = [](UINT32 w, UINT32 h) { return (DWORD)(w * h * 4); };
+    CHECK_EQ(RgbRowStride(bytes(1648, 864), 1636, 854), 1648L * 4);   // both padded
+    CHECK_EQ(RgbRowStride(bytes(1744, 864), 1736, 856), 1744L * 4);
+    CHECK_EQ(RgbRowStride(bytes(880, 688), 868, 674), 880L * 4);
+    CHECK_EQ(RgbRowStride(bytes(1712, 848), 1702, 846), 1712L * 4);
+    CHECK_EQ(RgbRowStride(bytes(1888, 1008), 1884, 1008), 1888L * 4);  // only the width padded
+    CHECK_EQ(RgbRowStride(bytes(2560, 1408), 2560, 1400), 2560L * 4);  // only the height padded
+    CHECK_EQ(RgbRowStride(bytes(1920, 1080), 1920, 1080), 1920L * 4);  // nothing padded
+    CHECK_EQ(RgbRowStride(12345, 1920, 1080), 1920L * 4);              // a length that fits nothing: the width's
 }
 
 }  // namespace ather
