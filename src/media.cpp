@@ -438,15 +438,25 @@ HRESULT Mp4Writer::Begin(const std::wstring& path, int w, int h, int fps, int au
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, w, h);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(in.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    // No B-frames. Windows' software H.264 encoder (used when there's no GPU encoder) adds them, and the MP4 sink stores
+    // their reordering without an edit list, so every frame would show one frame late: the first at 1/fps, the last past
+    // the file's end, and the picture a frame behind the sound. GPU encoders don't use them anyway.
     // A set size (Compress): constant bit rate, which software and GPU encoders all keep to closely.
-    ComPtr<IMFAttributes> params;
-    if (SUCCEEDED(hr) && videoBps && SUCCEEDED(MFCreateAttributes(&params, 2))) {
-        params->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-        params->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, videoBps);
+    ComPtr<IMFAttributes> params, rateOnly;
+    if (SUCCEEDED(hr) && SUCCEEDED(MFCreateAttributes(&params, 3))) {
+        params->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        if (videoBps && SUCCEEDED(MFCreateAttributes(&rateOnly, 2))) {
+            for (IMFAttributes* a : {params.Get(), rateOnly.Get()}) {
+                a->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+                a->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, videoBps);
+            }
+        }
     }
     if (SUCCEEDED(hr)) {
         hr = p_->writer->SetInputMediaType(p_->video, in.Get(), params.Get());
-        if (FAILED(hr) && params) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), nullptr);  // the rate on `out` still holds
+        // An encoder that refuses a setting: without the B-frame one, then without any (the rate on `out` still holds).
+        if (FAILED(hr) && rateOnly) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), rateOnly.Get());
+        if (FAILED(hr) && params) hr = p_->writer->SetInputMediaType(p_->video, in.Get(), nullptr);
     }
     if (SUCCEEDED(hr) && audioRate > 0) hr = AddAacStream(p_->writer.Get(), audioRate, audioChannels, &p_->audio, audioBps);
     ComPtr<IMFTransform> enc;
