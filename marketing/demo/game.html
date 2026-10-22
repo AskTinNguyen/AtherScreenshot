@@ -24,7 +24,7 @@ function step(dt,now){
  const tt=(now-t0)/1000;
  // the bug: from 10 s, every 20 s, for 6 s the runner sinks through the floor
  const ph=(tt-10)%20, glitching=tt>=10&&ph<6;
- if(glitching){glitch=ph;cam+=SPEED*dt*0.15;fallY=Math.min(fallY+60*dt,T*1.1);return}
+ if(glitching){glitch=ph;cam+=SPEED*dt*0.15;px=cam+W*0.3;fallY=Math.min(fallY+60*dt,T*1.1);return}
  if(glitch>=0){glitch=-1;fallY=0;reset()}
  cam+=SPEED*dt;px=cam+W*0.3;
  const i=Math.floor((px+T/2)/T);

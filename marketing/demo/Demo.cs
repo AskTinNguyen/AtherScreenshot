@@ -36,8 +36,6 @@ public static class Demo {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
-    delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string dev, int mode, ref DEVMODE dm);
@@ -103,28 +101,32 @@ public static class Demo {
         return new int[] { p.X, p.Y, r.Right - r.Left, r.Bottom - r.Top };
     }
     public static int[] Window(IntPtr h) { RECT r; GetWindowRect(h, out r); return new int[] { r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top }; }
-    // Visible top-level windows whose title contains `part` (and class, if given).
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+    static List<IntPtr> All() {
+        List<IntPtr> all = new List<IntPtr>();
+        for (IntPtr h = FindWindowEx(IntPtr.Zero, IntPtr.Zero, null, null); h != IntPtr.Zero && all.Count < 5000; h = FindWindowEx(IntPtr.Zero, h, null, null)) all.Add(h);
+        return all;
+    }
+    static string Text(IntPtr h) { StringBuilder t = new StringBuilder(512); GetWindowText(h, t, 512); return t.ToString(); }
+    static string Cls(IntPtr h) { StringBuilder c = new StringBuilder(256); GetClassName(h, c, 256); return c.ToString(); }
+    // Visible top-level windows whose title contains `part` (and class, if given), front to back.
     public static IntPtr[] Find(string cls, string part) {
         List<IntPtr> found = new List<IntPtr>();
-        EnumWindows(delegate (IntPtr h, IntPtr l) {
-            if (!IsWindowVisible(h)) return true;
-            StringBuilder t = new StringBuilder(512), c = new StringBuilder(256);
-            GetWindowText(h, t, 512); GetClassName(h, c, 256);
-            if ((cls == null || c.ToString() == cls) && (part == null || t.ToString().IndexOf(part, StringComparison.OrdinalIgnoreCase) >= 0)) found.Add(h);
-            return true;
-        }, IntPtr.Zero);
+        foreach (IntPtr h in All()) {
+            if (!IsWindowVisible(h)) continue;
+            if ((cls == null || Cls(h) == cls) && (part == null || Text(h).IndexOf(part, StringComparison.OrdinalIgnoreCase) >= 0)) found.Add(h);
+        }
         return found.ToArray();
     }
     public static string List() {
         StringBuilder sb = new StringBuilder();
-        EnumWindows(delegate (IntPtr h, IntPtr l) {
-            if (!IsWindowVisible(h)) return true;
-            StringBuilder t = new StringBuilder(512), c = new StringBuilder(256);
-            GetWindowText(h, t, 512); GetClassName(h, c, 256);
+        List<IntPtr> all = All();
+        sb.AppendFormat("  {0} top-level windows\n", all.Count);
+        foreach (IntPtr h in all) {
+            if (!IsWindowVisible(h)) continue;
             RECT r; GetWindowRect(h, out r);
-            sb.AppendFormat("  {0} [{1}] '{2}' {3},{4} {5}x{6}\n", h, c, t, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
-            return true;
-        }, IntPtr.Zero);
+            sb.AppendFormat("  {0} [{1}] '{2}' {3},{4} {5}x{6}\n", h, Cls(h), Text(h), r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
+        }
         return sb.ToString();
     }
 }

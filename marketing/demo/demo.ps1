@@ -19,6 +19,13 @@ function WaitWin($cls, $part, $secs) {
     for ($i = 0; $i -lt $secs * 10; $i++) { $h = Win1 $cls $part; if ($h -ne [IntPtr]::Zero) { return $h }; Wait 0.1 }
     Log "no window $cls '$part'"; Log ([Demo]::List()); return [IntPtr]::Zero
 }
+function ExplorerHwnd($urlPart, $secs) {  # Explorer windows by their folder
+    for ($i = 0; $i -lt $secs * 5; $i++) {
+        foreach ($w in (New-Object -ComObject Shell.Application).Windows()) { if ($w.LocationURL -like "*$urlPart*") { return [IntPtr]$w.HWND } }
+        Wait 0.2
+    }
+    Log "no Explorer window $urlPart"; return [IntPtr]::Zero
+}
 function Center($h) { $c = [Demo]::Window($h); @([int]($c[0] + $c[2] / 2), [int]($c[1] + $c[3] / 2)) }
 
 Log ("display: " + [Demo]::Resolution(1920, 1080))
@@ -72,12 +79,22 @@ $logJob = Start-Job -ArgumentList "$demo\game\logs\SkyLedge.log" -ScriptBlock {
     }
 }
 
-# Desktop recording: gdigrab, 30 fps.
+# Desktop recording: ddagrab (Desktop Duplication: sees the app's layered windows, like its toasts); gdigrab if it can't.
 $ff = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
-$psi = New-Object Diagnostics.ProcessStartInfo $ff, "-y -loglevel warning -f gdigrab -framerate 30 -draw_mouse 1 -i desktop -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p `"$Out\desktop.mkv`""
-$psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true
-$rec = [Diagnostics.Process]::Start($psi)
-Wait 1.5
+function StartRec($src, $file) {
+    $psi = New-Object Diagnostics.ProcessStartInfo $ff, "-y -loglevel warning $src -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p `"$file`""
+    $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true
+    [Diagnostics.Process]::Start($psi)
+}
+$dda = '-f lavfi -i ddagrab=output_idx=0:framerate=30:draw_mouse=1,hwdownload,format=bgra'
+$rec = StartRec $dda "$Out\desktop.mkv"
+Wait 3
+if ($rec.HasExited -or -not (Test-Path "$Out\desktop.mkv") -or (Get-Item "$Out\desktop.mkv").Length -lt 1000) {
+    Log "ddagrab failed (exit $($rec.ExitCode)): gdigrab"
+    if (-not $rec.HasExited) { $rec.Kill() }
+    $rec = StartRec '-f gdigrab -framerate 30 -draw_mouse 1 -i desktop' "$Out\desktop.mkv"
+    Wait 1.5
+}
 Log 'recording desktop'
 
 # ---- start: the app (tray), the game ----
@@ -86,9 +103,8 @@ Wait 2
 $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
 Start-Process $edge -ArgumentList '--user-data-dir=C:\demo\edge', '--no-first-run', '--no-default-browser-check', '--start-maximized', '--disable-features=msEdgeWelcomePage', '--app=file:///C:/demo/game/game.html'
 $gameStart = $sw.Elapsed.TotalSeconds + 1.2  # the page starts its clock once loaded
-$game = WaitWin $null 'Sky Ledge' 20
+$game = WaitWin $null 'Sky Ledge' 25
 Log "game window $game"
-[Demo]::ShowWindow($game, 3) | Out-Null
 Wait 3
 Log ([Demo]::List())
 
@@ -123,7 +139,7 @@ $c = [Demo]::Client($ve)
 Log "video editor client $($c -join ',')"
 $sy = $c[1] + $c[3] - 132
 $sx0 = $c[0] + 100; $sx1 = $c[0] + $c[2] - 14
-$a = [int]($sx0 + ($sx1 - $sx0) * 0.42); $b = [int]($sx0 + ($sx1 - $sx0) * 0.80)
+$a = [int]($sx0 + ($sx1 - $sx0) * 0.50); $b = [int]($sx0 + ($sx1 - $sx0) * 0.74)
 [Demo]::Move($a, $sy, 700); Wait 0.4
 [Demo]::KeyDown(0x10); Wait 0.25
 [Demo]::Down(); Wait 0.15; [Demo]::Move($b, $sy, 1400); Wait 0.2; [Demo]::Up()
@@ -134,7 +150,7 @@ Ctrl 'C'
 Log 'Ctrl+C'
 Wait 3.5
 Start-Process explorer.exe "`"$env:USERPROFILE\Desktop\Shared clips`""
-$ex = WaitWin 'CabinetWClass' 'Shared clips' 10
+$ex = ExplorerHwnd 'Shared%20clips' 10
 Wait 1
 [Demo]::MoveWindow($ex, 940, 330, 900, 560, $true) | Out-Null
 Wait 1
@@ -157,24 +173,31 @@ Log "bug folder: $($bug.FullName)"
 Get-ChildItem -Recurse $bug.FullName | ForEach-Object { Log "  $($_.FullName.Substring($bug.FullName.Length)) $($_.Length)" }
 [Demo]::ShowWindow($ex, 6) | Out-Null
 Start-Process explorer.exe "`"$($bug.FullName)`""
-$bx = WaitWin 'CabinetWClass' $bug.Name.Substring(0, 12) 10
+$bx = ExplorerHwnd ([Uri]::EscapeUriString($bug.Name)) 10
 Wait 1
 [Demo]::MoveWindow($bx, 200, 140, 1520, 800, $true) | Out-Null
 Wait 1
 [Demo]::Click(1200, 820, 800)
 [Demo]::Chord(0x11, 0x10, 0x32)            # Ctrl+Shift+2: large icons
 Wait 4
-Start-Process $edge -ArgumentList '--user-data-dir=C:\demo\edge', '--start-maximized', "--app=file:///$($bug.FullName.Replace('\','/'))/bug.png"
-Wait 5
+$png = 'file:///' + ($bug.FullName.Replace('\','/') + '/bug.png').Replace(' ', '%20')
+Start-Process $edge -ArgumentList '--user-data-dir=C:\demo\edge2', '--no-first-run', '--no-default-browser-check', '--start-maximized', "--app=$png"
+Wait 6
 Start-Process notepad.exe "`"$($bug.FullName)\bug.md`""
+Wait 2
 $np = WaitWin $null 'bug.md' 10
-[Demo]::MoveWindow($np, 360, 120, 1200, 820, $true) | Out-Null
+if ($np -ne [IntPtr]::Zero) { [Demo]::MoveWindow($np, 360, 120, 1200, 820, $true) | Out-Null }
 Wait 5
+Log ([Demo]::List())
 
 # ---- 4. capture tray ----
 Log 'scene: tray'
-foreach ($h in @($np, $bx, $ve) + [Demo]::Find($null, 'bug.png')) { [Demo]::ShowWindow($h, 6) | Out-Null }
-Wait 1
+Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-CimInstance Win32_Process -Filter "name='msedge.exe'" | Where-Object { $_.CommandLine -like '*edge2*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+foreach ($w in (New-Object -ComObject Shell.Application).Windows()) { $w.Quit() }
+[Demo]::ShowWindow($ve, 6) | Out-Null
+Wait 2
+Log ([Demo]::List())
 [Demo]::Click(1840, 560, 700)               # back to the game
 Wait 1.5
 CtrlAlt 'E'
