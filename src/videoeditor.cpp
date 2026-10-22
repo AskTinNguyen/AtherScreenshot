@@ -12,6 +12,7 @@
 #pragma comment(lib, "secur32")
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 
@@ -677,7 +678,123 @@ public:
             return it != overlayPics.end() ? it->second : nullptr;
         };
         shown = r.Render(*raw, playing ? rawT : paused);
+        if (mono && shown) Grayscale(*shown);
     }
+
+    // ---- composition guides and the monochrome view ----
+    // Lines over the preview to check framing (golden section, thirds, phi grid, diagonals), on the part the saved video
+    // shows (the crop), and a black-and-white view to check values. The preview's only: never saved. They stay as set for
+    // the next video opened.
+    static inline std::array<bool, kGuideKinds> lastGuides{};
+    static inline bool lastGuidesOn = false, lastMono = false;
+    std::array<bool, kGuideKinds> guides = lastGuides;
+    bool guidesOn = lastGuidesOn;  // Hide guides (G) keeps which ones were on
+    bool mono = lastMono;
+    bool GuideShown(GuideKind k) const { return guidesOn && guides[(size_t)k]; }
+    bool AnyGuide() const {
+        for (int k = 0; k < kGuideKinds; ++k)
+            if (GuideShown((GuideKind)k)) return true;
+        return false;
+    }
+    void GuidesChanged() {
+        lastGuides = guides;
+        lastGuidesOn = guidesOn;
+        lastMono = mono;
+        Invalidate();
+    }
+    void ToggleGuide(GuideKind k) {
+        bool& on = guides[(size_t)k];
+        if (!guidesOn) guidesOn = on = true;  // from hidden: just this one comes back on
+        else on = !on;
+        GuidesChanged();
+    }
+    void ShowAllGuides() {
+        guides.fill(true);
+        guidesOn = true;
+        GuidesChanged();
+    }
+    void HideGuides() {
+        guidesOn = false;
+        GuidesChanged();
+    }
+    // G: hides the guides, or shows them again (the rule of thirds when none was picked yet).
+    void ToggleGuides() {
+        if (AnyGuide()) return HideGuides();
+        guidesOn = true;
+        if (!AnyGuide()) guides[(size_t)GuideKind::Thirds] = true;
+        GuidesChanged();
+    }
+    void ToggleMono() {
+        mono = !mono;
+        Rerender();
+        GuidesChanged();
+    }
+    static gp::Color GuideColor(GuideKind k) {
+        switch (k) {
+            case GuideKind::Golden: return gp::Color(235, 235, 40, 40);    // red
+            case GuideKind::Thirds: return gp::Color(235, 50, 90, 255);    // blue
+            case GuideKind::Phi: return gp::Color(235, 235, 215, 40);      // yellow
+            default: return gp::Color(220, 255, 236, 120);                // pale yellow
+        }
+    }
+    static const wchar_t* GuideColorName(GuideKind k) {
+        switch (k) {
+            case GuideKind::Golden: return L"red";
+            case GuideKind::Thirds: return L"blue";
+            case GuideKind::Phi: return L"yellow";
+            default: return L"pale yellow";
+        }
+    }
+    std::vector<MenuItem> GuidesMenu() {
+        std::vector<MenuItem> v;
+        MenuItem all;
+        all.label = L"Show all guides";
+        all.run = [this] { ShowAllGuides(); };
+        v.push_back(all);
+        MenuItem none;
+        none.label = L"Hide guides\tG";
+        none.enabled = AnyGuide();
+        none.run = [this] { HideGuides(); };
+        v.push_back(none);
+        v.push_back(MenuItem::Sep());
+        for (int k = 0; k < kGuideKinds; ++k) {
+            const GuideKind kind = (GuideKind)k;
+            MenuItem it;
+            it.label = std::wstring(GuideLabel(kind)) + L" (" + GuideColorName(kind) + L")";
+            it.checked = GuideShown(kind);
+            it.run = [this, kind] { ToggleGuide(kind); };
+            v.push_back(it);
+        }
+        v.push_back(MenuItem::Sep());
+        MenuItem bw;
+        bw.label = L"Monochrome view";
+        bw.checked = mono;
+        bw.run = [this] { ToggleMono(); };
+        v.push_back(bw);
+        return v;
+    }
+    static void Grayscale(Bitmap& b) {
+        uint32_t* p = b.Bits();
+        for (size_t i = 0, n = (size_t)b.Width() * b.Height(); i < n; ++i) {
+            const uint32_t c = p[i];
+            const uint32_t y = (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;  // Rec. 601 luma
+            p[i] = (c & 0xFF000000u) | y << 16 | y << 8 | y;
+        }
+    }
+    void PaintGuides(gp::Graphics& g) {
+        if (!AnyGuide()) return;
+        const gp::RectF a = ToView(ViewRect());  // what the saved video shows
+        gp::Pen shade(gp::Color(110, 0, 0, 0), 3.25f * s);  // a dark edge under each line, so it reads on any picture
+        for (int pass = 0; pass < 2; ++pass)
+            for (int k = 0; k < kGuideKinds; ++k) {
+                const GuideKind kind = (GuideKind)k;
+                if (!GuideShown(kind)) continue;
+                gp::Pen pen(GuideColor(kind), 1.25f * s);
+                for (const auto& [p, q] : GuideLines(kind, {a.X, a.Y, a.Width, a.Height}))
+                    g.DrawLine(pass ? &pen : &shade, (float)p.x, (float)p.y, (float)q.x, (float)q.y);
+            }
+    }
+    POINT rDown{};  // where a right click started (a click without a drag opens the guides menu)
 
     // ---- overlay videos in the preview ----
     std::unique_ptr<OverlayFetcher> overlayFetcher;
@@ -2354,6 +2471,13 @@ public:
             hots.back().click = [this, fr] { Popup(fr, FlipMenu()); };
         }
         x = r.right + S(4);
+        r = Button(dc, g, x, y, h, 0, L"Guides", true, AnyGuide() || mono, [] {},
+                   L"Composition guides over the preview (G), or a black-and-white view: never saved. Right-click the video for them too");
+        {
+            const RECT gr = r;
+            hots.back().click = [this, gr] { Popup(gr, GuidesMenu()); };
+        }
+        x = r.right + S(4);
         Separator(dc, x, y, h);
         int si = 1;
         for (int i = 0; i < 5; ++i)
@@ -2476,6 +2600,7 @@ public:
         // Guides and handles are drawn above the video, so they show while it plays too.
         g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
         if (magZoom > 1) g.SetClip(v);
+        PaintGuides(g);
         const COLORREF accent = theme::kAccent;
         if (edit.crop) {
             const gp::RectF r = ToView(*edit.crop);
@@ -2897,7 +3022,7 @@ public:
         }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · Shift+drag mark · Ctrl+C copy · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · Shift+drag mark · Ctrl+C copy · G guides · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -3952,6 +4077,7 @@ public:
             case 'C': cropping = !cropping; Invalidate(); break;
             case 'M': AddNote(); break;
             case 'F': FitMagnifier(); break;
+            case 'G': ToggleGuides(); break;
             case VK_OEM_4: JumpNote(-1); break;  // [
             case VK_OEM_6: JumpNote(1); break;   // ]
             case VK_DELETE:
@@ -4456,18 +4582,28 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_RBUTTONDOWN: {
             const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             const RECT st = StageRect();
+            rDown = p;
             if (PtInRect(&st, p) && magZoom > 1) {
                 magDrag = p;
                 SetCapture(hwnd);
             }
             return 0;
         }
-        case WM_RBUTTONUP:
+        case WM_RBUTTONUP: {
+            const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             if (magDrag) {
                 magDrag.reset();
                 ReleaseCapture();
             }
+            // A right click on the video (not a magnifier pan): the guides menu there.
+            const RECT st = StageRect();
+            if (PtInRect(&st, p) && std::abs(p.x - rDown.x) + std::abs(p.y - rDown.y) <= S(4)) {
+                POINT sp = p;
+                ClientToScreen(hwnd, &sp);
+                RunMenu(hwnd, GuidesMenu(), sp);
+            }
             return 0;
+        }
         case WM_MOUSEWHEEL: {
 
             POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -5037,6 +5173,16 @@ int VideoEditorSnapshots(const std::wstring& outDir) {
         Pump(100);
         SavePng(*Snapshot(e), outDir + L"\\video-editor-loop.png");
         e->ToggleLoop();
+        e->ShowAllGuides();  // every composition guide, then the black-and-white view with the thirds
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-guides.png");
+        e->guides.fill(false);
+        e->ToggleGuide(GuideKind::Thirds);
+        e->ToggleMono();
+        Pump(100);
+        SavePng(*Snapshot(e), outDir + L"\\video-editor-mono.png");
+        e->ToggleMono();
+        e->HideGuides();
         Pump(300);
         // Notes of every kind, one resolved, the selected one pinned.
         struct Spec {
@@ -6116,6 +6262,67 @@ ATHER_TEST(video_editor_saves_review_video_notes_list_and_sheet) {
     for (int i = 0; i < 300 && e->busy; ++i) Pump(100);
     CHECK(FileNameOf(e->lastReviewOut) == L"shot 60 review 2.mp4");
     CHECK(GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES);
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Composition guides and the monochrome view: picked from the menu one by one or all at once, G hides them and brings
+// them back, they're drawn over the preview (on the crop) and never change the edit; monochrome turns the preview grey.
+ATHER_TEST(video_editor_guides) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 2, false));  // red, then green
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const auto keepGuides = VideoEditor::lastGuides;
+    const bool keepOn = VideoEditor::lastGuidesOn, keepMono = VideoEditor::lastMono;
+    e->guides.fill(false);
+    e->guidesOn = e->mono = false;
+    CHECK(!e->AnyGuide());
+    e->Key('G', {});  // nothing picked yet: the rule of thirds
+    CHECK(e->GuideShown(GuideKind::Thirds) && !e->GuideShown(GuideKind::Golden));
+    e->ToggleGuide(GuideKind::Golden);
+    CHECK(e->GuideShown(GuideKind::Golden));
+    e->Key('G', {});  // hide…
+    CHECK(!e->AnyGuide());
+    e->Key('G', {});  // …and back, the same two
+    CHECK(e->GuideShown(GuideKind::Thirds) && e->GuideShown(GuideKind::Golden) && !e->GuideShown(GuideKind::Phi));
+    // The menu: show all; its items are checked for the ones on.
+    e->GuidesMenu()[0].run();
+    CHECK(e->AnyGuide());
+    for (int k = 0; k < kGuideKinds; ++k) CHECK(e->GuideShown((GuideKind)k));
+    const auto menu = e->GuidesMenu();
+    CHECK(menu.size() == 9 && menu[3].checked && menu[6].checked);
+    CHECK(VideoEditor::lastGuidesOn);  // kept for the next video
+    // Drawn over the preview: a thirds line across the middle of the video's left third shows in the window.
+    e->Seek(0.5);
+    for (int i = 0; i < 40 && !e->raw; ++i) Pump(50);
+    const VideoEdit before = e->edit;
+    auto snap = Snapshot(e);
+    const gp::RectF view = e->ToView(e->ViewRect());
+    const int gx = (int)std::lround(view.X + view.Width / 3), gy = (int)std::lround(view.Y + view.Height * 0.15);
+    int blue = 0;
+    for (int dx = -2; dx <= 2; ++dx) {
+        const uint32_t px = snap->Bits()[(size_t)gy * snap->Width() + gx + dx];
+        blue += (px & 255) > 150 && ((px >> 16) & 255) < 150;
+    }
+    CHECK(blue > 0);
+    CHECK(e->edit == before);  // the edit is untouched
+    // Monochrome: the preview turns grey (red footage reads as grey).
+    e->ToggleMono();
+    CHECK(e->mono && e->shown);
+    if (e->shown) {
+        const uint32_t p = e->shown->Pixel(320, 180);
+        CHECK(((p >> 16) & 255) == (p & 255) && ((p >> 8) & 255) == (p & 255));
+    }
+    e->ToggleMono();
+    if (e->shown) CHECK(((e->shown->Pixel(320, 180) >> 16) & 255) > 150);  // red again
+    e->HideGuides();
+    CHECK(!e->AnyGuide());
+    VideoEditor::lastGuides = keepGuides;
+    VideoEditor::lastGuidesOn = keepOn;
+    VideoEditor::lastMono = keepMono;
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

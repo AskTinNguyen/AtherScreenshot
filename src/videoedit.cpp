@@ -225,6 +225,54 @@ Motion Motion::Between(AnimStyle inS, AnimStyle outS, double start, double end, 
 
 // ---------- captions from words ----------
 
+// ---------- composition guides ----------
+
+const wchar_t* GuideLabel(GuideKind k) {
+    switch (k) {
+        case GuideKind::Golden: return L"Golden section";
+        case GuideKind::Thirds: return L"Rule of thirds";
+        case GuideKind::Phi: return L"Phi grid";
+        default: return L"Diagonals";
+    }
+}
+
+std::vector<std::pair<VPoint, VPoint>> GuideLines(GuideKind k, VRect r) {
+    std::vector<std::pair<VPoint, VPoint>> out;
+    auto at = [&](double f) {  // a vertical and a horizontal line at fraction f, and at 1 − f
+        for (double x : {f, 1 - f}) {
+            out.push_back({{r.x + r.w * x, r.y}, {r.x + r.w * x, r.MaxY()}});
+            out.push_back({{r.x, r.y + r.h * x}, {r.MaxX(), r.y + r.h * x}});
+        }
+    };
+    const double phi = (1 + std::sqrt(5.0)) / 2;
+    switch (k) {
+        case GuideKind::Golden: at(1 / (phi * phi)); break;  // 0.382 and 0.618
+        case GuideKind::Thirds: at(1.0 / 3); break;
+        case GuideKind::Phi: at(1 / (2 + phi)); break;       // 1 : φ : 1, so 0.276 and 0.724
+        case GuideKind::Diagonal: {
+            if (r.w <= 0 || r.h <= 0) break;
+            const VPoint tl{r.x, r.y}, tr{r.MaxX(), r.y}, bl{r.x, r.MaxY()}, br{r.MaxX(), r.MaxY()};
+            out.push_back({tl, br});
+            out.push_back({tr, bl});
+            // From a corner along `d` to where it leaves the rectangle.
+            auto toEdge = [&](VPoint c, double dx, double dy) {
+                double t = 1e300;
+                if (dx > 0) t = std::min(t, (r.MaxX() - c.x) / dx);
+                if (dx < 0) t = std::min(t, (r.x - c.x) / dx);
+                if (dy > 0) t = std::min(t, (r.MaxY() - c.y) / dy);
+                if (dy < 0) t = std::min(t, (r.y - c.y) / dy);
+                out.push_back({c, {c.x + dx * t, c.y + dy * t}});
+            };
+            toEdge(tl, r.h, r.w);    // square to tr–bl, which runs along (−w, h)
+            toEdge(br, -r.h, -r.w);
+            toEdge(tr, -r.h, r.w);   // square to tl–br, which runs along (w, h)
+            toEdge(bl, r.h, -r.w);
+            break;
+        }
+    }
+    return out;
+}
+
 bool Clip::SameFootage(const Clip& o) const {
     Clip a = *this, b = o;
     a.flipH = a.flipV = b.flipH = b.flipV = false;
@@ -1955,6 +2003,37 @@ ATHER_TEST(video_flip_mirrors_the_picture) {
     const auto boxed = wr.Render(*TestFrame(), 2);
     CHECK(Px(*boxed, 330, 220).Brightness() < 0.05);  // its left: the black right half
     CHECK(Px(*boxed, 470, 220).g > 0.9);
+}
+
+// Composition guides: each kind's lines sit at its fractions of the picture, end on its edges, and the diagonal
+// guide's corner lines are square to the other diagonal, in a wide picture and a tall one.
+ATHER_TEST(video_composition_guide_lines) {
+    const VRect r{100, 50, 1600, 900};
+    auto xs = [&](GuideKind k) {  // where the vertical lines are, as fractions of the width
+        std::vector<double> f;
+        for (const auto& [p, q] : GuideLines(k, r))
+            if (p.x == q.x) f.push_back((p.x - r.x) / r.w);
+        std::sort(f.begin(), f.end());
+        return f;
+    };
+    const auto thirds = xs(GuideKind::Thirds), golden = xs(GuideKind::Golden), phi = xs(GuideKind::Phi);
+    CHECK(thirds.size() == 2 && std::fabs(thirds[0] - 1.0 / 3) < 1e-9 && std::fabs(thirds[1] - 2.0 / 3) < 1e-9);
+    CHECK(golden.size() == 2 && std::fabs(golden[0] - 0.381966) < 1e-5 && std::fabs(golden[1] - 0.618034) < 1e-5);
+    CHECK(phi.size() == 2 && std::fabs(phi[0] - 0.276393) < 1e-5 && std::fabs(phi[1] - 0.723607) < 1e-5);
+    CHECK_EQ(GuideLines(GuideKind::Thirds, r).size(), 4u);  // two across, two down
+    for (const VRect box : {r, VRect{0, 0, 600, 1000}}) {
+        const auto d = GuideLines(GuideKind::Diagonal, box);
+        CHECK_EQ(d.size(), 6u);
+        auto onEdge = [&](VPoint p) {
+            return std::fabs(p.x - box.x) < 1e-6 || std::fabs(p.x - box.MaxX()) < 1e-6 || std::fabs(p.y - box.y) < 1e-6 ||
+                   std::fabs(p.y - box.MaxY()) < 1e-6;
+        };
+        for (const auto& [p, q] : d) CHECK(onEdge(p) && onEdge(q) && (p.x != q.x || p.y != q.y));
+        // The line from the top-left corner (third) is square to the top-right → bottom-left diagonal (second).
+        const auto& [a, b] = d[2];
+        const auto& [c, e] = d[1];
+        CHECK(std::fabs((b.x - a.x) * (e.x - c.x) + (b.y - a.y) * (e.y - c.y)) < 1e-6);
+    }
 }
 
 ATHER_TEST(video_arrow_emoji_and_title) {
