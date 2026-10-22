@@ -6133,14 +6133,20 @@ ATHER_TEST(video_editor_loop) {
     if (e->loop) e->ToggleLoop();
     e->Key('L', {true, false, false});  // Ctrl+L
     CHECK(e->loop);
+    // Waits for `done` (up to 10 s: a runner without a GPU starts playing slowly, more so after the clips change),
+    // then a moment more so a round in progress settles.
+    auto waitFor = [&](const std::function<bool()>& done) {
+        for (int i = 0; i < 200 && !done(); ++i) Pump(50);
+        Pump(150);
+        test::Note("loops " + std::to_string(e->loops) + ", now " + std::to_string(e->Now()) + ", playing " + std::to_string(e->playing));
+    };
     // Round the trim 0.3–0.9.
     e->edit.trimStart = 0.3;
     e->edit.trimEnd = 0.9;
     e->Changed();
     e->Seek(0.3);
     e->Play();
-    Pump(1600);
-    test::Note("loops " + std::to_string(e->loops) + ", now " + std::to_string(e->Now()));
+    waitFor([&] { return e->loops >= 1; });
     CHECK(e->loops >= 1);
     CHECK(e->playing);
     CHECK(e->Now() >= 0.25 && e->Now() <= 0.95);
@@ -6155,8 +6161,10 @@ ATHER_TEST(video_editor_loop) {
     e->loops = 0;
     e->Seek(1.5);
     e->Play();
-    Pump(1500);
-    CHECK(e->loops >= 1 && e->playing && e->Now() >= 0.95);
+    waitFor([&] { return e->loops >= 1; });
+    CHECK(e->loops >= 1);
+    CHECK(e->playing);
+    CHECK(e->Now() >= 0.95);  // still in that clip
     e->Pause();
     // Review playback at a slower speed wraps too.
     e->SelectClip(std::nullopt);
@@ -6167,7 +6175,7 @@ ATHER_TEST(video_editor_loop) {
     e->Seek(0.2);
     e->previewRate = 0.5;
     e->Review(1);
-    Pump(1500);
+    waitFor([&] { return e->loops >= 1; });
     CHECK(e->loops >= 1 && e->reviewDir == 1);
     e->Pause();
     // Off: it stops at the end.
@@ -6175,10 +6183,12 @@ ATHER_TEST(video_editor_loop) {
     CHECK(!e->loop);
     e->edit.trimEnd = e->duration;
     e->Changed();
+    e->loops = 0;
     e->Seek(1.6);
     e->Play();
-    Pump(1200);
+    waitFor([&] { return !e->playing; });
     CHECK(!e->playing);
+    CHECK_EQ(e->loops, 0);
     if (VideoEditor::lastLoop != before) VideoEditor::lastLoop = before;
     e->dirty = false;
     DestroyWindow(e->hwnd);
