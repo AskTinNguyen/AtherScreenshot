@@ -10,10 +10,26 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new in this update (Windows, build 0.0.2.6)
+## What's new in this update (Windows, build 0.0.2.7)
+
+In the video editor on Windows, each clip now has its own speed, and footage can play backwards. The Mac app stays at
+build 0.0.2.5 for now.
+
+### Speed per clip
+- **What:** after you split a video, **Speed ▾** sets the speed of just that piece: the selected clip, else the one at the playhead. Speed up the boring part and keep the rest at 1×.
+- **All at once:** **Speed ▾ › Every clip at** sets every clip to the same speed.
+- **Where it shows:** the saved video, its sound (pitch kept), Save GIF, Copy clip and the preview all follow each clip's speed. The timeline still shows the footage at 1×, and the clip lane marks sped-up or slowed-down clips with `2×`, `0.5×`…
+
+### Reverse: the end becomes the start
+- **A clip:** select a clip and press **Reverse** in the toolbar: it plays end to start, picture and sound.
+- **The whole timeline:** with no clip selected, Reverse turns the whole video around: the clips in the opposite order, each one backwards, with markup, captions, videos on top and the trim mirrored along with them.
+- **Back:** press Reverse again (or Ctrl+Z) to play it forward. Reversed clips show `◀ reversed` on the clip lane.
+- **Good to know:** reversing writes the backwards footage to a file in your temp folder first, so a long clip takes a moment; a toast shows how far along it is.
+
+## Earlier update (Windows, build 0.0.2.6)
 
 The video editor on Windows can now build a new video out of pieces, put a second video on top or beside it, and flip
-clips. The Mac app stays at build 0.0.2.5 for now.
+clips.
 
 ### Clip bin: keep the pieces you cut, then arrange them into a new video
 - **What:** a **Bin** lane above the clip lane holds clips taken out of the video, so you can put them back or rearrange them instead of losing them. It shows once there's more than one clip, or anything in the bin.
