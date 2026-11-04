@@ -196,7 +196,8 @@ Opening a video (from the gallery, the "Recording saved" notification, Open rece
   - S splits the clip at the playhead (then remove a middle part, or reorder the halves). The selected clip's row has Split, Earlier, Later and Remove (Del).
   - Markup and captions move with the footage they're on; undo covers clip changes too.
 - **Crop:** press C and drag on the video; pick Free, 16:9, 4:3, 1:1 or 9:16 to keep a shape.
-- **Speed** 0.5–4× (audio keeps its pitch) and **Mute**.
+- **Speed** 0.5–4× (audio keeps its pitch) and **Mute**. On Windows the speed is per clip: split a video and set the speed of just that piece (the selected clip, else the one at the playhead); Speed ▾ › Every clip at sets them all.
+- **Reverse** (Windows) plays footage end to start, sound too: the selected clip, or with no clip selected the whole timeline (its end becomes its start, markup and captions mirrored with it). Reverse again to go back.
 - **Captions:**
   - T adds one at the playhead. Type in the field, drag it on the timeline to move it or its edges to retime it, and choose top, middle or bottom.
   - **Auto captions** transcribes the speech on this PC with Windows speech recognition and splits it into short captions.

@@ -109,7 +109,8 @@ std::vector<Scenario> Scenarios(const Clip& c) {
     {
         Scenario s{L"speed2", false, {}};
         s.edit.trimEnd = std::min(D, 30.0);
-        s.edit.speed = 2;
+        s.edit.clips = {c};
+        s.edit.clips[0].speed = 2;
         out.push_back(s);
     }
     {  // captions all along, nothing else
