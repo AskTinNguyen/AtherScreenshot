@@ -1,10 +1,10 @@
 {
     "windows":  {
-                    "version":  "0.0.2.6",
+                    "version":  "0.0.2.7",
                     "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "3ac2a34f4ad0ff318f5c21035808b2108c994558f709c8cc057356d43bb853e3",
-                    "size":  4602368,
-                    "notes":  "Clip bin, picture in picture, split screen, flip, loop, framing guides in the video editor, and scrubbing videos in the gallery."
+                    "sha256":  "f74f6370ba63719d8a8f336c99c1a7a6b7b8be11db8b36cb5eebfeb091791c41",
+                    "size":  4657152,
+                    "notes":  "Speed per clip after a split, and Reverse for a clip or the whole timeline in the video editor."
                 },
     "macos":  {
                   "version":  "0.0.2.5",
