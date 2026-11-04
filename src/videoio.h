@@ -152,6 +152,9 @@ bool ExportMp4Sized(const std::wstring& source, const VideoEdit& e, const Mp4Tar
 // held). One encoder; the frames go through the same frame renderer as Save's. A plain Save never comes here.
 bool ExportReviewMp4(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan, const std::wstring& out, std::wstring* error,
                      ExportProgress progress = {});
+// Reverse: clip `c`'s footage ([in, out) of its file, upright, with its sound) played end to start, as a new MP4 of the
+// same length and frame times. Time r of it shows the file's time c.out − r.
+bool WriteReversed(const Clip& c, const std::wstring& out, std::wstring* error, ExportProgress progress = {});
 // Each note's frame as the review video shows it (the edit's frame, without the burn-in and card), with its pin.
 std::vector<BitmapPtr> NoteFrames(const std::wstring& source, const VideoEdit& e, const ReviewPlan& plan);
 // The review's contact sheet ("<video> review sheet.png"): a header (title, date, reviewers, count), then one tile per
@@ -218,13 +221,15 @@ public:
     bool Playing() const;
     void Seek(double t);
     double Now() const;
-    void SetRate(double r);
+    void SetRate(double r);  // each clip plays at this × its speed
+    void SetSpeeds(const std::vector<Clip>& clips);  // the same clips with other speeds
     void SetMuted(bool m);
     BitmapPtr NewFrame(double* t);
 
 private:
     SequencePlayer() = default;
     VideoPlayer* Cur() const;
+    double ClipRate() const;  // the current clip's
     void Start(VideoPlayer* p);
     void Advance();  // on to the next clip that can play (past ones whose engine failed), or the end
     Sequence seq_;

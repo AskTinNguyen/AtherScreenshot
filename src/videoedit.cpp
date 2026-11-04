@@ -277,7 +277,43 @@ std::vector<std::pair<VPoint, VPoint>> GuideLines(GuideKind k, VRect r) {
 bool Clip::SameFootage(const Clip& o) const {
     Clip a = *this, b = o;
     a.flipH = a.flipV = b.flipH = b.flipV = false;
+    a.speed = b.speed = 1;
     return a == b;
+}
+
+// Output time over the trim: each clip's stretch of the timeline lasts its length / its speed (past the last clip's
+// end, the last clip's speed).
+double VideoEdit::OutputSpan(double a, double b) const {
+    if (b <= a) return 0;
+    if (clips.empty()) return b - a;
+    double at = 0, d = 0;
+    for (size_t i = 0; i < clips.size(); ++i) {
+        const double c0 = i == 0 ? std::min(a, 0.0) : at, c1 = i + 1 == clips.size() ? std::max(b, at + clips[i].Duration()) : at + clips[i].Duration();
+        at += clips[i].Duration();
+        const double lo = std::max(a, c0), hi = std::min(b, c1);
+        if (hi > lo) d += (hi - lo) / clips[i].speed;
+    }
+    return d;
+}
+
+double VideoEdit::TimelineAt(double u) const {
+    if (clips.empty()) return trimStart + u;
+    double t = trimStart, at = 0;
+    for (size_t i = 0; i < clips.size(); ++i) {
+        const double c1 = at + clips[i].Duration();
+        at = c1;
+        if (c1 <= t && i + 1 < clips.size()) continue;
+        const double s = clips[i].speed, span = (c1 - t) / s;
+        if (u <= span || i + 1 == clips.size()) return t + u * s;
+        u -= span;
+        t = c1;
+    }
+    return t;
+}
+
+double VideoEdit::SpeedAt(double t) const {
+    const auto spot = LocateClip(clips, t);
+    return spot ? clips[spot->first].speed : 1;
 }
 
 bool SameFootage(const std::vector<Clip>& a, const std::vector<Clip>& b) {
@@ -2257,6 +2293,34 @@ ATHER_TEST(video_clips_locate_and_total) {
     CHECK(s && s->first == 0 && std::fabs(s->second - 1.5) < 1e-9);
     s = LocateClip(v, 99);  // past the end: the end of the last clip
     CHECK(s && s->first == 1 && std::fabs(s->second - 4) < 1e-9);
+}
+
+// Each clip plays at its own speed in the saved video: a split clip's piece at 2× runs half as long, the rest as it was.
+ATHER_TEST(video_clip_speeds_set_output_time) {
+    VideoEdit e;
+    e.clips = {TestClip(L"a", 0, 2), TestClip(L"a", 2, 6), TestClip(L"b", 0, 2)};  // timeline 0–2, 2–6, 6–8
+    e.clips[1].speed = 2;
+    e.clips[2].speed = 0.5;
+    e.trimEnd = 8;
+    CHECK_NEAR(e.OutputDuration(), 2 + 2 + 4, 1e-9);
+    CHECK_NEAR(e.OutputSpan(1, 3), 1 + 0.5, 1e-9);  // across a speed change
+    CHECK_NEAR(e.TimelineAt(1), 1, 1e-9);
+    CHECK_NEAR(e.TimelineAt(3), 4, 1e-9);   // 1 s into the 2× piece: 2 s of its footage
+    CHECK_NEAR(e.TimelineAt(5), 6.5, 1e-9); // 1 s into the 0.5× clip: half a second of it
+    CHECK_NEAR(e.SpeedAt(3), 2, 1e-9);
+    CHECK_NEAR(e.SpeedAt(7), 0.5, 1e-9);
+    e.trimStart = 3;  // from inside the fast piece
+    CHECK_NEAR(e.OutputDuration(), 1.5 + 4, 1e-9);
+    CHECK_NEAR(e.TimelineAt(1), 5, 1e-9);
+    CHECK_NEAR(e.TimelineAt(2), 6.25, 1e-9);
+    // A speed is no new footage: the decoders and thumbnails stay.
+    std::vector<Clip> plain = e.clips;
+    for (auto& c : plain) c.speed = 1;
+    CHECK(SameFootage(plain, e.clips) && !(plain == e.clips));
+    VideoEdit none;  // the whole file, no clips: 1×
+    none.trimStart = 1, none.trimEnd = 4;
+    CHECK_NEAR(none.OutputDuration(), 3, 1e-9);
+    CHECK_NEAR(none.TimelineAt(2), 3, 1e-9);
 }
 
 // Reordering, removing and trimming clips moves markup and captions with their footage.

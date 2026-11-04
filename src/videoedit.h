@@ -139,9 +139,16 @@ struct Clip {
     bool hasAudio = false;
     // Its picture mirrored left–right and/or upside down (before anything is drawn on it). Pieces split from it keep it.
     bool flipH = false, flipV = false;
+    // How fast it plays in the saved video (VideoEdit::kSpeeds); the timeline shows its footage at 1×. Pieces split from it keep it.
+    double speed = 1;
+    // A clip made backwards (Reverse): `path` is a file the editor wrote with this footage played end to start, and
+    // `reverseOf` the file it came from. Time r of `path` shows reverseOf's time reverseEnd − r. Empty: not reversed.
+    std::wstring reverseOf;
+    double reverseEnd = 0;
     double Duration() const { return std::max(0.0, out - in); }
     bool Flipped() const { return flipH || flipV; }
-    bool SameFootage(const Clip& o) const;  // the same but for the flip: what the decoders and thumbnails care about
+    bool Reversed() const { return !reverseOf.empty(); }
+    bool SameFootage(const Clip& o) const;  // the same but for the flip and speed: what the decoders and thumbnails care about
     bool operator==(const Clip&) const = default;
 };
 bool SameFootage(const std::vector<Clip>& a, const std::vector<Clip>& b);
@@ -189,7 +196,6 @@ struct VideoEdit {
     int frameW = 0, frameH = 0;  // the sequence frame; 0 = the first clip's size
     double trimStart = 0, trimEnd = 0;
     std::optional<VRect> crop;
-    double speed = 1;
     bool muted = false;
     std::vector<Caption> captions;
     int captionSize = 2;   // 0…4
@@ -205,7 +211,12 @@ struct VideoEdit {
     static constexpr double kCaptionScale[] = {0.03, 0.037, 0.045, 0.055, 0.068};
     static const wchar_t* const kCaptionSizes[5];
 
-    double OutputDuration() const { return std::max(0.0, trimEnd - trimStart) / speed; }
+    // Speed: each clip plays at its own (Clip::speed) in the saved video, so output time runs at a different pace in
+    // each. Without clips (the whole source file) it's 1×.
+    double OutputDuration() const { return OutputSpan(trimStart, trimEnd); }
+    double OutputSpan(double a, double b) const;  // how long timeline [a, b) runs in the saved video
+    double TimelineAt(double u) const;            // the timeline time the saved video shows `u` seconds in
+    double SpeedAt(double t) const;               // the speed of the clip at timeline time `t`
     bool operator==(const VideoEdit&) const = default;
 };
 

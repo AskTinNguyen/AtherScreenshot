@@ -55,7 +55,7 @@ namespace gp = Gdiplus;
 constexpr wchar_t kClass[] = L"AtherScreenshotVideoEditor";
 constexpr wchar_t kIconFace[] = L"Segoe Fluent Icons";
 constexpr UINT WM_ENGINE = WM_APP + 40, WM_THUMBS = WM_APP + 41, WM_TRANSCRIBED = WM_APP + 42, WM_SAVED = WM_APP + 43, WM_FETCHED = WM_APP + 44,
-               WM_FRAMES = WM_APP + 45, WM_STRIP = WM_APP + 46, WM_OVERLAYS = WM_APP + 47;
+               WM_FRAMES = WM_APP + 45, WM_STRIP = WM_APP + 46, WM_OVERLAYS = WM_APP + 47, WM_REVERSED = WM_APP + 48;
 enum : UINT_PTR { kTimerFrame = 1 };
 enum : int { kField1 = 200, kField2 };
 
@@ -643,7 +643,10 @@ public:
     // Anything in the edit changed: the preview, the timeline and the fields follow.
     void Changed() {
         if (!SameFootage(edit.clips, builtClips)) RebuildSequence();
-        else builtClips = edit.clips;  // only a flip: the players and thumbnails stay (the renderer and strip flip)
+        else {  // only a flip or a speed: the players and thumbnails stay (the renderer and strip flip)
+            builtClips = edit.clips;
+            if (player) player->SetSpeeds(edit.clips);
+        }
         if (marked) SetMarked(marked->start, marked->end);  // still inside the trim
         RequestOverlays(playing ? rawT : paused);
         LoadNotes();
@@ -946,7 +949,7 @@ public:
         const auto [from, to] = loop ? LoopRange() : std::pair{edit.trimStart, edit.trimEnd};
         if (Now() < from || Now() >= to - 0.05) Seek(from);
         player->Seek(paused);
-        player->SetRate(edit.speed);
+        player->SetRate(1);  // each clip at its own speed
         player->SetMuted(edit.muted);
         player->Play();
         playing = true;
@@ -1012,7 +1015,7 @@ public:
         const size_t m = dir > 0 ? std::min(n + 1, tframes.size() - 1) : n > 0 ? n - 1 : 0;
         double d = std::fabs(tframes.frames[m].t - tframes.frames[n].t);
         if (d <= 0) d = 1 / tframes.Fps(n);
-        return d / (previewRate * edit.speed);
+        return d / (previewRate * edit.SpeedAt(tframes.frames[n].t));
     }
     // Each tick: once the frame shown has come and its time is up, on to the next one.
     void ReviewTick() {
@@ -1966,6 +1969,200 @@ public:
         Changed();
     }
 
+    // ---- speed ----
+
+    // What Speed sets: the selected clip, else the clip at the playhead (so after a split, just that piece).
+    std::optional<size_t> SpeedClip() const {
+        if (const auto i = SelClipIndex()) return i;
+        if (const auto spot = LocateClip(edit.clips, Now())) return spot->first;
+        return std::nullopt;
+    }
+    std::wstring SpeedTip() const {
+        if (edit.clips.size() < 2) return L"Playback speed of the saved video";
+        if (SelClipIndex()) return L"Playback speed of the selected clip in the saved video";
+        return L"Playback speed of the clip at the playhead in the saved video (select a clip to pick another)";
+    }
+    std::vector<MenuItem> SpeedMenu() {
+        const auto k = SpeedClip();
+        std::vector<std::wstring> labels;
+        int si = -1;
+        for (int i = 0; i < (int)std::size(VideoEdit::kSpeeds); ++i) {
+            labels.push_back(SpeedLabel(VideoEdit::kSpeeds[i]));
+            if (k && VideoEdit::kSpeeds[i] == edit.clips[*k].speed) si = i;
+        }
+        std::vector<MenuItem> v = ListMenu(labels, si, [this](int i) { SetSpeed(VideoEdit::kSpeeds[i], false); });
+        if (edit.clips.size() > 1) {
+            MenuItem all;
+            all.label = L"Every clip at";
+            for (int i = 0; i < (int)labels.size(); ++i) {
+                MenuItem m;
+                m.label = labels[i];
+                m.checked = std::all_of(edit.clips.begin(), edit.clips.end(), [&](const Clip& c) { return c.speed == VideoEdit::kSpeeds[i]; });
+                m.run = [this, i] { SetSpeed(VideoEdit::kSpeeds[i], true); };
+                all.sub.push_back(m);
+            }
+            v.push_back(MenuItem::Sep());
+            v.push_back(all);
+        }
+        return v;
+    }
+    // One undo step: how fast the clip (or every clip) plays in the saved video. The timeline stays as it is.
+    void SetSpeed(double speed, bool every) {
+        const auto k = SpeedClip();
+        if (!k) return;
+        std::vector<Clip> clips = edit.clips;
+        for (size_t i = 0; i < clips.size(); ++i)
+            if (every || i == *k) clips[i].speed = speed;
+        if (clips == edit.clips) return;
+        PushUndo();
+        edit.clips = std::move(clips);
+        Changed();
+    }
+
+    // ---- reverse ----
+
+    // Reverse plays footage end to start: the selected clip, else the whole timeline (its clips in the opposite order,
+    // each one backwards, and everything on it mirrored in time). A reversed clip is a file the editor writes in the
+    // temp folder (WriteReversed) and then plays like any other; reversing it again goes back to the original footage.
+    bool reversing = false;
+    std::wstring ReverseLabel() const { return reversing ? L"Reversing…" : L"Reverse"; }
+    std::wstring ReverseTip() const {
+        if (SelClipIndex()) return L"Play the selected clip backwards, end to start";
+        if (edit.clips.size() > 1) return L"Play the whole timeline backwards: the end becomes the start (select a clip to reverse just that one)";
+        return L"Play the video backwards: the end becomes the start";
+    }
+    struct ReverseResult {
+        std::vector<Clip> before;  // the clips it was made for
+        std::vector<Clip> clips;   // each one reversed (or back to its original footage), in the same places
+        std::optional<size_t> only;  // just this clip; else the whole timeline
+        std::wstring err;
+    };
+    // Where clip `c` reversed is kept: the same footage reuses the file.
+    static std::wstring ReversedPath(const Clip& c) {
+        wchar_t tdir[MAX_PATH];
+        GetTempPathW(MAX_PATH, tdir);
+        const std::wstring dir = std::wstring(tdir) + L"ather-reversed";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        wchar_t key[64];
+        swprintf_s(key, L"%016llx", (unsigned long long)std::hash<std::wstring>{}(Lower(c.path) + L"|" + std::to_wstring(c.in) + L"|" + std::to_wstring(c.out)));
+        return dir + L"\\" + FileNameOf(c.path).substr(0, 40) + L" reversed " + key + L".mp4";
+    }
+    // `c` played the other way: a reversed file of its footage, or for a reversed clip the original file again.
+    static std::optional<Clip> ReverseClip(const Clip& c, std::wstring* err, const ExportProgress& progress) {
+        Clip r = c;
+        if (c.Reversed()) {
+            const auto o = ClipOf(c.reverseOf);
+            if (!o) {
+                *err = L"The original video can't be read any more: " + FileNameOf(c.reverseOf);
+                return std::nullopt;
+            }
+            r.path = c.reverseOf;
+            r.in = std::clamp(c.reverseEnd - c.out, 0.0, o->length);
+            r.out = std::clamp(c.reverseEnd - c.in, r.in, o->length);
+            r.reverseOf.clear();
+            r.reverseEnd = 0;
+            r.length = o->length, r.w = o->w, r.h = o->h, r.fps = o->fps, r.hasAudio = o->hasAudio;
+            return r;
+        }
+        const std::wstring file = ReversedPath(c);
+        std::optional<Clip> made = ClipOf(file);
+        if (!made) {
+            const std::wstring part = file + L".part.mp4";
+            if (!WriteReversed(c, part, err, progress) || !MoveFileExW(part.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                DeleteFileW(part.c_str());
+                if (err->empty()) *err = L"Can't write the reversed video.";
+                return std::nullopt;
+            }
+            if (!(made = ClipOf(file))) {
+                *err = L"Can't read the reversed video.";
+                return std::nullopt;
+            }
+        }
+        r.path = file;
+        r.in = 0;
+        r.out = std::min(c.Duration(), made->length);
+        r.length = made->length, r.w = made->w, r.h = made->h, r.fps = made->fps, r.hasAudio = c.hasAudio && made->hasAudio;
+        r.reverseOf = c.path;
+        r.reverseEnd = c.out;
+        return r;
+    }
+    void Reverse() {
+        if (busy || edit.clips.empty()) return;
+        SetFocus(hwnd);  // commits a field being edited
+        Pause();
+        const std::optional<size_t> only = SelClipIndex();
+        const std::vector<Clip> before = edit.clips;
+        busy = reversing = true;
+        Invalidate();
+        const uint64_t toast = ShowToast(L"Reversing…", only || before.size() == 1 ? L"Playing the clip end to start" : L"The whole timeline, end to start",
+                                         nullptr, nullptr, 600000);
+        HWND h = hwnd;
+        std::thread([=] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            auto* r = new ReverseResult{before, before, only, L""};
+            int lastPct = -1;
+            const size_t count = only ? 1 : before.size();
+            for (size_t k = 0, done = 0; k < before.size() && r->err.empty(); ++k) {
+                if (only && k != *only) continue;
+                const auto c = ReverseClip(before[k], &r->err, [&](double p) {
+                    const int pct = (int)((done + p) * 100 / count);
+                    if (pct / 5 != lastPct / 5) {
+                        lastPct = pct;
+                        const std::wstring body = std::to_wstring(pct) + L"%";
+                        RunOnUi([toast, body] { UpdateToastBody(toast, body); });
+                    }
+                    return true;
+                });
+                if (c) r->clips[k] = *c;
+                ++done;
+            }
+            CoUninitialize();
+            if (!PostMessageW(h, WM_REVERSED, 0, (LPARAM)r)) delete r;  // the editor was closed meanwhile
+        }).detach();
+    }
+    // One undo step: the reversed clips in place. On the clip (or the timeline) markup and captions are mirrored in time,
+    // so each shows over the same footage; the trim and videos on top follow on a whole timeline.
+    void ReverseDone(const ReverseResult& r) {
+        busy = reversing = false;
+        if (!r.err.empty()) {
+            ShowToast(L"Reverse failed", r.err, nullptr, nullptr, 8000);
+            return Invalidate();
+        }
+        if (edit.clips != r.before) {
+            ShowToast(L"The clips changed while reversing", L"Reverse again to play them backwards.", nullptr, nullptr, 4000);
+            return Invalidate();
+        }
+        PushUndo();
+        double t0 = 0, t1 = ClipsDuration(edit.clips);
+        if (r.only) t0 = ClipStart(edit.clips, *r.only), t1 = t0 + edit.clips[*r.only].Duration();
+        auto mirror = [&](double& start, double& end) {
+            const double s = start;
+            start = t0 + t1 - end;
+            end = t0 + t1 - s;
+        };
+        auto inside = [&](double start, double end) { return !r.only || (start >= t0 - 1e-6 && end <= t1 + 1e-6); };
+        for (auto& m : edit.marks)
+            if (inside(m.start, m.end)) mirror(m.start, m.end);
+        for (auto& c : edit.captions)
+            if (inside(c.start, c.end)) {
+                mirror(c.start, c.end);
+                for (auto& w : c.words) mirror(w.start, w.end);
+                std::reverse(c.words.begin(), c.words.end());
+            }
+        edit.clips = r.clips;
+        if (!r.only) {
+            std::reverse(edit.clips.begin(), edit.clips.end());
+            for (auto& o : edit.overlays) o.start = std::max(0.0, t1 - o.End());
+            const double a = edit.trimStart;
+            edit.trimStart = std::max(0.0, t1 - edit.trimEnd);
+            edit.trimEnd = std::min(t1, t1 - a);
+        }
+        const double now = Now();
+        Changed();
+        Seek(r.only ? t0 : std::clamp(t1 - now, edit.trimStart, edit.trimEnd));
+        ShowToast(r.clips[r.only ? *r.only : 0].Reversed() ? L"Reversed" : L"Back to playing forward", L"Ctrl+Z undoes it", nullptr, nullptr, 2500);
+    }
+
     std::vector<MenuItem> AddMenu() {
         std::vector<MenuItem> v;
         MenuItem clip;
@@ -2377,10 +2574,10 @@ public:
         if (!anchor) marked.reset();
         Invalidate();
     }
-    // "6.2 s · Ctrl+C copies": how long the copied clip runs (at the edit's speed).
+    // "6.2 s · Ctrl+C copies": how long the copied clip runs (each clip at its speed).
     std::wstring MarkedLabel() const {
         if (!marked) return L"";
-        return ClipSeconds((marked->end - marked->start) / edit.speed) + L" · Ctrl+C copies";
+        return ClipSeconds(edit.OutputSpan(marked->start, marked->end)) + L" · Ctrl+C copies";
     }
 
     // ---- stage geometry ----
@@ -2483,23 +2680,14 @@ public:
         }
         x = r.right + S(4);
         Separator(dc, x, y, h);
-        int si = 1;
-        for (int i = 0; i < 5; ++i)
-            if (VideoEdit::kSpeeds[i] == edit.speed) si = i;
-        r = Button(dc, g, x, y, h, 0, L"Speed " + SpeedLabel(edit.speed), true, edit.speed != 1, [] {}, L"Playback speed of the saved video");
+        const double speed = SpeedClip() ? edit.clips[*SpeedClip()].speed : 1;
+        r = Button(dc, g, x, y, h, 0, L"Speed " + SpeedLabel(speed), true, speed != 1, [] {}, SpeedTip());
         {
             const RECT sr = r;
-            hots.back().click = [this, sr, si] {
-                std::vector<std::wstring> labels;
-                for (double v : VideoEdit::kSpeeds) labels.push_back(SpeedLabel(v));
-                Popup(sr, ListMenu(labels, si, [this](int i) {
-                    PushUndo();
-                    edit.speed = VideoEdit::kSpeeds[i];
-                    if (playing && player) player->SetRate(edit.speed);
-                    Changed();
-                }));
-            };
+            hots.back().click = [this, sr] { Popup(sr, SpeedMenu()); };
         }
+        x = r.right + S(4);
+        r = Button(dc, g, x, y, h, 0xE72C, ReverseLabel(), false, SpeedClip() && edit.clips[*SpeedClip()].Reversed(), [this] { Reverse(); }, ReverseTip());
         x = r.right + S(4);
         r = Button(dc, g, x, y, h, edit.muted ? 0xE74F : 0xE767, L"Mute", false, edit.muted, [this] {
             PushUndo();
@@ -3009,7 +3197,7 @@ public:
         if (const auto k = SelClipIndex(); k && !ci && !mi && !ni && !goingTo) {
             const size_t i = *k;
             const Clip& c = edit.clips[i];
-            label(L"Clip " + std::to_wstring(i + 1) + L" of " + std::to_wstring(edit.clips.size()) + L":  " + FileNameOf(c.path) + L"  ·  " + Clock(c.Duration()));
+            label(L"Clip " + std::to_wstring(i + 1) + L" of " + std::to_wstring(edit.clips.size()) + L":  " + ClipName(c) + L"  ·  " + Clock(c.Duration()));
             button(0xE8C6, L"Split at playhead", false, [this](RECT) { SplitAtPlayhead(); }, L"Cut this clip in two at the playhead (S)");
             if (i > 0) button(0xE760, L"Earlier", false, [this, i](RECT) { MoveClip(i, i - 1); }, L"Play this clip before the one on its left");
             if (i + 1 < edit.clips.size()) button(0xE761, L"Later", false, [this, i](RECT) { MoveClip(i, i + 1); }, L"Play this clip after the one on its right");
@@ -3018,7 +3206,7 @@ public:
         if (const auto k = SelBinIndex(); k && !ci && !mi && !ni && !goingTo) {
             const size_t i = *k;
             const Clip& c = edit.bin[i];
-            label(L"In the bin:  " + FileNameOf(c.path) + L"  ·  " + Clock(c.in) + L"–" + Clock(c.out) + L"  ·  " + Clock(c.Duration()));
+            label(L"In the bin:  " + ClipName(c) + L"  ·  " + Clock(c.in) + L"–" + Clock(c.out) + L"  ·  " + Clock(c.Duration()));
             button(0xE710, L"Add at end", false, [this, i](RECT) { PlaceFromBin(i, edit.clips.size()); }, L"Put it back at the end of the video (or drag it onto the timeline)");
             button(0, L"On top", false, [this, i](RECT) { BinToOverlay(i, InsertTime()); },
                    L"Show it on top from the playhead, in a box or side by side (or drag it to the bottom lane)");
@@ -3322,13 +3510,18 @@ public:
         }
     }
 
+    // The name a clip goes by: its file's (for a reversed clip, the original's).
+    static std::wstring ClipName(const Clip& c) { return FileNameOf(c.Reversed() ? c.reverseOf : c.path); }
+
     // A clip's bar: its name and length, clipped to the bar.
     void PaintClipChip(HDC dc, gp::Graphics& g, const RECT& r, const Clip& c, bool sel, BYTE alpha) {
         FillRR(g, r, (float)S(4), sel ? A(theme::kAccent, alpha) : gp::Color((BYTE)(46 * alpha / 255), 255, 255, 255));
         HRGN clip = CreateRectRgn(r.left + S(3), r.top, r.right - S(3), r.bottom);
         SelectClipRgn(dc, clip);
-        const std::wstring flips = std::wstring(c.flipH ? L"  ↔" : L"") + (c.flipV ? L"  ↕" : L"");  // flipped, at a glance
-        Text(dc, fSmall, FileNameOf(c.path) + L"  " + Clock(c.Duration()) + flips, {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
+        // Flipped, sped up or slowed down, and reversed, at a glance.
+        const std::wstring flips = std::wstring(c.flipH ? L"  ↔" : L"") + (c.flipV ? L"  ↕" : L"") + (c.speed != 1 ? L"  " + SpeedLabel(c.speed) : L"") +
+                                   (c.Reversed() ? L"  ◀ reversed" : L"");
+        Text(dc, fSmall, ClipName(c) + L"  " + Clock(c.Duration()) + flips, {r.left + S(7), r.top, r.right, r.bottom}, sel ? theme::kOnAccent : theme::kText);
         SelectClipRgn(dc, nullptr);
         DeleteObject(clip);
     }
@@ -4391,7 +4584,7 @@ public:
         VideoEdit e = edit;
         e.trimStart = a;
         e.trimEnd = b - 1e-4;  // the frame starting right at `b` stays out, whatever the rounding of frame times
-        const double seconds = (b - a) / e.speed;
+        const double seconds = e.OutputSpan(a, b);
         const std::wstring out = MakeCapturePath(g_folder, L"mp4", {window, app});
         SHCreateDirectoryExW(nullptr, out.substr(0, out.find_last_of(L'\\')).c_str(), nullptr);
         wchar_t tdir[MAX_PATH];
@@ -4722,6 +4915,11 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
         case WM_TRANSCRIBED: {
             std::unique_ptr<TranscribeResult> r(reinterpret_cast<TranscribeResult*>(l));
             Transcribed(r->ok, std::move(r->caps), r->err);
+            return 0;
+        }
+        case WM_REVERSED: {
+            std::unique_ptr<ReverseResult> r(reinterpret_cast<ReverseResult*>(l));
+            ReverseDone(*r);
             return 0;
         }
         case WM_SAVED: {
@@ -5656,7 +5854,7 @@ ATHER_TEST(video_editor_review_playback_jkl) {
     CHECK(steps(slow, 1));
     CHECK(slow.size() >= 15 && slow.size() <= 26);  // 15 frames a second at 0.25× of 60 fps
     CHECK(e->edit == before);
-    CHECK(e->edit.speed == 1);
+    CHECK(e->edit.clips[0].speed == 1);
     e->Key('L', {});
     CHECK(e->reviewDir == 1 && e->previewRate == 0.5);
     const auto half = watch(600);
@@ -6054,7 +6252,7 @@ ATHER_TEST(video_editor_timeline_zoom) {
     e->Key('0', {true, false, false});
     CHECK_NEAR(e->tlZoom, 1, 1e-9);
     // Zooming never touches the edit.
-    CHECK(e->edit.speed == 1 && !e->edit.crop);
+    CHECK(e->edit.clips[0].speed == 1 && !e->edit.crop);
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
@@ -6412,6 +6610,96 @@ ATHER_TEST(video_editor_loop) {
     CHECK(!e->playing);
     CHECK_EQ(e->loops, 0);
     if (VideoEditor::lastLoop != before) VideoEditor::lastLoop = before;
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Speed after a split sets just that piece (the selected one, else the one at the playhead); "Every clip at" sets all.
+// Reverse with nothing selected turns the whole timeline around: the clips in the opposite order, each backwards, markup
+// mirrored in time; again, and it's the footage as it was. With a clip selected, only that clip.
+ATHER_TEST(video_editor_speed_per_clip_and_reverse) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring clip = dir + L"/colors.mp4";
+    CHECK(WriteTestClip(clip, 640, 360, 30, 3, true));  // red, green, blue seconds
+    VideoEditor* e = OpenHidden(clip, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    e->Seek(1.0);
+    e->SplitAtPlayhead();  // [0, 1) and [1, 3), the second selected
+    CHECK(e->edit.clips.size() == 2);
+    e->SetSpeed(2, false);
+    CHECK(e->edit.clips[0].speed == 1 && e->edit.clips[1].speed == 2);
+    const double D = e->duration;  // the timeline still shows the footage at 1× (the file's length, about 3 s)
+    test::Note("duration " + std::to_string(D) + ", out " + std::to_string(e->edit.OutputDuration()) + ", trim " + std::to_string(e->edit.trimStart) + "–" + std::to_string(e->edit.trimEnd));
+    CHECK_NEAR(D, 3, 0.05);
+    CHECK_NEAR(e->edit.OutputDuration(), 1 + (e->edit.trimEnd - 1) / 2, 1e-6);
+    e->SelectClip(std::nullopt);
+    e->Seek(0.5);
+    e->SetSpeed(0.5, false);  // the clip at the playhead
+    CHECK(e->edit.clips[0].speed == 0.5 && e->edit.clips[1].speed == 2);
+    e->SetSpeed(1.5, true);
+    CHECK(e->edit.clips[0].speed == 1.5 && e->edit.clips[1].speed == 1.5);
+    e->Undo();
+    CHECK(e->edit.clips[0].speed == 0.5 && e->edit.clips[1].speed == 2);
+
+    // The whole timeline backwards.
+    e->AddMark(MarkKind::Box);
+    e->edit.marks.back().start = 0.2, e->edit.marks.back().end = 0.6;
+    e->SelectClip(std::nullopt);
+    const std::vector<Clip> before = e->edit.clips;
+    auto reverse = [&] {
+        e->Reverse();
+        for (int i = 0; i < 600 && e->reversing; ++i) Pump(50);
+        CHECK(!e->reversing);
+    };
+    reverse();
+    CHECK(e->edit.clips.size() == 2);
+    if (e->edit.clips.size() == 2) {
+        const Clip &a = e->edit.clips[0], &b = e->edit.clips[1];
+        CHECK(a.Reversed() && b.Reversed() && a.id == before[1].id && b.id == before[0].id);
+        CHECK_NEAR(a.Duration(), 2, 0.04);
+        CHECK_NEAR(b.Duration(), 1, 0.04);
+        CHECK(a.speed == 2 && b.speed == 0.5);  // each keeps its speed
+        CHECK(e->ClipName(a) == L"colors.mp4");
+    }
+    CHECK_NEAR(e->edit.marks.back().start, D - 0.6, 0.05);
+    CHECK_NEAR(e->edit.marks.back().end, D - 0.2, 0.05);
+    CHECK_NEAR(e->edit.trimEnd - e->edit.trimStart, 3, 0.05);
+    // Saved: blue first (the end of the video), red last.
+    const std::wstring out = dir + L"/reversed.mp4";
+    const bool saved = ExportMp4(clip, e->edit, out, nullptr);
+    CHECK(saved);
+    if (saved) {
+        BitmapPtr f;
+        auto hue = [&](double t) {
+            f.reset();
+            if (!ProbeVideo(out, nullptr, t, 0, &f) || !f) return -1;
+            const uint32_t p = f->Bits()[20 * f->Width() + 20];
+            const int r = (p >> 16) & 255, g = (p >> 8) & 255, bl = p & 255;
+            return r >= g && r >= bl ? 0 : g >= bl ? 1 : 2;
+        };
+        CHECK_EQ(hue(0.2), 2);  // the 2× clip, backwards: blue, then green
+        CHECK_EQ(hue(0.8), 1);
+        CHECK_EQ(hue(1.5), 0);  // the 0.5× clip: red
+    }
+    // Again: forward, as it was.
+    reverse();
+    CHECK(e->edit.clips.size() == 2);
+    if (e->edit.clips.size() == 2) {
+        for (size_t i = 0; i < 2; ++i) {
+            CHECK(!e->edit.clips[i].Reversed() && e->edit.clips[i].path == clip && e->edit.clips[i].id == before[i].id);
+            CHECK_NEAR(e->edit.clips[i].in, before[i].in, 0.04);
+            CHECK_NEAR(e->edit.clips[i].out, before[i].out, 0.04);
+        }
+    }
+    CHECK_NEAR(e->edit.marks.back().start, 0.2, 0.05);
+    // Just the selected clip.
+    e->SelectClip(e->edit.clips[0].id);
+    reverse();
+    CHECK(e->edit.clips[0].Reversed() && !e->edit.clips[1].Reversed());
+    CHECK_NEAR(e->edit.marks.back().start, 0.4, 0.05);  // mirrored within the clip
+    e->Undo();
+    CHECK(!e->edit.clips[0].Reversed());
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }
