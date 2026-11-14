@@ -43,6 +43,7 @@ struct VideoEdit: Equatable {
     var highlightWords = true  // auto captions: the spoken word lights up
     var clips: [Clip] = []     // played back to back; every time above is timeline time
     var bin: [Clip] = []       // pieces taken off the timeline, kept to put back: never played or saved
+    var overlays: [VideoOverlay] = []   // videos on top (silent), in the order they're drawn
     var frame = CGSize.zero    // the sequence frame: the first video's upright size, kept when clips change
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
@@ -88,14 +89,14 @@ enum VideoExport {
     static func prepare(_ e: VideoEdit, probe: Probe? = nil) async throws -> Prepared {
         // Every frame goes through the same renderer the preview uses.
         let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
-        let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), muted: e.muted,
+        let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), muted: e.muted, overlays: e.overlays,
                                               box: RendererBox(renderer, probe: probe))
         return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
 
     // One frame of the edit as the export draws it (crop, captions and markup at timeline time `t`), at the export's size.
     static func frame(_ e: VideoEdit, at t: Double) async throws -> CGImage {
-        let b = try await VideoSequence.build(e.clips, frame: e.frame, box: RendererBox(FrameRenderer(edit: e, full: e.frame, preview: false)))
+        let b = try await VideoSequence.build(e.clips, frame: e.frame, overlays: e.overlays, box: RendererBox(FrameRenderer(edit: e, full: e.frame, preview: false)))
         let gen = AVAssetImageGenerator(asset: b.composition)
         gen.videoComposition = b.video
         gen.requestedTimeToleranceBefore = .zero
@@ -213,10 +214,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var unplayable: Set<UUID> = []        // clips whose file can't be read: playback skips them
     private var pendingSeek: Double?              // where to go once the rebuilt sequence is in the player
     private var refreshPending = false
+    private var builtOverlays: [VideoOverlay] = []    // the videos on top it has (their timing)
     private var playingClips: [Clip] = []        // what the player's item was built from: maps its time to timeline time
-    private(set) var builds = 0                    // tests: how many times the player was given a rebuilt sequence
+    private(set) var builds = 0
+    var lastWheelScale = Date.distantPast                    // tests: how many times the player was given a rebuilt sequence
 
     private let stage = VideoStage()
+    var stageView: VideoStage { stage }   // tests
     let timeline = Timeline()
     private let playButton = NSButton()
     let loopButton = NSButton()
@@ -307,14 +311,16 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     // The preview plays the sequence through the export renderer. Rebuilt when the clips change.
     @MainActor func rebuildPlayer() async {
-        let clips = edit.clips
+        let clips = edit.clips, overlays = edit.overlays
         builtClips = clips
+        builtOverlays = overlays.map(\.timing)
         duration = VideoSequence.total(clips)
         videoSize = edit.frame
         let box = RendererBox(FrameRenderer(edit: edit, full: videoSize, preview: true))
         do {
-            let b = try await VideoSequence.build(clips, frame: edit.frame, box: box)
-            guard VideoSequence.sameFootage(clips, edit.clips) else { return }  // changed again meanwhile: that rebuild wins
+            let b = try await VideoSequence.build(clips, frame: edit.frame, overlays: overlays, box: box)
+            // Changed again meanwhile: that rebuild wins.
+            guard VideoSequence.sameFootage(clips, edit.clips), overlays.map(\.timing) == edit.overlays.map(\.timing) else { return }
             // The playhead stays where playback is (an undo while playing doesn't jump back to where Play was
             // pressed), unless a clip change asked for a spot.
             let at = pendingSeek ?? now
@@ -387,7 +393,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         addPopup.item(at: 0)?.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add")
         let entries: [(String, String, String, () -> Void)] = [("Caption", "captions.bubble", "T", { [weak self] in self?.addCaption() })]
             + MarkKind.allCases.map { k in (k.label, k.symbol, k.key, { [weak self] in self?.addMark(k) }) }
-            + [("Video clip…", "film.stack", "⌘O", { [weak self] in self?.addClipDialog() })]
+            + [("Video clip…", "film.stack", "⌘O", { [weak self] in self?.addClipDialog() }),
+               ("Video on top (picture in picture)…", "pip", "", { [weak self] in self?.addOverlayDialog(.pip) }),
+               ("Video side by side (split screen)…", "rectangle.split.2x1", "", { [weak self] in self?.addOverlayDialog(.splitRight) })]
         for (title, symbol, key, run) in entries {
             let it = NSMenuItem(title: key.isEmpty ? title : "\(title)    \(key)", action: #selector(MenuAction.fire), keyEquivalent: "")
             it.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
@@ -397,7 +405,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             addPopup.menu?.addItem(it)
             if title == "Caption" || title == "Step number" || title == "Pixelate" || title == MarkKind.allCases.last?.label { addPopup.menu?.addItem(.separator()) }
         }
-        addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead, or join another video"
+        addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead, join another video, or show one on top or side by side"
 
         let auto = barButton("Auto captions", "waveform.badge.mic", "Transcribe speech into captions, on this Mac") { [weak self] in self?.autoCaptions() }
         captionsMenu.bezelStyle = .recessed
@@ -533,8 +541,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func rebuildInspector() {
         for v in inspector.arrangedSubviews { inspector.removeArrangedSubview(v); v.removeFromSuperview() }
         inspectorActions = []
-        let ci = selectedCaptionIndex, mi = selectedMarkIndex, k = selectedClipIndex, bi = selectedBinIndex
-        inspector.isHidden = ci == nil && mi == nil && k == nil && bi == nil
+        let ci = selectedCaptionIndex, mi = selectedMarkIndex, k = selectedClipIndex, bi = selectedBinIndex, oi = selectedOverlayIndex
+        inspector.isHidden = ci == nil && mi == nil && k == nil && bi == nil && oi == nil
         hint.isHidden = !inspector.isHidden
         if let ci {
             let c = edit.captions[ci]
@@ -627,12 +635,37 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             if k + 1 < edit.clips.count { button("Later", "arrow.right", "Play this clip after the one on its right") { [weak self] in self?.moveClip(k, to: k + 1) } }
             if edit.clips.count > 1 { button("To bin", "tray.and.arrow.up", "Take this clip out into the bin, to put back later (⌫, or drag it up)") { [weak self] in self?.moveToBin(k) } }
         }
+        if let oi {
+            let o = edit.overlays[oi]
+            rowLabel("Video on top:  \(o.clip.displayName)  ·  \(clock(o.clip.duration))  ·  no sound")
+            let layout = popup(OverlayLayout.allCases.map(\.label), o.layout.rawValue) { [weak self] i in
+                self?.updateOverlay { $0.layout = OverlayLayout(rawValue: i) ?? .pip }
+                self?.rebuildInspector()
+            }
+            layout.toolTip = "In a box on top, or side by side with the video"
+            inspector.addArrangedSubview(layout)
+            if o.isSplit {
+                inspector.addArrangedSubview(popup(["Fit: all of each picture, with bars", "Fill: each half filled, cut to fit"], o.fill ? 1 : 0) { [weak self] i in
+                    self?.updateOverlay { $0.fill = i == 1 }
+                })
+            } else {
+                let cur = VideoOverlay.sizes.indices.min { abs(VideoOverlay.sizes[$0].1 - o.width) < abs(VideoOverlay.sizes[$1].1 - o.width) } ?? 1
+                let size = popup(VideoOverlay.sizes.map(\.0), cur) { [weak self] i in self?.updateOverlay { $0.width = VideoOverlay.sizes[i].1 } }
+                size.toolTip = "Its size (or drag its corner on the video, or scroll over it)"
+                inspector.addArrangedSubview(size)
+            }
+            button("To bin", "tray.and.arrow.up", "Take it off into the bin (⌫)") { [weak self] in self?.deleteSelected() }
+        }
         if let bi, ci == nil, mi == nil {
             let c = edit.bin[bi]
             rowLabel("In the bin:  \(c.displayName)  ·  \(clock(c.inPoint))–\(clock(c.outPoint))  ·  \(clock(c.duration))")
             button("Add at end", "plus", "Put it back at the end of the video (or drag it onto the timeline)") { [weak self] in
                 guard let self else { return }
                 self.placeFromBin(bi, at: self.edit.clips.count)
+            }
+            button("On top", "pip", "Show it in a box on top of the video, from the playhead") { [weak self] in
+                guard let self else { return }
+                self.binToOverlay(bi, at: self.insertTime)
             }
             button("Delete", "trash", "Delete this piece for good (⌫)") { [weak self] in self?.deleteFromBin(bi) }
         }
@@ -850,6 +883,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var selectedCaptionIndex: Int? { selected.flatMap { id in edit.captions.firstIndex { $0.id == id } } }
     var selectedMarkIndex: Int? { selected.flatMap { id in edit.marks.firstIndex { $0.id == id } } }
     var selectedClipIndex: Int? { selected.flatMap { id in edit.clips.firstIndex { $0.id == id } } }
+    var selectedOverlayIndex: Int? { selected.flatMap { id in edit.overlays.firstIndex { $0.id == id } } }
     var selectedBinIndex: Int? { selected.flatMap { id in edit.bin.firstIndex { $0.id == id } } }   // a clip keeps its id going to the bin and back
     var viewRect: CGRect {
         let f = CGRect(origin: .zero, size: videoSize)
@@ -867,15 +901,17 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         guard let e = undoStack.popLast() else { return }
         edit = e
         if let s = selected, !edit.captions.contains(where: { $0.id == s }) && !edit.marks.contains(where: { $0.id == s }) && !edit.clips.contains(where: { $0.id == s })
-            && !edit.bin.contains(where: { $0.id == s }) { selected = nil }
+            && !edit.bin.contains(where: { $0.id == s }) && !edit.overlays.contains(where: { $0.id == s }) { selected = nil }
         rebuildInspector()
     }
 
     private func changed() {
         duration = VideoSequence.total(edit.clips)
-        if !VideoSequence.sameFootage(edit.clips, builtClips), !edit.clips.isEmpty {   // a flip alone doesn't rebuild the player
+        let footageChanged = !VideoSequence.sameFootage(edit.clips, builtClips)
+        if footageChanged || edit.overlays.map(\.timing) != builtOverlays, !edit.clips.isEmpty {   // a flip alone doesn't rebuild the player
             builtClips = edit.clips
-            marked = nil   // its times would now show other footage
+            builtOverlays = edit.overlays.map(\.timing)
+            if footageChanged { marked = nil }   // its times would now show other footage
             Task { @MainActor in await self.rebuildPlayer() }
         }
         if let m = marked { setMarked(m.lowerBound, m.upperBound) }   // still inside the trim
@@ -1120,7 +1156,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         setClips(clips)
     }
 
-    private var insertTime: Double { min(max(now, edit.trimStart), max(edit.trimStart, edit.trimEnd - 0.5)) }
+    var insertTime: Double { min(max(now, edit.trimStart), max(edit.trimStart, edit.trimEnd - 0.5)) }
 
     func addCaption() {
         pushUndo()
@@ -1184,6 +1220,12 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         if let k = selectedBinIndex { return deleteFromBin(k) }
         guard selected != nil else { return }
         pushUndo()
+        if let o = edit.overlays.first(where: { $0.id == selected }) {   // a video on top's footage goes to the bin, like a clip's
+            var c = o.clip
+            c.id = UUID()
+            edit.bin.append(c)
+            edit.overlays.removeAll { $0.id == o.id }
+        }
         edit.captions.removeAll { $0.id == selected }
         edit.marks.removeAll { $0.id == selected }
         selected = nil
@@ -1540,7 +1582,32 @@ final class VideoStage: NSView {
     var playerLayer: AVPlayerLayer { playerView.playerLayer }
     // Guides and handles draw in a view above the video; a layer-backed view's own drawing sits under its sublayers.
     private let overlay = StageOverlay()
-    private enum Drag { case crop(CGPoint), move(UUID, CGPoint, Mark), handle(UUID, Int, Mark), caption(UUID, CGPoint, CGRect) }
+    private enum Drag {
+        case crop(CGPoint), move(UUID, CGPoint, Mark), handle(UUID, Int, Mark), caption(UUID, CGPoint, CGRect)
+        case overlayBox(UUID, handle: Int, from: CGPoint, VideoOverlay)   // handle 0 moves it; 1–4 (corners) size it
+    }
+
+    // A video on top under `vp` (video coordinates), topmost first: a corner of the selected box (1 top-left,
+    // 2 top-right, 3 bottom-left, 4 bottom-right: to size it), or a box or a split's half (0: to move or select it).
+    func overlayAt(_ vp: CGPoint) -> (Int, Int)? {
+        guard let ed = editor else { return nil }
+        let t = ed.now, slop = 12 / max(0.01, scale)
+        if let i = ed.selectedOverlayIndex, ed.edit.overlays[i].active(t), !ed.edit.overlays[i].isSplit {
+            let r = ed.overlayOnVideo(ed.edit.overlays[i])
+            let corners = [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY)]
+            if let k = corners.firstIndex(where: { hypot($0.x - vp.x, $0.y - vp.y) <= slop }) { return (i, k + 1) }
+        }
+        for i in ed.edit.overlays.indices.reversed() where ed.edit.overlays[i].active(t) && ed.overlayOnVideo(ed.edit.overlays[i]).contains(vp) { return (i, 0) }
+        return nil
+    }
+
+    // The wheel over a box sizes it.
+    override func scrollWheel(with e: NSEvent) {
+        guard let ed = editor, let (i, _) = overlayAt(toVideo(convert(e.locationInWindow, from: nil))), !ed.edit.overlays[i].isSplit, e.scrollingDeltaY != 0 else {
+            return super.scrollWheel(with: e)
+        }
+        ed.scaleOverlay(i, by: e.scrollingDeltaY > 0 ? 1.08 : 1 / 1.08)
+    }
     private var drag: Drag?
 
     override init(frame: NSRect) {
@@ -1632,6 +1699,17 @@ final class VideoStage: NSView {
         guard let ed = editor else { return }
         let vp = toVideo(convert(e.locationInWindow, from: nil))
         let slop = 8 / max(0.01, scale)
+        // Videos on top are drawn over the markup, so they're picked first; cropping goes on around them (and over one
+        // that isn't selected).
+        if let (i, h) = overlayAt(vp), !ed.cropping || ed.selectedOverlayIndex == i {
+            let o = ed.edit.overlays[i]
+            ed.cropping = false
+            ed.selected = o.id
+            if o.isSplit { return }
+            ed.pushUndo()
+            drag = .overlayBox(o.id, handle: h, from: vp, o)
+            return
+        }
         if ed.cropping {
             ed.pushUndo()
             drag = .crop(vp)
@@ -1686,6 +1764,26 @@ final class VideoStage: NSView {
                 b = CGPoint(x: a.x + (b.x < a.x ? -W : W), y: a.y + (b.y < a.y ? -H : H))
             }
             ed.setCrop(Geo.norm(a, b))
+        case .overlayBox(let id, let h, let from, let o0):   // the box moves, or (its corner) grows and shrinks
+            guard let i = ed.edit.overlays.firstIndex(where: { $0.id == id }) else { return }
+            let v = ed.viewRect
+            var o = ed.edit.overlays[i]
+            if h == 0 {
+                o.pos = CGPoint(x: o0.pos.x + (p.x - from.x) / v.width, y: o0.pos.y + (p.y - from.y) / v.height)
+            } else {   // a corner: the opposite one stays put, the shape stays the video's
+                let r0 = o0.rect(v.size)
+                let left = h == 1 || h == 3, top = h <= 2
+                let ax = left ? r0.maxX : r0.minX, ay = top ? r0.maxY : r0.minY
+                let shape = r0.height / max(1, r0.width)
+                let px = p.x - v.minX, py = p.y - v.minY
+                var w = max(left ? ax - px : px - ax, (top ? ay - py : py - ay) / shape)
+                w = max(0.08 * v.width, min(w, min(left ? ax : v.width - ax, (top ? ay : v.height - ay) / shape)))   // stays on the frame
+                o.width = w / v.width
+                o.pos = CGPoint(x: (left ? ax - w : ax) / v.width, y: (top ? ay - w * shape : ay) / v.height)
+            }
+            let r = o.rect(v.size)   // kept on the frame
+            o.pos = CGPoint(x: r.minX / v.width, y: r.minY / v.height)
+            ed.edit.overlays[i] = o
         case .caption(let id, let from, let r):
             guard let i = ed.edit.captions.firstIndex(where: { $0.id == id }) else { return }
             let v = ed.viewRect
@@ -1765,6 +1863,23 @@ final class VideoStage: NSView {
             NSBezierPath(roundedRect: CGRect(x: v.midX - sz.width / 2 - 12, y: v.midY - sz.height / 2 - 6, width: sz.width + 24, height: sz.height + 12), xRadius: 8, yRadius: 8).fill()
             s.draw(at: CGPoint(x: v.midX - sz.width / 2, y: v.midY - sz.height / 2))
         }
+        // A selected video on top: its box (or half) and, for a box, the corners that size it.
+        if let i = ed.selectedOverlayIndex, ed.edit.overlays[i].active(ed.now) {
+            let o = ed.edit.overlays[i]
+            let r = toView(ed.overlayOnVideo(o))
+            ctx.setStrokeColor(Theme.accent.cgColor)
+            ctx.setLineWidth(1.5)
+            ctx.stroke(r.insetBy(dx: 0.75, dy: 0.75))
+            if !o.isSplit {
+                for c in [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY)] {
+                    let box = CGRect(x: c.x - 5, y: c.y - 5, width: 10, height: 10)
+                    ctx.setFillColor(NSColor.white.cgColor)
+                    ctx.fillEllipse(in: box)
+                    ctx.setStrokeColor(Theme.accent.cgColor)
+                    ctx.strokeEllipse(in: box)
+                }
+            }
+        }
         // Selection: outline and handles. Zoom and blur regions show their box only while selected.
         if let i = ed.selectedMarkIndex {
             let m = ed.edit.marks[i]
@@ -1840,7 +1955,8 @@ final class Timeline: NSView {
         case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double)
         case clipIn(Int, grab: Double, value: Double), clipOut(Int, grab: Double, value: Double)  // applied on mouse-up
         case clipMove(Int, down: CGPoint, target: Int?, toBin: Bool)   // dragged up over the bin: it goes there
-        case binMove(Int, down: CGPoint, at: CGPoint, target: Int?, moved: Bool)  // a bin piece carried onto the clip lane
+        case binMove(Int, down: CGPoint, at: CGPoint, target: Int?, moved: Bool, toOverlay: Bool)  // a bin piece carried onto the clip lane or on top
+        case overlayItem(UUID, edge: Int, grab: Double, VideoOverlay)   // a video on top's bar: moved, or (an end) trimmed
         case range(anchor: Double, before: Range<Double>?)   // marking a range (⇧-drag, or a grip): Esc puts `before` back
     }
     private var drag: Drag?
@@ -1870,8 +1986,22 @@ final class Timeline: NSView {
         needsDisplay = true
     }
 
+    // Videos dropped on the lane of videos on top go on top there; anywhere else on the timeline they join the clips.
+    private func videos(_ info: NSDraggingInfo) -> [URL] {
+        (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []).filter(MediaFiles.isVideo)
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { videos(sender).isEmpty ? [] : .copy }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let v = videos(sender)
+        guard let e = editor, !v.isEmpty else { return false }
+        let p = convert(sender.draggingLocation, from: nil)
+        if p.y >= ovY - 6 { e.addOverlay(v[0], at: t(p.x), layout: .pip) } else { e.addClips(v) }
+        return true
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        registerForDraggedTypes([.fileURL])
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
         if let w = window { NotificationCenter.default.addObserver(self, selector: #selector(lostMouse), name: NSWindow.didResignKeyNotification, object: w) }
     }
@@ -1949,7 +2079,10 @@ final class Timeline: NSView {
     }
 
     var rowCount: Int { max(3, min(8, (rows().map(\.1).max() ?? 0) + 1)) }
-    var wantedHeight: CGFloat { markY + CGFloat(rowCount) * rowH }
+    // The videos on top: a lane at the bottom, under the markup's rows.
+    var ovY: CGFloat { markY + CGFloat(rowCount) * rowH + 4 }
+    let ovH: CGFloat = 22
+    var wantedHeight: CGFloat { ovY + ovH }
 
     private func barRect(_ s: Double, _ e: Double, y: CGFloat, h: CGFloat) -> CGRect {
         CGRect(x: x(s), y: y, width: max(6, x(e) - x(s)), height: h)
@@ -1970,7 +2103,7 @@ final class Timeline: NSView {
             if let i = binChips().firstIndex(where: { $0.contains(p) }) {
                 if ev.clickCount == 2 { e.placeFromBin(i, at: e.edit.clips.count); return }
                 e.selected = e.edit.bin[i].id
-                drag = .binMove(i, down: p, at: p, target: nil, moved: false)
+                drag = .binMove(i, down: p, at: p, target: nil, moved: false, toOverlay: false)
             } else { e.selected = nil }
             needsDisplay = true
             return
@@ -2005,6 +2138,20 @@ final class Timeline: NSView {
             e.pushUndo()
             drag = .item(target, edge: edge, grab: t(p.x), start: s, end: en)
             if ev.clickCount == 2 { e.seek(s); e.focusFieldPublic() }
+        }
+        if p.y >= ovY - 2 {   // the lane of videos on top: move a bar, or drag its ends to trim it
+            for o in e.edit.overlays.reversed() {
+                let x0 = x(o.start), x1 = x(o.end)
+                guard p.x >= x0 - 4, p.x <= max(x0 + 6, x1) + 4 else { continue }
+                e.selected = o.id
+                e.pushUndo()
+                drag = .overlayItem(o.id, edge: abs(p.x - x0) < 6 ? -1 : abs(p.x - x1) < 6 ? 1 : 0, grab: t(p.x), o)
+                if ev.clickCount == 2 { e.seek(o.start) }
+                return
+            }
+            e.selected = nil
+            e.seek(t(p.x))
+            return
         }
         if p.y >= markY {
             if let (m, _) = rows().last(where: { barRect($0.0.start, $0.0.end, y: markY + CGFloat($0.1) * rowH, h: rowH - 2).insetBy(dx: -4, dy: 0).contains(p) }) {
@@ -2059,11 +2206,32 @@ final class Timeline: NSView {
             guard e.edit.clips.indices.contains(k), target != nil || toBin || abs(p.x - down.x) >= 5 || abs(p.y - down.y) >= 5 else { break }
             let up = binH > 0 && p.y < binH + 4   // up over the bin
             drag = .clipMove(k, down: down, target: up ? nil : insertIndex(p.x, skip: k), toBin: up)
-        case .binMove(let i, let down, _, _, let moved):
+        case .binMove(let i, let down, _, _, let moved, _):
             let p = convert(ev.locationInWindow, from: nil)
             guard e.edit.bin.indices.contains(i), moved || abs(p.x - down.x) >= 5 || abs(p.y - down.y) >= 5 else { break }
             let overClips = p.y >= binH + 4 && p.y <= stripY + stripH   // the clip lane or the thumbnails under it
-            drag = .binMove(i, down: down, at: p, target: overClips ? insertIndex(p.x, skip: nil) : nil, moved: true)
+            let onTop = p.y >= ovY - 6 && p.y <= ovY + ovH + 10   // the lane of videos on top
+            drag = .binMove(i, down: down, at: p, target: overClips ? insertIndex(p.x, skip: nil) : nil, moved: true, toOverlay: onTop)
+        case .overlayItem(let id, let edge, let grab, let o0):
+            let len = o0.clip.duration, most = max(o0.clip.length, o0.clip.outPoint) - o0.clip.inPoint   // footage after its in point
+            let shortest = min(0.2, len)   // a piece already shorter than that keeps its length
+            guard let i = e.edit.overlays.firstIndex(where: { $0.id == id }) else { return cancelDrag() }
+            var o = e.edit.overlays[i]
+            switch edge {
+            case -1:   // its start and in point move together
+                let d = min(max(now - o0.start, max(-o0.clip.inPoint, -o0.start)), len - shortest)
+                o.start = o0.start + d
+                o.clip.inPoint = o0.clip.inPoint + d
+                e.seek(o.start)
+            case 1:
+                let end = min(max(now, o0.start + shortest), o0.start + most)
+                o.clip.outPoint = o0.clip.inPoint + (end - o0.start)
+                e.seek(end - 0.01)
+            default:
+                o.start = min(max(0, o0.start + now - grab), max(0, e.duration - 0.1))
+                e.seek(o.start)
+            }
+            e.edit.overlays[i] = o
         case .item(let target, let edge, let grab, let s0, let e0):
             var s = s0, en = e0
             switch edge {
@@ -2093,7 +2261,8 @@ final class Timeline: NSView {
         case .clipOut(let k, _, let v): e.trimClip(k, out: v)
         case .clipMove(let k, _, _, true): e.moveToBin(k)
         case .clipMove(let k, _, let target?, false): e.moveClip(k, to: target)
-        case .binMove(let i, _, _, let target?, true): e.placeFromBin(i, at: target)
+        case .binMove(let i, _, let at, _, true, true): e.binToOverlay(i, at: e.snapEdge(t(at.x)))
+        case .binMove(let i, _, _, let target?, true, false): e.placeFromBin(i, at: target)
         default: break
         }
         needsDisplay = true
@@ -2179,13 +2348,30 @@ final class Timeline: NSView {
             bar(barRect(m.start, m.end, y: markY + CGFloat(row) * rowH + 1, h: rowH - 2), label, m.kind.symbol, selected: m.id == e.selected)
         }
 
+        var taking = false   // a bin piece carried over the lane
+        if case .binMove(_, _, _, _, true, true)? = drag { taking = true }
+        let ol = CGRect(x: 0, y: ovY, width: bounds.width, height: ovH)
+        lane(ol, "Videos on top: Add ▾ › Video on top or side by side, or drag a piece here from the bin", e.edit.overlays.isEmpty && !taking)
+        if taking, case .binMove(_, _, let at, _, _, _)? = drag {
+            Theme.accent.setStroke()
+            let path = NSBezierPath(roundedRect: ol.insetBy(dx: 0.5, dy: 0.5), xRadius: 5, yRadius: 5)
+            path.lineWidth = 1.5
+            path.stroke()
+            Theme.accent.setFill()
+            CGRect(x: x(e.snapEdge(t(at.x))) - 1.5, y: ol.minY, width: 3, height: ol.height).fill()
+        }
+        for o in e.edit.overlays {
+            bar(barRect(o.start, o.end, y: ovY + 2, h: ovH - 4), (o.isSplit ? "Split · " : "On top · ") + o.clip.displayName + o.clip.badges,
+                o.isSplit ? "rectangle.split.2x1" : "pip", selected: o.id == e.selected)
+        }
+
         if let m = e.marked { drawMarked(e, m) }
 
         let px = x(e.now)
         NSColor.white.setFill()
         CGRect(x: px - 1, y: laneY - 2, width: 2, height: bounds.height - laneY + 2).fill()
         NSBezierPath(ovalIn: CGRect(x: px - 5, y: laneY - 4, width: 10, height: 10)).fill()
-        if case .binMove(let i, _, let at, _, true)? = drag, e.edit.bin.indices.contains(i) {   // the piece beside the mouse
+        if case .binMove(let i, _, let at, _, true, _)? = drag, e.edit.bin.indices.contains(i) {   // the piece beside the mouse
             let w = min(binChips()[i].width, 180)
             chip(CGRect(x: at.x + 10, y: at.y - (binH - 6) / 2, width: w, height: binH - 6), e.edit.bin[i], selected: true, alpha: 0.8)
         }
@@ -2222,7 +2408,7 @@ final class Timeline: NSView {
             return
         }
         var carried: Int?
-        if case .binMove(let i, _, _, _, true)? = drag { carried = i }
+        if case .binMove(let i, _, _, _, true, _)? = drag { carried = i }
         for (i, cr) in binChips().enumerated() { chip(cr, e.edit.bin[i], selected: e.selected == e.edit.bin[i].id, alpha: carried == i ? 0.35 : 1) }
     }
 
@@ -2284,7 +2470,7 @@ final class Timeline: NSView {
             order?.remove(at: k)
             target = t
         }
-        if case .binMove(_, _, _, let t?, true)? = drag { order = e.edit.clips; target = t }   // where the bin piece would go
+        if case .binMove(_, _, _, let t?, true, false)? = drag { order = e.edit.clips; target = t }   // where the bin piece would go
         if let order {
             let mx = x(target < order.count ? VideoSequence.starts(order)[target] : VideoSequence.total(order))
             Theme.accent.setFill()
@@ -2298,7 +2484,7 @@ final class Timeline: NSView {
 extension VideoEditor {
     // What Flip acts on: the selected clip, else the clip at the playhead.
     var flipTarget: Int? { selectedClipIndex ?? VideoSequence.locate(edit.clips, now)?.index }
-    var flipClip: Clip? { flipTarget.map { edit.clips[$0] } }
+    var flipClip: Clip? { selectedOverlayIndex.map { edit.overlays[$0].clip } ?? flipTarget.map { edit.clips[$0] } }
 
     fileprivate func buildFlipMenu() {
         flipMenu.bezelStyle = .recessed
@@ -2325,13 +2511,18 @@ extension VideoEditor {
         flipMenu.item(at: 2)?.state = c?.flipV == true ? .on : .off
         flipMenu.item(at: 1)?.isEnabled = c != nil
         flipMenu.item(at: 2)?.isEnabled = c != nil
-        flipMenu.toolTip = selectedClipIndex != nil ? "Mirror the selected clip (left–right or upside down)"
+        flipMenu.toolTip = selectedOverlayIndex != nil ? "Mirror the selected video on top" : selectedClipIndex != nil ? "Mirror the selected clip (left–right or upside down)"
             : edit.clips.count > 1 ? "Mirror the clip at the playhead (select a clip to pick another)" : "Mirror the video (left–right or upside down)"
     }
 
     // One undo step: one clip's picture mirrored one way. The markup that sits wholly on it is mirrored with it, so it
     // stays on the same footage; the crop (all clips share it) and captions stay put.
     func toggleFlip(horizontal: Bool) {
+        if let k = selectedOverlayIndex {   // a video on top: just its picture
+            pushUndo()
+            if horizontal { edit.overlays[k].clip.flipH.toggle() } else { edit.overlays[k].clip.flipV.toggle() }
+            return syncFlipMenu()
+        }
         guard let i = flipTarget else { return }
         pushUndo()
         let t0 = VideoSequence.starts(edit.clips)[i], t1 = t0 + edit.clips[i].duration
@@ -2439,5 +2630,82 @@ extension VideoEditor {
         pendingSeek = now
         edit.clips = clips
         syncSpeedMenu()
+    }
+}
+
+// MARK: - Videos on top (picture in picture, split screen)
+
+extension VideoEditor {
+    // Puts `clip` on top from timeline time `at` (picture in picture, or one half of a split screen), selected.
+    func addOverlay(_ clip: Clip, at: Double, layout: OverlayLayout) {
+        player.pause()
+        playStateChanged()
+        pushUndo()
+        cropping = false   // so the next drag on the video moves the box
+        let o = VideoOverlay(clip: clip, start: min(max(0, at), max(0, duration - 0.1)), layout: layout)
+        edit.overlays.append(o)
+        selected = o.id
+    }
+
+    func addOverlay(_ url: URL, at: Double, layout: OverlayLayout) {
+        Task { @MainActor in
+            guard MediaFiles.isVideo(url), let c = try? await VideoSource.probe(url) else {
+                return Toast.shared.show("Can't add that as a video", url.lastPathComponent, ms: 4000)
+            }
+            self.addOverlay(c, at: at, layout: layout)
+        }
+    }
+
+    func addOverlayDialog(_ layout: OverlayLayout) {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = MediaFiles.contentTypes(pictures: false, videos: true)
+        p.message = layout == .pip ? "Video to show in a box on top" : "Video to show side by side"
+        let at = insertTime
+        p.beginSheetModal(for: window) { [weak self] r in if r == .OK, let u = p.url { self?.addOverlay(u, at: at, layout: layout) } }
+    }
+
+    // Bin piece `i` goes on top from `at` (one undo step with taking it from the bin).
+    func binToOverlay(_ i: Int, at: Double) {
+        guard edit.bin.indices.contains(i) else { return }
+        player.pause()
+        playStateChanged()
+        pushUndo()
+        cropping = false
+        var e = edit
+        let o = VideoOverlay(clip: e.bin.remove(at: i), start: min(max(0, at), max(0, duration - 0.1)))
+        e.overlays.append(o)
+        edit = e
+        selected = o.id
+    }
+
+    // One undo step changing the selected overlay.
+    func updateOverlay(_ f: (inout VideoOverlay) -> Void) {
+        guard let i = selectedOverlayIndex else { return }
+        pushUndo()
+        f(&edit.overlays[i])
+    }
+
+    // Where an overlay shows on the video (video coordinates), in the preview's frame (the crop).
+    func overlayOnVideo(_ o: VideoOverlay) -> CGRect {
+        let v = viewRect
+        return o.rect(v.size).offsetBy(dx: v.minX, dy: v.minY)
+    }
+
+    // The scroll wheel over a box: `factor` times as wide, about its middle (a run of wheel turns is one undo step).
+    func scaleOverlay(_ i: Int, by factor: Double) {
+        guard edit.overlays.indices.contains(i) else { return }
+        let t = Date()
+        if selected != edit.overlays[i].id || t.timeIntervalSince(lastWheelScale) > 0.8 { pushUndo() }
+        lastWheelScale = t
+        selected = edit.overlays[i].id
+        let v = viewRect.size
+        var o = edit.overlays[i]
+        let r0 = o.rect(v)
+        o.width = min(max(o.width * factor, 0.08), 1)
+        let r1 = o.rect(v)
+        o.pos = CGPoint(x: (r0.midX - r1.width / 2) / v.width, y: (r0.midY - r1.height / 2) / v.height)
+        let r = o.rect(v)   // kept on the frame
+        o.pos = CGPoint(x: r.minX / v.width, y: r.minY / v.height)
+        edit.overlays[i] = o
     }
 }

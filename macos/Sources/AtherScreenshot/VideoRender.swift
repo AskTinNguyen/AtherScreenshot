@@ -175,8 +175,9 @@ final class FrameRenderer {
         unit = max(1, full.height / 720)
     }
 
-    // `src`: source frame. `t`: source time in seconds.
-    func render(_ src: CIImage, at t: Double) -> CIImage {
+    // `src`: source frame. `t`: timeline time in seconds. `videos`: the frames of the videos on top showing at `t`
+    // (upright, at their own size), by overlay id; one that's missing isn't drawn.
+    func render(_ src: CIImage, at t: Double, videos: [UUID: CIImage] = [:]) -> CIImage {
         let H = full.height
         var img = src
         // 0. The clip's flip, first: everything else is placed on the flipped picture (the frame is fitted into the
@@ -215,6 +216,8 @@ final class FrameRenderer {
             .concatenating(CGAffineTransform(scaleX: target.width / rc.width, y: target.height / rc.height))
             .concatenating(CGAffineTransform(translationX: target.minX, y: target.minY))
         var framed = img.transformed(by: tf).cropped(to: target)
+        // 4a. Videos on top, on the output frame: a box over the picture, or a split screen.
+        if !videos.isEmpty { framed = drawVideos(framed, target: target, t: t, videos: videos) }
         // 4. Captions and title cards stay put on screen.
         let tsize = target.size
         let origin = preview ? view.origin : .zero
@@ -234,6 +237,36 @@ final class FrameRenderer {
             return monochrome ? shown.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0]) : shown
         }
         return framed.composited(over: CIImage(color: .black).cropped(to: target))
+    }
+
+    // The first split showing makes a new frame: the video in its half and the overlay in the other; then every box.
+    private func drawVideos(_ framed: CIImage, target: CGRect, t: Double, videos: [UUID: CIImage]) -> CIImage {
+        var out = framed
+        func toCI(_ r: CGRect) -> CGRect { CGRect(x: target.minX + r.minX, y: target.minY + target.height - r.maxY, width: r.width, height: r.height) }
+        func picture(_ o: VideoOverlay) -> CIImage? {
+            guard let f = videos[o.id] else { return nil }
+            return VideoSequence.mirrored(f, h: o.clip.flipH, v: o.clip.flipV, size: f.extent.size)
+        }
+        if let o = edit.overlays.first(where: { $0.isSplit && $0.active(t) }) {
+            out = FrameRenderer.put(framed, into: toCI(o.mainHalf(target.size)), fill: o.fill).composited(over: CIImage(color: .black).cropped(to: target))
+            if let p = picture(o) { out = FrameRenderer.put(p, into: toCI(o.rect(target.size)), fill: o.fill).composited(over: out) }
+        }
+        for o in edit.overlays where !o.isSplit && o.active(t) {
+            if let p = picture(o) { out = FrameRenderer.put(p, into: toCI(o.rect(target.size)), fill: true).composited(over: out) }
+        }
+        return out
+    }
+
+    // `pic` into `r`: all of it centered (with nothing around it), or (`fill`) filling it, cut to fit.
+    static func put(_ pic: CIImage, into r: CGRect, fill: Bool) -> CIImage {
+        let e = pic.extent
+        guard e.width > 0, e.height > 0, r.width >= 1, r.height >= 1 else { return CIImage.empty() }
+        let k = fill ? max(r.width / e.width, r.height / e.height) : min(r.width / e.width, r.height / e.height)
+        let w = e.width * k, h = e.height * k
+        let x = fill ? r.midX - w / 2 : (r.minX + (r.width - w) / 2).rounded(), y = fill ? r.midY - h / 2 : (r.minY + (r.height - h) / 2).rounded()
+        let placed = pic.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY).concatenating(CGAffineTransform(scaleX: k, y: k))
+            .concatenating(CGAffineTransform(translationX: x, y: y)))
+        return placed.cropped(to: fill ? r : CGRect(x: x, y: y, width: w, height: h).intersection(r))
     }
 
     func viewRect(at t: Double) -> CGRect {

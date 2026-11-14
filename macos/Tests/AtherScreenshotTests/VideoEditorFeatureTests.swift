@@ -463,4 +463,168 @@ final class VideoEditorFeatureTests: XCTestCase {
             close(e)
         }
     }
+
+    // MARK: videos on top
+
+    // Port of video_overlay_box_and_split_screen / video_export_with_overlay_video: the box and both split modes land
+    // where they should in the saved video (and in Copy frame and the GIF), only while the overlay shows.
+    func testOverlayRenderPositions() async throws {
+        let main = try await TestMedia.colors(seconds: 3, colors: [.red])
+        let top = try await TestMedia.colors(w: 320, h: 180, seconds: 2, colors: [.green])
+        let m = try await VideoSource.probe(main), o = try await VideoSource.probe(top)
+        var e = TestMedia.edit([m])
+        var ov = VideoOverlay(clip: o, start: 1)   // 1–3 s
+        ov.pos = CGPoint(x: 0.5, y: 0.5)
+        ov.width = 0.25   // 160 × 90 at (320, 180)
+        e.overlays = [ov]
+        XCTAssertEqual(ov.rect(CGSize(width: 640, height: 360)), CGRect(x: 320, y: 180, width: 160, height: 90))
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("ather-pip-\(UUID().uuidString).mp4")
+        try await VideoExport.mp4(e, to: out)
+        let asset = AVURLAsset(url: out)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        XCTAssertEqual(tracks.count, 1)
+        let before = try await TestMedia.frame(asset, at: 0.5), during = try await TestMedia.frame(asset, at: 1.5)
+        XCTAssertGreaterThan(TestMedia.rgb(before, 400, 225).0, 0.8, "not on yet")
+        XCTAssertGreaterThan(TestMedia.rgb(during, 400, 225).1, 0.8, "the box")
+        XCTAssertGreaterThan(TestMedia.rgb(during, 300, 225).0, 0.8, "left of the box: the video")
+        XCTAssertGreaterThan(TestMedia.rgb(during, 400, 300).0, 0.8, "under the box: the video")
+        // Copy frame draws it too.
+        let copied = try await VideoExport.frame(e, at: 1.5)
+        XCTAssertGreaterThan(TestMedia.rgb(copied, 400, 225).1, 0.8)
+        // Split, right half, fit: each picture shown whole, 320 × 180 in the middle of its half, black bars above and below.
+        e.overlays[0].layout = .splitRight
+        let fit = try await VideoExport.frame(e, at: 1.5)
+        XCTAssertGreaterThan(TestMedia.rgb(fit, 160, 180).0, 0.8, "the video in the left half")
+        XCTAssertGreaterThan(TestMedia.rgb(fit, 480, 180).1, 0.8, "the overlay in the right half")
+        XCTAssertLessThan(TestMedia.rgb(fit, 160, 20).0, 0.1, "bars")
+        XCTAssertLessThan(TestMedia.rgb(fit, 480, 340).1, 0.1)
+        // Fill: each half filled.
+        e.overlays[0].fill = true
+        let fill = try await VideoExport.frame(e, at: 1.5)
+        XCTAssertGreaterThan(TestMedia.rgb(fill, 160, 20).0, 0.8)
+        XCTAssertGreaterThan(TestMedia.rgb(fill, 480, 340).1, 0.8)
+        // The top half.
+        e.overlays[0].layout = .splitTop
+        let topHalf = try await VideoExport.frame(e, at: 1.5)
+        XCTAssertGreaterThan(TestMedia.rgb(topHalf, 320, 60).1, 0.8)
+        XCTAssertGreaterThan(TestMedia.rgb(topHalf, 320, 300).0, 0.8)
+        // A GIF shows it the same way.
+        let gif = FileManager.default.temporaryDirectory.appendingPathComponent("ather-pip-\(UUID().uuidString).gif")
+        try await VideoExport.gif(e, to: gif, fps: 4)
+        let src = CGImageSourceCreateWithURL(gif as CFURL, nil)!
+        let g = CGImageSourceCreateImageAtIndex(src, 7, nil)!   // 1.75 s
+        XCTAssertGreaterThan(TestMedia.rgb(g, g.width / 2, g.height / 6).1, 0.7)
+        XCTAssertGreaterThan(TestMedia.rgb(g, g.width / 2, g.height * 5 / 6).0, 0.7)
+    }
+
+    // A flipped video on top is mirrored in its box.
+    func testFlippedOverlay() async throws {
+        let main = try await TestMedia.colors(seconds: 2, colors: [.black])
+        let top = try await TestMedia.clip(w: 320, h: 180, seconds: 2) { _, ctx in   // green left, black right
+            ctx.setFillColor(NSColor.black.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 320, height: 180))
+            ctx.setFillColor(NSColor.green.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 160, height: 180))
+        }
+        var e = TestMedia.edit([try await VideoSource.probe(main)])
+        var ov = VideoOverlay(clip: try await VideoSource.probe(top))
+        ov.pos = CGPoint(x: 0.5, y: 0.5); ov.width = 0.25   // 160 × 90 at (320, 180)
+        ov.clip.flipH = true
+        e.overlays = [ov]
+        let img = try await VideoExport.frame(e, at: 1)
+        XCTAssertLessThan(TestMedia.rgb(img, 330, 220).1, 0.1, "its left: the black right half")
+        XCTAssertGreaterThan(TestMedia.rgb(img, 470, 220).1, 0.8)
+    }
+
+    // Port of video_editor_overlay_videos and video_editor_short_overlay_trims_stay_in_its_footage: the box moves and
+    // sizes on the video, its bar moves and trims on the lane, a bin piece dragged to the lane goes on top, ⌫ takes it
+    // to the bin; undo covers each step.
+    func testEditorOverlayVideos() async throws {
+        let top = try await TestMedia.colors(w: 320, h: 180, seconds: 2, colors: [.green])
+        let topClip = try await VideoSource.probe(top)
+        let e = try await open(try await TestMedia.colors(seconds: 3))
+        let b0 = await MainActor.run { e.builds }
+        await MainActor.run {
+            e.addOverlay(topClip, at: 0.5, layout: .pip)
+            XCTAssertEqual(e.edit.overlays.count, 1)
+            XCTAssertEqual(e.selectedOverlayIndex, 0)
+            XCTAssertGreaterThan(e.timeline.wantedHeight, e.timeline.ovY, "the lane at the bottom")
+        }
+        try await until("rebuilt with the overlay") { e.builds > b0 }
+        await MainActor.run { e.seek(1) }
+        try await until("at 1 s") { abs(e.now - 1) < 0.05 }
+        await MainActor.run {
+            e.window.contentView?.layoutSubtreeIfNeeded()
+            let st = e.stageView
+            let o = e.edit.overlays[0]
+            let r = st.toView(e.overlayOnVideo(o))
+            // Drag the box 64 video pixels left.
+            let k = r.width / o.rect(e.viewRect.size).width
+            mouse(e, .leftMouseDown, CGPoint(x: r.midX, y: r.midY), in: st)
+            mouse(e, .leftMouseDragged, CGPoint(x: r.midX - 64 * k, y: r.midY), in: st)
+            mouse(e, .leftMouseUp, CGPoint(x: r.midX - 64 * k, y: r.midY), in: st)
+            XCTAssertEqual(e.edit.overlays[0].pos.x, o.pos.x - 0.1, accuracy: 0.01)
+            // Its bottom-right corner, dragged out: bigger, the top-left stays.
+            let r2 = st.toView(e.overlayOnVideo(e.edit.overlays[0]))
+            mouse(e, .leftMouseDown, CGPoint(x: r2.maxX, y: r2.maxY), in: st)
+            mouse(e, .leftMouseDragged, CGPoint(x: r2.maxX + 40, y: r2.maxY + 40), in: st)
+            mouse(e, .leftMouseUp, CGPoint(x: r2.maxX + 40, y: r2.maxY + 40), in: st)
+            XCTAssertGreaterThan(e.edit.overlays[0].width, o.width + 0.03)
+            XCTAssertEqual(e.edit.overlays[0].pos.x, o.pos.x - 0.1, accuracy: 0.01)
+            // The wheel: smaller; the presets.
+            let w = e.edit.overlays[0].width
+            e.scaleOverlay(0, by: 1 / 1.08)
+            XCTAssertLessThan(e.edit.overlays[0].width, w)
+            e.updateOverlay { $0.width = VideoOverlay.sizes[2].1 }
+            XCTAssertEqual(e.edit.overlays[0].width, 0.5)
+            // Its bar: dragged half a second later; its end, trimmed.
+            let tl = e.timeline, y = tl.ovY + tl.ovH / 2
+            let ob = e.edit.overlays[0]
+            mouse(e, .leftMouseDown, CGPoint(x: tl.x(ob.start + 0.8), y: y))
+            mouse(e, .leftMouseDragged, CGPoint(x: tl.x(ob.start + 1.3), y: y))
+            mouse(e, .leftMouseUp, CGPoint(x: tl.x(ob.start + 1.3), y: y))
+            XCTAssertEqual(e.edit.overlays[0].start, 1, accuracy: 0.05)
+            let o3 = e.edit.overlays[0]
+            mouse(e, .leftMouseDown, CGPoint(x: tl.x(o3.end), y: y))
+            mouse(e, .leftMouseDragged, CGPoint(x: tl.x(o3.end - 1), y: y))
+            mouse(e, .leftMouseUp, CGPoint(x: tl.x(o3.end - 1), y: y))
+            XCTAssertEqual(e.edit.overlays[0].clip.duration, 1, accuracy: 0.05)
+            // A short overlay's start dragged far left stays in its footage.
+            e.edit.overlays[0].clip.inPoint = 0.05; e.edit.overlays[0].clip.outPoint = 0.15
+            let o4 = e.edit.overlays[0]
+            mouse(e, .leftMouseDown, CGPoint(x: tl.x(o4.start), y: y))
+            mouse(e, .leftMouseDragged, CGPoint(x: tl.x(o4.start - 0.8), y: y))
+            mouse(e, .leftMouseUp, CGPoint(x: tl.x(o4.start - 0.8), y: y))
+            XCTAssertGreaterThanOrEqual(e.edit.overlays[0].clip.inPoint, 0)
+            XCTAssertLessThanOrEqual(e.edit.overlays[0].clip.outPoint, topClip.length + 1e-6)
+            // ⌫: its footage goes to the bin; undo brings it back on top.
+            e.selected = e.edit.overlays[0].id
+            key(e, kVK_Delete)
+            XCTAssertTrue(e.edit.overlays.isEmpty)
+            XCTAssertEqual(e.edit.bin.count, 1)
+            e.undo()
+            XCTAssertEqual(e.edit.overlays.count, 1)
+            XCTAssertTrue(e.edit.bin.isEmpty)
+            e.selected = e.edit.overlays[0].id
+            key(e, kVK_Delete)
+        }
+        await MainActor.run {
+            // A bin piece dragged down to the lane goes on top there.
+            e.window.contentView?.layoutSubtreeIfNeeded()
+            let tl = e.timeline
+            guard let chip = tl.binChips().first else { XCTFail("no bin piece \(e.edit.bin.count) \(tl.binH) \(tl.bounds) \(e.duration)"); return close(e) }
+            mouse(e, .leftMouseDown, CGPoint(x: chip.midX, y: chip.midY))
+            mouse(e, .leftMouseDragged, CGPoint(x: chip.midX + 20, y: chip.midY + 30))
+            mouse(e, .leftMouseDragged, CGPoint(x: tl.x(2), y: tl.ovY + 10))
+            mouse(e, .leftMouseUp, CGPoint(x: tl.x(2), y: tl.ovY + 10))
+            XCTAssertEqual(e.edit.overlays.count, 1)
+            XCTAssertTrue(e.edit.bin.isEmpty)
+            XCTAssertEqual(e.edit.overlays[0].start, 2, accuracy: 0.05)
+            // The split layouts from the inspector's menu, and flipping the selected one.
+            e.updateOverlay { $0.layout = .splitLeft }
+            XCTAssertTrue(e.edit.overlays[0].isSplit)
+            e.toggleFlip(horizontal: true)
+            XCTAssertTrue(e.edit.overlays[0].clip.flipH)
+            XCTAssertFalse(e.edit.clips[0].flipH, "the clip stays")
+            close(e)
+        }
+    }
 }

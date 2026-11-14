@@ -65,6 +65,66 @@ struct Clip: Equatable {
     }
 }
 
+// MARK: - Videos on top
+
+// A second video shown together with the timeline's, without its sound: in a box over the picture (picture in
+// picture), or in one half of a split screen with the timeline's video in the other half. It sits at a timeline time,
+// not on footage: moving clips around leaves it where it is (Overlay in videoedit.h).
+enum OverlayLayout: Int, CaseIterable {
+    case pip, splitLeft, splitRight, splitTop, splitBottom   // split: the half the overlay takes
+    var label: String { ["Picture in picture", "Split: left half", "Split: right half", "Split: top half", "Split: bottom half"][rawValue] }
+}
+
+struct VideoOverlay: Equatable {
+    var id = UUID()
+    var clip: Clip                     // its footage: [in, out) of a file (and its flip)
+    var start: Double = 0              // where it begins on the timeline
+    var layout = OverlayLayout.pip
+    var pos = CGPoint(x: 0.62, y: 0.6) // picture in picture: the box's top-left, as fractions of the output frame
+    var width: Double = 0.34           // and its width, as a fraction of the frame's (its height follows the video's shape)
+    var fill = false                   // split: fills its half (cut to fit) instead of showing all of the picture
+
+    static let sizes: [(String, Double)] = [("Small", 0.22), ("Medium", 0.34), ("Large", 0.5)]
+    var end: Double { start + clip.duration }
+    func active(_ t: Double) -> Bool { t >= start && t < end }
+    var isSplit: Bool { layout != .pip }
+    // What the composition depends on (the rest only changes how it's drawn).
+    var timing: VideoOverlay {
+        var o = self
+        o.layout = .pip; o.pos = .zero; o.width = 0; o.fill = false; o.clip.flipH = false; o.clip.flipV = false
+        return o
+    }
+
+    // Where its picture goes in an output frame of `out` pixels (top-left origin): the box, or its half.
+    func rect(_ out: CGSize) -> CGRect {
+        let W = out.width, H = out.height, hw = floor(W / 2), hh = floor(H / 2)
+        switch layout {
+        case .splitLeft: return CGRect(x: 0, y: 0, width: hw, height: H)
+        case .splitRight: return CGRect(x: hw, y: 0, width: W - hw, height: H)
+        case .splitTop: return CGRect(x: 0, y: 0, width: W, height: hh)
+        case .splitBottom: return CGRect(x: 0, y: hh, width: W, height: H - hh)
+        case .pip: break
+        }
+        let aspect = clip.w > 0 && clip.h > 0 ? Double(clip.h) / Double(clip.w) : 9.0 / 16
+        var w = min(max(width, 0.08), 1) * W, h = w * aspect
+        if h > H { h = H; w = h / aspect }
+        w = max(2, w.rounded()); h = max(2, h.rounded())
+        return CGRect(x: min(max(0, pos.x * W), max(0, W - w)).rounded(), y: min(max(0, pos.y * H), max(0, H - h)).rounded(), width: w, height: h)
+    }
+
+    // The other half of a split screen, where the timeline's video goes.
+    func mainHalf(_ out: CGSize) -> CGRect {
+        let r = rect(out), W = out.width, H = out.height
+        switch layout {
+        case .splitLeft: return CGRect(x: r.width, y: 0, width: W - r.width, height: H)
+        case .splitRight: return CGRect(x: 0, y: 0, width: r.minX, height: H)
+        case .splitTop: return CGRect(x: 0, y: r.height, width: W, height: H - r.height)
+        case .splitBottom: return CGRect(x: 0, y: 0, width: W, height: r.minY)
+        case .pip: return CGRect(origin: .zero, size: out)
+        }
+    }
+}
+
 enum VideoSource {
     enum Failure: LocalizedError {
         case noVideo, undecodable(String)
@@ -169,6 +229,7 @@ extension VideoEdit {
         trimStart = wholeStart || ts.t == nil ? 0 : ts.t!
         trimEnd = wholeEnd || te.t == nil ? newTotal : min(newTotal, te.t! + (te.side != 0 ? 0 : 1e-6))  // looked up just before itself
         if trimEnd - trimStart < 0.1 { trimStart = 0; trimEnd = newTotal }
+        for i in overlays.indices { overlays[i].start = min(overlays[i].start, max(0, newTotal - 0.1)) }   // overlays keep their time on the timeline
         self.clips = clips
     }
 }
@@ -242,9 +303,10 @@ enum VideoSequence {
     static let timeScale: CMTimeScale = 60000
 
     // `range`: the part of the timeline to include (nil: all). Each clip plays at its own speed (`atSpeed` false: all at
-    // 1×, for auto captions, whose times are timeline times). `box` draws the markup.
+    // 1×, for auto captions, whose times are timeline times). `overlays`: videos on top, a track each (silent), at their
+    // timeline time; their frames go to the renderer with the main one. `box` draws the markup.
     static func build(_ clips: [Clip], frame: CGSize, range: ClosedRange<Double>? = nil, atSpeed: Bool = true, muted: Bool = false,
-                      box: RendererBox) async throws -> Built {
+                      overlays: [VideoOverlay] = [], box: RendererBox) async throws -> Built {
         let comp = AVMutableComposition()
         guard let vtrack = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw VideoSource.Failure.noVideo }
         var audio: [AVMutableCompositionTrack] = []
@@ -286,6 +348,22 @@ enum VideoSequence {
             cursor = CMTimeAdd(cursor, src.duration)
         }
         guard !pieces.isEmpty, unplayable.count < pieces.count else { throw VideoSource.Failure.noVideo }
+        // Videos on top: the part of each inside the range, at its place on the timeline. Scaled with the pieces below,
+        // so they run at the speed of the clip they're over, as the renderer asks for them by timeline time.
+        var overlayTracks: [(CMPersistentTrackID, UUID)] = []
+        let endT = min(b, timeline)
+        for o in overlays {
+            let from = max(a, o.start), to = min(endT, o.end)
+            guard to - from > 0.0005 else { continue }
+            let asset = AVURLAsset(url: o.clip.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+            guard let vt = try? await asset.loadTracks(withMediaType: .video).first,
+                  let t = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
+            let src = CMTimeRange(start: CMTime(seconds: o.clip.inPoint + from - o.start, preferredTimescale: timeScale), duration: CMTime(seconds: to - from, preferredTimescale: timeScale))
+            do {
+                try t.insertTimeRange(src, of: vt, at: CMTime(seconds: from - a, preferredTimescale: timeScale))
+                overlayTracks.append((t.trackID, o.id))
+            } catch { comp.removeTrack(t) }
+        }
         // Each piece at its clip's speed: scaled from the last one back, so the earlier pieces stay where they are. The
         // sound (pitch kept by the reader or player) follows.
         let speeds = pieces.map { atSpeed ? clips[$0.index].speed : 1 }
@@ -305,7 +383,8 @@ enum VideoSequence {
             let end = n == pieces.count - 1 ? comp.duration : outAt
             let near = [n > 0 ? pieces[n - 1].index : nil, n + 1 < pieces.count ? pieces[n + 1].index : nil].compactMap { $0 }.map { clips[$0] }
             instructions.append(SequenceInstruction(range: CMTimeRange(start: start, end: max(start, end)), track: vtrack.trackID, clip: clips[p.index],
-                                                    neighbours: near, frame: frame, timelineStart: p.timelineStart, speed: speeds[n], box: box))
+                                                    neighbours: near, frame: frame, timelineStart: p.timelineStart, speed: speeds[n], box: box,
+                                                    overlays: overlayTracks))
         }
         let vc = AVMutableVideoComposition()
         vc.customVideoCompositorClass = SequenceCompositor.self
@@ -316,16 +395,21 @@ enum VideoSequence {
         return Built(composition: comp, video: vc, unplayable: unplayable)
     }
 
-    // A clip's frame turned upright and fitted into the sequence frame with black bars (CI coordinates, y up).
-    static func place(_ src: CIImage, clip: Clip, frame: CGSize) -> CIImage {
+    // A frame of `clip`'s file turned upright, at the origin.
+    static func upright(_ src: CIImage, rotation: Int) -> CIImage {
         var img = src
-        switch clip.rotation {
+        switch rotation {
         case 90: img = img.oriented(.right)
         case 180: img = img.oriented(.down)
         case 270: img = img.oriented(.left)
         default: break
         }
-        img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+        return img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+    }
+
+    // A clip's frame turned upright and fitted into the sequence frame with black bars (CI coordinates, y up).
+    static func place(_ src: CIImage, clip: Clip, frame: CGSize) -> CIImage {
+        let img = upright(src, rotation: clip.rotation)
         let w = img.extent.width, h = img.extent.height
         guard w > 0, h > 0 else { return CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: frame)) }
         if abs(w - frame.width) < 0.5 && abs(h - frame.height) < 0.5 { return img }
@@ -349,11 +433,14 @@ final class SequenceInstruction: NSObject, AVVideoCompositionInstructionProtocol
     let timelineStart: Double  // timeline time at the start of this instruction
     let speed: Double
     let box: RendererBox
+    let overlays: [(CMPersistentTrackID, UUID)]   // the videos on top: their tracks, and which overlay each one is
 
-    init(range: CMTimeRange, track: CMPersistentTrackID, clip: Clip, neighbours: [Clip], frame: CGSize, timelineStart: Double, speed: Double, box: RendererBox) {
+    init(range: CMTimeRange, track: CMPersistentTrackID, clip: Clip, neighbours: [Clip], frame: CGSize, timelineStart: Double, speed: Double, box: RendererBox,
+         overlays: [(CMPersistentTrackID, UUID)] = []) {
         timeRange = range
         self.track = track
-        requiredSourceTrackIDs = [NSNumber(value: track)]
+        self.overlays = overlays
+        requiredSourceTrackIDs = ([track] + overlays.map(\.0)).map { NSNumber(value: $0) }
         self.clip = clip
         self.neighbours = neighbours
         self.frame = frame
@@ -391,8 +478,14 @@ final class SequenceCompositor: NSObject, AVVideoCompositing {
         let size = req.renderContext.size
         let src = req.sourceFrame(byTrackID: ins.track).map { VideoSequence.place(CIImage(cvPixelBuffer: $0), clip: ins.clip(for: $0), frame: ins.frame) }
             ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: ins.frame))
-        var img = ins.box.renderer.render(src, at: ins.timelineTime(req.compositionTime))
-        let full = ins.box.renderer.out
+        let r = ins.box.renderer, t = ins.timelineTime(req.compositionTime)
+        var videos: [UUID: CIImage] = [:]
+        for (track, id) in ins.overlays {
+            guard let pb = req.sourceFrame(byTrackID: track), let o = r.edit.overlays.first(where: { $0.id == id }), o.active(t) else { continue }
+            videos[id] = VideoSequence.upright(CIImage(cvPixelBuffer: pb), rotation: o.clip.rotation)
+        }
+        var img = r.render(src, at: t, videos: videos)
+        let full = r.out
         if abs(size.width - full.width) > 0.5 || abs(size.height - full.height) > 0.5 {   // rendered smaller (a GIF): scaled to fit
             img = img.transformed(by: CGAffineTransform(scaleX: size.width / full.width, y: size.height / full.height))
         }
