@@ -357,4 +357,110 @@ final class VideoEditorFeatureTests: XCTestCase {
             close(e)
         }
     }
+
+    // MARK: speed per clip
+
+    // Port of video_clip_speeds_set_output_time.
+    func testClipSpeedsSetOutputTime() {
+        func c(_ d: Double, _ v: Double) -> Clip { var x = Clip(path: "/a.mp4", inPoint: 0, outPoint: d, length: 10, w: 640, h: 360, fps: 30, hasAudio: false); x.speed = v; return x }
+        let clips = [c(2, 2), c(1, 1), c(2, 0.5)]
+        XCTAssertEqual(VideoSequence.outputTime(clips, 5), 6, accuracy: 1e-9)
+        XCTAssertEqual(VideoSequence.outputTime(clips, 1), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(VideoSequence.outputTime(clips, 6), 8, accuracy: 1e-9, "past the end at the last clip's speed")
+        XCTAssertEqual(VideoSequence.timelineTime(clips, 1.5), 2.5, accuracy: 1e-9)
+        XCTAssertEqual(VideoSequence.timelineTime(clips, 4), 4, accuracy: 1e-9)
+        for t in stride(from: 0.0, through: 5, by: 0.25) { XCTAssertEqual(VideoSequence.timelineTime(clips, VideoSequence.outputTime(clips, t)), t, accuracy: 1e-9) }
+        var e = TestMedia.edit(clips)
+        XCTAssertEqual(e.outputDuration, 6, accuracy: 1e-9)
+        e.trimStart = 1; e.trimEnd = 3
+        XCTAssertEqual(e.outputDuration, 1.5, accuracy: 1e-9)
+        XCTAssertEqual(e.speed, 1, "mixed speeds read as 1×")
+        e.speed = 2   // the whole-video setter: every clip
+        XCTAssertEqual(e.clips.map(\.speed), [2, 2, 2])
+        XCTAssertEqual(e.clips[2].badges, "  2×")
+    }
+
+    // Port of video_export_speed_per_clip: the saved video, its sound, the GIF and Copy clip follow each clip's speed.
+    func testExportSpeedPerClip() async throws {
+        let src = try await TestMedia.colors(seconds: 3, tone: true)   // red, green, blue a second each
+        let c = try await VideoSource.probe(src)
+        var a = c, b = c
+        a.outPoint = 1; a.speed = 2
+        b.id = UUID(); b.inPoint = 1; b.speed = 0.5
+        let e = TestMedia.edit([a, b])
+        XCTAssertEqual(e.outputDuration, 4.5, accuracy: 1e-6)
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("ather-speed-\(UUID().uuidString).mp4")
+        try await VideoExport.mp4(e, to: out)
+        let asset = AVURLAsset(url: out)
+        let v = try await asset.loadTracks(withMediaType: .video).first!
+        let au = try await asset.loadTracks(withMediaType: .audio).first
+        let vd = try await v.load(.timeRange).duration.seconds
+        XCTAssertEqual(vd, 4.5, accuracy: 0.1)
+        XCTAssertNotNil(au, "sound kept")
+        if let au {
+            let ad = try await au.load(.timeRange).duration.seconds
+            XCTAssertEqual(ad, 4.5, accuracy: 0.15, "sound stretched with each clip")
+        }
+        let f0 = try await TestMedia.frame(asset, at: 0.25), f1 = try await TestMedia.frame(asset, at: 1.0), f2 = try await TestMedia.frame(asset, at: 4.0)
+        XCTAssertGreaterThan(TestMedia.rgb(f0, 10, 10).0, 0.7, "0.25 s out is 0.5 s in: red")
+        XCTAssertGreaterThan(TestMedia.rgb(f1, 10, 10).1, 0.7, "1.0 s out is 1.25 s in: green")
+        XCTAssertGreaterThan(TestMedia.rgb(f2, 10, 10).2, 0.7, "4.0 s out is 2.75 s in: blue")
+        // The GIF: 4.5 s at 10 fps.
+        let gif = FileManager.default.temporaryDirectory.appendingPathComponent("ather-speed-\(UUID().uuidString).gif")
+        try await VideoExport.gif(e, to: gif, fps: 10)
+        let n = CGImageSourceGetCount(CGImageSourceCreateWithURL(gif as CFURL, nil)!)
+        XCTAssertEqual(Double(n), 45, accuracy: 2)
+        // Copy clip over timeline 0.5–2: 0.25 s + 2 s.
+        var r = e
+        r.trimStart = 0.5; r.trimEnd = 2
+        let clip = try await Compress.clip(r)
+        let cd = try await AVURLAsset(url: clip).load(.duration).seconds
+        XCTAssertEqual(cd, 2.25, accuracy: 0.1)
+        try? FileManager.default.removeItem(at: clip)
+    }
+
+    // The editor: Speed sets the selected clip (else the one at the playhead), Every clip at sets all, one undo step each;
+    // the timeline stays at 1× while the preview plays each clip at its speed.
+    func testEditorSpeedPerClip() async throws {
+        let e = try await open(try await TestMedia.colors(seconds: 3))
+        await MainActor.run { e.seek(1) }
+        try await until("at 1 s") { abs(e.now - 1) < 0.05 }
+        let b0 = await MainActor.run { e.builds }
+        await MainActor.run { e.splitAtPlayhead(); e.selected = nil }
+        try await until("split") { e.builds > b0 }
+        await MainActor.run { e.seek(0.5) }
+        try await until("at 0.5 s") { abs(e.now - 0.5) < 0.05 }
+        let b1 = await MainActor.run { () -> Int in
+            XCTAssertEqual(e.speedTarget, 0, "the clip at the playhead")
+            e.syncSpeedMenu()
+            XCTAssertEqual(e.speedMenu.itemTitle(at: 0), "Speed 1×")
+            XCTAssertNotNil(e.speedMenu.menu?.item(withTitle: "Every clip at"))
+            let b = e.builds
+            e.setSpeed(2, every: false)
+            XCTAssertEqual(e.edit.clips.map(\.speed), [2, 1])
+            XCTAssertEqual(e.duration, 3, accuracy: 1e-6, "the timeline shows the footage at 1×")
+            XCTAssertEqual(e.edit.outputDuration, 2.5, accuracy: 1e-6)
+            XCTAssertEqual(e.speedMenu.itemTitle(at: 0), "Speed 2×")
+            return b
+        }
+        try await until("rebuilt at speed") { e.builds > b1 }
+        await MainActor.run {
+            XCTAssertEqual(e.now, 0.5, accuracy: 0.05, "the playhead stays on its footage")
+            XCTAssertEqual(e.player.currentTime().seconds, 0.25, accuracy: 0.05, "the player plays the output")
+            e.seek(2)
+        }
+        try await until("at 2 s") { abs(e.now - 2) < 0.05 }
+        await MainActor.run {
+            e.selected = e.edit.clips[1].id
+            e.setSpeed(0.5, every: false)
+            XCTAssertEqual(e.edit.clips.map(\.speed), [2, 0.5])
+            e.setSpeed(4, every: true)
+            XCTAssertEqual(e.edit.clips.map(\.speed), [4, 4])
+            e.undo()
+            XCTAssertEqual(e.edit.clips.map(\.speed), [2, 0.5])
+            e.undo(); e.undo()
+            XCTAssertEqual(e.edit.clips.map(\.speed), [1, 1])
+            close(e)
+        }
+    }
 }

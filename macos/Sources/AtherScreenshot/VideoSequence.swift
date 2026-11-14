@@ -44,6 +44,9 @@ struct Clip: Equatable {
     var rotation = 0           // clockwise degrees that show it upright (phone videos)
     // Its picture mirrored left–right and/or upside down (before anything is drawn on it). Pieces split from it keep it.
     var flipH = false, flipV = false
+    // How fast it plays in the saved video and the preview (VideoEdit.speeds); the timeline shows its footage at 1×.
+    // Pieces split from it keep it.
+    var speed: Double = 1
 
     var flipped: Bool { flipH || flipV }
     // The same footage, whatever the flip: what the composition (and so the player) depends on.
@@ -57,7 +60,9 @@ struct Clip: Equatable {
     var url: URL { URL(fileURLWithPath: path) }
     var name: String { url.lastPathComponent }
     var displayName: String { name }
-    var badges: String { (flipH ? "  ↔" : "") + (flipV ? "  ↕" : "") }   // how it's changed, for the clip lane
+    var badges: String {   // how it's changed, for the clip lane
+        (flipH ? "  ↔" : "") + (flipV ? "  ↕" : "") + (speed != 1 ? "  " + VideoEdit.speedLabel(speed) : "")
+    }
 }
 
 enum VideoSource {
@@ -182,6 +187,34 @@ enum VideoSequence {
     static func total(_ clips: [Clip]) -> Double { clips.reduce(0) { $0 + $1.duration } }
     static func sameFootage(_ a: [Clip], _ b: [Clip]) -> Bool { a.count == b.count && zip(a, b).allSatisfy { $0.sameFootage($1) } }
 
+    // Speed: each clip's stretch of the timeline lasts its length / its speed in the output (the preview and the saved
+    // video). Output time of timeline time `t` from the timeline's start (past the last clip's end, at its speed).
+    static func outputTime(_ clips: [Clip], _ t: Double) -> Double {
+        guard !clips.isEmpty, t > 0 else { return t }
+        var at = 0.0, u = 0.0
+        for (i, c) in clips.enumerated() {
+            let last = i == clips.count - 1
+            let hi = last ? max(t, at + c.duration) : at + c.duration
+            if t <= at { break }
+            u += (min(t, hi) - at) / max(0.01, c.speed)
+            at += c.duration
+        }
+        return u
+    }
+
+    // The timeline time output time `u` shows (the inverse of outputTime).
+    static func timelineTime(_ clips: [Clip], _ u: Double) -> Double {
+        guard !clips.isEmpty, u > 0 else { return u }
+        var at = 0.0, left = u
+        for (i, c) in clips.enumerated() {
+            let span = c.duration / max(0.01, c.speed)
+            if left <= span || i == clips.count - 1 { return at + left * c.speed }
+            left -= span
+            at += c.duration
+        }
+        return at
+    }
+
     // `img` (extent 0,0 – size) mirrored as the clip says.
     static func mirrored(_ img: CIImage, h: Bool, v: Bool, size: CGSize) -> CIImage {
         guard h || v else { return img }
@@ -208,8 +241,9 @@ enum VideoSequence {
     // Clip times are kept at this scale, and so are the saved MP4's frame times (VideoEncode.swift).
     static let timeScale: CMTimeScale = 60000
 
-    // `range`: the part of the timeline to include (nil: all). `speed` scales it. `box` draws the markup.
-    static func build(_ clips: [Clip], frame: CGSize, range: ClosedRange<Double>? = nil, speed: Double = 1, muted: Bool = false,
+    // `range`: the part of the timeline to include (nil: all). Each clip plays at its own speed (`atSpeed` false: all at
+    // 1×, for auto captions, whose times are timeline times). `box` draws the markup.
+    static func build(_ clips: [Clip], frame: CGSize, range: ClosedRange<Double>? = nil, atSpeed: Bool = true, muted: Bool = false,
                       box: RendererBox) async throws -> Built {
         let comp = AVMutableComposition()
         guard let vtrack = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw VideoSource.Failure.noVideo }
@@ -252,19 +286,26 @@ enum VideoSequence {
             cursor = CMTimeAdd(cursor, src.duration)
         }
         guard !pieces.isEmpty, unplayable.count < pieces.count else { throw VideoSource.Failure.noVideo }
-        if speed != 1 {
-            comp.scaleTimeRange(CMTimeRange(start: .zero, duration: cursor), toDuration: CMTimeMultiplyByFloat64(cursor, multiplier: 1 / speed))
+        // Each piece at its clip's speed: scaled from the last one back, so the earlier pieces stay where they are. The
+        // sound (pitch kept by the reader or player) follows.
+        let speeds = pieces.map { atSpeed ? clips[$0.index].speed : 1 }
+        var scaled = pieces.map(\.duration)
+        for n in pieces.indices.reversed() where speeds[n] != 1 {
+            scaled[n] = CMTimeMultiplyByFloat64(pieces[n].duration, multiplier: 1 / speeds[n])
+            comp.scaleTimeRange(CMTimeRange(start: pieces[n].at, duration: pieces[n].duration), toDuration: scaled[n])
         }
         // One instruction per piece, back to back (consecutive pieces of one file may share a track segment, so
         // these come from the pieces, not the segments). Each knows its neighbours, in case a frame right at a cut
         // comes from the other side.
         var instructions: [SequenceInstruction] = []
+        var outAt = CMTime.zero
         for (n, p) in pieces.enumerated() {
             let start = instructions.last?.timeRange.end ?? .zero
-            let end = n == pieces.count - 1 ? comp.duration : CMTimeMultiplyByFloat64(CMTimeAdd(p.at, p.duration), multiplier: 1 / speed)
+            outAt = CMTimeAdd(outAt, scaled[n])
+            let end = n == pieces.count - 1 ? comp.duration : outAt
             let near = [n > 0 ? pieces[n - 1].index : nil, n + 1 < pieces.count ? pieces[n + 1].index : nil].compactMap { $0 }.map { clips[$0] }
             instructions.append(SequenceInstruction(range: CMTimeRange(start: start, end: max(start, end)), track: vtrack.trackID, clip: clips[p.index],
-                                                    neighbours: near, frame: frame, timelineStart: p.timelineStart, speed: speed, box: box))
+                                                    neighbours: near, frame: frame, timelineStart: p.timelineStart, speed: speeds[n], box: box))
         }
         let vc = AVMutableVideoComposition()
         vc.customVideoCompositorClass = SequenceCompositor.self

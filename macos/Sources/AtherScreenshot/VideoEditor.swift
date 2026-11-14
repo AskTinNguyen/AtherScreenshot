@@ -32,7 +32,6 @@ struct VideoEdit: Equatable {
     var trimStart: Double = 0
     var trimEnd: Double
     var crop: CGRect?          // in video pixels, top-left origin
-    var speed: Double = 1
     var muted = false
     var captions: [Caption] = []
     var captionSize = 2        // 0…4
@@ -47,10 +46,21 @@ struct VideoEdit: Equatable {
     var frame = CGSize.zero    // the sequence frame: the first video's upright size, kept when clips change
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
+    static func speedLabel(_ s: Double) -> String { String(format: "%g×", s) }
+
+    // Speed belongs to each clip (Clip.speed). This reads the speed when every clip shares it (else 1) and sets every
+    // clip, as the whole-video speed did before speed per clip.
+    var speed: Double {
+        get { clips.first.map { s in clips.allSatisfy { $0.speed == s.speed } ? s.speed : 1 } ?? 1 }
+        set { for i in clips.indices { clips[i].speed = newValue } }
+    }
+    // How long timeline [a, b) runs in the output.
+    func outputSpan(_ a: Double, _ b: Double) -> Double { b <= a ? 0 : VideoSequence.outputTime(clips, b) - VideoSequence.outputTime(clips, a) }
+    var anySpeedChange: Bool { clips.contains { $0.speed != 1 } }
     static let captionScale: [CGFloat] = [0.03, 0.037, 0.045, 0.055, 0.068]
     static let captionSizes = ["Extra small", "Small", "Medium", "Large", "Extra large"]
 
-    var outputDuration: Double { max(0, trimEnd - trimStart) / speed }
+    var outputDuration: Double { outputSpan(trimStart, trimEnd) }
 }
 
 // MARK: - Export
@@ -78,7 +88,7 @@ enum VideoExport {
     static func prepare(_ e: VideoEdit, probe: Probe? = nil) async throws -> Prepared {
         // Every frame goes through the same renderer the preview uses.
         let renderer = FrameRenderer(edit: e, full: e.frame, preview: false)
-        let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), speed: e.speed, muted: e.muted,
+        let b = try await VideoSequence.build(e.clips, frame: e.frame, range: e.trimStart...max(e.trimStart, e.trimEnd), muted: e.muted,
                                               box: RendererBox(renderer, probe: probe))
         return Prepared(composition: b.composition, video: b.video, size: renderer.out)
     }
@@ -90,7 +100,7 @@ enum VideoExport {
         gen.videoComposition = b.video
         gen.requestedTimeToleranceBefore = .zero
         gen.requestedTimeToleranceAfter = .zero
-        return try await gen.image(at: CMTime(seconds: t, preferredTimescale: VideoSequence.timeScale)).image
+        return try await gen.image(at: CMTime(seconds: VideoSequence.outputTime(e.clips, t), preferredTimescale: VideoSequence.timeScale)).image
     }
 
     static func captionAttributes(_ size: CGFloat, dim: Bool = false, look: CaptionLook = .pill,
@@ -126,7 +136,7 @@ enum VideoExport {
             throw Failure.failed("Speech recognition isn't available for your language.")
         }
         // The sequence's sound in the trimmed range, mixed into one file.
-        let seq = try await VideoSequence.build(clips, frame: frame, range: start...max(start, end), box: RendererBox(FrameRenderer(edit: VideoEdit(trimEnd: 0), full: frame, preview: true)))
+        let seq = try await VideoSequence.build(clips, frame: frame, range: start...max(start, end), atSpeed: false, box: RendererBox(FrameRenderer(edit: VideoEdit(trimEnd: 0), full: frame, preview: true)))
         let comp = seq.composition
         guard !comp.tracks(withMediaType: .audio).isEmpty else {
             throw Failure.failed("This video has no sound. For recordings, turn on system audio or the microphone in Settings › Recording.")
@@ -203,6 +213,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var unplayable: Set<UUID> = []        // clips whose file can't be read: playback skips them
     private var pendingSeek: Double?              // where to go once the rebuilt sequence is in the player
     private var refreshPending = false
+    private var playingClips: [Clip] = []        // what the player's item was built from: maps its time to timeline time
     private(set) var builds = 0                    // tests: how many times the player was given a rebuilt sequence
 
     private let stage = VideoStage()
@@ -215,7 +226,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var loop = VideoEditor.lastLoop { didSet { VideoEditor.lastLoop = loop; syncLoop() } }
     private(set) var loops = 0   // tests: times playback went round
     private let timeLabel = NSTextField(labelWithString: "")
-    private let speedPopup = NSPopUpButton()
+    let speedMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Speed ▸ the selected clip's (else the one at the playhead), Every clip at
     private let captionsMenu = NSPopUpButton(frame: .zero, pullsDown: true)
     private let aspectPopup = NSPopUpButton()
     private let addPopup = NSPopUpButton(frame: .zero, pullsDown: true)
@@ -287,7 +298,10 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         undoStack = []
         dirty = false
         await rebuildPlayer()
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] t in self?.tick(t.seconds) }
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] t in
+            guard let self else { return }
+            self.tick(VideoSequence.timelineTime(self.playingClips, t.seconds))
+        }
         changed()
     }
 
@@ -310,10 +324,12 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             box.renderer = previewRenderer()
             let item = AVPlayerItem(asset: b.composition)
             item.videoComposition = b.video
+            item.audioTimePitchAlgorithm = .spectral   // sped-up clips keep their pitch
+            playingClips = clips
             previewComposition = b.video
             unplayable = b.unplayable
             player.replaceCurrentItem(with: item)
-            await player.seek(to: CMTime(seconds: min(max(0, at), duration), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            await player.seek(to: CMTime(seconds: VideoSequence.outputTime(clips, min(max(0, at), duration)), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             if rate != 0 { player.rate = rate }
             builds += 1
             timeline.needsDisplay = true
@@ -360,14 +376,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         aspectPopup.toolTip = "Crop shape"
         bind(aspectPopup) { [weak self] in self?.applyAspect() }
 
-        speedPopup.addItems(withTitles: VideoEdit.speeds.map { $0 == 1 ? "Speed 1×" : "Speed \(String(format: "%g", $0))×" })
-        speedPopup.bezelStyle = .recessed
-        bind(speedPopup) { [weak self] in
-            guard let self else { return }
-            self.pushUndo()
-            self.edit.speed = VideoEdit.speeds[self.speedPopup.indexOfSelectedItem]
-            if self.player.rate != 0 { self.player.rate = Float(self.edit.speed) }
-        }
+        speedMenu.bezelStyle = .recessed
+        speedMenu.menu?.delegate = self
+        speedMenu.menu?.autoenablesItems = false
         style(muteButton, "Mute", "speaker.slash", "Remove the sound", toggle: true) { [weak self] in guard let self else { return }; self.pushUndo(); self.edit.muted.toggle() }
 
         // One "Add" menu instead of a button per tool.
@@ -417,7 +428,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         guidesMenu.toolTip = "Composition guides over the preview (G hides them), and a black-and-white view. Never saved."
         guidesMenu.menu?.delegate = self
         guidesChanged()
-        for v in [cropButton, aspectPopup, flipMenu, guidesMenu, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        for v in [cropButton, aspectPopup, flipMenu, guidesMenu, separator(), speedMenu, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
@@ -781,7 +792,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func replay(_ m: Mark) {
         player.pause()
         seek(max(edit.trimStart, m.start - 0.4))
-        player.rate = Float(edit.speed)
+        player.rate = 1   // each clip at its own speed
         playStateChanged()
     }
 
@@ -834,7 +845,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     // MARK: state
 
-    var now: Double { player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0 }
+    // The player plays the output (each clip at its speed); the editor works in timeline time.
+    var now: Double { player.currentTime().seconds.isFinite ? VideoSequence.timelineTime(playingClips, player.currentTime().seconds) : 0 }
     var selectedCaptionIndex: Int? { selected.flatMap { id in edit.captions.firstIndex { $0.id == id } } }
     var selectedMarkIndex: Int? { selected.flatMap { id in edit.marks.firstIndex { $0.id == id } } }
     var selectedClipIndex: Int? { selected.flatMap { id in edit.clips.firstIndex { $0.id == id } } }
@@ -882,7 +894,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         aspectPopup.isHidden = !cropping
         syncFlipMenu()
         muteButton.state = edit.muted ? .on : .off
-        speedPopup.selectItem(at: VideoEdit.speeds.firstIndex(of: edit.speed) ?? 1)
+        syncSpeedMenu()
         rebuildCaptionsMenu()
     }
 
@@ -928,7 +940,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         } else {
             let (from, to) = loop ? loopRange : (edit.trimStart, edit.trimEnd)
             if now < from || now >= to - 0.05 { seek(from) }
-            player.rate = Float(edit.speed)
+            player.rate = 1   // each clip at its own speed
         }
         playStateChanged()
     }
@@ -955,7 +967,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     func seek(_ t: Double) {
-        player.seek(to: CMTime(seconds: min(max(0, t), duration), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        player.seek(to: CMTime(seconds: VideoSequence.outputTime(playingClips, min(max(0, t), duration)), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         timeline.needsDisplay = true
         stage.needsDisplay = true
         updateTime()
@@ -1411,6 +1423,7 @@ extension VideoEditor: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === copyMenu.menu { copyMenu.item(at: 1)?.isEnabled = canCopyClip }   // Copy clip: with a range or a selected clip
         if menu === flipMenu.menu { syncFlipMenu() }
+        if menu === speedMenu.menu { syncSpeedMenu() }
         if menu === guidesMenu.menu { fillGuidesMenu(menu, title: true) }
     }
 
@@ -1445,7 +1458,7 @@ extension VideoEditor: NSMenuDelegate {
     }
 
     // "6.2 s · ⌘C copies": how long the copied clip runs (at the edit's speed).
-    var markedLabel: String { marked.map { "\(lengthText(($0.upperBound - $0.lowerBound) / edit.speed)) · ⌘C copies" } ?? "" }
+    var markedLabel: String { marked.map { "\(lengthText(edit.outputSpan($0.lowerBound, $0.upperBound))) · ⌘C copies" } ?? "" }
     func lengthText(_ s: Double) -> String { s < 60 ? String(format: "%.1f s", s) : clock(s) }
 
     var canCopyClip: Bool { marked != nil || selectedClipIndex != nil }
@@ -1479,7 +1492,7 @@ extension VideoEditor: NSMenuDelegate {
         var e = edit
         e.trimStart = r.lowerBound
         e.trimEnd = r.upperBound - 1e-4   // the frame starting right at the end stays out, whatever the rounding
-        let length = lengthText((r.upperBound - r.lowerBound) / e.speed)
+        let length = lengthText(e.outputSpan(r.lowerBound, r.upperBound))
         let toast = Toast.shared.post("Copying clip…", "\(length) long", ms: 600_000)
         let pb = pasteboard
         Task { @MainActor in
@@ -2378,5 +2391,53 @@ extension VideoEditor {
         let on = !shownGuides.isEmpty
         guidesMenu.item(at: 0)?.title = monochrome ? (on ? "Guides · B&W" : "B&W view") : "Guides"
         stage.needsDisplay = true
+    }
+}
+
+// MARK: - Speed per clip
+
+extension VideoEditor {
+    // What Speed sets: the selected clip, else the clip at the playhead (so after a split, just that piece).
+    var speedTarget: Int? { selectedClipIndex ?? VideoSequence.locate(edit.clips, now)?.index }
+
+    func syncSpeedMenu() {
+        guard let menu = speedMenu.menu else { return }
+        menu.removeAllItems()
+        let k = speedTarget
+        let cur = k.map { edit.clips[$0].speed } ?? 1
+        menu.addItem(withTitle: "Speed " + VideoEdit.speedLabel(cur), action: nil, keyEquivalent: "")
+        speedMenu.item(at: 0)?.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: "Speed")
+        func item(_ menu: NSMenu, _ t: String, on: Bool, _ run: @escaping () -> Void) {
+            let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
+            let a = MenuAction(run)
+            actionsKeep(a)
+            it.target = a
+            it.state = on ? .on : .off
+            menu.addItem(it)
+        }
+        for v in VideoEdit.speeds { item(menu, VideoEdit.speedLabel(v), on: k != nil && cur == v) { [weak self] in self?.setSpeed(v, every: false) } }
+        if edit.clips.count > 1 {
+            menu.addItem(.separator())
+            let sub = NSMenu()
+            for v in VideoEdit.speeds { item(sub, VideoEdit.speedLabel(v), on: edit.clips.allSatisfy { $0.speed == v }) { [weak self] in self?.setSpeed(v, every: true) } }
+            let all = NSMenuItem(title: "Every clip at", action: nil, keyEquivalent: "")
+            all.submenu = sub
+            menu.addItem(all)
+        }
+        speedMenu.toolTip = edit.clips.count < 2 ? "Playback speed of the saved video (sound keeps its pitch)"
+            : selectedClipIndex != nil ? "Playback speed of the selected clip in the saved video"
+            : "Playback speed of the clip at the playhead in the saved video (select a clip to pick another)"
+    }
+
+    // One undo step: how fast the clip (or every clip) plays. The timeline stays as it is.
+    func setSpeed(_ v: Double, every: Bool) {
+        guard let k = speedTarget else { return }
+        var clips = edit.clips
+        for i in clips.indices where every || i == k { clips[i].speed = v }
+        guard clips != edit.clips else { return }
+        pushUndo()
+        pendingSeek = now
+        edit.clips = clips
+        syncSpeedMenu()
     }
 }
