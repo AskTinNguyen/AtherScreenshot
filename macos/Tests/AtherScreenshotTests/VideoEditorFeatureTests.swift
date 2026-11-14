@@ -282,4 +282,79 @@ final class VideoEditorFeatureTests: XCTestCase {
             close(e)
         }
     }
+
+    // MARK: guides
+
+    // Port of video_composition_guide_lines: each guide's lines at its fractions, ending on the picture's edges, and the
+    // diagonals' corner lines square to the other diagonal (wide and tall).
+    func testGuideLines() {
+        let r = CGRect(x: 10, y: 20, width: 1600, height: 900)
+        for (g, f) in [(GuideKind.golden, 0.317), (.thirds, 1.0 / 3), (.phi, 0.24)] {
+            let l = g.lines(r)
+            XCTAssertEqual(l.count, 4)
+            XCTAssertEqual(l[0].0.x, r.minX + r.width * f, accuracy: 1e-6)
+            XCTAssertEqual(l[0].0.y, r.minY); XCTAssertEqual(l[0].1.y, r.maxY)
+            XCTAssertEqual(l[1].0.y, r.minY + r.height * f, accuracy: 1e-6)
+            XCTAssertEqual(l[2].0.x, r.minX + r.width * (1 - f), accuracy: 1e-6)
+        }
+        for rect in [r, CGRect(x: 0, y: 0, width: 600, height: 1000)] {
+            let d = GuideKind.diagonal.lines(rect)
+            XCTAssertEqual(d.count, 6)
+            func dir(_ l: (CGPoint, CGPoint)) -> CGVector { CGVector(dx: l.1.x - l.0.x, dy: l.1.y - l.0.y) }
+            XCTAssertEqual(dir(d[2]).dx * dir(d[1]).dx + dir(d[2]).dy * dir(d[1]).dy, 0, accuracy: 1e-3, "square to the other diagonal")
+            XCTAssertEqual(dir(d[4]).dx * dir(d[0]).dx + dir(d[4]).dy * dir(d[0]).dy, 0, accuracy: 1e-3)
+            for l in d {   // every line ends on an edge
+                let p = l.1
+                let onEdge = abs(p.x - rect.minX) < 1e-6 || abs(p.x - rect.maxX) < 1e-6 || abs(p.y - rect.minY) < 1e-6 || abs(p.y - rect.maxY) < 1e-6
+                XCTAssertTrue(onEdge)
+            }
+        }
+        // On 16:9 the golden section passes where the diagonal's corner lines cross the other diagonal ((9/16)² ≈ 0.316).
+        XCTAssertEqual(pow(9.0 / 16, 2), 0.317, accuracy: 0.002)
+    }
+
+    // Port of video_editor_guides: the menu, G and Show all; the monochrome preview; the edit (and so the export) untouched.
+    func testEditorGuidesAndMonochrome() async throws {
+        let e = try await open(try await TestMedia.colors(seconds: 2))
+        await MainActor.run {
+            e.guides = []; e.guidesHidden = false; e.monochrome = false
+            let before = e.edit
+            XCTAssertTrue(key(e, kVK_ANSI_G))
+            XCTAssertEqual(e.shownGuides, [.thirds], "G with none picked: rule of thirds")
+            key(e, kVK_ANSI_G)
+            XCTAssertTrue(e.shownGuides.isEmpty, "G hides them")
+            key(e, kVK_ANSI_G)
+            XCTAssertEqual(e.shownGuides, [.thirds], "and brings the same back")
+            let menu = NSMenu()
+            e.fillGuidesMenu(menu, title: false)
+            XCTAssertEqual(menu.items.prefix(4).map(\.title), GuideKind.allCases.map(\.label))
+            (menu.items.first { $0.title == "Show all" }!.target as! MenuAction).fire()
+            XCTAssertEqual(e.shownGuides, GuideKind.allCases)
+            e.fillGuidesMenu(menu, title: false)
+            (menu.items.first { $0.title == "Monochrome view" }!.target as! MenuAction).fire()
+            XCTAssertTrue(e.monochrome)
+            XCTAssertEqual(e.edit, before, "guides and the monochrome view aren't part of the edit")
+            XCTAssertTrue(e.previewRenderer().monochrome)
+        }
+        // The preview renderer turns the picture gray; the export's renderer doesn't.
+        let edit = await MainActor.run { e.edit }
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 640, height: 360))
+        let ctx = CIContext()
+        func px(_ img: CIImage) -> [UInt8] {
+            var b = [UInt8](repeating: 0, count: 4)
+            ctx.render(img, toBitmap: &b, rowBytes: 4, bounds: CGRect(x: 100, y: 100, width: 1, height: 1), format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+            return b
+        }
+        let pr = FrameRenderer(edit: edit, full: CGSize(width: 640, height: 360), preview: true)
+        pr.monochrome = true
+        let gray = px(pr.render(red, at: 0.5))
+        XCTAssertLessThan(abs(Int(gray[0]) - Int(gray[1])), 6, "black and white")
+        let saved = try await VideoExport.frame(edit, at: 0.5)
+        XCTAssertGreaterThan(TestMedia.rgb(saved, 320, 180).0, 0.8, "the saved frame keeps its color and has no guide lines")
+        XCTAssertGreaterThan(TestMedia.rgb(saved, 213, 120).0, 0.8)
+        await MainActor.run {
+            e.guides = []; e.monochrome = false
+            close(e)
+        }
+    }
 }

@@ -229,6 +229,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private(set) var lastCopiedFrame: CGImage?
     private let muteButton = NSButton()
     private let cropButton = NSButton()
+    let guidesMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Guides ▸ golden section, thirds, phi grid, diagonals, Monochrome view
+    // Guides and the monochrome view are the preview's only: never saved, and they stay as set for the next video opened.
+    static var lastGuides: Set<GuideKind> = [], lastGuidesHidden = false, lastMonochrome = false
+    var guides = VideoEditor.lastGuides { didSet { VideoEditor.lastGuides = guides; guidesChanged() } }
+    var guidesHidden = VideoEditor.lastGuidesHidden { didSet { VideoEditor.lastGuidesHidden = guidesHidden; guidesChanged() } }
+    var monochrome = VideoEditor.lastMonochrome { didSet { VideoEditor.lastMonochrome = monochrome; guidesChanged(); refreshPreview() } }
+    var shownGuides: [GuideKind] { guidesHidden ? [] : GuideKind.allCases.filter(guides.contains) }
     let flipMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Flip ▸ horizontally / vertically: the selected clip (or video on top)
     private let inspector = NSStackView()
     private let hint = NSTextField(labelWithString: "")
@@ -300,7 +307,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             pendingSeek = nil
             let rate = player.rate
             previewBox = box
-            box.renderer = FrameRenderer(edit: edit, full: videoSize, preview: true)
+            box.renderer = previewRenderer()
             let item = AVPlayerItem(asset: b.composition)
             item.videoComposition = b.video
             previewComposition = b.video
@@ -318,12 +325,17 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         timeline.loadThumbnails()
     }
 
+    func previewRenderer() -> FrameRenderer {
+        let r = FrameRenderer(edit: edit, full: videoSize, preview: true)
+        r.zoomInPreview = player.rate != 0
+        r.monochrome = monochrome
+        return r
+    }
+
     // Hands the latest edit to the preview; while paused, re-renders the current frame.
     private func refreshPreview() {
         guard let box = previewBox else { return }
-        let r = FrameRenderer(edit: edit, full: videoSize, preview: true)
-        r.zoomInPreview = player.rate != 0
-        box.renderer = r
+        box.renderer = previewRenderer()
         guard player.rate == 0, !refreshPending, let vc = previewComposition else { return }
         refreshPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 30) { [weak self] in
@@ -401,7 +413,11 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
         buildFlipMenu()
-        for v in [cropButton, aspectPopup, flipMenu, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        guidesMenu.bezelStyle = .recessed
+        guidesMenu.toolTip = "Composition guides over the preview (G hides them), and a black-and-white view. Never saved."
+        guidesMenu.menu?.delegate = self
+        guidesChanged()
+        for v in [cropButton, aspectPopup, flipMenu, guidesMenu, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
@@ -1317,6 +1333,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         case kVK_ANSI_X: addMark(.blur)
         case kVK_ANSI_Z: addMark(.zoom)
         case kVK_ANSI_C: cropping.toggle()
+        case kVK_ANSI_G: toggleGuides()
         case kVK_Delete, kVK_ForwardDelete: deleteSelected()
         case kVK_Escape:
             if marked != nil { marked = nil } else if cropping { cropping = false } else if selected != nil { selected = nil } else { window.performClose(nil) }
@@ -1394,6 +1411,7 @@ extension VideoEditor: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === copyMenu.menu { copyMenu.item(at: 1)?.isEnabled = canCopyClip }   // Copy clip: with a range or a selected clip
         if menu === flipMenu.menu { syncFlipMenu() }
+        if menu === guidesMenu.menu { fillGuidesMenu(menu, title: true) }
     }
 
     // The timeline's frame rate: the first clip's, as the preview and the export step through it (at most 60).
@@ -1689,9 +1707,31 @@ final class VideoStage: NSView {
         drag = nil
     }
 
+    // A right click on the video: the Guides menu.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let ed = editor else { return nil }
+        let m = NSMenu()
+        ed.fillGuidesMenu(m, title: false)
+        return m
+    }
+
+    // The guides over the part the saved video shows (the crop), with a dark edge so they read on any picture.
+    private func drawGuides(_ ed: VideoEditor, _ ctx: CGContext) {
+        let r = toView(ed.viewRect)
+        for g in ed.shownGuides {
+            let lines = g.lines(r)
+            for (width, color) in [(3.0, NSColor.black.withAlphaComponent(0.45)), (1.0, g.color)] as [(CGFloat, NSColor)] {
+                ctx.setStrokeColor(color.cgColor)
+                ctx.setLineWidth(width)
+                for (a, b) in lines { ctx.strokeLineSegments(between: [a, b]) }
+            }
+        }
+    }
+
     fileprivate func drawOverlay() {
         guard let ed = editor, let ctx = NSGraphicsContext.current?.cgContext else { return }
         let v = videoRect
+        if !ed.shownGuides.isEmpty && !ed.cropping { drawGuides(ed, ctx) }
         if let c = ed.edit.crop {
             let r = toView(c)
             let p = CGMutablePath()
@@ -2292,5 +2332,51 @@ extension VideoEditor {
         if horizontal { e.clips[i].flipH.toggle() } else { e.clips[i].flipV.toggle() }
         edit = e
         syncFlipMenu()
+    }
+}
+
+// MARK: - Guides and monochrome view
+
+extension VideoEditor {
+    // The Guides menu (also on a right click on the video): each guide, Show all, G to hide, Monochrome view.
+    func fillGuidesMenu(_ menu: NSMenu, title: Bool) {
+        menu.removeAllItems()
+        menu.autoenablesItems = false
+        if title {
+            menu.addItem(withTitle: "Guides", action: nil, keyEquivalent: "")
+            menu.item(at: 0)?.image = NSImage(systemSymbolName: "grid", accessibilityDescription: "Guides")
+        }
+        func item(_ t: String, on: Bool, _ run: @escaping () -> Void) {
+            let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
+            let a = MenuAction(run)
+            actionsKeep(a)
+            it.target = a
+            it.state = on ? .on : .off
+            menu.addItem(it)
+        }
+        for g in GuideKind.allCases {
+            item(g.label, on: shownGuides.contains(g)) { [weak self] in
+                guard let self else { return }
+                if self.guidesHidden { self.guides = [g]; self.guidesHidden = false }   // hidden: show just this one
+                else if self.guides.contains(g) { self.guides.remove(g) } else { self.guides.insert(g) }
+            }
+        }
+        item("Show all", on: false) { [weak self] in self?.guides = Set(GuideKind.allCases); self?.guidesHidden = false }
+        item(guidesHidden ? "Show guides    G" : "Hide guides    G", on: false) { [weak self] in self?.toggleGuides() }
+        menu.items.last?.isEnabled = !guides.isEmpty
+        menu.addItem(.separator())
+        item("Monochrome view", on: monochrome) { [weak self] in self?.monochrome.toggle() }
+    }
+
+    // G: hides the guides, and brings the same ones back (rule of thirds when none were picked yet).
+    func toggleGuides() {
+        if guides.isEmpty { guides = [.thirds]; guidesHidden = false } else { guidesHidden.toggle() }
+    }
+
+    func guidesChanged() {
+        if let m = guidesMenu.menu { fillGuidesMenu(m, title: true) }
+        let on = !shownGuides.isEmpty
+        guidesMenu.item(at: 0)?.title = monochrome ? (on ? "Guides · B&W" : "B&W view") : "Guides"
+        stage.needsDisplay = true
     }
 }
