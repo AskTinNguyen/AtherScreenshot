@@ -752,4 +752,68 @@ final class VideoEditorFeatureTests: XCTestCase {
             close(e)
         }
     }
+
+    // MARK: snapshots
+
+    // The editor with the bin lane (a piece in it), clips with ↔, 2× and ◀ reversed badges, a video on top (selected,
+    // with its lane bar) and the golden-section and thirds guides; and the same frame as Save draws it (no guides).
+    func testFeatureSnapshots() async throws {
+        guard let out = ProcessInfo.processInfo.environment["ATHER_TEST_OUT"] else { throw XCTSkip("set ATHER_TEST_OUT") }
+        let a = try await TestMedia.colors(w: 640, h: 360, seconds: 4, colors: [.systemTeal, .systemIndigo, .systemPink, .systemOrange])
+        let top = try await TestMedia.colors(w: 320, h: 180, seconds: 3, colors: [.systemYellow])
+        let topClip = try await VideoSource.probe(top)
+        let e = try await open(a)
+        await MainActor.run { e.seek(1) }
+        try await until("at 1 s") { abs(e.now - 1) < 0.05 }
+        var b = await MainActor.run { e.builds }
+        await MainActor.run { e.splitAtPlayhead() }
+        try await until("split") { e.builds > b }
+        await MainActor.run { e.seek(2.5) }
+        try await until("at 2.5 s") { abs(e.now - 2.5) < 0.05 }
+        b = await MainActor.run { e.builds }
+        await MainActor.run { e.splitAtPlayhead() }   // [0–1, 1–2.5, 2.5–4]
+        try await until("split again") { e.builds > b }
+        await MainActor.run {
+            e.selected = e.edit.clips[2].id
+            e.reverse()
+        }
+        try await until("reversed", timeout: 20) { !e.busy && e.edit.clips[2].reversed }
+        b = await MainActor.run { e.builds }
+        await MainActor.run {
+            e.selected = e.edit.clips[0].id
+            e.moveToBin(0)   // a piece in the bin: [1–2.5, ◀ 2.5–4]
+        }
+        try await until("to bin") { e.builds > b }
+        b = await MainActor.run { e.builds }
+        await MainActor.run {
+            e.selected = e.edit.clips[0].id
+            e.toggleFlip(horizontal: true)
+            e.setSpeed(2, every: false)
+            e.selected = nil
+            e.guides = [.golden, .thirds]
+            e.guidesHidden = false
+            e.edit.captions = [Caption(start: 0.4, end: 2.2, text: "Two videos at once")]
+            e.addOverlay(topClip, at: 0.3, layout: .pip)
+        }
+        try await until("rebuilt") { e.builds > b }
+        await MainActor.run { e.seek(1) }
+        try await until("at 1 s") { abs(e.now - 1) < 0.05 }
+        try await Task.sleep(nanoseconds: 900_000_000)   // thumbnails and the paused preview
+        await MainActor.run {
+            Self.snapshot(e, "ui-video-editor-bin-overlay.png")
+            let p = Process()   // a real window capture (with the video layer), when this process may record the screen
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-o", "-l\(e.window.windowNumber)", URL(fileURLWithPath: out).appendingPathComponent("ui-video-editor-bin-overlay-live.png").path]
+            try? p.run()
+            p.waitUntilExit()
+        }
+        let edit = await MainActor.run { e.edit }
+        let frame = try await VideoExport.frame(edit, at: 1)
+        let rep = NSBitmapImageRep(cgImage: frame)
+        try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out).appendingPathComponent("video-frame-overlay.png"))
+        await MainActor.run {
+            e.guides = []
+            close(e)
+        }
+    }
 }

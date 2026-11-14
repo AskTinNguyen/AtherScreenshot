@@ -2367,7 +2367,7 @@ final class Timeline: NSView {
             CGRect(x: x(e.snapEdge(t(at.x))) - 1.5, y: ol.minY, width: 3, height: ol.height).fill()
         }
         for o in e.edit.overlays {
-            bar(barRect(o.start, o.end, y: ovY + 2, h: ovH - 4), (o.isSplit ? "Split · " : "On top · ") + o.clip.displayName + o.clip.badges,
+            bar(barRect(o.start, min(o.end, e.duration), y: ovY + 2, h: ovH - 4), (o.isSplit ? "Split · " : "On top · ") + o.clip.displayName + o.clip.badges,
                 o.isSplit ? "rectangle.split.2x1" : "pip", selected: o.id == e.selected)
         }
 
