@@ -191,7 +191,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var duration: Double = 0
     var videoSize = CGSize(width: 16, height: 9)
     var edit = VideoEdit(trimEnd: 0) { didSet { if edit != oldValue { changed() } } }
-    var selected: UUID? { didSet { if selected != oldValue { rebuildInspector() }; timeline.needsDisplay = true; stage.needsDisplay = true } }
+    var selected: UUID? { didSet { if selected != oldValue { rebuildInspector(); syncFlipMenu() }; timeline.needsDisplay = true; stage.needsDisplay = true } }
     var cropping = false { didSet { stage.needsDisplay = true; syncToolbar() } }
     var dirty = false
     private var undoStack: [VideoEdit] = []
@@ -203,6 +203,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var unplayable: Set<UUID> = []        // clips whose file can't be read: playback skips them
     private var pendingSeek: Double?              // where to go once the rebuilt sequence is in the player
     private var refreshPending = false
+    private(set) var builds = 0                    // tests: how many times the player was given a rebuilt sequence
 
     private let stage = VideoStage()
     let timeline = Timeline()
@@ -222,6 +223,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private(set) var lastCopiedFrame: CGImage?
     private let muteButton = NSButton()
     private let cropButton = NSButton()
+    let flipMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Flip ▸ horizontally / vertically: the selected clip (or video on top)
     private let inspector = NSStackView()
     private let hint = NSTextField(labelWithString: "")
     private var actions: [MenuAction] = []
@@ -285,7 +287,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         let box = RendererBox(FrameRenderer(edit: edit, full: videoSize, preview: true))
         do {
             let b = try await VideoSequence.build(clips, frame: edit.frame, box: box)
-            guard clips == edit.clips else { return }  // changed again meanwhile: that rebuild wins
+            guard VideoSequence.sameFootage(clips, edit.clips) else { return }  // changed again meanwhile: that rebuild wins
             // The playhead stays where playback is (an undo while playing doesn't jump back to where Play was
             // pressed), unless a clip change asked for a spot.
             let at = pendingSeek ?? now
@@ -300,6 +302,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             player.replaceCurrentItem(with: item)
             await player.seek(to: CMTime(seconds: min(max(0, at), duration), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             if rate != 0 { player.rate = rate }
+            builds += 1
             timeline.needsDisplay = true
             stage.needsDisplay = true
             updateTime()
@@ -391,7 +394,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for v in [cropButton, aspectPopup, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        buildFlipMenu()
+        for v in [cropButton, aspectPopup, flipMenu, separator(), speedPopup, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
@@ -454,6 +458,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         b.toolTip = tip
         bind(b, run)
     }
+
+    func actionsKeep(_ a: MenuAction) { actions.append(a) }
 
     private func bind(_ c: NSControl, _ run: @escaping () -> Void) {
         let a = MenuAction(run)
@@ -821,7 +827,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
 
     private func changed() {
         duration = VideoSequence.total(edit.clips)
-        if edit.clips != builtClips, !edit.clips.isEmpty {
+        if !VideoSequence.sameFootage(edit.clips, builtClips), !edit.clips.isEmpty {   // a flip alone doesn't rebuild the player
             builtClips = edit.clips
             marked = nil   // its times would now show other footage
             Task { @MainActor in await self.rebuildPlayer() }
@@ -840,6 +846,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private func syncToolbar() {
         cropButton.state = cropping ? .on : .off
         aspectPopup.isHidden = !cropping
+        syncFlipMenu()
         muteButton.state = edit.muted ? .on : .off
         speedPopup.selectItem(at: VideoEdit.speeds.firstIndex(of: edit.speed) ?? 1)
         rebuildCaptionsMenu()
@@ -1344,6 +1351,7 @@ extension VideoEditor: NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === copyMenu.menu { copyMenu.item(at: 1)?.isEnabled = canCopyClip }   // Copy clip: with a range or a selected clip
+        if menu === flipMenu.menu { syncFlipMenu() }
     }
 
     // The timeline's frame rate: the first clip's, as the preview and the export step through it (at most 60).
@@ -1731,6 +1739,7 @@ private final class StageOverlay: NSView {
 final class Timeline: NSView {
     weak var editor: VideoEditor?
     private var thumbs: [CGImage] = []
+    private var thumbTimes: [Double] = []   // the timeline time each thumbnail shows (it follows its clip's flip)
     private enum Target { case caption(UUID), mark(UUID) }
     private enum Drag {
         case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double)
@@ -1787,10 +1796,11 @@ final class Timeline: NSView {
         let count = 16
         thumbJob = Task { @MainActor in
             var gens: [String: AVAssetImageGenerator] = [:]
-            var out: [CGImage] = []
+            var out: [CGImage] = [], times: [Double] = []
             for i in 0..<count {
                 guard !Task.isCancelled else { return }
-                guard let (k, ft) = VideoSequence.locate(clips, total * (Double(i) + 0.5) / Double(count)) else { continue }
+                let tt = total * (Double(i) + 0.5) / Double(count)
+                guard let (k, ft) = VideoSequence.locate(clips, tt) else { continue }
                 let path = clips[k].path
                 let gen = gens[path] ?? {
                     let g = AVAssetImageGenerator(asset: AVURLAsset(url: clips[k].url))
@@ -1799,10 +1809,11 @@ final class Timeline: NSView {
                     gens[path] = g
                     return g
                 }()
-                if let img = try? await gen.image(at: CMTime(seconds: ft, preferredTimescale: 600)).image { out.append(img) }
+                if let img = try? await gen.image(at: CMTime(seconds: ft, preferredTimescale: 600)).image { out.append(img); times.append(tt) }
             }
             guard !Task.isCancelled else { return }
             self.thumbs = out
+            self.thumbTimes = times
             self.needsDisplay = true
         }
     }
@@ -2009,6 +2020,11 @@ final class Timeline: NSView {
                 let dw = CGFloat(img.width) * s, dh = CGFloat(img.height) * s
                 ctx.saveGState()
                 ctx.clip(to: cell)
+                if i < thumbTimes.count, let k = VideoSequence.locate(e.edit.clips, thumbTimes[i])?.index, e.edit.clips[k].flipped {
+                    let c = e.edit.clips[k]
+                    ctx.translateBy(x: c.flipH ? cell.midX * 2 : 0, y: c.flipV ? cell.midY * 2 : 0)
+                    ctx.scaleBy(x: c.flipH ? -1 : 1, y: c.flipV ? -1 : 1)
+                }
                 drawImageFlipped(ctx, img, in: CGRect(x: cell.midX - dw / 2, y: cell.midY - dh / 2, width: dw, height: dh))
                 ctx.restoreGState()
             }
@@ -2179,5 +2195,60 @@ final class Timeline: NSView {
             Theme.accent.setFill()
             CGRect(x: mx - 1.5, y: y0 - 2, width: 3, height: strip.maxY - y0 + 2).fill()
         }
+    }
+}
+
+// MARK: - Flip
+
+extension VideoEditor {
+    // What Flip acts on: the selected clip, else the clip at the playhead.
+    var flipTarget: Int? { selectedClipIndex ?? VideoSequence.locate(edit.clips, now)?.index }
+    var flipClip: Clip? { flipTarget.map { edit.clips[$0] } }
+
+    fileprivate func buildFlipMenu() {
+        flipMenu.bezelStyle = .recessed
+        let menu = flipMenu.menu!
+        menu.autoenablesItems = false
+        menu.delegate = self
+        menu.addItem(withTitle: "Flip", action: nil, keyEquivalent: "")
+        flipMenu.item(at: 0)?.image = NSImage(systemSymbolName: "arrow.left.and.right.righttriangle.left.righttriangle.right", accessibilityDescription: "Flip")
+        for (title, h) in [("Flip horizontally (mirror left–right)", true), ("Flip vertically (upside down)", false)] {
+            let it = NSMenuItem(title: title, action: #selector(MenuAction.fire), keyEquivalent: "")
+            let a = MenuAction { [weak self] in self?.toggleFlip(horizontal: h) }
+            actionsKeep(a)
+            it.target = a
+            menu.addItem(it)
+        }
+        syncFlipMenu()
+    }
+
+    func syncFlipMenu() {
+        guard flipMenu.numberOfItems >= 3 else { return }
+        let c = flipClip
+        flipMenu.item(at: 0)?.title = c.map { $0.flipH && $0.flipV ? "Flipped ↔ ↕" : $0.flipH ? "Flipped ↔" : $0.flipV ? "Flipped ↕" : "Flip" } ?? "Flip"
+        flipMenu.item(at: 1)?.state = c?.flipH == true ? .on : .off
+        flipMenu.item(at: 2)?.state = c?.flipV == true ? .on : .off
+        flipMenu.item(at: 1)?.isEnabled = c != nil
+        flipMenu.item(at: 2)?.isEnabled = c != nil
+        flipMenu.toolTip = selectedClipIndex != nil ? "Mirror the selected clip (left–right or upside down)"
+            : edit.clips.count > 1 ? "Mirror the clip at the playhead (select a clip to pick another)" : "Mirror the video (left–right or upside down)"
+    }
+
+    // One undo step: one clip's picture mirrored one way. The markup that sits wholly on it is mirrored with it, so it
+    // stays on the same footage; the crop (all clips share it) and captions stay put.
+    func toggleFlip(horizontal: Bool) {
+        guard let i = flipTarget else { return }
+        pushUndo()
+        let t0 = VideoSequence.starts(edit.clips)[i], t1 = t0 + edit.clips[i].duration
+        let W = videoSize.width, H = videoSize.height
+        var e = edit
+        func mirror(_ p: inout CGPoint) { if horizontal { p.x = W - p.x } else { p.y = H - p.y } }
+        for k in e.marks.indices where e.marks[k].start >= t0 - 1e-6 && e.marks[k].end <= t1 + 1e-6 {
+            mirror(&e.marks[k].a)
+            mirror(&e.marks[k].b)
+        }
+        if horizontal { e.clips[i].flipH.toggle() } else { e.clips[i].flipV.toggle() }
+        edit = e
+        syncFlipMenu()
     }
 }

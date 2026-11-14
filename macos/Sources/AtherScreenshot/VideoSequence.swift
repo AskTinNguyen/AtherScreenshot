@@ -42,12 +42,22 @@ struct Clip: Equatable {
     var fps: Double
     var hasAudio: Bool
     var rotation = 0           // clockwise degrees that show it upright (phone videos)
+    // Its picture mirrored left–right and/or upside down (before anything is drawn on it). Pieces split from it keep it.
+    var flipH = false, flipV = false
+
+    var flipped: Bool { flipH || flipV }
+    // The same footage, whatever the flip: what the composition (and so the player) depends on.
+    func sameFootage(_ o: Clip) -> Bool {
+        var a = self, b = o
+        a.flipH = false; a.flipV = false; b.flipH = false; b.flipV = false
+        return a == b
+    }
 
     var duration: Double { max(0, outPoint - inPoint) }
     var url: URL { URL(fileURLWithPath: path) }
     var name: String { url.lastPathComponent }
     var displayName: String { name }
-    var badges: String { "" }   // how it's changed, for the clip lane: flipped, speed, reversed
+    var badges: String { (flipH ? "  ↔" : "") + (flipV ? "  ↕" : "") }   // how it's changed, for the clip lane
 }
 
 enum VideoSource {
@@ -170,6 +180,13 @@ enum VideoSequence {
         return clips.map { c in defer { t += c.duration }; return t }
     }
     static func total(_ clips: [Clip]) -> Double { clips.reduce(0) { $0 + $1.duration } }
+    static func sameFootage(_ a: [Clip], _ b: [Clip]) -> Bool { a.count == b.count && zip(a, b).allSatisfy { $0.sameFootage($1) } }
+
+    // `img` (extent 0,0 – size) mirrored as the clip says.
+    static func mirrored(_ img: CIImage, h: Bool, v: Bool, size: CGSize) -> CIImage {
+        guard h || v else { return img }
+        return img.transformed(by: CGAffineTransform(a: h ? -1 : 1, b: 0, c: 0, d: v ? -1 : 1, tx: h ? size.width : 0, ty: v ? size.height : 0))
+    }
 
     // The clip showing timeline time `t`, and the time in its file.
     static func locate(_ clips: [Clip], _ t: Double) -> (index: Int, fileTime: Double)? {

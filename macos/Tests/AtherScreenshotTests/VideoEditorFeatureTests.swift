@@ -157,4 +157,81 @@ final class VideoEditorFeatureTests: XCTestCase {
         XCTAssertEqual(probed.length, VideoSequence.total(edit.clips), accuracy: 0.1)
         await MainActor.run { close(e) }
     }
+
+    // MARK: flip
+
+    // Left half red, right half blue, a green band along the top (for the vertical flip).
+    static func halves(seconds: Double = 2) async throws -> URL {
+        try await TestMedia.clip(w: 640, h: 360, seconds: seconds) { _, ctx in
+            ctx.setFillColor(NSColor.red.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 320, height: 360))
+            ctx.setFillColor(NSColor.blue.cgColor); ctx.fill(CGRect(x: 320, y: 0, width: 320, height: 360))
+            ctx.setFillColor(NSColor.green.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 60))
+        }
+    }
+
+    // Port of video_flip_mirrors_the_picture: only the flipped clip's frames mirror, in the saved video too.
+    func testFlipMirrorsTheSavedPicture() async throws {
+        let src = try await Self.halves()
+        let c = try await VideoSource.probe(src)
+        var a = c, b = c
+        a.outPoint = 1
+        b.id = UUID(); b.inPoint = 1
+        b.flipH = true
+        var e = TestMedia.edit([a, b])
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("ather-flip-\(UUID().uuidString).mp4")
+        try await VideoExport.mp4(e, to: out)
+        let asset = AVURLAsset(url: out)
+        let first = try await TestMedia.frame(asset, at: 0.5), second = try await TestMedia.frame(asset, at: 1.5)
+        XCTAssertGreaterThan(TestMedia.rgb(first, 20, 180).0, 0.8, "the first clip as it is: red on the left")
+        XCTAssertGreaterThan(TestMedia.rgb(second, 20, 180).2, 0.8, "the flipped clip: blue on the left")
+        XCTAssertGreaterThan(TestMedia.rgb(second, 620, 180).0, 0.8)
+        // Upside down: the green band at the bottom; the crop is taken from the flipped picture.
+        e.clips[1].flipH = false
+        e.clips[1].flipV = true
+        e.crop = CGRect(x: 0, y: 200, width: 320, height: 160)
+        let img = try await VideoExport.frame(e, at: 1.5)
+        XCTAssertEqual(img.width, 320)
+        XCTAssertGreaterThan(TestMedia.rgb(img, 160, img.height - 10).1, 0.8, "green at the bottom of the upside-down picture")
+        XCTAssertGreaterThan(TestMedia.rgb(img, 160, 20).0, 0.8)
+    }
+
+    // Port of video_editor_flip: Flip acts on the selected clip (else the one at the playhead), one undo step, markup
+    // wholly on that clip mirrored with it, the crop untouched; the clip lane shows ↔ / ↕.
+    func testEditorFlip() async throws {
+        let e = try await open(try await Self.halves(seconds: 3))
+        await MainActor.run { e.seek(1.5) }
+        try await until("seeked") { abs(e.now - 1.5) < 0.05 }
+        let b0 = await MainActor.run { e.builds }
+        await MainActor.run {
+            e.splitAtPlayhead()   // [0–1.5, 1.5–3], the second selected
+            e.selected = nil
+            e.edit.marks = [Mark(kind: .box, start: 1.6, end: 2.5, a: CGPoint(x: 40, y: 50), b: CGPoint(x: 140, y: 100)),
+                            Mark(kind: .box, start: 0.2, end: 1.0, a: CGPoint(x: 40, y: 50), b: CGPoint(x: 140, y: 100))]
+            e.edit.crop = CGRect(x: 10, y: 10, width: 300, height: 200)
+        }
+        try await until("rebuilt") { e.builds > b0 }
+        await MainActor.run { e.seek(2) }
+        try await until("at 2 s") { abs(e.now - 2) < 0.05 }
+        await MainActor.run {
+            XCTAssertEqual(e.flipTarget, 1, "the clip at the playhead")
+            e.toggleFlip(horizontal: true)
+            XCTAssertTrue(e.edit.clips[1].flipH)
+            XCTAssertFalse(e.edit.clips[0].flipH)
+            XCTAssertEqual(e.edit.marks[0].rect, CGRect(x: 500, y: 50, width: 100, height: 50), "markup on it mirrored")
+            XCTAssertEqual(e.edit.marks[1].rect, CGRect(x: 40, y: 50, width: 100, height: 50), "markup on the other clip stays")
+            XCTAssertEqual(e.edit.crop, CGRect(x: 10, y: 10, width: 300, height: 200), "the crop stays")
+            XCTAssertEqual(e.flipMenu.itemTitle(at: 0), "Flipped ↔")
+            XCTAssertTrue(e.edit.clips[1].badges.contains("↔"))
+            e.selected = e.edit.clips[0].id
+            e.toggleFlip(horizontal: false)
+            XCTAssertTrue(e.edit.clips[0].flipV)
+            XCTAssertEqual(e.edit.marks[1].rect, CGRect(x: 40, y: 260, width: 100, height: 50))
+            e.undo()
+            XCTAssertFalse(e.edit.clips[0].flipV)
+            e.undo()
+            XCTAssertFalse(e.edit.clips[1].flipH)
+            XCTAssertEqual(e.edit.marks[0].rect, CGRect(x: 40, y: 50, width: 100, height: 50))
+            close(e)
+        }
+    }
 }

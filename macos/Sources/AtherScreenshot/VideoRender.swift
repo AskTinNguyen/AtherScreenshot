@@ -178,6 +178,11 @@ final class FrameRenderer {
     func render(_ src: CIImage, at t: Double) -> CIImage {
         let H = full.height
         var img = src
+        // 0. The clip's flip, first: everything else is placed on the flipped picture (the frame is fitted into the
+        // sequence frame centered, so its bars mirror onto themselves).
+        if let k = VideoSequence.locate(edit.clips, t)?.index, edit.clips[k].flipped {
+            img = VideoSequence.mirrored(img, h: edit.clips[k].flipH, v: edit.clips[k].flipV, size: full)
+        }
         // 1. Blur and pixelate, in the order they were added.
         for m in edit.marks where (m.kind == .blur || m.kind == .pixelate) && m.active(t) {
             let r = ci(m.rect, H).intersection(img.extent)
