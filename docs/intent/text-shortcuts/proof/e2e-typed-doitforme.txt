@@ -1,0 +1,8 @@
+﻿ENTERS=0
+Hello Please do this end to end:
+1. Read the relevant code and docs first, so the change fits how this project already works.
+2. Make the change completely, including the tests it needs.
+3. Build and run the tests.
+4. Report what you changed, what you verified and how, and anything you couldn't verify.
+
+Task: 

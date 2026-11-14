@@ -18,6 +18,7 @@ struct SettingsUiHost {
     std::function<std::wstring(const std::wstring&)> hotkeyStatus;  // "" or why a shortcut isn't active
     std::function<bool()> getStartup;
     std::function<void(bool)> setStartup;
+    std::function<void()> openQuickPrompts;
 };
 
 // Native settings window: search, toggles, choices, inline text/number fields, folder picker and a

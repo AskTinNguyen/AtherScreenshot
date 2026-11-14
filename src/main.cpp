@@ -40,6 +40,9 @@ using std::min;
 #include "overlay.h"
 #include "palette.h"
 #include "pin.h"
+#include "quickprompts.h"
+#include "quickprompts_win.h"
+#include "quickpromptsui.h"
 #include "recorder.h"
 #include "settings.h"
 #include "settingsui.h"
@@ -116,6 +119,11 @@ enum Cmd : int {
     CmdBugReport,
     CmdCopyLastBug,
     CmdOpenBugsFolder,
+    CmdInsertQuickPrompt,
+    CmdOpenQuickPrompts,
+    CmdNewQuickPrompt,
+    CmdNewQuickPromptFromClipboard,
+    CmdToggleQuickPrompts,
     CmdInstallUpdate,  // tray and notification only: never from a link or the command line
     CmdExit,
     CmdRecentBase = 1000,
@@ -143,6 +151,11 @@ const CmdDef kCmds[] = {
     {CmdBugReport, L"BugReport", L"Bug report: start / stop", L"bug issue playtest report voice clip logs game qa", 0xEBE8, L"Ctrl+Alt+B", true},
     {CmdCopyLastBug, L"CopyLastBugReport", L"Copy last bug report", L"bug clipboard paste slack files clip logs", 0xE8C8, L"", false},
     {CmdOpenBugsFolder, L"OpenBugReportsFolder", L"Open bug reports folder", L"bug explorer directory files bundles", 0xE838, L"", false},
+    {CmdInsertQuickPrompt, L"InsertQuickPrompt", L"Insert QuickPrompt…", L"prompt snippet phrase text expand template paste ai agent claude chatgpt", 0xE8BD, L"Ctrl+Alt+Space", false},
+    {CmdOpenQuickPrompts, L"OpenQuickPrompts", L"QuickPrompts…", L"prompt snippet phrase text expansion library triggers manage edit team", 0xE8BD, L"", false},
+    {CmdNewQuickPrompt, L"NewQuickPrompt", L"New QuickPrompt…", L"prompt snippet phrase text expansion add create trigger", 0xE710, L"", false},
+    {CmdNewQuickPromptFromClipboard, L"NewQuickPromptFromClipboard", L"Save clipboard as a QuickPrompt…", L"prompt snippet phrase text expansion add create paste", 0xE77F, L"", false},
+    {CmdToggleQuickPrompts, L"ToggleQuickPrompts", L"Expand QuickPrompt triggers as I type", L"toggle prompt snippet text expansion typing listen keyboard", 0xE765, L"", false},
     {CmdRuler, L"ScreenRuler", L"Screen ruler", L"measure pixels distance size length angle", 0xECC6, L"", true},
     {CmdToggleSystemAudio, L"ToggleSystemAudio", L"Record system audio", L"toggle sound speaker loopback", 0xE767, L"", false},
     {CmdToggleMic, L"ToggleMicrophone", L"Record microphone", L"toggle mic voice", 0xE720, L"", false},
@@ -194,7 +207,8 @@ constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 constexpr UINT WM_APP_PALETTE = WM_APP + 2;
 constexpr ULONG_PTR kCopyDataCli = 0xA7E1;  // WM_COPYDATA tag for forwarded command lines
-constexpr UINT_PTR kDeferTimer = 1, kDelayTimer = 2, kLibraryTimer = 3, kUpdateTimer = 4;
+constexpr UINT_PTR kDeferTimer = 1, kDelayTimer = 2, kLibraryTimer = 3, kUpdateTimer = 4, kQuickPromptsTimer = 5;
+constexpr int kQuickPromptHotkeyBase = 3000;  // WM_HOTKEY ids of prompts' own shortcuts (after CmdRecentBase's range)
 
 HWND g_hwnd = nullptr;
 HICON g_icon = nullptr;     // small: tray
@@ -222,6 +236,8 @@ void CopyAgentSetup();
 void CheckForUpdates(bool manual);
 void InstallUpdate();
 void UpdateTrayTip();
+void RegisterQuickPromptHotkeys();
+void UnregisterQuickPromptHotkeys();
 
 const CmdDef* FindCmd(int id) {
     for (const auto& c : kCmds)
@@ -286,10 +302,183 @@ void RegisterHotkeys() {
             g_hotkeyStatus[c.key] = hk + L" is taken by another app or Windows";
         }
     }
+    RegisterQuickPromptHotkeys();
 }
 
 void UnregisterAllHotkeys() {
     for (const auto& c : kCmds) UnregisterHotKey(g_hwnd, c.id);
+    UnregisterQuickPromptHotkeys();
+}
+
+// ---- QuickPrompts ----
+
+std::vector<std::wstring> g_qpHotkeyIds;                 // index = WM_HOTKEY id - kQuickPromptHotkeyBase
+std::map<std::wstring, std::wstring> g_qpHotkeyStatus;   // prompt id -> why its shortcut isn't active
+
+void UnregisterQuickPromptHotkeys() {
+    for (size_t i = 0; i < g_qpHotkeyIds.size(); ++i) UnregisterHotKey(g_hwnd, kQuickPromptHotkeyBase + (int)i);
+    g_qpHotkeyIds.clear();
+}
+
+void RegisterQuickPromptHotkeys() {
+    UnregisterQuickPromptHotkeys();
+    g_qpHotkeyStatus.clear();
+    if (!g_hwnd || g_hotkeysSuspended) return;
+    for (const auto& p : QuickPromptStore::Shared().Active()) {
+        if (p.hotkey.empty() || p.source != L"user") continue;
+        UINT mods, vk;
+        const int id = kQuickPromptHotkeyBase + (int)g_qpHotkeyIds.size();
+        if (!ParseHotkey(p.hotkey, mods, vk)) {
+            g_qpHotkeyStatus[p.id] = L"“" + p.hotkey + L"” isn’t a valid shortcut";
+            continue;
+        }
+        if (!RegisterHotKey(g_hwnd, id, mods | MOD_NOREPEAT, vk)) {
+            g_qpHotkeyStatus[p.id] = p.hotkey + L" is taken by another command, app or Windows";
+            continue;
+        }
+        g_qpHotkeyIds.push_back(p.id);
+    }
+}
+
+// The path {lastcapture} and {lastcapture:image} use: the last capture, or the newest picture in the captures folder.
+std::wstring LastCaptureForPrompts() {
+    if (!g_lastPath.empty() && GetFileAttributesW(g_lastPath.c_str()) != INVALID_FILE_ATTRIBUTES) return g_lastPath;
+    auto recent = RecentCaptures(g_settings.CapturesFolder(), 1, false);
+    return recent.empty() ? L"" : recent[0];
+}
+
+void ApplyQuickPrompts() {
+    QuickPromptStore::Shared().SetTeamFile(g_settings.qpTeamFile);
+    SetQuickPromptsHost({LastCaptureForPrompts, [](const std::wstring& t, const std::wstring& b) {
+                             ShowToast(t, b, nullptr, nullptr, g_settings.toastMs + 3000);
+                         }});
+    ConfigureQuickPrompts({g_settings.qpTyping, g_settings.qpSkipFullscreen, g_settings.qpExcludedApps});
+}
+
+void QuickPromptsChanged() {
+    RefreshQuickPromptTriggers();
+    if (!g_hotkeysSuspended) RegisterQuickPromptHotkeys();
+}
+
+void SetQuickPromptsTyping(bool on) {
+    g_settings.qpTyping = on;
+    g_settings.WriteBool(L"QuickPrompts", L"ExpandAsYouType", on);
+    ApplyQuickPrompts();
+}
+
+QuickPromptsUiHost MakeQuickPromptsUiHost() {
+    QuickPromptsUiHost h;
+    h.icon = g_iconBig;
+    h.typing = [] { return g_settings.qpTyping; };
+    h.setTyping = [](bool on) { SetQuickPromptsTyping(on); };
+    h.changed = [] { QuickPromptsChanged(); };
+    h.hotkeyStatus = [](const std::wstring& id) {
+        auto it = g_qpHotkeyStatus.find(id);
+        return it == g_qpHotkeyStatus.end() ? std::wstring() : it->second;
+    };
+    h.teamFile = [] { return g_settings.qpTeamFile; };
+    h.setTeamFile = [](const std::wstring& path) {
+        g_settings.qpTeamFile = path;
+        g_settings.WriteString(L"QuickPrompts", L"TeamFile", path);
+        QuickPromptStore::Shared().SetTeamFile(path);
+    };
+    h.pickerHotkey = [] { return g_settings.Hotkey(L"InsertQuickPrompt"); };
+    h.lastCapture = [] { return LastCaptureForPrompts(); };
+    return h;
+}
+
+void OpenQuickPrompts(const std::wstring& select = L"") { ShowQuickPromptsWindow(MakeQuickPromptsUiHost(), select); }
+
+constexpr int kPromptPickBase = 5000;
+
+std::vector<PaletteItem> QuickPromptPaletteItems(std::vector<std::wstring>* ids) {
+    std::vector<PaletteItem> items;
+    auto all = QuickPromptStore::Shared().Active();
+    // Most used first, then as listed.
+    std::stable_sort(all.begin(), all.end(), [](const QuickPrompt& a, const QuickPrompt& b) { return a.uses > b.uses; });
+    for (const auto& p : all) {
+        std::wstring keywords = p.trigger;
+        for (const auto& t : p.tags) keywords += L" " + t;
+        keywords += L" " + p.text.substr(0, 400);
+        const wchar_t icon = p.source == L"builtin" ? 0xE735 : p.source == L"team" ? 0xE716 : 0xE8BD;
+        items.push_back({kPromptPickBase + (int)ids->size(), p.title.empty() ? p.trigger : p.title, p.trigger, keywords, icon});
+        ids->push_back(p.id);
+    }
+    return items;
+}
+
+void ShowQuickPromptPicker() {
+    if (PaletteVisible()) return HidePalette(true);
+    if (OverlayActive()) return;
+    QuickPromptStore::Shared().ReloadIfChanged();
+    HWND target = GetForegroundWindow();
+    if (target && IsOwnWindow(target)) target = nullptr;  // a window of ours: paste wherever focus goes back to
+    auto ids = std::make_shared<std::vector<std::wstring>>();
+    auto items = QuickPromptPaletteItems(ids.get());
+    PaletteOptions opt;
+    opt.placeholder = L"Search QuickPrompts…  (Enter pastes it)";
+    opt.createLabel = L"New QuickPrompt";
+    opt.onCreate = [](std::wstring text) {
+        QuickPrompt p;
+        p.title = text;
+        std::wstring base;
+        for (wchar_t c : text)
+            if (iswalnum(c)) base += (wchar_t)towlower(c);
+        if (base.size() < 2) base = L"newprompt";
+        if (base.size() > 24) base.resize(24);
+        p.trigger = base;
+        for (int i = 2; !QuickPromptStore::Shared().TriggerOwner(p.trigger, L"").empty(); ++i) p.trigger = base + std::to_wstring(i);
+        std::wstring id;
+        if (QuickPromptStore::Shared().Add(p, &id).empty()) {
+            QuickPromptsChanged();
+            OpenQuickPrompts(id);
+        }
+    };
+    ShowPalette(std::move(items), [ids, target](int id) {
+        const size_t i = (size_t)(id - kPromptPickBase);
+        QuickPrompt p;
+        if (i < ids->size() && QuickPromptStore::Shared().Find((*ids)[i], &p)) InsertQuickPrompt(p, target);
+    }, opt);
+}
+
+void NewQuickPromptFromClipboard() {
+    std::wstring text;
+    if (OpenClipboard(g_hwnd)) {
+        if (HANDLE h = GetClipboardData(CF_UNICODETEXT))
+            if (auto* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+                text = p;
+                GlobalUnlock(h);
+            }
+        CloseClipboard();
+    }
+    std::wstring clean;
+    for (wchar_t c : text)
+        if (c != L'\r') clean += c;
+    if (clean.empty()) {
+        Notify(L"Nothing to save", L"Copy some text first, then run “Save clipboard as a QuickPrompt”.");
+        return;
+    }
+    QuickPrompt p;
+    p.text = clean;
+    p.title = clean.substr(0, std::min<size_t>(clean.find(L'\n'), 48));
+    p.trigger = L"clipprompt";
+    for (int i = 2; !QuickPromptStore::Shared().TriggerOwner(p.trigger, L"").empty(); ++i) p.trigger = L"clipprompt" + std::to_wstring(i);
+    std::wstring id;
+    if (QuickPromptStore::Shared().Add(p, &id).empty()) {
+        QuickPromptsChanged();
+        OpenQuickPrompts(id);
+    }
+}
+
+void ShowQuickPromptsWelcomeOnce() {
+    if (g_settings.qpWelcomeShown) return;
+    // Q3 of docs/intent/text-shortcuts: on from the first launch, explained once.
+    g_settings.qpWelcomeShown = true;
+    g_settings.WriteBool(L"QuickPrompts", L"WelcomeShown", true);
+    if (!g_settings.qpTyping) SetQuickPromptsTyping(true);
+    ShowQuickPromptsWelcome(g_iconBig, g_settings.Hotkey(L"InsertQuickPrompt"), [](bool open) {
+        if (open) OpenQuickPrompts();
+    });
 }
 
 void ShowHotkeyErrors() {
@@ -318,6 +507,7 @@ void ApplyEditorDefaults() {
     Library::Shared().SetFolder(g_settings.CapturesFolder());
     Library::Shared().SetAutoTag(g_settings.autoTag);
     ApplyAgents();  // start or stop the MCP server to match
+    ApplyQuickPrompts();
     ConfigureBugReports({g_settings.CapturesFolder(), g_settings.bugVoice, g_settings.bugLogPaths, g_settings.bugPreRollSeconds,
                          g_settings.bugLogMaxMB, g_settings.captureCursor, g_settings.Hotkey(L"BugReport")},
                         {g_hwnd, [](const std::wstring& path) { OpenPath(path); }, [] { UpdateTrayTip(); }});
@@ -344,6 +534,7 @@ bool ToggleState(int id, bool* on) {
         case CmdToggleGamepad: *on = g_settings.showGamepad; return true;
         case CmdToggleAutoRedact: *on = g_settings.autoRedact; return true;
         case CmdToggleAgents: *on = g_settings.agentsEnabled; return true;
+        case CmdToggleQuickPrompts: *on = g_settings.qpTyping; return true;
     }
     return false;
 }
@@ -618,6 +809,7 @@ void OpenSettings() {
     };
     h.getStartup = [] { return IsRunAtStartup(); };
     h.setStartup = [](bool on) { SetRunAtStartup(on); };
+    h.openQuickPrompts = [] { OpenQuickPrompts(); };
     ShowSettingsWindow(h);
 }
 
@@ -813,6 +1005,14 @@ void InstallUpdate() {
 
 void Execute(int id, bool deferCapture, bool untrusted) {
     g_uploadAllowed = !untrusted;
+    if (id >= kQuickPromptHotkeyBase && id < kQuickPromptHotkeyBase + (int)g_qpHotkeyIds.size()) {  // a prompt's own shortcut
+        QuickPrompt p;
+        if (!untrusted && QuickPromptStore::Shared().Find(g_qpHotkeyIds[id - kQuickPromptHotkeyBase], &p)) {
+            HWND target = GetForegroundWindow();
+            InsertQuickPrompt(p, target && !IsOwnWindow(target) ? target : nullptr);
+        }
+        return;
+    }
     if (id >= CmdRecentBase) {
         size_t i = id - CmdRecentBase;
         if (i < g_recents.size()) IsVideoFile(g_recents[i]) ? (void)OpenVideoEditor(g_recents[i]) : OpenPath(g_recents[i]);
@@ -974,6 +1174,15 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdBugReport: ToggleBugReport(); break;
         case CmdCopyLastBug: CopyLastBugReport(); break;
         case CmdOpenBugsFolder: OpenBugReportsFolder(); break;
+        case CmdInsertQuickPrompt: ShowQuickPromptPicker(); break;
+        case CmdOpenQuickPrompts: OpenQuickPrompts(); break;
+        case CmdNewQuickPrompt: OpenQuickPrompts(L"new"); break;
+        case CmdNewQuickPromptFromClipboard: NewQuickPromptFromClipboard(); break;
+        case CmdToggleQuickPrompts:
+            SetQuickPromptsTyping(!g_settings.qpTyping);
+            Notify(g_settings.qpTyping ? L"QuickPrompt triggers: On" : L"QuickPrompt triggers: Off",
+                   g_settings.qpTyping ? L"Type a trigger and Space in any app." : L"The picker still lists every prompt.");
+            break;
         case CmdExit: DestroyWindow(g_hwnd); break;
     }
 }
@@ -1398,10 +1607,10 @@ void ShowTrayMenu() {
     sep();
     for (int id : {CmdRecordVideo, CmdRecordGif, CmdRecordWindow}) add(id);
     sep();
-    for (int id : {CmdPalette, CmdHistory, CmdOpenFolder, CmdEditLast, CmdOpenImage, CmdUploadLast}) add(id);
+    for (int id : {CmdPalette, CmdHistory, CmdOpenFolder, CmdEditLast, CmdOpenImage, CmdUploadLast, CmdOpenQuickPrompts}) add(id);
     sep();
     for (int id : {CmdToggleClipboard, CmdToggleSave, CmdToggleCursor, CmdToggleAutoRedact, CmdToggleSystemAudio,
-                   CmdToggleMic, CmdToggleStartup, CmdToggleAgents})
+                   CmdToggleMic, CmdToggleStartup, CmdToggleAgents, CmdToggleQuickPrompts})
         add(id);
     sep();
     if (g_update) {
@@ -1474,6 +1683,10 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (w == kLibraryTimer) Library::Shared().Refresh();
             else if (w == kDeferTimer) Execute(g_deferredCmd, false, g_deferredUntrusted);
             else if (w == kDelayTimer) Execute(g_delayedCmd, false, g_delayedUntrusted);
+            else if (w == kQuickPromptsTimer) {  // a hand-edited quickprompts.json or a changed team file
+                if (QuickPromptStore::Shared().ReloadIfChanged()) QuickPromptsChanged();
+                SetTimer(h, kQuickPromptsTimer, 3000, nullptr);
+            }
             else if (w == kUpdateTimer) {
                 if (g_settings.checkUpdates) CheckForUpdates(false);
                 SetTimer(h, kUpdateTimer, 24 * 60 * 60 * 1000, nullptr);  // and again tomorrow
@@ -1483,6 +1696,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_quitting = true;
             RemoveTrayIcon();
             for (const auto& c : kCmds) UnregisterHotKey(h, c.id);
+            UnregisterQuickPromptHotkeys();
             PostQuitMessage(0);
             return 0;
     }
@@ -1517,7 +1731,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         const bool editorSnaps = n >= 3 && _wcsicmp(av[1], L"--editor-snapshots") == 0;
         const bool videoSnaps = n >= 3 && _wcsicmp(av[1], L"--video-snapshots") == 0;
         const bool editVideo = n >= 3 && _wcsicmp(av[1], L"--edit-video") == 0;
-        const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps || videoSnaps || editVideo) && n >= 3 ? av[2] : L"";
+        const bool qpDev = n >= 3 && _wcsicmp(av[1], L"--quickprompts-dev") == 0;
+        const std::wstring filter = (selftest || featureStats || gallerySnaps || editorSnaps || videoSnaps || editVideo || qpDev) && n >= 3 ? av[2] : L"";
         std::vector<std::wstring> bench;
         if (n >= 3 && (_wcsicmp(av[1], L"--bench-export") == 0 || _wcsicmp(av[1], L"--bench-compare") == 0)) bench.assign(av + 1, av + n);
         LocalFree(av);
@@ -1536,6 +1751,35 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            return 0;
+        }
+        if (qpDev) {  // developer tool: QuickPrompts alone, beside a running copy (`--quickprompts-dev <seconds> [welcome]`)
+            const int seconds = std::max(5, _wtoi(filter.c_str()));
+            int m = 0;
+            LPWSTR* a2 = CommandLineToArgvW(GetCommandLineW(), &m);
+            const bool welcome = m >= 4 && _wcsicmp(a2[3], L"welcome") == 0;
+            LocalFree(a2);
+            HWND dispatcher = StartUiDispatcher();
+            QuickPromptStore::Shared().Load(SupportFolder(), L"");
+            // Software-typed keys count here so a script can type the trigger; the app itself never does this.
+            ConfigureQuickPrompts({true, false, L"", true});
+            QuickPromptsUiHost uh;
+            uh.icon = g_iconBig;
+            uh.typing = [] { return QuickPromptsListening(); };
+            uh.changed = [] { RefreshQuickPromptTriggers(); };
+            uh.pickerHotkey = [] { return std::wstring(L"Ctrl+Alt+Space"); };
+            ShowQuickPromptsWindow(uh);
+            if (welcome) ShowQuickPromptsWelcome(g_iconBig, L"Ctrl+Alt+Space", nullptr);
+            MSG msg;
+            for (const ULONGLONG end = GetTickCount64() + seconds * 1000ULL; GetTickCount64() < end;) {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                MsgWaitForMultipleObjects(0, nullptr, FALSE, 20, QS_ALLINPUT);
+            }
+            StopQuickPrompts();
+            StopUiDispatcher(dispatcher);
             return 0;
         }
         if (selftest) {  // unit tests (see selftest.h)
@@ -1587,6 +1831,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     bool firstRun = g_settings.Load(HotkeyDefs());
+    {
+        std::wstring qpError;
+        QuickPromptStore::Shared().Load(SupportFolder(), g_settings.qpTeamFile, &qpError);
+        if (!qpError.empty()) ShowToast(L"QuickPrompts", qpError, nullptr, nullptr, 9000);
+    }
     ApplyEditorDefaults();
     Library& lib = Library::Shared();
     lib.LoadIfNeeded();
@@ -1599,6 +1848,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     };
     SetTimer(g_hwnd, kLibraryTimer, 4000, nullptr);  // scan and index in the background once things settle
     SetTimer(g_hwnd, kUpdateTimer, 60 * 1000, nullptr);  // look for a new version once things have settled
+    SetTimer(g_hwnd, kQuickPromptsTimer, 3000, nullptr);
     RegisterHotkeys();
     AddTrayIcon();
     if (!g_hotkeyErrors.empty()) {
@@ -1608,6 +1858,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                g_settings.Hotkey(L"CaptureRegion") + L" to capture  ·  " + g_settings.Hotkey(L"CommandPalette") +
                    L" for commands");
     }
+    ShowQuickPromptsWelcomeOnce();
     RefreshInstallRecord();  // after an update (or if a launch raced the updated copy): the version in Apps & features
     if (justUpdated) {
         Notify(L"Updated to Ather Screenshot " ATHER_VERSION_WSTR, L"Your settings, captures and gallery are just as you left them.");
@@ -1626,6 +1877,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     mcp::StopHttp();
+    StopQuickPrompts();
     StopBugReports();
     // Let an in-flight recording finalize so the file isn't left truncated, and let video exports finish
     // (their completion registers the saved file with the library). Work posted back meanwhile still runs:
@@ -1786,4 +2038,156 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     StopBugReports();
     DestroyWindow(owner);
     StopUiDispatcher(dispatcher);
+}
+
+// QuickPrompts: settings, commands, the window and the welcome card (the store and the matcher: quickprompts.cpp).
+ATHER_TEST(quickprompts_settings_commands_and_ui) {
+    Settings s;
+    s.Load(HotkeyDefs());
+    CHECK(s.qpTyping && !s.qpWelcomeShown && s.qpSkipFullscreen && s.qpExcludedApps.empty() && s.qpTeamFile.empty());
+    UINT mods = 0, vk = 0;
+    CHECK(s.Hotkey(L"InsertQuickPrompt") == L"Ctrl+Alt+Space" && ParseHotkey(L"Ctrl+Alt+Space", mods, vk) && vk == VK_SPACE);
+    for (const auto& c : kCmds)  // a shortcut of its own
+        if (c.id != CmdInsertQuickPrompt) CHECK(_wcsicmp(c.defaultHotkey, L"Ctrl+Alt+Space") != 0);
+    s.WriteBool(L"QuickPrompts", L"ExpandAsYouType", false);
+    s.WriteString(L"QuickPrompts", L"ExcludedApps", L"KeePass.exe");
+    s.Load(HotkeyDefs());
+    CHECK(!s.qpTyping && s.qpExcludedApps == L"KeePass.exe");
+    s.WriteBool(L"QuickPrompts", L"ExpandAsYouType", true);
+    s.WriteString(L"QuickPrompts", L"ExcludedApps", L"");
+    s.Load(HotkeyDefs());
+
+    // The palette offers the commands.
+    const auto items = BuildPaletteItems();
+    for (int id : {CmdInsertQuickPrompt, CmdOpenQuickPrompts, CmdNewQuickPrompt, CmdNewQuickPromptFromClipboard, CmdToggleQuickPrompts})
+        CHECK(std::any_of(items.begin(), items.end(), [&](const PaletteItem& p) { return p.id == id && p.title == FindCmd(id)->title; }));
+    bool on = false;
+    CHECK(ToggleState(CmdToggleQuickPrompts, &on));
+
+    // Settings › QuickPrompts, found by searching.
+    SettingsUiHost h;
+    h.settings = &s;
+    for (const auto& c : kCmds) h.hotkeys.push_back({c.key, c.title, c.defaultHotkey});
+    std::vector<std::wstring> shown;
+    const BitmapPtr img = SettingsSnapshot(h, L"QuickPrompts", &shown);
+    CHECK(img);
+    for (const wchar_t* row : {L"QuickPrompts", L"Your prompts and the team's", L"Expand triggers as I type", L"Not in fullscreen apps",
+                               L"Never expand in these apps", L"Team prompts file", L"QuickPrompts…"})
+        CHECK(std::find(shown.begin(), shown.end(), row) != shown.end());
+
+    // The window lists the team starters first, and the picker lists every enabled prompt.
+    QuickPromptStore::Shared().Load(test::TempDir(), L"");
+    QuickPromptsUiHost uh;
+    uh.typing = [] { return true; };
+    uh.pickerHotkey = [] { return std::wstring(L"Ctrl+Alt+Space"); };
+    std::vector<std::wstring> rows;
+    const BitmapPtr win = QuickPromptsSnapshot(uh, BuiltinQuickPrompts()[0].id, &rows);
+    CHECK(win);
+    CHECK(rows.size() > 3 && rows[0] == L"# Team starters" && rows[1] == BuiltinQuickPrompts()[0].trigger);
+    const BitmapPtr card = QuickPromptsWelcomeSnapshot(L"Ctrl+Alt+Space");
+    CHECK(card);
+    std::vector<std::wstring> ids;
+    CHECK_EQ(QuickPromptPaletteItems(&ids).size(), BuiltinQuickPrompts().size());
+
+    wchar_t out[MAX_PATH];
+    if (GetEnvironmentVariableW(L"ATHER_TEST_OUT", out, MAX_PATH)) {
+        SHCreateDirectoryExW(nullptr, out, nullptr);
+        if (img) CHECK(SavePng(*img, std::wstring(out) + L"\\settings-quickprompts.png"));
+        if (win) CHECK(SavePng(*win, std::wstring(out) + L"\\quickprompts-window.png"));
+        if (card) CHECK(SavePng(*card, std::wstring(out) + L"\\quickprompts-welcome.png"));
+    }
+
+    // The listener follows the switch (Raw Input on its own thread; nothing listens while it's off).
+    ConfigureQuickPrompts({true, true, L""});
+    CHECK(QuickPromptsListening());
+    ConfigureQuickPrompts({false, true, L""});
+    CHECK(!QuickPromptsListening());
+}
+
+namespace {
+int g_returnsSeen = 0;
+WNDPROC g_editProc = nullptr;
+LRESULT CALLBACK CountReturns(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == VK_RETURN) ++g_returnsSeen;  // what "send" is in a chat box
+    return CallWindowProcW(g_editProc, h, m, w, l);
+}
+}  // namespace
+
+// A real paste: what typing "doitforme " leaves in a text box, and that line breaks never press Enter.
+ATHER_TEST(quickprompts_paste_into_text_boxes) {
+    HWND frame = CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"QuickPrompts test", WS_POPUP | WS_VISIBLE, 40, 40, 640, 300, nullptr,
+                                 nullptr, nullptr, nullptr);
+    HWND multi = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN, 0, 0, 640, 200, frame, nullptr,
+                                 nullptr, nullptr);
+    HWND single = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 220, 640, 30, frame, nullptr, nullptr, nullptr);
+    g_editProc = (WNDPROC)SetWindowLongPtrW(single, GWLP_WNDPROC, (LONG_PTR)CountReturns);
+    auto pump = [](int ms, const std::function<bool()>& done) {
+        for (const ULONGLONG end = GetTickCount64() + ms; GetTickCount64() < end && !done();) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(5);
+        }
+        return done();
+    };
+    ForceForeground(frame);
+    pump(300, [&] { return GetForegroundWindow() == frame; });
+    if (GetForegroundWindow() != frame) {  // a locked or busy desktop won't give a test the keyboard
+        test::Out("  skipped: quickprompts_paste_into_text_boxes (couldn't take the foreground)\n");
+        DestroyWindow(frame);
+        return;
+    }
+    // The developer's clipboard comes back afterwards.
+    std::wstring developers;
+    if (OpenClipboard(frame)) {
+        if (HANDLE hc = GetClipboardData(CF_UNICODETEXT))
+            if (auto* p = static_cast<const wchar_t*>(GlobalLock(hc))) {
+                developers = p;
+                GlobalUnlock(hc);
+            }
+        CloseClipboard();
+    }
+    auto clip = [&] {
+        std::wstring t;
+        if (OpenClipboard(frame)) {
+            if (HANDLE hc = GetClipboardData(CF_UNICODETEXT))
+                if (auto* p = static_cast<const wchar_t*>(GlobalLock(hc))) {
+                    t = p;
+                    GlobalUnlock(hc);
+                }
+            CloseClipboard();
+        }
+        return t;
+    };
+    CHECK(CopyTextToClipboard(frame, L"before"));
+
+    SetFocus(multi);
+    SetWindowTextW(multi, L"Hello doitforme ");
+    SendMessageW(multi, EM_SETSEL, 16, 16);
+    QuickPrompt p;
+    p.id = L"test.paste";
+    p.trigger = L"doitforme";
+    p.text = L"Line one\nLine two{cursor}!";
+    InsertQuickPrompt(p, frame, 10);
+    CHECK(pump(5000, [] { return !QuickPromptInsertBusy(); }));
+    wchar_t buf[256] = {};
+    GetWindowTextW(multi, buf, 256);
+    CHECK(std::wstring(buf) == L"Hello Line one\r\nLine two!");
+    DWORD a = 0, b = 0;
+    SendMessageW(multi, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    CHECK_EQ(a, (DWORD)wcslen(buf) - 1);  // {cursor}: before the "!"
+    CHECK(clip() == L"before");
+
+    SetFocus(single);
+    QuickPrompt three = p;
+    three.text = L"one\ntwo\nthree";
+    InsertQuickPrompt(three, frame, 0);
+    CHECK(pump(5000, [] { return !QuickPromptInsertBusy(); }));
+    CHECK_EQ(g_returnsSeen, 0);
+    CHECK(GetWindowTextLengthW(single) > 0);
+
+    if (!developers.empty()) CopyTextToClipboard(frame, developers);
+    DestroyWindow(frame);
 }
