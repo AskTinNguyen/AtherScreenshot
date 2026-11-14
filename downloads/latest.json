@@ -7,10 +7,10 @@
         "notes": "QuickPrompts: type a trigger and Space in any app to paste a saved prompt, or press Ctrl+Alt+Space to pick one."
     },
     "macos": {
-        "version": "0.0.2.8",
+        "version": "0.0.2.9",
         "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-        "sha256": "029cf6eb7fb59076487cdb4cd1ce6930f31084a532dafd727ea178b0c19cea1e",
-        "size": 5021181,
-        "notes": "QuickPrompts: type a trigger and Space in any app to paste a saved prompt, or press \u2303\u2325P to pick one. The video editor gets the clip bin, picture in picture and split screen, flip, loop, guides, speed per clip and Reverse; scrub videos in the gallery."
+        "sha256": "e8ba1099c5e13a7b3110ebbbb2a87dae3b34669524f3af7d91acd6409e7bd8bf",
+        "size": 5028644,
+        "notes": "QuickPrompts start as soon as you allow Accessibility, and your macOS Text Replacements win over a trigger with the same name. Includes 0.0.2.8: QuickPrompts (\u2303\u2325P picker), the clip bin, picture in picture and split screen, flip, loop, guides, speed per clip and Reverse, and gallery scrubbing."
     }
 }
