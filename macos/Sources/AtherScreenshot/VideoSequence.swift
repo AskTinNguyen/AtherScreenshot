@@ -46,6 +46,8 @@ struct Clip: Equatable {
     var duration: Double { max(0, outPoint - inPoint) }
     var url: URL { URL(fileURLWithPath: path) }
     var name: String { url.lastPathComponent }
+    var displayName: String { name }
+    var badges: String { "" }   // how it's changed, for the clip lane: flipped, speed, reversed
 }
 
 enum VideoSource {

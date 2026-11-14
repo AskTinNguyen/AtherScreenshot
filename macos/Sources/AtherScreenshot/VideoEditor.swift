@@ -43,6 +43,7 @@ struct VideoEdit: Equatable {
     var captionStyle = AnimStyle.auto
     var highlightWords = true  // auto captions: the spoken word lights up
     var clips: [Clip] = []     // played back to back; every time above is timeline time
+    var bin: [Clip] = []       // pieces taken off the timeline, kept to put back: never played or saved
     var frame = CGSize.zero    // the sequence frame: the first video's upright size, kept when clips change
 
     static let speeds: [Double] = [0.5, 1, 1.5, 2, 4]
@@ -226,6 +227,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var actions: [MenuAction] = []
     private var inspectorActions: [MenuAction] = []
     private lazy var timelineHeight = timeline.heightAnchor.constraint(equalToConstant: Timeline.height)
+    private lazy var playTop = playButton.topAnchor.constraint(equalTo: timeline.topAnchor, constant: 10)   // beside the clips, under the bin
 
     static func open(_ url: URL) {
         if let e = instances.first(where: { $0.url == url }) { activateApp(); e.window.makeKeyAndOrderFront(nil); return }
@@ -395,7 +397,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         inspector.spacing = 8
         hint.font = Theme.font(11)
         hint.textColor = Theme.muted
-        hint.stringValue = "Space plays · I and O trim · S split · ⇧-drag mark · ⌘C copy · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · drop videos to join them"
+        hint.stringValue = "Space plays · I and O trim · S split · ⌫ to bin · ⇧-drag mark · ⌘C copy · T caption · A arrow · R box · E emoji · N step · X blur · Z zoom · C crop · drop videos to join them"
 
         playButton.bezelStyle = .regularSquare
         playButton.isBordered = false
@@ -428,7 +430,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             hint.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             hint.centerYAnchor.constraint(equalTo: inspector.centerYAnchor),
             playButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            playButton.topAnchor.constraint(equalTo: timeline.topAnchor, constant: 10),
+            playTop,
             playButton.widthAnchor.constraint(equalToConstant: 30),
             timeLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 10),
             timeLabel.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 10),
@@ -480,8 +482,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func rebuildInspector() {
         for v in inspector.arrangedSubviews { inspector.removeArrangedSubview(v); v.removeFromSuperview() }
         inspectorActions = []
-        let ci = selectedCaptionIndex, mi = selectedMarkIndex, k = selectedClipIndex
-        inspector.isHidden = ci == nil && mi == nil && k == nil
+        let ci = selectedCaptionIndex, mi = selectedMarkIndex, k = selectedClipIndex, bi = selectedBinIndex
+        inspector.isHidden = ci == nil && mi == nil && k == nil && bi == nil
         hint.isHidden = !inspector.isHidden
         if let ci {
             let c = edit.captions[ci]
@@ -551,25 +553,37 @@ final class VideoEditor: NSObject, NSWindowDelegate {
                 inspector.addArrangedSubview(replay)
             }
         }
-        if let k, ci == nil, mi == nil {
-            let c = edit.clips[k]
-            let label = NSTextField(labelWithString: "Clip \(k + 1) of \(edit.clips.count):  \(c.name)  ·  \(clock(c.duration))")
+        func rowLabel(_ text: String) {
+            let label = NSTextField(labelWithString: text)
             label.font = Theme.font(12)
             label.textColor = Theme.text
             label.lineBreakMode = .byTruncatingMiddle
             inspector.addArrangedSubview(label)
-            func button(_ title: String, _ symbol: String, _ tip: String, _ run: @escaping () -> Void) {
-                let b = NSButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage(), target: nil, action: nil)
-                b.bezelStyle = .recessed
-                b.imagePosition = .imageLeading
-                b.toolTip = tip
-                link(b, run)
-                inspector.addArrangedSubview(b)
-            }
+        }
+        func button(_ title: String, _ symbol: String, _ tip: String, _ run: @escaping () -> Void) {
+            let b = NSButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage(), target: nil, action: nil)
+            b.bezelStyle = .recessed
+            b.imagePosition = .imageLeading
+            b.toolTip = tip
+            link(b, run)
+            inspector.addArrangedSubview(b)
+        }
+        if let k, ci == nil, mi == nil {
+            let c = edit.clips[k]
+            rowLabel("Clip \(k + 1) of \(edit.clips.count):  \(c.displayName)  ·  \(clock(c.duration))")
             button("Split at playhead", "scissors", "Cut this clip in two at the playhead (S)") { [weak self] in self?.splitAtPlayhead() }
             if k > 0 { button("Earlier", "arrow.left", "Play this clip before the one on its left") { [weak self] in self?.moveClip(k, to: k - 1) } }
             if k + 1 < edit.clips.count { button("Later", "arrow.right", "Play this clip after the one on its right") { [weak self] in self?.moveClip(k, to: k + 1) } }
-            if edit.clips.count > 1 { button("Remove", "trash", "Take this clip out (⌫)") { [weak self] in self?.removeClip(k) } }
+            if edit.clips.count > 1 { button("To bin", "tray.and.arrow.up", "Take this clip out into the bin, to put back later (⌫, or drag it up)") { [weak self] in self?.moveToBin(k) } }
+        }
+        if let bi, ci == nil, mi == nil {
+            let c = edit.bin[bi]
+            rowLabel("In the bin:  \(c.displayName)  ·  \(clock(c.inPoint))–\(clock(c.outPoint))  ·  \(clock(c.duration))")
+            button("Add at end", "plus", "Put it back at the end of the video (or drag it onto the timeline)") { [weak self] in
+                guard let self else { return }
+                self.placeFromBin(bi, at: self.edit.clips.count)
+            }
+            button("Delete", "trash", "Delete this piece for good (⌫)") { [weak self] in self?.deleteFromBin(bi) }
         }
         if ci != nil || mi != nil {
             let del = NSButton(title: "Delete", image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete") ?? NSImage(), target: nil, action: nil)
@@ -784,6 +798,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var selectedCaptionIndex: Int? { selected.flatMap { id in edit.captions.firstIndex { $0.id == id } } }
     var selectedMarkIndex: Int? { selected.flatMap { id in edit.marks.firstIndex { $0.id == id } } }
     var selectedClipIndex: Int? { selected.flatMap { id in edit.clips.firstIndex { $0.id == id } } }
+    var selectedBinIndex: Int? { selected.flatMap { id in edit.bin.firstIndex { $0.id == id } } }   // a clip keeps its id going to the bin and back
     var viewRect: CGRect {
         let f = CGRect(origin: .zero, size: videoSize)
         let c = edit.crop.map { $0.intersection(f) } ?? f
@@ -799,7 +814,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func undo() {
         guard let e = undoStack.popLast() else { return }
         edit = e
-        if let s = selected, !edit.captions.contains(where: { $0.id == s }) && !edit.marks.contains(where: { $0.id == s }) && !edit.clips.contains(where: { $0.id == s }) { selected = nil }
+        if let s = selected, !edit.captions.contains(where: { $0.id == s }) && !edit.marks.contains(where: { $0.id == s }) && !edit.clips.contains(where: { $0.id == s })
+            && !edit.bin.contains(where: { $0.id == s }) { selected = nil }
         rebuildInspector()
     }
 
@@ -812,6 +828,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         }
         if let m = marked { setMarked(m.lowerBound, m.upperBound) }   // still inside the trim
         if timelineHeight.constant != timeline.wantedHeight { timelineHeight.constant = timeline.wantedHeight }
+        if playTop.constant != timeline.laneY + 10 { playTop.constant = timeline.laneY + 10 }
         player.isMuted = edit.muted
         stage.needsDisplay = true
         timeline.needsDisplay = true
@@ -966,6 +983,52 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         selected = nil
     }
 
+    // MARK: bin
+
+    // One undo step for the clips and the bin together (a piece going from one to the other).
+    func setClipsAndBin(_ clips: [Clip], _ bin: [Clip], seekTo t: Double? = nil) {
+        guard !clips.isEmpty, clips != edit.clips || bin != edit.bin else { return }
+        player.pause()
+        playStateChanged()
+        pushUndo()
+        var e = edit
+        e.bin = bin
+        e.applyClips(clips)
+        if clips != edit.clips { pendingSeek = t }
+        edit = e
+        if let t, clips == builtClips { seek(t) }
+    }
+
+    // Takes a clip off the timeline into the bin, to put back later or delete there. The last clip stays. Markup and
+    // captions on it go, as when a clip is cut shorter.
+    func moveToBin(_ i: Int) {
+        guard edit.clips.indices.contains(i) else { return }
+        guard edit.clips.count > 1 else { return Toast.shared.show("The last clip stays on the timeline", ms: 2000) }
+        var clips = edit.clips, bin = edit.bin
+        bin.append(clips.remove(at: i))
+        setClipsAndBin(clips, bin, seekTo: VideoSequence.starts(clips)[min(i, clips.count - 1)])
+        selected = nil
+    }
+
+    // Puts bin piece `i` back on the timeline as clip `at`.
+    func placeFromBin(_ i: Int, at: Int) {
+        guard edit.bin.indices.contains(i) else { return }
+        var clips = edit.clips, bin = edit.bin
+        let c = bin.remove(at: i)
+        let k = min(max(0, at), clips.count)
+        clips.insert(c, at: k)
+        setClipsAndBin(clips, bin, seekTo: VideoSequence.starts(clips)[k])
+        selected = c.id
+    }
+
+    // Deletes bin piece `i` for good (undo brings it back).
+    func deleteFromBin(_ i: Int) {
+        guard edit.bin.indices.contains(i) else { return }
+        pushUndo()
+        edit.bin.remove(at: i)
+        selected = nil
+    }
+
     // The shortest a clip can be trimmed to; a clip already shorter keeps its own length, so a click on its edge
     // never pushes it past the end of its file.
     static func shortest(_ c: Clip) -> Double { min(0.2, c.duration) }
@@ -1041,7 +1104,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     }
 
     func deleteSelected() {
-        if let k = selectedClipIndex { return removeClip(k) }
+        if let k = selectedClipIndex { return moveToBin(k) }   // Del takes a clip out into the bin
+        if let k = selectedBinIndex { return deleteFromBin(k) }
         guard selected != nil else { return }
         pushUndo()
         edit.captions.removeAll { $0.id == selected }
@@ -1671,7 +1735,8 @@ final class Timeline: NSView {
     private enum Drag {
         case start, end, playhead, item(Target, edge: Int, grab: Double, start: Double, end: Double)
         case clipIn(Int, grab: Double, value: Double), clipOut(Int, grab: Double, value: Double)  // applied on mouse-up
-        case clipMove(Int, downX: CGFloat, target: Int?)
+        case clipMove(Int, down: CGPoint, target: Int?, toBin: Bool)   // dragged up over the bin: it goes there
+        case binMove(Int, down: CGPoint, at: CGPoint, target: Int?, moved: Bool)  // a bin piece carried onto the clip lane
         case range(anchor: Double, before: Range<Double>?)   // marking a range (⇧-drag, or a grip): Esc puts `before` back
     }
     private var drag: Drag?
@@ -1680,11 +1745,15 @@ final class Timeline: NSView {
     private let stripH: CGFloat = 52
     private let capH: CGFloat = 22
     private let rowH: CGFloat = 18
-    // The clip lane sits above the thumbnails, and only once there's more than one clip.
-    var laneH: CGFloat { (editor?.edit.clips.count ?? 0) > 1 ? 24 : 0 }
-    private var stripY: CGFloat { laneH }
-    private var capY: CGFloat { laneH + 62 }
-    private var markY: CGFloat { laneH + 90 }
+    // The clip lane sits above the thumbnails, and the bin lane above that (clear of the playhead knob), once there's
+    // more than one clip or anything in the bin.
+    var lanesShown: Bool { (editor?.edit.clips.count ?? 0) > 1 || !(editor?.edit.bin.isEmpty ?? true) }
+    var binH: CGFloat { lanesShown ? 30 : 0 }
+    var laneY: CGFloat { binH > 0 ? binH + 12 : 0 }   // the top of the timeline proper: the clip lane, or the thumbnails
+    var laneH: CGFloat { lanesShown ? 24 : 0 }
+    private var stripY: CGFloat { laneY + laneH }
+    private var capY: CGFloat { stripY + 62 }
+    private var markY: CGFloat { stripY + 90 }
 
     var isDragging: Bool { drag != nil }
 
@@ -1738,6 +1807,27 @@ final class Timeline: NSView {
         }
     }
 
+    // Where a clip dropped at `px` lands: how many of the clips (other than `skip`) end up before it.
+    func insertIndex(_ px: CGFloat, skip: Int?) -> Int {
+        guard let e = editor else { return 0 }
+        let starts = VideoSequence.starts(e.edit.clips)
+        return e.edit.clips.indices.filter { $0 != skip && x(starts[$0] + e.edit.clips[$0].duration / 2) < px }.count
+    }
+
+    // Each bin piece's chip, left to right after the "Bin" label: as long as on the timeline, shorter when they don't all fit.
+    static let binLabelW: CGFloat = 34
+    func binChips() -> [CGRect] {
+        guard let e = editor, !e.edit.bin.isEmpty, binH > 0 else { return [] }
+        let n = CGFloat(e.edit.bin.count), gap: CGFloat = 4, minW: CGFloat = 64, left = Timeline.binLabelW
+        let avail = max(n, bounds.width - left - gap * (n + 1))
+        let total = e.edit.bin.reduce(0) { $0 + $1.duration }
+        let k = min(bounds.width / CGFloat(max(0.001, e.duration)), avail / CGFloat(max(0.001, total)))
+        var w = e.edit.bin.map { max(minW, CGFloat($0.duration) * k) }
+        if w.reduce(0, +) > avail { w = w.map { _ in avail / n } }
+        var x0 = left + gap
+        return w.map { wi in defer { x0 += wi + gap }; return CGRect(x: x0, y: 3, width: wi, height: binH - 6) }
+    }
+
     func x(_ t: Double) -> CGFloat { bounds.width * CGFloat(t / max(0.001, editor?.duration ?? 1)) }
     func t(_ x: CGFloat) -> Double { Double(min(max(0, x), bounds.width) / max(1, bounds.width)) * (editor?.duration ?? 0) }
 
@@ -1769,9 +1859,19 @@ final class Timeline: NSView {
             if p.y >= stripY, p.y < stripY + stripH, min(d0, d1) < 6 { return beginMark(e, p, anchor: d0 <= d1 ? m.upperBound : m.lowerBound) }   // its grips
             if !m.contains(t(p.x)) { e.marked = nil }   // a plain click outside it clears it
         }
+        // The bin lane: a click selects a piece, a drag carries it onto the timeline, a double-click puts it back at the end.
+        if binH > 0, p.y < binH + 4 {
+            if let i = binChips().firstIndex(where: { $0.contains(p) }) {
+                if ev.clickCount == 2 { e.placeFromBin(i, at: e.edit.clips.count); return }
+                e.selected = e.edit.bin[i].id
+                drag = .binMove(i, down: p, at: p, target: nil, moved: false)
+            } else { e.selected = nil }
+            needsDisplay = true
+            return
+        }
         // The playhead knob sits over the clip lane: it scrubs, whatever is under it.
-        let onKnob = abs(p.x - x(e.now)) <= 7 && p.y < 8
-        if laneH > 0, p.y < laneH, !onKnob {
+        let onKnob = abs(p.x - x(e.now)) <= 7 && p.y >= laneY - 6 && p.y < laneY + 8
+        if laneH > 0, p.y >= laneY, p.y < laneY + laneH, !onKnob {
             // The selected clip's edges win over the neighbour's body.
             if let k = e.selectedClipIndex {
                 let st = VideoSequence.starts(e.edit.clips)[k], c = e.edit.clips[k]
@@ -1784,7 +1884,7 @@ final class Timeline: NSView {
             }
             if let (k, _) = VideoSequence.locate(e.edit.clips, t(p.x)) {
                 e.selected = e.edit.clips[k].id
-                drag = .clipMove(k, downX: p.x, target: nil)
+                drag = .clipMove(k, down: p, target: nil, toBin: false)
             } else { e.selected = nil }
             needsDisplay = true
             return
@@ -1848,13 +1948,16 @@ final class Timeline: NSView {
             let value = isIn ? min(max(0, v), c.outPoint - s) : min(max(v, c.inPoint + s), max(c.length, c.inPoint + s))
             drag = isIn ? .clipIn(k, grab: grab, value: value) : .clipOut(k, grab: grab, value: value)
             if value >= c.inPoint && value <= c.outPoint { e.seek(VideoSequence.starts(e.edit.clips)[k] + value - c.inPoint) }  // the frame at the cut
-        case .clipMove(let k, let downX, let target):
-            let px = convert(ev.locationInWindow, from: nil).x
-            guard e.edit.clips.indices.contains(k), target != nil || abs(px - downX) >= 5 else { break }
-            let starts = VideoSequence.starts(e.edit.clips)
-            // How many of the other clips end up before it.
-            let n = e.edit.clips.indices.filter { $0 != k && x(starts[$0] + e.edit.clips[$0].duration / 2) < px }.count
-            drag = .clipMove(k, downX: downX, target: n)
+        case .clipMove(let k, let down, let target, let toBin):
+            let p = convert(ev.locationInWindow, from: nil)
+            guard e.edit.clips.indices.contains(k), target != nil || toBin || abs(p.x - down.x) >= 5 || abs(p.y - down.y) >= 5 else { break }
+            let up = binH > 0 && p.y < binH + 4   // up over the bin
+            drag = .clipMove(k, down: down, target: up ? nil : insertIndex(p.x, skip: k), toBin: up)
+        case .binMove(let i, let down, _, _, let moved):
+            let p = convert(ev.locationInWindow, from: nil)
+            guard e.edit.bin.indices.contains(i), moved || abs(p.x - down.x) >= 5 || abs(p.y - down.y) >= 5 else { break }
+            let overClips = p.y >= binH + 4 && p.y <= stripY + stripH   // the clip lane or the thumbnails under it
+            drag = .binMove(i, down: down, at: p, target: overClips ? insertIndex(p.x, skip: nil) : nil, moved: true)
         case .item(let target, let edge, let grab, let s0, let e0):
             var s = s0, en = e0
             switch edge {
@@ -1882,7 +1985,9 @@ final class Timeline: NSView {
         case .item: e.edit.captions.sort { $0.start < $1.start }
         case .clipIn(let k, _, let v): e.trimClip(k, in: v)
         case .clipOut(let k, _, let v): e.trimClip(k, out: v)
-        case .clipMove(let k, _, let target?): e.moveClip(k, to: target)
+        case .clipMove(let k, _, _, true): e.moveToBin(k)
+        case .clipMove(let k, _, let target?, false): e.moveClip(k, to: target)
+        case .binMove(let i, _, _, let target?, true): e.placeFromBin(i, at: target)
         default: break
         }
         needsDisplay = true
@@ -1923,6 +2028,7 @@ final class Timeline: NSView {
             NSBezierPath(roundedRect: CGRect(x: hx - 4, y: stripY + 8, width: 8, height: stripH - 16), xRadius: 3, yRadius: 3).fill()
         }
         if laneH > 0 { drawClips(e, strip) }
+        if binH > 0 { drawBin(e) }
 
         func lane(_ r: CGRect, _ empty: String, _ isEmpty: Bool) {
             NSColor.white.withAlphaComponent(0.04).setFill()
@@ -1966,8 +2072,47 @@ final class Timeline: NSView {
 
         let px = x(e.now)
         NSColor.white.setFill()
-        CGRect(x: px - 1, y: -2, width: 2, height: bounds.height + 2).fill()
-        NSBezierPath(ovalIn: CGRect(x: px - 5, y: -4, width: 10, height: 10)).fill()
+        CGRect(x: px - 1, y: laneY - 2, width: 2, height: bounds.height - laneY + 2).fill()
+        NSBezierPath(ovalIn: CGRect(x: px - 5, y: laneY - 4, width: 10, height: 10)).fill()
+        if case .binMove(let i, _, let at, _, true)? = drag, e.edit.bin.indices.contains(i) {   // the piece beside the mouse
+            let w = min(binChips()[i].width, 180)
+            chip(CGRect(x: at.x + 10, y: at.y - (binH - 6) / 2, width: w, height: binH - 6), e.edit.bin[i], selected: true, alpha: 0.8)
+        }
+    }
+
+    // A clip's bar: its name and length (and, at a glance, how it's changed), clipped to the bar.
+    func chip(_ r: CGRect, _ c: Clip, selected sel: Bool, alpha: CGFloat = 1) {
+        guard let e = editor, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        (sel ? Theme.accent.withAlphaComponent(alpha) : NSColor.white.withAlphaComponent(0.18 * alpha)).setFill()
+        NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
+        ctx.saveGState()
+        ctx.clip(to: r.insetBy(dx: 3, dy: 0))
+        let label = NSAttributedString(string: "\(c.displayName)  \(e.clock(c.duration))\(c.badges)",
+                                       attributes: [.font: Theme.font(10, .medium), .foregroundColor: (sel ? Theme.onAccent : Theme.text).withAlphaComponent(max(0.5, alpha))])
+        label.draw(at: CGPoint(x: r.minX + 7, y: r.midY - label.size().height / 2))
+        ctx.restoreGState()
+    }
+
+    // The bin lane: a chip per piece taken off the timeline. It lights up while a clip is dragged up to it.
+    private func drawBin(_ e: VideoEditor) {
+        let r = CGRect(x: 0, y: 0, width: bounds.width, height: binH)
+        var taking = false
+        if case .clipMove(_, _, _, true)? = drag { taking = true }
+        (taking ? Theme.accent.withAlphaComponent(0.2) : NSColor.white.withAlphaComponent(0.04)).setFill()
+        let lane = NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5)
+        lane.fill()
+        if taking { Theme.accent.setStroke(); lane.lineWidth = 1.5; lane.stroke() }
+        let title = NSAttributedString(string: "Bin", attributes: [.font: Theme.font(10, .semibold), .foregroundColor: Theme.textDim])
+        title.draw(at: CGPoint(x: 9, y: r.midY - title.size().height / 2))
+        if e.edit.bin.isEmpty {
+            let s = NSAttributedString(string: "Clips taken out go here: ⌫, or drag a clip up · drag them back down to use them again",
+                                       attributes: [.font: Theme.font(10), .foregroundColor: Theme.muted])
+            s.draw(at: CGPoint(x: Timeline.binLabelW + 4, y: r.midY - s.size().height / 2))
+            return
+        }
+        var carried: Int?
+        if case .binMove(let i, _, _, _, true)? = drag { carried = i }
+        for (i, cr) in binChips().enumerated() { chip(cr, e.edit.bin[i], selected: e.selected == e.edit.bin[i].id, alpha: carried == i ? 0.35 : 1) }
     }
 
     // The marked range: a band down the timeline from the thumbnails, grips on its edges, and a label with its length and
@@ -2000,40 +2145,39 @@ final class Timeline: NSView {
 
     // One bar per clip (name and length), cut lines across the thumbnails, and what a drag would do.
     private func drawClips(_ e: VideoEditor, _ strip: CGRect) {
-        let starts = VideoSequence.starts(e.edit.clips), h = laneH - 4
+        let starts = VideoSequence.starts(e.edit.clips), h = laneH - 4, y0 = laneY
         for (i, c) in e.edit.clips.enumerated() {
             let t0 = starts[i], t1 = t0 + c.duration
-            var r = CGRect(x: x(t0) + 1, y: 0, width: x(t1) - x(t0) - 2, height: h)
+            var r = CGRect(x: x(t0) + 1, y: y0, width: x(t1) - x(t0) - 2, height: h)
             switch drag {  // the proposed cut
-            case .clipIn(i, _, let v)?: r = CGRect(x: x(t0 + v - c.inPoint), y: 0, width: r.maxX - x(t0 + v - c.inPoint), height: h)
+            case .clipIn(i, _, let v)?: r = CGRect(x: x(t0 + v - c.inPoint), y: y0, width: r.maxX - x(t0 + v - c.inPoint), height: h)
             case .clipOut(i, _, let v)?: r.size.width = x(t0 + v - c.inPoint) - r.minX
             default: break
             }
             let sel = e.selected == c.id
             var lifted = false
-            if case .clipMove(i, _, _?)? = drag { lifted = true }
-            (sel ? Theme.accent.withAlphaComponent(lifted ? 0.45 : 1) : NSColor.white.withAlphaComponent(lifted ? 0.08 : 0.18)).setFill()
-            NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
-            NSGraphicsContext.current?.cgContext.saveGState()
-            NSGraphicsContext.current?.cgContext.clip(to: r.insetBy(dx: 3, dy: 0))
-            let label = NSAttributedString(string: "\(c.name)  \(e.clock(c.duration))", attributes: [.font: Theme.font(10, .medium), .foregroundColor: sel ? Theme.onAccent : Theme.text])
-            label.draw(at: CGPoint(x: r.minX + 7, y: r.midY - label.size().height / 2))
-            NSGraphicsContext.current?.cgContext.restoreGState()
+            if case .clipMove(i, _, let target, let toBin)? = drag, target != nil || toBin { lifted = true }
+            chip(r, c, selected: sel, alpha: lifted ? 0.45 : 1)
             if sel {  // trim grips
                 Theme.onAccent.setFill()
-                for hx in [r.minX, r.maxX] { NSBezierPath(roundedRect: CGRect(x: hx - 2, y: 4, width: 4, height: h - 8), xRadius: 2, yRadius: 2).fill() }
+                for hx in [r.minX, r.maxX] { NSBezierPath(roundedRect: CGRect(x: hx - 2, y: y0 + 4, width: 4, height: h - 8), xRadius: 2, yRadius: 2).fill() }
             }
             if i > 0 {
                 NSColor.black.withAlphaComponent(0.9).setFill()
                 CGRect(x: x(t0) - 1, y: strip.minY, width: 2, height: strip.height).fill()
             }
         }
-        if case .clipMove(let k, _, let target?)? = drag, e.edit.clips.indices.contains(k) {  // where the clip would go
-            var order = e.edit.clips
-            order.remove(at: k)
+        var order: [Clip]?, target = 0
+        if case .clipMove(let k, _, let t?, false)? = drag, e.edit.clips.indices.contains(k) {  // where the clip would go
+            order = e.edit.clips
+            order?.remove(at: k)
+            target = t
+        }
+        if case .binMove(_, _, _, let t?, true)? = drag { order = e.edit.clips; target = t }   // where the bin piece would go
+        if let order {
             let mx = x(target < order.count ? VideoSequence.starts(order)[target] : VideoSequence.total(order))
             Theme.accent.setFill()
-            CGRect(x: mx - 1.5, y: -2, width: 3, height: strip.maxY + 2).fill()
+            CGRect(x: mx - 1.5, y: y0 - 2, width: 3, height: strip.maxY - y0 + 2).fill()
         }
     }
 }
