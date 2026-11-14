@@ -1,10 +1,10 @@
 {
     "windows":  {
-                    "version":  "0.0.2.7",
+                    "version":  "0.0.2.8",
                     "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "f74f6370ba63719d8a8f336c99c1a7a6b7b8be11db8b36cb5eebfeb091791c41",
-                    "size":  4657152,
-                    "notes":  "Speed per clip after a split, and Reverse for a clip or the whole timeline in the video editor."
+                    "sha256":  "512f6ce27f21e79e7541d06f31525f80e73ebda7c2e31618857d3ec247749846",
+                    "size":  4952576,
+                    "notes":  "QuickPrompts: type a trigger and Space in any app to paste a saved prompt, or press Ctrl+Alt+Space to pick one."
                 },
     "macos":  {
                   "version":  "0.0.2.5",

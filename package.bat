@@ -49,7 +49,7 @@ powershell -NoProfile -Command "Get-ChildItem '%DIST%\*' -Include *.exe,*.zip | 
 
 rem 4) What running copies read to find this build (src\updater.cpp): the build number, and the setup exe on the
 rem    GitHub Release. Other platforms' entries already in downloads\latest.json (e.g. macos) are kept.
-powershell -NoProfile -Command "$f = Get-Item '%DIST%\AtherScreenshot-Setup-%VER%.exe'; $w = [ordered]@{ version = '%BUILD%'; url = 'https://github.com/%REPO%/releases/download/v%VER%/' + $f.Name; sha256 = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(); size = $f.Length; notes = [string]$env:UPDATE_NOTES }; $m = [ordered]@{}; if (Test-Path 'downloads\latest.json') { foreach ($q in (Get-Content 'downloads\latest.json' -Raw | ConvertFrom-Json).PSObject.Properties) { $m[$q.Name] = $q.Value } }; $m['windows'] = $w; [IO.File]::WriteAllText((Join-Path (Resolve-Path '%DIST%') 'latest.json'), (ConvertTo-Json $m -Depth 4))" || exit /b 1
+powershell -NoProfile -Command "$f = Get-Item '%DIST%\AtherScreenshot-Setup-%VER%.exe'; $w = [ordered]@{ version = '%BUILD%'; url = 'https://github.com/%REPO%/releases/download/v%VER%/' + $f.Name; sha256 = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(); size = $f.Length; notes = [string]$env:UPDATE_NOTES }; $m = [ordered]@{}; if (Test-Path 'downloads\latest.json') { foreach ($q in (Get-Content 'downloads\latest.json' -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties) { $m[$q.Name] = $q.Value } }; $m['windows'] = $w; [IO.File]::WriteAllText((Join-Path (Resolve-Path '%DIST%') 'latest.json'), (ConvertTo-Json $m -Depth 4))" || exit /b 1
 
 echo.
 echo Packaged Ather Screenshot %VER% (build %BUILD%):
