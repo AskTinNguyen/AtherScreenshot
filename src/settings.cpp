@@ -289,6 +289,11 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Updates", L"CheckAutomatically", L"1"},
         {L"AiAgents", L"AllowAgents", L"0"},
         {L"AiAgents", L"AgentPort", L"47821"},
+        {L"QuickPrompts", L"ExpandAsYouType", L"1"},
+        {L"QuickPrompts", L"WelcomeShown", L"0"},
+        {L"QuickPrompts", L"SkipFullscreen", L"1"},
+        {L"QuickPrompts", L"ExcludedApps", L""},
+        {L"QuickPrompts", L"TeamFile", L""},
         {L"Upload", L"Uploader", L"none"},
         {L"Upload", L"ImgurClientId", L""},
         {L"Upload", L"CustomUrl", L""},
@@ -343,6 +348,11 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     autoTag = GetBool(L"Gallery", L"AutoTag", false);
     checkUpdates = GetBool(L"Updates", L"CheckAutomatically", true);
     agentsEnabled = GetBool(L"AiAgents", L"AllowAgents", false);
+    qpTyping = GetBool(L"QuickPrompts", L"ExpandAsYouType", true);
+    qpWelcomeShown = GetBool(L"QuickPrompts", L"WelcomeShown", false);
+    qpSkipFullscreen = GetBool(L"QuickPrompts", L"SkipFullscreen", true);
+    qpExcludedApps = Get(L"QuickPrompts", L"ExcludedApps", L"");
+    qpTeamFile = Get(L"QuickPrompts", L"TeamFile", L"");
     agentPort = std::clamp(_wtoi(Get(L"AiAgents", L"AgentPort", L"47821").c_str()), 1024, 65535);
     uploader = Lower(Get(L"Upload", L"Uploader", L"none"));
     imgurClientId = Get(L"Upload", L"ImgurClientId", L"");

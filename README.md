@@ -56,6 +56,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3), and compress a video or picture to under 8, 25 or 50 MB (or any size) for chat apps and email |
+| 💬 **QuickPrompts** | Type a short trigger and Space in any app, e.g. `doitforme`, and it becomes your saved prompt or phrase; or pick one from a list with `Ctrl+Alt+Space`. Team starters built in, team prompts from a shared file, your last screenshot pasted along when you want (Windows, [how](#quickprompts-windows)) |
 | ⌨️ **Automate** | Command palette, rebindable shortcuts, command line and `atherscreenshot://` links |
 | 🤖 **AI agents** | Claude Code, Codex and other MCP clients can take screenshots, record gameplay with markers, review videos frame by frame and search the gallery ([setup](#ai-agents-mcp)) |
 
@@ -75,6 +76,7 @@ OCR, tags and search run on your computer. Upload is off until you set it up. Au
 | Capture gallery | `⌃⌥H` | `Ctrl+Alt+H` |
 | Record MP4 / GIF (press again to stop) | `⌃⌥5` / `⌃⌥G` | `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` |
 | Bug report: start / stop | `⌃⌥B` | `Ctrl+Alt+B` |
+| Insert a QuickPrompt (pick from the list) | — | `Ctrl+Alt+Space` |
 
 macOS reserves `⌘⇧3/4/5`, so the Mac defaults use `⌃⌥`. In the gallery and editors, `Ctrl` on Windows replaces `⌘` on the Mac.
 
@@ -332,6 +334,33 @@ From 0.0.2, the Windows app updates itself; earlier versions need one manual dow
 - **Installing:** when there's a newer version, a notification offers it, and the tray menu shows "Update to version …". Click and it downloads the new exe (about 3 MB) in the background, checks its size, SHA-256 and the version inside it, swaps it in and restarts. Settings, captures and the gallery stay; there's no installer window and no admin prompt. It waits while you're recording or have an editor open.
 - **Safety:** it only downloads over HTTPS from this repository on GitHub, and if anything fails it keeps the version you have and offers the download page instead.
 
+### QuickPrompts (Windows)
+
+Save the prompts and phrases you type again and again, and insert them anywhere by typing a short trigger.
+
+- **Type a trigger, then Space:** in any app (a chat with Claude or ChatGPT, Slack, an editor, a terminal), type `doitforme` and press Space. The trigger turns into the saved prompt, line breaks and all. Only Space expands: Enter, Tab and punctuation leave the word as typed, so a trigger can never send a half-finished message. `redoitforme` doesn't fire: triggers match whole words only.
+- **Or pick one:** `Ctrl+Alt+Space` lists every prompt (most used first); type to search by trigger, title or text and press Enter to paste it where you were. The picker works even with typed triggers off.
+- **Team starters:** twelve prompts come built in, ready for the team: `doitforme` (do the task end to end and report back), `planpls`, `reviewpls`, `explainpls`, `bugpls` (a bug report from your last screenshot, picture attached), `fixthispls`, `testpls`, `shorterpls`, `vienpls` (Vietnamese ↔ English), `commitpls`, `playtestpls` and `standupme`. Turn any of them off, or **Duplicate** one to change its text.
+- **Your own:** palette → "QuickPrompts…" (or Settings › QuickPrompts, or the tray). **New** starts one; changes save as you type. A prompt has a trigger (2–32 characters, no spaces), a title, the text, tags, and optionally its own shortcut (e.g. `Ctrl+Alt+1`) that pastes it directly. "Save clipboard as a QuickPrompt…" makes one from what you copied. The **Try it** box at the bottom expands triggers right there, so you can test without leaving the window.
+- **Placeholders** in the text:
+
+  | Placeholder | Becomes |
+  |---|---|
+  | `{cursor}` | Where the cursor ends up after pasting |
+  | `{clipboard}` | The text on the clipboard |
+  | `{date}` `{time}` `{datetime}` `{date:dd/MM/yyyy}` | Today's date and time (`yyyy MM dd HH mm ss`) |
+  | `{lastcapture}` | The path of your last screenshot |
+  | `{lastcapture:image}` | Pastes your last screenshot as a picture after the text, for AI chats and Slack |
+
+  `{{` and `}}` are literal braces.
+- **Team prompts:** **Team file…** (or Settings › QuickPrompts › Team prompts file) points at a shared `quickprompts-team.json` in a synced folder, on a network drive or in a repo. Its prompts show for everyone in a **Team** group and update when the file changes. Whoever looks after the team's set makes it with **Export… › My prompts as a team file**. If a trigger is used twice, your own prompt wins, then the team's, then the starter.
+- **Import:** your macOS Text Replacements (drag them out of System Settings › Keyboard › Text Replacements to get the `.plist`), a CSV (`trigger,text,title`) or a QuickPrompts JSON. Triggers you already have are skipped and listed.
+- **How it pastes:** through the clipboard, so long prompts arrive at once and line breaks never act as Enter. What was on your clipboard (text, pictures, files) comes back half a second later, and the prompt is kept out of Windows' clipboard history. Terminals that need it get `Ctrl+Shift+V`.
+- **Where it doesn't expand:** Ather Screenshot's own windows, fullscreen apps such as games (Settings › QuickPrompts › Not in fullscreen apps), apps you list in **Never expand in these apps** (exe names, e.g. `KeePass.exe`), and windows running as administrator (Windows doesn't let a normal app type into them).
+- **What it listens to:** to spot triggers, the app reads the keys you press (Raw Input, on a thread of its own: it never slows your typing). It keeps the last 64 characters, in memory only, and clears them when you click, switch windows or move the cursor with the keys. They're never saved, logged or given to AI agents. Text typed by other software (Unikey, EVKey, on-screen keyboards) isn't counted, so use triggers made of plain letters, typed with your Vietnamese input method off. The welcome card explains this the first time the app starts; **Expand triggers as I type** (Settings or the QuickPrompts window) turns it off.
+- **Files:** your prompts are in `%APPDATA%\AtherScreenshot\quickprompts.json` (UTF-8, hand-editable; edits are picked up within seconds). A file that can't be read is left alone and copied to `quickprompts.json.bad`.
+- **AI agents:** the `list_quick_prompts` tool lets an agent read your prompt library (never what you type).
+
 ### Command line and links
 
 ```
@@ -365,7 +394,7 @@ AI agents such as Claude Code and Codex can drive Ather Screenshot through the [
    `--mcp` is a stdio MCP server that passes everything to the running app, and starts it if it isn't running. Clients that connect to a URL can use `http://127.0.0.1:47821/mcp` with the `Authorization: Bearer …` header the copied setup includes.
 3. Ask, e.g. *"Record the game window while you play the first level, mark every bug you see, then review the recording and list the bugs with timestamps."*
 
-The tools: `get_status`, `list_windows`, `take_screenshot`, `start_recording`, `add_marker`, `pause_recording`, `stop_recording`, `get_video_frames`, `get_capture`, `read_text`, `list_captures`, `tag_capture`, `configure`, `open_in_editor`, `upload_capture` and `run_command` (any palette command). Screenshots and recordings are saved in your captures folder and gallery as usual, with the tags and comments the agent gives them; markers are saved as review notes next to the video (`<video>.notes.json`), which the Windows video editor shows on their frames. All of it is in [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
+The tools: `get_status`, `list_windows`, `take_screenshot`, `start_recording`, `add_marker`, `pause_recording`, `stop_recording`, `get_video_frames`, `get_capture`, `read_text`, `list_captures`, `tag_capture`, `configure`, `open_in_editor`, `upload_capture`, `list_quick_prompts` (your QuickPrompts, read-only) and `run_command` (any palette command). Screenshots and recordings are saved in your captures folder and gallery as usual, with the tags and comments the agent gives them; markers are saved as review notes next to the video (`<video>.notes.json`), which the Windows video editor shows on their frames. All of it is in [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
 
 **Privacy:** the server listens on 127.0.0.1 only and needs the private token in your settings folder (`agent-token`, readable only by you), so web pages and other computers can't reach it. It refuses requests from web pages even on this computer. A notification shows when an agent connects. Agents can see your screen and, through `upload_capture`, send files with the uploader you've set up, so allow only agents you trust.
 
@@ -396,6 +425,7 @@ How the Windows app differs from the Mac app:
   - Windows recognizes "bug start" / "bug stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses on-device speech recognition.
   - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it writes `voice.wav` down as Vietnamese on the Mac when the Mac can, and sends it to Apple only when it can't. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
   - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
+- **QuickPrompts:** Windows only for now. On the Mac, macOS's own Text Replacements cover part of it.
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 
 ## Build from source

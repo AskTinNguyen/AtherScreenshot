@@ -67,6 +67,12 @@ public:
     // AI agents: the MCP server on 127.0.0.1 ([AiAgents] AllowAgents, AgentPort)
     bool agentsEnabled = false;
     int agentPort = 47821;
+    // QuickPrompts ([QuickPrompts], see quickprompts.h)
+    bool qpTyping = true;          // ExpandAsYouType: typed triggers expand (the welcome card explains it once)
+    bool qpWelcomeShown = false;   // WelcomeShown
+    bool qpSkipFullscreen = true;  // SkipFullscreen: never expand in fullscreen apps (games)
+    std::wstring qpExcludedApps;   // ExcludedApps: exe names separated by ;
+    std::wstring qpTeamFile;       // TeamFile: a shared quickprompts-team.json
     // upload
     std::wstring uploader = L"none";  // none | imgur | custom | s3
     std::wstring imgurClientId;

@@ -55,6 +55,7 @@ Coordinates are physical pixels on Windows and points on the Mac, with the prima
 | `configure` | Changes capture and recording settings: clipboard, saving, cursor, auto-redact, notifications, frame rates, countdown, audio, microphone and the click, key and controller overlays |
 | `open_in_editor` | Opens a picture or video in the editor for the person at the computer |
 | `upload_capture` | Uploads with the uploader from Settings › Upload and returns the link |
+| `list_quick_prompts` | The person's QuickPrompts (Windows): trigger, title, full text, source (`builtin`, `team`, `user`) and tags. `query` filters, `include_disabled` adds the ones turned off. Read-only, and never anything about what the person types |
 | `run_command` | Runs any command-palette command by its shortcut name, e.g. `CaptureScrolling` or `ToggleShowGamepad` |
 
 ### Markers and review notes

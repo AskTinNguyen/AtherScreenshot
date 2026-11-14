@@ -23,7 +23,7 @@ constexpr int kWidth = 800, kTopH = 60, kFooterH = 32, kRowH = 66, kHeaderH = 46
 constexpr int kEditId = 100;
 constexpr UINT WM_EDIT_DONE = WM_APP + 20;  // wParam: 1 = commit, 0 = cancel
 
-enum class Kind { Header, Toggle, Choice, Number, Text, Secret, Folder, Hotkey };
+enum class Kind { Header, Toggle, Choice, Number, Text, Secret, Folder, Hotkey, Action };  // Action: a button (`set` runs)
 
 struct Row {
     Kind kind;
@@ -206,6 +206,21 @@ void Window::Build() {
     add(Kind::Toggle, L"AiAgents", L"AllowAgents", L"Allow AI agents (MCP)",
         L"Claude Code, Codex and other agents on this PC can take screenshots, record and search the gallery", L"0");
     add(Kind::Number, L"AiAgents", L"AgentPort", L"Agent port", L"Local port for agents (127.0.0.1 only)", L"47821", 1024, 65535);
+
+    header(L"QuickPrompts");
+    {
+        Row* r = add(Kind::Action, L"QuickPrompts", L"Open", L"Your prompts and the team's", L"Triggers, the team starters and the team file", L"");
+        r->get = [] { return std::wstring(L"Open QuickPrompts"); };
+        r->set = [this](const std::wstring&) {
+            if (host.openQuickPrompts) host.openQuickPrompts();
+        };
+    }
+    add(Kind::Toggle, L"QuickPrompts", L"ExpandAsYouType", L"Expand triggers as I type",
+        L"Type a trigger and Space in any app. Keeps only the last few characters, in memory", L"1");
+    add(Kind::Toggle, L"QuickPrompts", L"SkipFullscreen", L"Not in fullscreen apps", L"Games and other fullscreen windows keep what you type", L"1");
+    add(Kind::Text, L"QuickPrompts", L"ExcludedApps", L"Never expand in these apps", L"Exe names separated by ;  e.g. KeePass.exe;Code.exe", L"");
+    add(Kind::Text, L"QuickPrompts", L"TeamFile", L"Team prompts file",
+        L"A shared quickprompts-team.json (synced folder, network drive or repo)", L"");
 
     header(L"Gallery");
     add(Kind::Toggle, L"Gallery", L"AutoTag", L"Tag captures automatically",
@@ -405,6 +420,9 @@ void Window::Click(POINT p, bool right) {
     }
     switch (r.kind) {
         case Kind::Toggle: Write(i, r.value == L"1" ? L"0" : L"1"); break;
+        case Kind::Action:
+            if (r.set) r.set(L"");
+            break;
         case Kind::Choice: ShowChoices(i); break;
         case Kind::Folder:
             if (PtInRect(&r.browse, p)) PickFolder(i);
@@ -529,6 +547,14 @@ void Window::Paint(HDC hdc) {
                 FillRounded(dc, c, RectH(c) / 2, on ? theme::kAccent : theme::kBgRaised, on ? theme::kAccent : theme::kBorder);
                 const int k = RectH(c) - S(8), kx = on ? c.right - S(4) - k : c.left + S(4);
                 FillRounded(dc, {kx, c.top + S(4), kx + k, c.top + S(4) + k}, k / 2, on ? theme::kOnAccent : theme::kMuted);
+                break;
+            }
+            case Kind::Action: {
+                FillRounded(dc, c, S(7), theme::kBgRaised, theme::kAccent);
+                SelectObject(dc, fValue);
+                SetTextColor(dc, theme::kAccent);
+                RECT tr = c;
+                DrawTextW(dc, r.value.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
                 break;
             }
             case Kind::Hotkey: {

@@ -13,6 +13,7 @@
 #include "media.h"
 #include "ocr.h"
 #include "output.h"
+#include "quickprompts.h"
 #include "recorder.h"
 #include "selftest.h"
 #include "settings.h"
@@ -961,6 +962,36 @@ void UploadTool(const Json& args, Reply reply) {
     });
 }
 
+// The person's prompt library (QuickPrompts), read-only. Never anything about what they type.
+void ListQuickPromptsTool(const Json& args, Reply reply) {
+    const std::wstring q = args["query"].WStr();
+    std::wstring ql;
+    for (wchar_t c : q) ql += (wchar_t)towlower(c);
+    const bool includeOff = args["include_disabled"].Bool(false);
+    Json arr = Json::Array();
+    for (const auto& p : QuickPromptStore::Shared().All()) {
+        if (!p.enabled && !includeOff) continue;
+        if (!ql.empty()) {
+            std::wstring hay = p.trigger + L" " + p.title + L" " + p.text;
+            for (auto& c : hay) c = (wchar_t)towlower(c);
+            if (hay.find(ql) == std::wstring::npos) continue;
+        }
+        Json o = Json::Object();
+        o.Set("trigger", Json(p.trigger));
+        o.Set("title", Json(p.title));
+        o.Set("text", Json(p.text));
+        o.Set("source", Json(p.source));
+        o.Set("enabled", p.enabled);
+        Json tags = Json::Array();
+        for (const auto& t : p.tags) tags.Push(Json(t));
+        o.Set("tags", tags);
+        arr.Push(o);
+    }
+    Json d = Json::Object();
+    d.Set("prompts", arr);
+    reply(JsonResult(d));
+}
+
 void RunCommandTool(const Json& args, Reply reply) {
     const std::wstring want = args["command"].WStr();
     for (const auto& c : g_host.commands)
@@ -1139,6 +1170,13 @@ std::vector<Tool> AgentTools() {
                          "Uploads a file with the uploader set up in Settings › Upload (Imgur, a custom endpoint or S3) and "
                          "returns its link. Sends the file off this computer.",
                          Schema(R"("path": {"type": "string"})", "\"path\""), UploadTool, false, true, 5 * 60 * 1000));
+    tools.push_back(Make("list_quick_prompts", "List QuickPrompts",
+                         "Lists the person's saved prompts and phrases (QuickPrompts): trigger, title, full text, where it comes "
+                         "from (builtin team starter, team file or their own) and tags. Placeholders such as {cursor}, "
+                         "{clipboard} and {lastcapture} appear as written. Read-only.",
+                         Schema(R"("query": {"type": "string", "description": "Only prompts whose trigger, title or text contains this."},
+    "include_disabled": {"type": "boolean", "description": "Also prompts the person turned off (default false)."})"),
+                         ListQuickPromptsTool, true));
     std::string runDesc = "Runs any command from the command palette, like pressing its shortcut. Commands that select a "
                           "region wait for the person at the computer. Commands:" + commandList;
     tools.push_back(Make("run_command", "Run a palette command", runDesc.c_str(),
