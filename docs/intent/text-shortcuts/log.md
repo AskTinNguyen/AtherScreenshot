@@ -37,3 +37,10 @@ Followed by seven prompt texts (agent away 8 hours, level building, thermo-nucle
 Backwards, overnight run with a decision log, interior design rendering album, architecture exploration). They are in
 `BuiltinQuickPrompts()` in `src/quickprompts.cpp` as `awaypls`, `levelpls`, `nukepls`, `workbackpls`, `bedtimepls`,
 `interiorpls` and `archpls`, with spelling fixed (see progress.md, S6); the owner's originals are in the conversation.
+
+## L-6 (2026-11-14) | class: intent | -> rev 3 (content)
+
+One more prompt text (agents decide on Tin's behalf, logged in a "Decision on Behalf of Tin" log, following the boss
+and creation skills), added as `onbehalfpls`, then:
+
+> Spawn Sonnet Agents to review through my past transcripts sessions on this computer, propose additional good quality prompts that we could and should add

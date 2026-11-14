@@ -231,6 +231,13 @@ const std::vector<QuickPrompt>& BuiltinQuickPrompts() {
              L"hours, so I can review it tomorrow.\n\n"
              L"I entrust you with this responsibility. Godspeed.",
              L"agent autonomy overnight log"},
+            {L"builtin.onbehalfpls", L"onbehalfpls", L"Decide on my behalf (with a log)",
+             L"You have made very good design decisions on my behalf so far. Whenever the agents need you or need me, "
+             L"just give responses and decisions on my behalf and log them in a \"Decision on Behalf of Tin\" log. It's "
+             L"okay to proceed until everything is done to a high standard. Just make sure they follow our best "
+             L"practices, such as the boss skill, the creation skill, and references to well-made bosses like "
+             L"[Proven and Verifiable Quality Work].",
+             L"agent autonomy log"},
             {L"builtin.nukepls", L"nukepls", L"Thermo-nuclear code review gate",
              L"Once you're done with the full implementation, accompanied by visual proofs, a thermo-nuclear code review "
              L"must also be run by an Opus agent at extra-high effort, with all critical findings addressed. This is the "
