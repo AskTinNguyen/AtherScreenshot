@@ -47,6 +47,11 @@ struct Clip: Equatable {
     // How fast it plays in the saved video and the preview (VideoEdit.speeds); the timeline shows its footage at 1×.
     // Pieces split from it keep it.
     var speed: Double = 1
+    // A clip made backwards (Reverse): `path` is a file the editor wrote with this footage played end to start, and
+    // `reverseOf` the file it came from. Time r of `path` shows reverseOf's time reverseEnd − r. Nil: not reversed.
+    var reverseOf: String?
+    var reverseEnd: Double = 0
+    var reversed: Bool { reverseOf != nil }
 
     var flipped: Bool { flipH || flipV }
     // The same footage, whatever the flip: what the composition (and so the player) depends on.
@@ -59,9 +64,9 @@ struct Clip: Equatable {
     var duration: Double { max(0, outPoint - inPoint) }
     var url: URL { URL(fileURLWithPath: path) }
     var name: String { url.lastPathComponent }
-    var displayName: String { name }
+    var displayName: String { reverseOf.map { URL(fileURLWithPath: $0).lastPathComponent } ?? name }   // a reversed clip goes by its original's
     var badges: String {   // how it's changed, for the clip lane
-        (flipH ? "  ↔" : "") + (flipV ? "  ↕" : "") + (speed != 1 ? "  " + VideoEdit.speedLabel(speed) : "")
+        (flipH ? "  ↔" : "") + (flipV ? "  ↕" : "") + (speed != 1 ? "  " + VideoEdit.speedLabel(speed) : "") + (reversed ? "  ◀ reversed" : "")
     }
 }
 

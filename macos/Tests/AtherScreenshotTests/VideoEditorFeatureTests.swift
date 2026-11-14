@@ -627,4 +627,129 @@ final class VideoEditorFeatureTests: XCTestCase {
             close(e)
         }
     }
+
+    // MARK: reverse
+
+    // Port of video_reversed_clip_plays_end_to_start: the reversed file shows the clip's frames last to first, its sound
+    // the same length, and reversing it again gives back the original footage.
+    func testReversedClipPlaysEndToStart() async throws {
+        let src = try await TestMedia.colors(seconds: 3, colors: [.red, .green, .blue], tone: true)
+        var c = try await VideoSource.probe(src)
+        c.inPoint = 0.5; c.outPoint = 2.5   // red 0.5 s, green 1 s, blue 0.5 s
+        try? FileManager.default.removeItem(at: VideoReverse.path(for: c))
+        var seen: [Double] = []
+        let r = try await VideoReverse.toggled(c) { seen.append($0) }
+        XCTAssertTrue(r.reversed)
+        XCTAssertEqual(r.reverseOf, c.path)
+        XCTAssertEqual(r.id, c.id, "still the same clip")
+        XCTAssertEqual(r.duration, 2, accuracy: 0.05)
+        XCTAssertEqual(seen.last ?? 0, 1, accuracy: 1e-9, "progress")
+        XCTAssertTrue(r.hasAudio)
+        XCTAssertTrue(r.badges.contains("◀ reversed"))
+        XCTAssertEqual(r.displayName, c.name)
+        let asset = AVURLAsset(url: r.url)
+        let a = try await TestMedia.frame(asset, at: 0.25), b = try await TestMedia.frame(asset, at: 1.0), z = try await TestMedia.frame(asset, at: 1.8)
+        XCTAssertGreaterThan(TestMedia.rgb(a, 10, 10).2, 0.7, "starts with the end: blue")
+        XCTAssertGreaterThan(TestMedia.rgb(b, 10, 10).1, 0.7, "green in the middle")
+        XCTAssertGreaterThan(TestMedia.rgb(z, 10, 10).0, 0.7, "ends with the start: red")
+        let at = try await asset.loadTracks(withMediaType: .audio).first
+        XCTAssertNotNil(at)
+        if let at {
+            let d = try await at.load(.timeRange).duration.seconds
+            XCTAssertEqual(d, 2, accuracy: 0.1)
+        }
+        // Saved through the editor's pipeline, the clip plays backwards too.
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("ather-rev-\(UUID().uuidString).mp4")
+        try await VideoExport.mp4(TestMedia.edit([r]), to: out)
+        let saved = try await TestMedia.frame(AVURLAsset(url: out), at: 0.25)
+        XCTAssertGreaterThan(TestMedia.rgb(saved, 10, 10).2, 0.7)
+        // Again: the original footage.
+        let back = try await VideoReverse.toggled(r)
+        XCTAssertFalse(back.reversed)
+        XCTAssertEqual(back.path, c.path)
+        XCTAssertEqual(back.inPoint, 0.5, accuracy: 1e-6)
+        XCTAssertEqual(back.outPoint, 2.5, accuracy: 1e-6)
+    }
+
+    // A longer clip with sound, reversed in several blocks: every frame is there, in order, and the sound lasts as long.
+    func testReverseInBlocks() async throws {
+        let colors: [NSColor] = [.red, .green, .blue, .yellow, .cyan, .magenta, .white, .orange]
+        let src = try await TestMedia.colors(w: 1280, h: 720, seconds: 8, colors: colors, tone: true)
+        let c = try await VideoSource.probe(src)
+        try? FileManager.default.removeItem(at: VideoReverse.path(for: c))
+        let r = try await VideoReverse.toggled(c)
+        XCTAssertEqual(r.duration, 8, accuracy: 0.05)
+        let asset = AVURLAsset(url: r.url)
+        let frames = try await asset.loadTracks(withMediaType: .video).first!.load(.timeRange).duration.seconds * 30
+        XCTAssertEqual(frames, 240, accuracy: 1.5)
+        for k in 0..<8 {
+            let f = try await TestMedia.frame(asset, at: Double(k) + 0.5)
+            let want = colors[7 - k].usingColorSpace(.sRGB)!, got = TestMedia.rgb(f, 20, 20)
+            XCTAssertEqual(got.0, want.redComponent, accuracy: 0.25, "second \(k)")
+            XCTAssertEqual(got.1, want.greenComponent, accuracy: 0.25, "second \(k)")
+        }
+        let ad = try await asset.loadTracks(withMediaType: .audio).first!.load(.timeRange).duration.seconds
+        XCTAssertEqual(ad, 8, accuracy: 0.15)
+    }
+
+    // Port of the reverse half of video_editor_speed_per_clip_and_reverse: with a clip selected Reverse turns just it
+    // around (its markup mirrored inside it); with none, the whole timeline (clip order, each clip, markup, captions,
+    // videos on top and the trim mirrored); ⌘Z and Reverse again go back.
+    func testEditorReverse() async throws {
+        let e = try await open(try await TestMedia.colors(seconds: 3))
+        await MainActor.run { e.seek(1) }
+        try await until("at 1 s") { abs(e.now - 1) < 0.05 }
+        let b0 = await MainActor.run { e.builds }
+        await MainActor.run { e.splitAtPlayhead() }   // [0–1, 1–3], the second selected
+        try await until("split") { e.builds > b0 }
+        let (first, second) = await MainActor.run { () -> (UUID, UUID) in
+            e.edit.marks = [Mark(kind: .box, start: 1.2, end: 1.7, a: .zero, b: CGPoint(x: 50, y: 50)),   // on the second clip
+                            Mark(kind: .box, start: 0.2, end: 0.5, a: .zero, b: CGPoint(x: 50, y: 50))]  // on the first
+            e.edit.captions = [Caption(start: 0.1, end: 0.6, text: "start", words: [CaptionWord(start: 0.1, end: 0.3, text: "a"), CaptionWord(start: 0.3, end: 0.6, text: "b")])]
+            e.edit.overlays = [VideoOverlay(clip: e.edit.clips[0], start: 0.5)]   // 0.5–1.5
+            e.edit.trimStart = 0.2
+            e.edit.trimEnd = 2.5
+            return (e.edit.clips[0].id, e.edit.clips[1].id)
+        }
+        // The selected clip alone.
+        await MainActor.run { e.selected = second; e.reverse() }
+        try await until("reversed the clip", timeout: 20) { !e.busy && e.edit.clips[1].reversed }
+        await MainActor.run {
+            XCTAssertNil(e.lastReverseError)
+            XCTAssertFalse(e.edit.clips[0].reversed)
+            XCTAssertEqual(e.edit.marks[0].start, 2.3, accuracy: 1e-6, "mirrored inside the clip (1–3)")
+            XCTAssertEqual(e.edit.marks[0].end, 2.8, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.marks[1].start, 0.2, accuracy: 1e-6, "the other clip's stays")
+            XCTAssertEqual(e.edit.trimStart, 0.2, accuracy: 1e-6, "the trim stays for one clip")
+            e.undo()
+            XCTAssertFalse(e.edit.clips[1].reversed, "⌘Z goes back")
+            XCTAssertEqual(e.edit.marks[0].start, 1.2, accuracy: 1e-6)
+            e.selected = nil
+            e.reverse()
+        }
+        // The whole timeline.
+        try await until("reversed the timeline", timeout: 20) { !e.busy && e.edit.clips.allSatisfy(\.reversed) }
+        await MainActor.run {
+            XCTAssertEqual(e.edit.clips.map(\.id), [second, first], "clips in the opposite order")
+            XCTAssertEqual(e.edit.clips[0].duration, 2, accuracy: 0.05)
+            XCTAssertEqual(e.edit.marks[0].start, 1.3, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.marks[1].start, 2.5, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.captions[0].start, 2.4, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.captions[0].words.map(\.text), ["b", "a"])
+            XCTAssertEqual(e.edit.captions[0].words[0].start, 2.4, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.overlays[0].start, 1.5, accuracy: 1e-6, "videos on top mirrored")
+            XCTAssertEqual(e.edit.trimStart, 0.5, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.trimEnd, 2.8, accuracy: 1e-6)
+            e.reverse()   // again: forward
+        }
+        try await until("forward again", timeout: 20) { !e.busy && !e.edit.clips.contains(where: \.reversed) }
+        await MainActor.run {
+            XCTAssertEqual(e.edit.clips.map(\.id), [first, second])
+            XCTAssertEqual(e.edit.clips[0].outPoint, 1, accuracy: 1e-3)
+            XCTAssertEqual(e.edit.clips[1].inPoint, 1, accuracy: 1e-3)
+            XCTAssertEqual(e.edit.marks[0].start, 1.2, accuracy: 1e-6)
+            XCTAssertEqual(e.edit.trimStart, 0.2, accuracy: 1e-6)
+            close(e)
+        }
+    }
 }

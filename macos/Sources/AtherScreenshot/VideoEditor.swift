@@ -207,7 +207,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var dirty = false
     private var undoStack: [VideoEdit] = []
     private var timeObserver: Any?
-    private var busy = false
+    private(set) var busy = false
     private var previewBox: RendererBox?
     private var previewComposition: AVVideoComposition?
     private var builtClips: [Clip] = []          // what the preview player plays now
@@ -217,6 +217,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var builtOverlays: [VideoOverlay] = []    // the videos on top it has (their timing)
     private var playingClips: [Clip] = []        // what the player's item was built from: maps its time to timeline time
     private(set) var builds = 0
+    private(set) var reversing = false
+    func setBusy(_ b: Bool, reversing r: Bool) { busy = b; reversing = r; syncReverse() }
+    var lastReverseError: String?   // tests
     var lastWheelScale = Date.distantPast                    // tests: how many times the player was given a rebuilt sequence
 
     private let stage = VideoStage()
@@ -230,6 +233,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var loop = VideoEditor.lastLoop { didSet { VideoEditor.lastLoop = loop; syncLoop() } }
     private(set) var loops = 0   // tests: times playback went round
     private let timeLabel = NSTextField(labelWithString: "")
+    var reverseButton = NSButton()
     let speedMenu = NSPopUpButton(frame: .zero, pullsDown: true)   // Speed ▸ the selected clip's (else the one at the playhead), Every clip at
     private let captionsMenu = NSPopUpButton(frame: .zero, pullsDown: true)
     private let aspectPopup = NSPopUpButton()
@@ -407,6 +411,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         }
         addPopup.toolTip = "Add text, emoji, callouts, blur, zoom or a title card at the playhead, join another video, or show one on top or side by side"
 
+        reverseButton = barButton("Reverse", "backward", "Play the video backwards: the end becomes the start") { [weak self] in self?.reverse() }
         let auto = barButton("Auto captions", "waveform.badge.mic", "Transcribe speech into captions, on this Mac") { [weak self] in self?.autoCaptions() }
         captionsMenu.bezelStyle = .recessed
         captionsMenu.toolTip = "Caption look, animation and size, for the whole video"
@@ -436,7 +441,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         guidesMenu.toolTip = "Composition guides over the preview (G hides them), and a black-and-white view. Never saved."
         guidesMenu.menu?.delegate = self
         guidesChanged()
-        for v in [cropButton, aspectPopup, flipMenu, guidesMenu, separator(), speedMenu, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
+        for v in [cropButton, aspectPopup, flipMenu, guidesMenu, separator(), speedMenu, reverseButton, muteButton, separator(), addPopup, auto, captionsMenu, spacer, copyMenu, smallerMenu, gif, save] as [NSView] { top.addArrangedSubview(v) }
 
         inspector.orientation = .horizontal
         inspector.spacing = 8
@@ -931,6 +936,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         syncFlipMenu()
         muteButton.state = edit.muted ? .on : .off
         syncSpeedMenu()
+        syncReverse()
         rebuildCaptionsMenu()
     }
 
@@ -2707,5 +2713,83 @@ extension VideoEditor {
         let r = o.rect(v)   // kept on the frame
         o.pos = CGPoint(x: r.minX / v.width, y: r.minY / v.height)
         edit.overlays[i] = o
+    }
+}
+
+// MARK: - Reverse
+
+extension VideoEditor {
+    func syncReverse() {
+        reverseButton.attributedTitle = NSAttributedString(string: reversing ? "Reversing…" : "Reverse", attributes: [.foregroundColor: Theme.text, .font: Theme.font(12)])
+        reverseButton.isEnabled = !reversing
+        reverseButton.toolTip = selectedClipIndex != nil ? "Play the selected clip backwards, end to start"
+            : edit.clips.count > 1 ? "Play the whole timeline backwards: the end becomes the start (select a clip to reverse just that one)"
+            : "Play the video backwards: the end becomes the start"
+    }
+
+    // Reverse plays footage end to start: the selected clip, else the whole timeline (its clips in the opposite order,
+    // each one backwards, and everything on it mirrored in time). Reversed footage is written to a temp file first, with
+    // a progress toast; reversing again (or ⌘Z) goes back to playing forward.
+    func reverse() {
+        guard !busy, !edit.clips.isEmpty else { return }
+        window.makeFirstResponder(stage)   // commits a field being edited
+        player.pause()
+        playStateChanged()
+        let only = selectedClipIndex
+        let before = edit.clips
+        setBusy(true, reversing: true)
+        let toast = Toast.shared.post("Reversing…", only != nil || before.count == 1 ? "Playing the clip end to start" : "The whole timeline, end to start", ms: 600_000)
+        Task { @MainActor in
+            var clips = before
+            do {
+                let ks = only.map { [$0] } ?? Array(before.indices)
+                for (n, k) in ks.enumerated() {
+                    clips[k] = try await VideoReverse.toggled(before[k]) { p in
+                        let pct = Int((Double(n) + p) * 100 / Double(ks.count))
+                        DispatchQueue.main.async { Toast.shared.update(toast, body: "\(pct)%") }
+                    }
+                }
+            } catch {
+                self.setBusy(false, reversing: false)
+                lastReverseError = error.localizedDescription
+                return Toast.shared.show("Reverse failed", error.localizedDescription, ms: 8000)
+            }
+            self.setBusy(false, reversing: false)
+            self.reverseDone(before: before, clips: clips, only: only)
+        }
+    }
+
+    // One undo step: the reversed clips in place. On the clip (or the timeline) markup and captions are mirrored in time,
+    // so each shows over the same footage; the trim and the videos on top follow on a whole timeline.
+    func reverseDone(before: [Clip], clips: [Clip], only: Int?) {
+        guard edit.clips == before else { return Toast.shared.show("The clips changed while reversing", "Reverse again to play them backwards.", ms: 4000) }
+        pushUndo()
+        let starts = VideoSequence.starts(before)
+        var t0 = 0.0, t1 = VideoSequence.total(before)
+        if let k = only { t0 = starts[k]; t1 = t0 + before[k].duration }
+        var e = edit
+        func mirrored(_ a: Double, _ b: Double) -> (Double, Double) { (t0 + t1 - b, t0 + t1 - a) }
+        func inside(_ a: Double, _ b: Double) -> Bool { only == nil || (a >= t0 - 1e-6 && b <= t1 + 1e-6) }
+        for i in e.marks.indices where inside(e.marks[i].start, e.marks[i].end) { (e.marks[i].start, e.marks[i].end) = mirrored(e.marks[i].start, e.marks[i].end) }
+        for i in e.captions.indices where inside(e.captions[i].start, e.captions[i].end) {
+            var c = e.captions[i]
+            (c.start, c.end) = mirrored(c.start, c.end)
+            for w in c.words.indices { (c.words[w].start, c.words[w].end) = mirrored(c.words[w].start, c.words[w].end) }
+            c.words.reverse()
+            e.captions[i] = c
+        }
+        e.captions.sort { $0.start < $1.start }
+        e.clips = clips
+        let at = now
+        if only == nil {
+            e.clips.reverse()
+            for i in e.overlays.indices { e.overlays[i].start = max(0, t1 - e.overlays[i].end) }
+            let a = e.trimStart
+            e.trimStart = max(0, t1 - e.trimEnd)
+            e.trimEnd = min(t1, t1 - a)
+        }
+        pendingSeek = only != nil ? t0 : min(max(t1 - at, e.trimStart), e.trimEnd)
+        edit = e
+        Toast.shared.show(clips[only ?? 0].reversed ? "Reversed" : "Back to playing forward", "⌘Z undoes it", ms: 2500)
     }
 }
