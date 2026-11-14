@@ -366,4 +366,12 @@ final class QuickPromptsTests: XCTestCase {
         XCTAssertEqual(prompts(["query": "DOITFOR"]).map { $0["trigger"] as? String }, ["doitforme"])
         XCTAssertEqual(prompts(["query": "doitforme"]).first?["source"] as? String, "builtin")
     }
+
+    // macOS Text Replacements win: their shortcuts are read case-insensitively, and ones switched off don't count.
+    func testSystemTextReplacementsAreRead() {
+        let items: [Any] = [["replace": "doitforme", "with": "x"], ["replace": "OMW", "with": "On my way!"],
+                            ["replace": "off", "with": "y", "on": 0], ["with": "no shortcut"], "junk"]
+        XCTAssertEqual(QuickPromptsMac.readSystemReplacements(items), ["doitforme", "omw"])
+        XCTAssertEqual(QuickPromptsMac.readSystemReplacements(nil), [])
+    }
 }

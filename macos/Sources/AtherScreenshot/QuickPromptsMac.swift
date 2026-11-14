@@ -47,12 +47,20 @@ final class QuickPromptsMac {
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
                                                             object: nil, queue: .main) { [weak self] _ in self?.updateInputSource() }
         updateInputSource()
+        wasTrusted = Self.accessibilityGranted
         apply()
         // Picks up hand edits and the team file changing, and starts listening once Accessibility is allowed.
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.reload()
-            if self.s.bool("ExpandAsYouType") && !self.listener.running && Self.accessibilityGranted { self.apply() }
+            if self.updateSystemReplacements() { self.refreshTriggers() }
+            // A tap made before Accessibility was allowed gets no keys, so it's made again when the permission changes.
+            let trusted = Self.accessibilityGranted
+            if trusted != self.wasTrusted {
+                self.wasTrusted = trusted
+                self.listener.stop()
+                self.apply()
+            } else if self.s.bool("ExpandAsYouType") && !self.listener.running && trusted { self.apply() }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.showWelcomeOnce() }
     }
@@ -61,6 +69,7 @@ final class QuickPromptsMac {
 
     // Re-reads changed files; a quickprompts.json that newly can't be read is said once (edits are refused meanwhile).
     private var shownError = ""
+    private var wasTrusted = false
     private func reload() {
         guard store.reloadIfChanged() else { return }
         let err = store.userError
@@ -73,7 +82,7 @@ final class QuickPromptsMac {
         store.setTeamFile(s.string("TeamFile"))
         refreshTriggers()
         listener.skipOwnPid = ProcessInfo.processInfo.processIdentifier
-        if s.bool("ExpandAsYouType") { _ = listener.start() } else { listener.stop() }
+        if s.bool("ExpandAsYouType") && Self.accessibilityGranted { _ = listener.start() } else { listener.stop() }
         QuickPromptsStatus.shared.refresh()
     }
 
@@ -82,8 +91,25 @@ final class QuickPromptsMac {
         AppDelegate.shared?.registerHotkeys()  // prompts' own shortcuts
     }
 
+    // macOS Text Replacements (System Settings › Keyboard › Text Replacements) also fire on Space. A trigger that is
+    // one of them would be replaced twice, so on the Mac the person's own Text Replacement wins and ours is skipped.
+    private(set) var systemReplacements: Set<String> = []
+    static func readSystemReplacements(_ items: [Any]?) -> Set<String> {
+        Set((items ?? []).compactMap { item -> String? in
+            guard let d = item as? [String: Any], (d["on"] as? Int ?? 1) != 0, let r = d["replace"] as? String, !r.isEmpty else { return nil }
+            return r.lowercased()
+        })
+    }
+    private func updateSystemReplacements() -> Bool {
+        let now = Self.readSystemReplacements(UserDefaults.standard.array(forKey: "NSUserDictionaryReplacementItems"))
+        guard now != systemReplacements else { return false }
+        systemReplacements = now
+        return true
+    }
+
     private func refreshTriggers() {
-        let active = store.active
+        _ = updateSystemReplacements()
+        let active = store.active.filter { !systemReplacements.contains($0.trigger.lowercased()) }
         listener.setTriggers(active.enumerated().map { .init(trigger: $1.trigger, caseSensitive: $1.caseSensitive, tag: $0) }, ids: active.map(\.id))
     }
 
@@ -193,6 +219,7 @@ final class QuickPromptsMac {
 
     fileprivate func typed(id: String, erase: Int, keySeq: UInt64, pid: pid_t) {
         guard let front = NSWorkspace.shared.frontmostApplication else { return }
+        Listener.log("typed front=\(front.processIdentifier) eventPid=\(pid)")
         if pid > 0 && front.processIdentifier != pid { return }
         if front.processIdentifier == ProcessInfo.processInfo.processIdentifier { return }  // our own text boxes (the window has Try it)
         if Self.isExcluded(bundleID: front.bundleIdentifier ?? "", name: front.localizedName ?? "", list: s.string("ExcludedApps")) { return }
@@ -437,6 +464,9 @@ private final class Listener {
     var skipOwnPid: pid_t = 0
     // Developer tool only: also count keys typed by software (scripts that test the listener).
     private let acceptInjected = ProcessInfo.processInfo.environment["ATHER_QP_ACCEPT_INJECTED"] == "1"
+    // Developer tool only: ATHER_QP_DEBUG=1 logs what the listener decides to stderr (never the characters typed).
+    static let debug = ProcessInfo.processInfo.environment["ATHER_QP_DEBUG"] == "1"
+    static func log(_ m: @autoclosure () -> String) { if debug { FileHandle.standardError.write(("[qp] " + m() + "\n").data(using: .utf8)!) } }
 
     // Only the listener thread touches these.
     private var matcher = TriggerMatcher()
@@ -477,6 +507,7 @@ private final class Listener {
                 self.tap = tap
                 self.runLoop = rl
             }
+            Listener.log("tap created; listen access=\(CGPreflightListenEventAccess()) ax=\(AXIsProcessTrusted())")
             ready.signal()
             while !self.lock.withLock({ self.stopping }) { _ = CFRunLoopRunInMode(.defaultMode, 1, false) }
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -518,6 +549,7 @@ private final class Listener {
         case .keyDown: break
         default: return
         }
+        Listener.log("key state=\(e.getIntegerValueField(.eventSourceStateID)) pid=\(e.getIntegerValueField(.eventTargetUnixProcessID)) code=\(e.getIntegerValueField(.keyboardEventKeycode)) composing=\(lock.withLock { composing }) secure=\(IsSecureEventInputEnabled())")
         if e.getIntegerValueField(.eventSourceUserData) == QuickPromptsMac.eventMarker { return }  // our own ⌫ and ⌘V
         if !acceptInjected && e.getIntegerValueField(.eventSourceStateID) == Int64(CGEventSourceStateID.privateState.rawValue) { return }
         let (version, isComposing) = lock.withLock { () -> (Int, Bool) in
@@ -539,7 +571,9 @@ private final class Listener {
         case .backspace: return matcher.backspace()
         case .typedSpace: return matcher.char(" ")
         case .space:
-            if let hit = matcher.space() { matched(hit, pid: pid_t(truncatingIfNeeded: pid)) }
+            let hit = matcher.space()
+            Listener.log("space hit=\(hit.map { "\($0.tag)/\($0.erase)" } ?? "none") buffered=\(matcher.buffer.count)")
+            if let hit { matched(hit, pid: pid_t(truncatingIfNeeded: pid)) }
             return
         case .text: break
         }

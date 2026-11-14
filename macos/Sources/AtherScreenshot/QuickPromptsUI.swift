@@ -34,6 +34,7 @@ final class QuickPromptsModel: ObservableObject {
     var setTyping: (Bool) -> Void = { QuickPromptsMac.shared.setTyping($0) }
     var pickerHotkey: () -> String = { Hotkey.display(Settings.shared.hotkey(.insertQuickPrompt)) }
     var hotkeyStatus: (String) -> String? = { QuickPromptsMac.shared.hotkeyStatus[$0] }
+    var isSystemReplacement: (String) -> Bool = { QuickPromptsMac.shared.systemReplacements.contains($0.lowercased()) }
     private var loading = false
     private var saveWork: DispatchWorkItem?
     private var observer: NSObjectProtocol?
@@ -120,6 +121,9 @@ final class QuickPromptsModel: ObservableObject {
             notes.append("“\(p.trigger)” is also the trigger of “\(o.name)”" + (mineWins ? "; this one wins." : "; that one wins."))
         }
         if !p.hotkey.isEmpty, let hs = hotkeyStatus(p.id) { notes.append(hs) }
+        if p.enabled && isSystemReplacement(p.trigger) {
+            notes.append("“\(p.trigger)” is also one of your macOS Text Replacements, which wins as you type; the picker still pastes this one.")
+        }
         status = notes.joined(separator: "   ·   ")
     }
 

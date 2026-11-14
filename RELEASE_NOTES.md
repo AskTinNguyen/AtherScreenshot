@@ -10,6 +10,12 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## Mac fixes (build 0.0.2.9)
+
+- **QuickPrompts start working as soon as you allow Accessibility.** In 0.0.2.8, triggers didn't expand until the app was restarted if Accessibility was allowed after it started.
+- **Your macOS Text Replacements win.** A trigger that is also one of your Text Replacements (System Settings › Keyboard › Text Replacements) is left to macOS instead of being replaced twice; the QuickPrompts window says so, and the picker still pastes it.
+- **The video editor opens wide enough for its toolbar,** so the window no longer widens when Flip, Guides or Speed change.
+
 ## What's new for the Mac (build 0.0.2.8): QuickPrompts, and the video editor catches up with Windows
 
 The Mac app now has everything Windows got in builds 0.0.2.6 to 0.0.2.8. Each feature works as described in the

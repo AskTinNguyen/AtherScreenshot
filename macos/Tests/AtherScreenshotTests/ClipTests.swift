@@ -312,8 +312,9 @@ final class ClipEditorTests: XCTestCase {
         await MainActor.run { e.seek(1) }
         try await until("at 1 s") { abs(e.now - 1) < 0.05 }
         await MainActor.run {
+            // Grab the knob where it is: the seek can land a frame or so off 1 s, more than the knob's 7 pt reach.
             let tl = e.timeline
-            mouse(e, .leftMouseDown, CGPoint(x: tl.x(1), y: tl.laneY + 2))
+            mouse(e, .leftMouseDown, CGPoint(x: tl.x(e.now), y: tl.laneY + 2))
             mouse(e, .leftMouseDragged, CGPoint(x: tl.x(2), y: tl.laneY + 2))
             mouse(e, .leftMouseUp, CGPoint(x: tl.x(2), y: tl.laneY + 2))
             XCTAssertEqual(e.edit.clips.count, 2, "no clip drag")

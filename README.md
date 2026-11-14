@@ -431,6 +431,7 @@ How the Windows app differs from the Mac app:
   - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
 - **QuickPrompts:**
   - The Mac needs Accessibility (Settings › QuickPrompts shows it and has an Allow button) to spot triggers and paste. It clears what it heard while a password field has secure input on.
+  - On the Mac, a trigger that is also one of your macOS Text Replacements is left to macOS (it would otherwise be replaced twice); the QuickPrompts window says so, and the picker still pastes it.
   - On the Mac, triggers are ignored while an input method such as Vietnamese Telex is selected, because the keys pressed aren't the text that appears: switch to ABC/U.S. to type a trigger, or use the picker (`⌃⌥P`).
   - The Mac marks the pasted prompt as transient so clipboard managers skip it; Windows keeps it out of clipboard history. Mac full-screen apps (Safari, Xcode…) still expand; only full-screen games are skipped. Excluded apps take bundle ids or app names (`.exe` endings are ignored, so a list shared with Windows works).
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).

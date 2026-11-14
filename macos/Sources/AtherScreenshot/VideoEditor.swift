@@ -277,7 +277,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private init(_ url: URL) {
         self.url = url
         let vis = Geo.mouseScreen.visibleFrame
-        let size = NSSize(width: min(1240, vis.width * 0.92), height: min(880, vis.height * 0.92))
+        // Wide enough for the toolbar with its longest titles ("Flipped ↔ ↕", "Guides · B&W", "Speed 0.5×"), so changing
+        // them doesn't widen the window.
+        let size = NSSize(width: min(1400, vis.width * 0.92), height: min(880, vis.height * 0.92))
         window = NSWindow(contentRect: NSRect(x: vis.midX - size.width / 2, y: vis.midY - size.height / 2, width: size.width, height: size.height),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
