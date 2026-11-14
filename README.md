@@ -56,7 +56,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
 | 🔎 **Smart search** | Suggested tags, related-word search ("graph" finds charts), dates ("last week") and text inside images |
 | ☁️ **Share** | Copy to clipboard, pin to screen, optional upload (Imgur, custom endpoint or S3), and compress a video or picture to under 8, 25 or 50 MB (or any size) for chat apps and email |
-| 💬 **QuickPrompts** | Type a short trigger and Space in any app, e.g. `doitforme`, and it becomes your saved prompt or phrase; or pick one from a list with `Ctrl+Alt+Space`. Team starters built in, team prompts from a shared file, your last screenshot pasted along when you want (Windows, [how](#quickprompts-windows)) |
+| 💬 **QuickPrompts** | Type a short trigger and Space in any app, e.g. `doitforme`, and it becomes your saved prompt or phrase; or pick one from a list with `Ctrl+Alt+Space` (`⌃⌥P` on the Mac). Team starters built in, team prompts from a shared file, your last screenshot pasted along when you want ([how](#quickprompts)) |
 | ⌨️ **Automate** | Command palette, rebindable shortcuts, command line and `atherscreenshot://` links |
 | 🤖 **AI agents** | Claude Code, Codex and other MCP clients can take screenshots, record gameplay with markers, review videos frame by frame and search the gallery ([setup](#ai-agents-mcp)) |
 
@@ -76,7 +76,7 @@ OCR, tags and search run on your computer. Upload is off until you set it up. Au
 | Capture gallery | `⌃⌥H` | `Ctrl+Alt+H` |
 | Record MP4 / GIF (press again to stop) | `⌃⌥5` / `⌃⌥G` | `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` |
 | Bug report: start / stop | `⌃⌥B` | `Ctrl+Alt+B` |
-| Insert a QuickPrompt (pick from the list) | — | `Ctrl+Alt+Space` |
+| Insert a QuickPrompt (pick from the list) | `⌃⌥P` | `Ctrl+Alt+Space` |
 
 macOS reserves `⌘⇧3/4/5`, so the Mac defaults use `⌃⌥`. In the gallery and editors, `Ctrl` on Windows replaces `⌘` on the Mac.
 
@@ -198,8 +198,8 @@ Opening a video (from the gallery, the "Recording saved" notification, Open rece
   - S splits the clip at the playhead (then remove a middle part, or reorder the halves). The selected clip's row has Split, Earlier, Later and Remove (Del).
   - Markup and captions move with the footage they're on; undo covers clip changes too.
 - **Crop:** press C and drag on the video; pick Free, 16:9, 4:3, 1:1 or 9:16 to keep a shape.
-- **Speed** 0.5–4× (audio keeps its pitch) and **Mute**. On Windows the speed is per clip: split a video and set the speed of just that piece (the selected clip, else the one at the playhead); Speed ▾ › Every clip at sets them all.
-- **Reverse** (Windows) plays footage end to start, sound too: the selected clip, or with no clip selected the whole timeline (its end becomes its start, markup and captions mirrored with it). Reverse again to go back.
+- **Speed** 0.5–4× (audio keeps its pitch) and **Mute**. The speed is per clip: split a video and set the speed of just that piece (the selected clip, else the one at the playhead); Speed ▾ › Every clip at sets them all.
+- **Reverse** plays footage end to start, sound too: the selected clip, or with no clip selected the whole timeline (its end becomes its start, markup and captions mirrored with it). Reverse again to go back.
 - **Captions:**
   - T adds one at the playhead. Type in the field, drag it on the timeline to move it or its edges to retime it, and choose top, middle or bottom.
   - **Auto captions** transcribes the speech on this PC with Windows speech recognition and splits it into short captions.
@@ -334,12 +334,12 @@ From 0.0.2, the Windows app updates itself; earlier versions need one manual dow
 - **Installing:** when there's a newer version, a notification offers it, and the tray menu shows "Update to version …". Click and it downloads the new exe (about 3 MB) in the background, checks its size, SHA-256 and the version inside it, swaps it in and restarts. Settings, captures and the gallery stay; there's no installer window and no admin prompt. It waits while you're recording or have an editor open.
 - **Safety:** it only downloads over HTTPS from this repository on GitHub, and if anything fails it keeps the version you have and offers the download page instead.
 
-### QuickPrompts (Windows)
+### QuickPrompts
 
 Save the prompts and phrases you type again and again, and insert them anywhere by typing a short trigger.
 
 - **Type a trigger, then Space:** in any app (a chat with Claude or ChatGPT, Slack, an editor, a terminal), type `doitforme` and press Space. The trigger turns into the saved prompt, line breaks and all. Only Space expands: Enter, Tab and punctuation leave the word as typed, so a trigger can never send a half-finished message. `redoitforme` doesn't fire: triggers match whole words only.
-- **Or pick one:** `Ctrl+Alt+Space` lists every prompt (most used first); type to search by trigger, title or text and press Enter to paste it where you were. The picker works even with typed triggers off.
+- **Or pick one:** `Ctrl+Alt+Space` (`⌃⌥P` on the Mac, where `⌃⌥Space` switches keyboards) lists every prompt (most used first); type to search by trigger, title or text and press Enter to paste it where you were. The picker works even with typed triggers off.
 - **Team starters:** seventeen prompts come built in, ready for the team:
   - **Agent runs:** `awaypls` (away for 8 hours, full autonomy until it's done and proven), `bedtimepls` (overnight run that keeps an HTML decision log), `doitforme` (do the task end to end and report back), `planpls`, `reviewpls`, `testpls`, `commitpls`.
   - **Art and games:** `interiorpls` (an interior design rendering album), `archpls` (50 architecture exploration images), `playtestpls`, `bugpls` (a bug report from your last screenshot, picture attached), `fixthispls`.
@@ -362,7 +362,7 @@ Save the prompts and phrases you type again and again, and insert them anywhere 
 - **How it pastes:** through the clipboard, so long prompts arrive at once and line breaks never act as Enter. What was on your clipboard (text, pictures, files) comes back half a second later, and the prompt is kept out of Windows' clipboard history. Terminals that need it get `Ctrl+Shift+V`.
 - **Where it doesn't expand:** Ather Screenshot's own windows, fullscreen apps such as games (Settings › QuickPrompts › Not in fullscreen apps), apps you list in **Never expand in these apps** (exe names, e.g. `KeePass.exe`), and windows running as administrator (Windows doesn't let a normal app type into them).
 - **What it listens to:** to spot triggers, the app reads the keys you press (Raw Input, on a thread of its own: it never slows your typing). It keeps the last 64 characters, in memory only, and clears them when you click, switch windows or move the cursor with the keys. They're never saved, logged or given to AI agents. Text typed by other software (Unikey, EVKey, on-screen keyboards) isn't counted, so use triggers made of plain letters, typed with your Vietnamese input method off. The welcome card explains this the first time the app starts; **Expand triggers as I type** (Settings or the QuickPrompts window) turns it off.
-- **Files:** your prompts are in `%APPDATA%\AtherScreenshot\quickprompts.json` (UTF-8, hand-editable; edits are picked up within seconds). A file that can't be read is left alone and copied to `quickprompts.json.bad`.
+- **Files:** your prompts are in `%APPDATA%\AtherScreenshot\quickprompts.json` (Mac: `~/Library/Application Support/AtherScreenshot/quickprompts.json`) (UTF-8, hand-editable; edits are picked up within seconds). A file that can't be read is left alone and copied to `quickprompts.json.bad`.
 - **AI agents:** the `list_quick_prompts` tool lets an agent read your prompt library (never what you type).
 
 ### Command line and links
@@ -429,7 +429,10 @@ How the Windows app differs from the Mac app:
   - Windows recognizes "bug start" / "bug stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses on-device speech recognition.
   - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it writes `voice.wav` down as Vietnamese on the Mac when the Mac can, and sends it to Apple only when it can't. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
   - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
-- **QuickPrompts:** Windows only for now. On the Mac, macOS's own Text Replacements cover part of it.
+- **QuickPrompts:**
+  - The Mac needs Accessibility (Settings › QuickPrompts shows it and has an Allow button) to spot triggers and paste. It clears what it heard while a password field has secure input on.
+  - On the Mac, triggers are ignored while an input method such as Vietnamese Telex is selected, because the keys pressed aren't the text that appears: switch to ABC/U.S. to type a trigger, or use the picker (`⌃⌥P`).
+  - The Mac marks the pasted prompt as transient so clipboard managers skip it; Windows keeps it out of clipboard history. Mac full-screen apps (Safari, Xcode…) still expand; only full-screen games are skipped. Excluded apps take bundle ids or app names (`.exe` endings are ignored, so a list shared with Windows works).
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 
 ## Build from source

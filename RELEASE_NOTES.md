@@ -10,10 +10,18 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## What's new for the Mac (build 0.0.2.8): QuickPrompts, and the video editor catches up with Windows
+
+The Mac app now has everything Windows got in builds 0.0.2.6 to 0.0.2.8. Each feature works as described in the
+sections below; on the Mac, use ⌘ where Windows uses Ctrl.
+
+- **QuickPrompts:** type a trigger and Space in any app, or press **⌃⌥P** to pick one (Windows uses Ctrl+Alt+Space; on the Mac ⌃⌥Space switches keyboards). It needs Accessibility, which the welcome card and Settings › QuickPrompts ask for. Triggers are ignored while an input method such as Vietnamese Telex is on: switch to ABC/U.S. to type one, or use the picker. Same `quickprompts.json` and team file format as Windows.
+- **Video editor:** clip bin, picture in picture and split screen, Flip, Loop (⌘L), Guides (G) and the monochrome view, speed per clip and Reverse.
+- **Gallery:** move along the thin timeline at the bottom of a video tile to scrub it.
+
 ## What's new in this update (Windows, build 0.0.2.8): QuickPrompts
 
-Save the prompts and phrases you type again and again, and insert them anywhere by typing a short trigger. The Mac app
-stays at build 0.0.2.5 for now and doesn't have QuickPrompts yet.
+Save the prompts and phrases you type again and again, and insert them anywhere by typing a short trigger.
 
 - **Type a trigger, then Space:** in any app, `doitforme` followed by Space turns into your saved prompt, line breaks and all. Only Space expands, so Enter never sends a half-finished message, and triggers match whole words only.
 - **Or pick one:** `Ctrl+Alt+Space` lists every prompt; type to search and press Enter to paste it where you were.
@@ -25,8 +33,8 @@ stays at build 0.0.2.5 for now and doesn't have QuickPrompts yet.
 
 ## Earlier update (Windows, build 0.0.2.7)
 
-In the video editor on Windows, each clip now has its own speed, and footage can play backwards. The Mac app stays at
-build 0.0.2.5 for now.
+In the video editor on Windows, each clip now has its own speed, and footage can play backwards (on the Mac from build
+0.0.2.8).
 
 ### Speed per clip
 - **What:** after you split a video, **Speed ▾** sets the speed of just that piece: the selected clip, else the one at the playhead. Speed up the boring part and keep the rest at 1×.
@@ -42,7 +50,7 @@ build 0.0.2.5 for now.
 ## Earlier update (Windows, build 0.0.2.6)
 
 The video editor on Windows can now build a new video out of pieces, put a second video on top or beside it, and flip
-clips.
+clips (on the Mac from build 0.0.2.8).
 
 ### Clip bin: keep the pieces you cut, then arrange them into a new video
 - **What:** a **Bin** lane above the clip lane holds clips taken out of the video, so you can put them back or rearrange them instead of losing them. It shows once there's more than one clip, or anything in the bin.

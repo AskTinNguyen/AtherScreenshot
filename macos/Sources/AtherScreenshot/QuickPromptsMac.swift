@@ -131,7 +131,7 @@ final class QuickPromptsMac {
         }
     }
 
-    // ⌃⌥Space: every prompt, searchable; ↩ pastes it into the app that was in front.
+    // ⌃⌥P (Ctrl+Alt+Space on Windows; ⌃⌥Space is the input-source switch on Macs with several keyboards): every prompt, searchable; ↩ pastes it into the app that was in front.
     func showPicker() {
         store.reloadIfChanged()
         let target = Self.frontOtherApp()

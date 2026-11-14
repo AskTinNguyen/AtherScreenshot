@@ -18,12 +18,12 @@ xcrun swift test      # unit tests; ATHER_TEST_OUT=<dir> also renders the editor
 
 Saving speed: `AtherScreenshot --bench-export <outDir> [tap] <clips…>` exports each clip in the same scenarios as the Windows bench (plain, edits, speed2, captions, light, long, gif) and prints time, frames and how each export ran; `tap` keeps frame hashes for `AtherScreenshot --bench-compare <dirA> <dirB>`. `ATHER_BENCH_ONLY=<scenario>`, `ATHER_ENCODERS=n` and `ATHER_GIF_PARTS=n` narrow or change a run.
 
-Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.5), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
+Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.8), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
 
 ## Permissions
 
 - **Screen & System Audio Recording** (required): macOS asks on first capture. Ad-hoc builds get a new signature on every rebuild, so macOS may ask again after rebuilding. Sign with a stable identity to avoid that.
-- **Accessibility**: only for scrolling capture (it posts scroll events) and for showing keystrokes in recordings.
+- **Accessibility**: only for scrolling capture (it posts scroll events), for showing keystrokes in recordings, and for QuickPrompts (spotting triggers and pasting).
 - **Microphone**: only when "Record microphone" is on (macOS 15 or later), or for bug reports' voice commands.
 - **Speech Recognition**: for Auto captions, and for bug reports' voice commands when you turn them on.
 
@@ -44,8 +44,13 @@ macOS reserves ⌘⇧3/4/5, so the defaults use ⌃⌥:
 | ⌃⌥H | Capture history |
 | ⌃⌥5 / ⌃⌥G | Record MP4 / GIF (press again to stop) |
 | ⌃⌥B | Bug report: start / stop |
+| ⌃⌥P | Insert a QuickPrompt (⌃⌥Space is macOS's keyboard switch) |
 
 All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.ather.screenshot`) under the same key names as `settings.ini`, so `defaults write com.ather.screenshot Uploader s3` works.
+
+## QuickPrompts
+
+Type a saved prompt's trigger and Space in any app, or press ⌃⌥P to pick one; palette → "QuickPrompts…" to edit them. Same `quickprompts.json` and team file as Windows (see the main README). Code: `QuickPrompts.swift` (model, matcher, placeholders, starters), `QuickPromptsMac.swift` (key tap and paste), `QuickPromptsUI.swift`.
 
 ## Editor extras
 

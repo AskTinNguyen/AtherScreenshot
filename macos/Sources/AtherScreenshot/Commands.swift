@@ -99,7 +99,7 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .editLast, title: "Annotate last capture", keywords: "edit editor draw markup", icon: "pencil.and.outline", hotkey: "", capture: false),
     CmdDef(cmd: .openImage, title: "Open a picture or video to edit…", keywords: "edit file annotate load image video mp4 mov import", icon: "photo", hotkey: "", capture: false),
     CmdDef(cmd: .compressFile, title: "Compress a picture or video…", keywords: "smaller shrink size mb discord email reduce file jpeg mp4", icon: "arrow.down.right.and.arrow.up.left", hotkey: "", capture: false),
-    CmdDef(cmd: .insertQuickPrompt, title: "Insert QuickPrompt…", keywords: "prompt snippet phrase text expand template paste ai agent claude chatgpt", icon: "text.insert", hotkey: "Ctrl+Alt+Space", capture: false),
+    CmdDef(cmd: .insertQuickPrompt, title: "Insert QuickPrompt…", keywords: "prompt snippet phrase text expand template paste ai agent claude chatgpt", icon: "text.insert", hotkey: "Ctrl+Alt+P", capture: false),
     CmdDef(cmd: .openQuickPrompts, title: "QuickPrompts…", keywords: "prompt snippet phrase text expansion library triggers manage edit team", icon: "text.quote", hotkey: "", capture: false),
     CmdDef(cmd: .newQuickPrompt, title: "New QuickPrompt…", keywords: "prompt snippet phrase text expansion add create trigger", icon: "plus.bubble", hotkey: "", capture: false),
     CmdDef(cmd: .newQuickPromptFromClipboard, title: "Save clipboard as a QuickPrompt…", keywords: "prompt snippet phrase text expansion add create paste", icon: "doc.on.clipboard", hotkey: "", capture: false),

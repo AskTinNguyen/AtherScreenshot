@@ -78,7 +78,7 @@ final class QuickPromptsSnapshotTests: XCTestCase {
 
     func testQuickPromptsWelcome() throws {
         try XCTSkipIf(out == nil)
-        let v = QuickPromptsWelcome.makeView(picker: Hotkey.display("Ctrl+Alt+Space")) { _ in }
+        let v = QuickPromptsWelcome.makeView(picker: Hotkey.display("Ctrl+Alt+P")) { _ in }
         let w = host(v, size: v.frame.size)
         snap(v, "ui-quickprompts-welcome")
         w.close()

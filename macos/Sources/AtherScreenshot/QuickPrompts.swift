@@ -1,7 +1,7 @@
 import Foundation
 
 // QuickPrompts: saved phrases and AI-agent prompts. Typing a prompt's trigger and then Space in any app replaces the
-// trigger with the prompt (QuickPromptsMac.swift listens and pastes); the picker (⌃⌥Space) lists them all.
+// trigger with the prompt (QuickPromptsMac.swift listens and pastes); the picker (⌃⌥P) lists them all.
 // The Swift side of src/quickprompts.h/.cpp: the same model, file format, matcher and placeholders, so one
 // quickprompts.json / quickprompts-team.json works on both platforms.
 //
