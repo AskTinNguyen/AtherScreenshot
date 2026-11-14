@@ -60,7 +60,7 @@ extension VideoExport {
         p.video.frameDuration = mp4FrameDuration(p.video.frameDuration, size: p.size)
         let frames = Int((p.composition.duration.seconds / p.video.frameDuration.seconds).rounded(.up))
         let parts = split(frames, into: encoders ?? self.encoders(for: p.composition.duration.seconds))
-        let sound = await audio(p, speed: e.speed)
+        let sound = await audio(p, retimed: e.anySpeedChange)
         probe?.note(parts.count == 1 ? "writer 1 piece" : "writer \(parts.count) pieces")
         if parts.count == 1 { return try await encode(p, parts[0], of: frames, to: url, final: true, sound: sound) }
 
@@ -179,10 +179,10 @@ extension VideoExport {
 
     // The composition's sound as written to the MP4: copied as it is when nothing changes it (one AAC source at
     // normal speed, like the export session did), otherwise mixed, sped up keeping its pitch, and encoded as AAC.
-    private static func audio(_ p: Prepared, speed: Double) async -> Sound? {
+    private static func audio(_ p: Prepared, retimed: Bool) async -> Sound? {
         let tracks = p.composition.tracks(withMediaType: .audio)
         guard !tracks.isEmpty else { return nil }
-        if speed == 1, tracks.count == 1, let t = tracks.first {
+        if !retimed, tracks.count == 1, let t = tracks.first {
             let descs = (try? await t.load(.formatDescriptions)) ?? []
             if descs.count == 1, CMFormatDescriptionGetMediaSubType(descs[0]) == kAudioFormatMPEG4AAC {
                 let o = AVAssetReaderTrackOutput(track: t, outputSettings: nil)

@@ -157,6 +157,7 @@ final class FrameRenderer {
     let out: CGSize              // output pixels
     let preview: Bool            // preview: output stays in place inside the full frame, placeholders show
     var zoomInPreview = false    // preview applies zoom only while playing, so editing stays put
+    var monochrome = false       // preview only (Guides ▾ › Monochrome view): black and white, never saved
     private let unit: CGFloat
 
     private static var cache: [String: CGImage] = [:]
@@ -174,10 +175,16 @@ final class FrameRenderer {
         unit = max(1, full.height / 720)
     }
 
-    // `src`: source frame. `t`: source time in seconds.
-    func render(_ src: CIImage, at t: Double) -> CIImage {
+    // `src`: source frame. `t`: timeline time in seconds. `videos`: the frames of the videos on top showing at `t`
+    // (upright, at their own size), by overlay id; one that's missing isn't drawn.
+    func render(_ src: CIImage, at t: Double, videos: [UUID: CIImage] = [:]) -> CIImage {
         let H = full.height
         var img = src
+        // 0. The clip's flip, first: everything else is placed on the flipped picture (the frame is fitted into the
+        // sequence frame centered, so its bars mirror onto themselves).
+        if let k = VideoSequence.locate(edit.clips, t)?.index, edit.clips[k].flipped {
+            img = VideoSequence.mirrored(img, h: edit.clips[k].flipH, v: edit.clips[k].flipV, size: full)
+        }
         // 1. Blur and pixelate, in the order they were added.
         for m in edit.marks where (m.kind == .blur || m.kind == .pixelate) && m.active(t) {
             let r = ci(m.rect, H).intersection(img.extent)
@@ -209,6 +216,8 @@ final class FrameRenderer {
             .concatenating(CGAffineTransform(scaleX: target.width / rc.width, y: target.height / rc.height))
             .concatenating(CGAffineTransform(translationX: target.minX, y: target.minY))
         var framed = img.transformed(by: tf).cropped(to: target)
+        // 4a. Videos on top, on the output frame: a box over the picture, or a split screen.
+        if !videos.isEmpty { framed = drawVideos(framed, target: target, t: t, videos: videos) }
         // 4. Captions and title cards stay put on screen.
         let tsize = target.size
         let origin = preview ? view.origin : .zero
@@ -223,8 +232,41 @@ final class FrameRenderer {
             guard let cg = titleImage(m, size: tsize) else { continue }
             framed = place(cg, CGRect(origin: origin, size: tsize), OH, mo).composited(over: framed)
         }
-        if preview { return framed.composited(over: img) }
+        if preview {
+            let shown = framed.composited(over: img)
+            return monochrome ? shown.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0]) : shown
+        }
         return framed.composited(over: CIImage(color: .black).cropped(to: target))
+    }
+
+    // The first split showing makes a new frame: the video in its half and the overlay in the other; then every box.
+    private func drawVideos(_ framed: CIImage, target: CGRect, t: Double, videos: [UUID: CIImage]) -> CIImage {
+        var out = framed
+        func toCI(_ r: CGRect) -> CGRect { CGRect(x: target.minX + r.minX, y: target.minY + target.height - r.maxY, width: r.width, height: r.height) }
+        func picture(_ o: VideoOverlay) -> CIImage? {
+            guard let f = videos[o.id] else { return nil }
+            return VideoSequence.mirrored(f, h: o.clip.flipH, v: o.clip.flipV, size: f.extent.size)
+        }
+        if let o = edit.overlays.first(where: { $0.isSplit && $0.active(t) }) {
+            out = FrameRenderer.put(framed, into: toCI(o.mainHalf(target.size)), fill: o.fill).composited(over: CIImage(color: .black).cropped(to: target))
+            if let p = picture(o) { out = FrameRenderer.put(p, into: toCI(o.rect(target.size)), fill: o.fill).composited(over: out) }
+        }
+        for o in edit.overlays where !o.isSplit && o.active(t) {
+            if let p = picture(o) { out = FrameRenderer.put(p, into: toCI(o.rect(target.size)), fill: true).composited(over: out) }
+        }
+        return out
+    }
+
+    // `pic` into `r`: all of it centered (with nothing around it), or (`fill`) filling it, cut to fit.
+    static func put(_ pic: CIImage, into r: CGRect, fill: Bool) -> CIImage {
+        let e = pic.extent
+        guard e.width > 0, e.height > 0, r.width >= 1, r.height >= 1 else { return CIImage.empty() }
+        let k = fill ? max(r.width / e.width, r.height / e.height) : min(r.width / e.width, r.height / e.height)
+        let w = e.width * k, h = e.height * k
+        let x = fill ? r.midX - w / 2 : (r.minX + (r.width - w) / 2).rounded(), y = fill ? r.midY - h / 2 : (r.minY + (r.height - h) / 2).rounded()
+        let placed = pic.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY).concatenating(CGAffineTransform(scaleX: k, y: k))
+            .concatenating(CGAffineTransform(translationX: x, y: y)))
+        return placed.cropped(to: fill ? r : CGRect(x: x, y: y, width: w, height: h).intersection(r))
     }
 
     func viewRect(at t: Double) -> CGRect {
@@ -600,5 +642,57 @@ final class RendererBox {
     var renderer: FrameRenderer {
         get { lock.lock(); defer { lock.unlock() }; return r }
         set { lock.lock(); r = newValue; lock.unlock() }
+    }
+}
+
+// MARK: - Composition guides
+
+// Drawn over the editor's preview to check framing (never saved): golden section (0.317 / 0.683), rule of thirds, phi
+// grid (0.24 / 0.76) and diagonals (both diagonals, and from each corner the line square to the other diagonal).
+// The golden section and phi grid sit where they were marked on a 16:9 frame (GuideLines in videoedit.cpp).
+enum GuideKind: Int, CaseIterable {
+    case golden, thirds, phi, diagonal
+    var label: String { ["Golden section", "Rule of thirds", "Phi grid", "Diagonals"][rawValue] }
+    var color: NSColor {
+        switch self {
+        case .golden: return Theme.rgb(255, 70, 60)
+        case .thirds: return Theme.rgb(70, 160, 255)
+        case .phi: return Theme.rgb(255, 214, 10)
+        case .diagonal: return Theme.rgb(255, 240, 160)
+        }
+    }
+
+    // The guide's lines over `r` (any coordinates), each ending on r's edges.
+    func lines(_ r: CGRect) -> [(CGPoint, CGPoint)] {
+        var out: [(CGPoint, CGPoint)] = []
+        func at(_ f: CGFloat) {   // a vertical and a horizontal line at fraction f, and at 1 − f
+            for x in [f, 1 - f] {
+                out.append((CGPoint(x: r.minX + r.width * x, y: r.minY), CGPoint(x: r.minX + r.width * x, y: r.maxY)))
+                out.append((CGPoint(x: r.minX, y: r.minY + r.height * x), CGPoint(x: r.maxX, y: r.minY + r.height * x)))
+            }
+        }
+        switch self {
+        case .golden: at(0.317)
+        case .thirds: at(1.0 / 3)
+        case .phi: at(0.24)
+        case .diagonal:
+            guard r.width > 0, r.height > 0 else { break }
+            let tl = CGPoint(x: r.minX, y: r.minY), tr = CGPoint(x: r.maxX, y: r.minY), bl = CGPoint(x: r.minX, y: r.maxY), br = CGPoint(x: r.maxX, y: r.maxY)
+            out.append((tl, br))
+            out.append((tr, bl))
+            func toEdge(_ c: CGPoint, _ dx: CGFloat, _ dy: CGFloat) {   // from a corner along (dx, dy) to where it leaves r
+                var t = CGFloat.greatestFiniteMagnitude
+                if dx > 0 { t = min(t, (r.maxX - c.x) / dx) }
+                if dx < 0 { t = min(t, (r.minX - c.x) / dx) }
+                if dy > 0 { t = min(t, (r.maxY - c.y) / dy) }
+                if dy < 0 { t = min(t, (r.minY - c.y) / dy) }
+                out.append((c, CGPoint(x: c.x + dx * t, y: c.y + dy * t)))
+            }
+            toEdge(tl, r.height, r.width)    // square to tr–bl, which runs along (−w, h)
+            toEdge(br, -r.height, -r.width)
+            toEdge(tr, -r.height, r.width)   // square to tl–br, which runs along (w, h)
+            toEdge(bl, r.height, -r.width)
+        }
+        return out
     }
 }
