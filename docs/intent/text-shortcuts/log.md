@@ -40,7 +40,15 @@ Backwards, overnight run with a decision log, interior design rendering album, a
 
 ## L-6 (2026-11-14) | class: intent | -> rev 3 (content)
 
-One more prompt text (agents decide on Tin's behalf, logged in a "Decision on Behalf of Tin" log, following the boss
-and creation skills), added as `onbehalfpls`, then:
+One more prompt text (agents decide on the owner's behalf, with a log), added as `onbehalfpls`, then:
 
 > Spawn Sonnet Agents to review through my past transcripts sessions on this computer, propose additional good quality prompts that we could and should add
+
+## L-7 (2026-11-14) | class: intent | -> rev 3 (content)
+
+Asked whether to move the studio-specific starters out of the app (the repo and releases are public):
+
+> Yes, move them
+
+`levelpls`, `onbehalfpls` and `nukepls` left the built-in list for the team prompts file, which the team shares
+privately. The prompts mined from past sessions (L-6) also went to that file, not into the app.

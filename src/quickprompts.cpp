@@ -231,41 +231,6 @@ const std::vector<QuickPrompt>& BuiltinQuickPrompts() {
              L"hours, so I can review it tomorrow.\n\n"
              L"I entrust you with this responsibility. Godspeed.",
              L"agent autonomy overnight log"},
-            {L"builtin.onbehalfpls", L"onbehalfpls", L"Decide on my behalf (with a log)",
-             L"You have made very good design decisions on my behalf so far. Whenever the agents need you or need me, "
-             L"just give responses and decisions on my behalf and log them in a \"Decision on Behalf of Tin\" log. It's "
-             L"okay to proceed until everything is done to a high standard. Just make sure they follow our best "
-             L"practices, such as the boss skill, the creation skill, and references to well-made bosses like "
-             L"[Proven and Verifiable Quality Work].",
-             L"agent autonomy log"},
-            {L"builtin.nukepls", L"nukepls", L"Thermo-nuclear code review gate",
-             L"Once you're done with the full implementation, accompanied by visual proofs, a thermo-nuclear code review "
-             L"must also be run by an Opus agent at extra-high effort, with all critical findings addressed. This is the "
-             L"condition for your Intent to be complete.",
-             L"agent review intent"},
-            {L"builtin.levelpls", L"levelpls", L"Build playable levels",
-             L"Use the /level-art-pass skill and the skills for 2D to 3D and level blockout to build these [Level Name] "
-             L"playable levels for [Biome Name].\n\n"
-             L"- The levels must be scale-accurate for gameplay.\n"
-             L"- Levels must use ActorIO for interactive traversal and puzzle elements, using the existing premade "
-             L"templates and puzzle example setups.\n"
-             L"- Levels should use the /s2-lighting skill to follow the Lighting Standards and capture the lighting and "
-             L"color moods closest to the reference image, adding effects like FogLite, artificial lighting and other "
-             L"forms of lighting, and MegaLights where required.\n"
-             L"- Levels must have hidden rooms and contraptions that reward the player on discovery.\n"
-             L"- Levels must be performant and optimized with best practices, even with a lot of objects and actors.\n"
-             L"- Levels must be set up following World Partition streaming.\n"
-             L"- Levels must be structured to allow for modularity.\n"
-             L"- Levels must focus on sense of scale and composition, and self-correct any inaccuracies in the reference "
-             L"images.\n"
-             L"- Levels should use blockout objects first to capture the composition, then add the detailed blockout with "
-             L"better, more realistic assets from the repo library where available.\n"
-             L"- Levels must take advantage of and use the existing enemies and bosses.\n"
-             L"- If your agents have access to Blender and the Tripo API, use them. If you need Blender, install it so "
-             L"agents can use it.\n\n"
-             L"When the level is complete, run a /level-art-pass loop with a fresh-eyes review agent. The visual quality "
-             L"must reach a score of 7/10 for the Intent to be complete.",
-             L"level art unreal blockout lighting"},
             {L"builtin.workbackpls", L"workbackpls", L"Working Backwards plan",
              L"Use Amazon's Working Backwards method: describe the outcomes that would make our players feel joy and value "
              L"in [Feature]. Based on that, create a living document that details the plan to reach the ultimate outcome, "

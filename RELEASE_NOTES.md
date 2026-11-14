@@ -17,7 +17,7 @@ doesn't have it yet.
 
 - **Type a trigger, then Space:** in any app, `doitforme` followed by Space turns into your saved prompt, line breaks and all. Only Space expands, so Enter never sends a half-finished message, and triggers match whole words only.
 - **Or pick one:** `Ctrl+Alt+Space` lists every prompt; type to search and press Enter to paste it where you were.
-- **Team starters:** twenty built-in prompts for the team, among them `awaypls`, `bedtimepls` and `onbehalfpls` (long unattended agent runs), `nukepls` (a thermo-nuclear code review gate), `levelpls` (build playable levels to the team's standards), `interiorpls` and `archpls` (concept image sets), `workbackpls` (Working Backwards plan), `doitforme`, `reviewpls` and `bugpls` (a bug report from your last screenshot, with the picture). Turn any off, or duplicate one to change it.
+- **Team starters:** seventeen built-in prompts, among them `awaypls` and `bedtimepls` (long unattended agent runs), `interiorpls` and `archpls` (concept image sets), `workbackpls` (Working Backwards plan), `doitforme`, `reviewpls` and `bugpls` (a bug report from your last screenshot, with the picture). Turn any off, or duplicate one to change it.
 - **Your own and the team's:** palette → "QuickPrompts…" to write your own (saved as you type, with a Try it box), give one its own shortcut, or point everyone at a shared `quickprompts-team.json`. Imports macOS Text Replacements and CSV.
 - **Placeholders:** `{cursor}`, `{clipboard}`, `{date}`, `{time}`, `{lastcapture}` and `{lastcapture:image}`, which pastes your last screenshot after the text.
 - **Your clipboard stays yours:** prompts are pasted through the clipboard, which gets back what it held, and they stay out of Windows' clipboard history.
