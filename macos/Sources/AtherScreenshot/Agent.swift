@@ -750,6 +750,18 @@ enum Agent {
         return MCP.result(["ran": c.cmd.rawValue, "title": c.title])
     }
 
+    // The person's prompt library (QuickPrompts), read-only. Never anything about what they type.
+    static func listQuickPrompts(_ a: JSON, store: QuickPromptStore = .shared) -> JSON {
+        let q = (MCP.str(a["query"]) ?? "").lowercased()
+        let includeOff = MCP.bool(a["include_disabled"]) ?? false
+        let list: [JSON] = store.all.compactMap { p in
+            if !p.enabled && !includeOff { return nil }
+            if !q.isEmpty && !"\(p.trigger) \(p.title) \(p.text)".lowercased().contains(q) { return nil }
+            return ["trigger": p.trigger, "title": p.title, "text": p.text, "source": p.source, "enabled": p.enabled, "tags": p.tags]
+        }
+        return MCP.result(["prompts": list])
+    }
+
     // MARK: the tool list
 
     private static let targetProps: JSON = [
@@ -873,6 +885,11 @@ enum Agent {
             tool("upload_capture", "Upload a capture",
                  "Uploads a file with the uploader set up in Settings › Upload (Imgur, a custom endpoint or S3) and returns its link. Sends the file off this computer.",
                  schema(["path": ["type": "string"]], required: ["path"]), timeout: 300, upload),
+            tool("list_quick_prompts", "List QuickPrompts",
+                 "Lists the person's saved prompts and phrases (QuickPrompts): trigger, title, full text, where it comes from (builtin team starter, team file or their own) and tags. Placeholders such as {cursor}, {clipboard} and {lastcapture} appear as written. Read-only.",
+                 schema(["query": ["type": "string", "description": "Only prompts whose trigger, title or text contains this."],
+                         "include_disabled": ["type": "boolean", "description": "Also prompts the person turned off (default false)."]]),
+                 readOnly: true, sync { a in listQuickPrompts(a) }),
             tool("run_command", "Run a palette command",
                  "Runs any command from the command palette, like pressing its shortcut. Commands that select a region wait for the person at the computer. Commands:" + commandList,
                  schema(["command": ["type": "string", "enum": commands.map(\.cmd.rawValue)]], required: ["command"]), sync(runCommand)),
