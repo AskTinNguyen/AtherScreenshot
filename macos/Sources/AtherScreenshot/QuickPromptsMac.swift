@@ -40,6 +40,7 @@ final class QuickPromptsMac {
         started = true
         let err = store.load(folder: Settings.supportFolder, teamFile: s.string("TeamFile"))
         if !err.isEmpty { Toast.shared.show("QuickPrompts", err, ms: 8000) }
+        shownError = err
         NotificationCenter.default.addObserver(forName: QuickPromptStore.changed, object: store, queue: .main) { [weak self] _ in
             self?.storeChanged()
         }
@@ -50,13 +51,22 @@ final class QuickPromptsMac {
         // Picks up hand edits and the team file changing, and starts listening once Accessibility is allowed.
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.store.reloadIfChanged()
+            self.reload()
             if self.s.bool("ExpandAsYouType") && !self.listener.running && Self.accessibilityGranted { self.apply() }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.showWelcomeOnce() }
     }
 
     func stop() { listener.stop() }
+
+    // Re-reads changed files; a quickprompts.json that newly can't be read is said once (edits are refused meanwhile).
+    private var shownError = ""
+    private func reload() {
+        guard store.reloadIfChanged() else { return }
+        let err = store.userError
+        if !err.isEmpty && err != shownError { Toast.shared.show("QuickPrompts", err, ms: 8000) }
+        shownError = err
+    }
 
     // Settings changed: the team file and the listener follow.
     func apply() {
@@ -133,7 +143,7 @@ final class QuickPromptsMac {
 
     // ⌃⌥P (Ctrl+Alt+Space on Windows; ⌃⌥Space is the input-source switch on Macs with several keyboards): every prompt, searchable; ↩ pastes it into the app that was in front.
     func showPicker() {
-        store.reloadIfChanged()
+        reload()
         let target = Self.frontOtherApp()
         Palette.shared.show(paletteItems(target: target), placeholder: "Search QuickPrompts…  (↩ pastes it)", mruKey: "QuickPromptsMRU",
                             create: ("New QuickPrompt", { [weak self] text in self?.newPrompt(title: text) }))
@@ -146,7 +156,7 @@ final class QuickPromptsMac {
         let base = String(title.lowercased().filter { $0.isLetter || $0.isNumber }.prefix(24))
         p.trigger = store.uniqueTrigger(base.count >= 2 ? base : "newprompt")
         let r = store.add(p)
-        if r.error.isEmpty { QuickPromptsWindow.show(select: r.id, focusTrigger: true) }
+        if r.error.isEmpty { QuickPromptsWindow.show(select: r.id, focusTrigger: true) } else { Toast.shared.show("QuickPrompts", r.error, ms: 8000) }
     }
 
     func newFromClipboard() {
@@ -157,7 +167,7 @@ final class QuickPromptsMac {
         p.title = String(text.prefix { $0 != "\n" }.prefix(48))
         p.trigger = store.uniqueTrigger("clipprompt")
         let r = store.add(p)
-        if r.error.isEmpty { QuickPromptsWindow.show(select: r.id, focusTrigger: true) }
+        if r.error.isEmpty { QuickPromptsWindow.show(select: r.id, focusTrigger: true) } else { Toast.shared.show("QuickPrompts", r.error, ms: 8000) }
     }
 
     // The path {lastcapture} and {lastcapture:image} use: the last capture, or the newest one in the captures folder.
@@ -272,9 +282,19 @@ final class QuickPromptsMac {
             guard ok, keySeq.map({ $0 == self.listener.keySeq }) ?? true else { self.busy = false; return }
             let pb = NSPasteboard.general
             let saved = Self.savePasteboard(pb)
+            // What's on the clipboard is too big to keep: pasting through it would lose it.
+            if !saved.complete && (!exp.text.isEmpty || image != nil) {
+                Toast.shared.show("QuickPrompts", "The clipboard holds something too big to put back, so “\(p.trigger)” wasn’t pasted. Copy something smaller and try again.", ms: 6000)
+                self.busy = false
+                return
+            }
             var ours = -1
             if !exp.text.isEmpty {
-                guard Self.putText(exp.text, on: pb) else { self.busy = false; return }
+                guard Self.putText(exp.text, on: pb) else {
+                    Self.restorePasteboard(saved, on: pb)
+                    self.busy = false
+                    return
+                }
                 ours = pb.changeCount
                 Self.press(CGKeyCode(kVK_Delete), times: erase)
                 Self.press(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
@@ -298,10 +318,10 @@ final class QuickPromptsMac {
             }
             guard let image else { return afterText() }
             DispatchQueue.main.asyncAfter(deadline: .now() + (exp.text.isEmpty ? 0 : 0.25)) {
-                if Self.putImage(image, on: pb) {
-                    ours = pb.changeCount
-                    Self.press(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
-                }
+                let c0 = pb.changeCount
+                let ok = Self.putImage(image, on: pb)
+                if pb.changeCount != c0 { ours = pb.changeCount }  // cleared by us (even if the write failed): put it back
+                if ok { Self.press(CGKeyCode(kVK_ANSI_V), flags: .maskCommand) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { afterText() }
             }
         }
@@ -379,6 +399,25 @@ final class QuickPromptsMac {
         if let tiff = img.nsImage().tiffRepresentation { item.setData(tiff, forType: .tiff) }
         mark(item)
         return pb.writeObjects([item])
+    }
+}
+
+extension QuickPromptsMac {
+    enum KeyAction: Equatable { case reset, backspace, space, typedSpace, text }
+
+    // What a key press does to the typed buffer. Anything that may move the caret or delete more than one character
+    // (⌥⌫ deletes a word, ⌘⌫ a line, ⌥/⌘ arrows jump) forgets it, like Ctrl/Alt do on Windows: an expansion would
+    // otherwise erase the wrong text.
+    static func keyAction(code: Int, flags: CGEventFlags) -> KeyAction {
+        if flags.contains(.maskCommand) || flags.contains(.maskControl) { return .reset }  // a shortcut
+        switch code {
+        case kVK_Space: return flags.contains(.maskShift) ? .typedSpace : .space  // ⇧Space: a space, never an expansion
+        case kVK_Delete: return flags.isDisjoint(with: [.maskAlternate, .maskShift, .maskSecondaryFn]) ? .backspace : .reset
+        case kVK_Return, kVK_ANSI_KeypadEnter, kVK_Tab, kVK_Escape, kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
+             kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown, kVK_ForwardDelete, kVK_Help:
+            return .reset
+        default: return .text
+        }
     }
 }
 
@@ -495,19 +534,14 @@ private final class Listener {
             matcher.reset()
             lastPid = pid
         }
-        let flags = e.flags
-        if flags.contains(.maskCommand) || flags.contains(.maskControl) { return matcher.reset() }  // a shortcut
-        let code = Int(e.getIntegerValueField(.keyboardEventKeycode))
-        switch code {
-        case kVK_Space:
-            if flags.contains(.maskShift) { return matcher.char(" ") }  // ⇧Space: a space, never an expansion
+        switch QuickPromptsMac.keyAction(code: Int(e.getIntegerValueField(.keyboardEventKeycode)), flags: e.flags) {
+        case .reset: return matcher.reset()
+        case .backspace: return matcher.backspace()
+        case .typedSpace: return matcher.char(" ")
+        case .space:
             if let hit = matcher.space() { matched(hit, pid: pid_t(truncatingIfNeeded: pid)) }
             return
-        case kVK_Delete: return matcher.backspace()
-        case kVK_Return, kVK_ANSI_KeypadEnter, kVK_Tab, kVK_Escape, kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
-             kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown, kVK_ForwardDelete, kVK_Help:
-            return matcher.reset()
-        default: break
+        case .text: break
         }
         if isComposing { return matcher.reset() }
         var len = 0

@@ -514,7 +514,9 @@ final class QuickPromptStore {
     private var team: [QuickPrompt] = []
     private var state: [String: State] = [:]
     private var userStamp: Date?, teamStamp: Date?
-    private var userBad = false  // the file didn't parse: don't overwrite it
+    private var userBad = false  // the file couldn't be read or didn't parse: don't overwrite it
+    private var userErr = ""  // why (shown, and returned by edits while userBad)
+    private var backedUp = false  // quickprompts.json.bak was written this session (before the first overwrite)
     private(set) var version: UInt64 = 1  // bumps on every change, for the listener and the UI
 
     var userURL: URL? { folder?.appendingPathComponent("quickprompts.json") }
@@ -543,8 +545,9 @@ final class QuickPromptStore {
         return d
     }
 
-    // Reads quickprompts.json from `folder` (the support folder) and the team file. Missing files are fine; a file
-    // that doesn't parse is kept as quickprompts.json.bad and never overwritten (the error says so).
+    // Reads quickprompts.json from `folder` (the support folder) and the team file. A missing file is fine; one that
+    // can't be read (too big, no permission) or doesn't parse (or whose "prompts" isn't a list) is kept as
+    // quickprompts.json.bad and never overwritten: edits are refused until it's fixed (the error says so).
     @discardableResult
     func load(folder: URL, teamFile: String) -> String {
         locked {
@@ -553,11 +556,12 @@ final class QuickPromptStore {
             user = []
             state = [:]
             userBad = false
-            var error = ""
+            userErr = ""
             let path = userURL!
             userStamp = Self.stamp(path)
-            if let bytes = Self.readFile(path) {
-                if let root = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] {
+            if FileManager.default.fileExists(atPath: path.path) {
+                if let bytes = Self.readFile(path), let root = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+                   root["prompts"] is [Any] {
                     user = QuickPrompts.parsePrompts(root)
                     for (id, v) in root["state"] as? [String: Any] ?? [:] {
                         guard let st = v as? [String: Any] else { continue }
@@ -569,7 +573,7 @@ final class QuickPromptStore {
                     let bad = path.appendingPathExtension("bad")
                     try? FileManager.default.removeItem(at: bad)
                     try? FileManager.default.copyItem(at: path, to: bad)
-                    error = "quickprompts.json couldn't be read, so it was left as it is (a copy is in quickprompts.json.bad)."
+                    userErr = "quickprompts.json couldn't be read, so it was left as it is (a copy is in quickprompts.json.bad). Changes aren't saved until it's fixed."
                 }
                 for i in user.indices {
                     user[i].source = "user"
@@ -578,9 +582,12 @@ final class QuickPromptStore {
             }
             loadTeam()
             bump()
-            return error
+            return userErr
         }
     }
+
+    // Why the person's prompts can't be saved right now ("" when they can).
+    var userError: String { locked { userErr } }
 
     private func teamURL() -> URL? {
         teamFile.isEmpty ? nil : URL(fileURLWithPath: (teamFile as NSString).expandingTildeInPath)
@@ -630,12 +637,17 @@ final class QuickPromptStore {
         }
     }
 
-    // Atomically (temp + rename).
+    // Atomically (temp + rename). The first overwrite of a session keeps the file as it was in quickprompts.json.bak.
     @discardableResult
     func save() -> Bool {
         locked {
             bump()
             guard let u = userURL, !userBad else { return false }
+            if !backedUp && FileManager.default.fileExists(atPath: u.path) {
+                let bak = u.appendingPathExtension("bak")
+                try? FileManager.default.removeItem(at: bak)
+                backedUp = (try? FileManager.default.copyItem(at: u, to: bak)) != nil
+            }
             var st: [String: Any] = [:]
             for (id, s) in state where !(s.enabled && s.uses == 0) {
                 st[id] = ["enabled": s.enabled, "uses": s.uses, "lastUsed": s.lastUsed] as [String: Any]
@@ -702,11 +714,12 @@ final class QuickPromptStore {
         locked {
             var p = p
             p.source = "user"
+            if userBad { return (userErr, "") }
             if p.id.isEmpty || user.contains(where: { $0.id == p.id }) { p.id = QuickPrompts.makeId() }
             let e = validate(p)
             if !e.isEmpty { return (e, "") }
             user.append(p)
-            save()
+            if !save() { user.removeLast(); return (Self.notSaved, "") }
             return ("", p.id)
         }
     }
@@ -715,33 +728,49 @@ final class QuickPromptStore {
     func update(_ p: QuickPrompt) -> String {
         locked {
             guard let i = user.firstIndex(where: { $0.id == p.id }) else { return "Only your own prompts can be changed. Duplicate it to edit a copy." }
+            if userBad { return userErr }
             let e = validate(p)
             if !e.isEmpty { return e }
             var next = p
             next.source = "user"
+            let old = user[i]
             user[i] = next
-            save()
+            if !save() { user[i] = old; return Self.notSaved }
             return ""
         }
     }
 
-    func remove(_ id: String) {
+    static let notSaved = "Not saved: quickprompts.json couldn't be written."
+
+    // remove/setEnabled/noteUsed return "" or why nothing changed (the file can't be read, or the write failed).
+    @discardableResult
+    func remove(_ id: String) -> String {
         locked {
+            if userBad { return userErr }
+            let old = user
             user.removeAll { $0.id == id }
-            save()
+            if !save() { user = old; return Self.notSaved }
+            return ""
         }
     }
 
     // Any source.
-    func setEnabled(_ id: String, _ on: Bool) {
+    @discardableResult
+    func setEnabled(_ id: String, _ on: Bool) -> String {
         locked {
+            if userBad { return userErr }
+            let oldUser = user, oldState = state
             if let i = user.firstIndex(where: { $0.id == id }) { user[i].enabled = on } else { state[id, default: State()].enabled = on }
-            save()
+            if !save() { user = oldUser; state = oldState; return Self.notSaved }
+            return ""
         }
     }
 
-    func noteUsed(_ id: String) {
+    // Counting a use is skipped (not an error) while the file can't be read.
+    @discardableResult
+    func noteUsed(_ id: String) -> String {
         locked {
+            if userBad { return userErr }
             let now = QuickPrompts.nowIso()
             if let i = user.firstIndex(where: { $0.id == id }) {
                 user[i].uses += 1
@@ -750,7 +779,7 @@ final class QuickPromptStore {
                 state[id, default: State()].uses += 1
                 state[id, default: State()].lastUsed = now
             }
-            save()
+            return save() ? "" : Self.notSaved
         }
     }
 
@@ -766,6 +795,8 @@ final class QuickPromptStore {
             incoming = list
         }
         return locked {
+            if userBad { return (0, [], userErr) }
+            let old = user
             var added = 0, skipped: [String] = []
             for var p in incoming {
                 p.id = ""
@@ -781,7 +812,7 @@ final class QuickPromptStore {
                 user.append(p)
                 added += 1
             }
-            if added > 0 { save() }
+            if added > 0 && !save() { user = old; return (0, [], Self.notSaved) }
             return (added, skipped, "")
         }
     }

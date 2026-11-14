@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import XCTest
 @testable import AtherScreenshot
 
@@ -160,8 +161,69 @@ final class QuickPromptsTests: XCTestCase {
         let bad = QuickPromptStore()
         XCTAssertNotEqual(bad.load(folder: dir, teamFile: ""), "")
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("quickprompts.json.bad").path))
-        bad.add(QuickPrompt(trigger: "zzz", text: "x"))  // accepted in memory, but the broken file is kept
+        XCTAssertNotEqual(bad.add(QuickPrompt(trigger: "zzz", text: "x")).error, "")  // refused: the broken file is kept
+        XCTAssertNotEqual(bad.noteUsed("builtin.doitforme"), "")
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "{ not json")
+    }
+
+    // A file that exists but can't be used (too big, "prompts" not a list) is never replaced by an empty list, and
+    // the first overwrite of a session keeps the previous file as quickprompts.json.bak.
+    func testUnreadableFileIsNeverOverwritten() throws {
+        let fm = FileManager.default
+        for contents in [Data(#"{"version": 1, "prompts": {"id": "x", "trigger": "keepme", "text": "mine"}}"#.utf8),
+                         Data(#"{"version": 1}"#.utf8),
+                         Data(count: (16 << 20) + 10)] {
+            let dir = tempDir()
+            let file = dir.appendingPathComponent("quickprompts.json")
+            try contents.write(to: file)
+            let s = QuickPromptStore()
+            XCTAssertNotEqual(s.load(folder: dir, teamFile: ""), "")
+            XCTAssertNotEqual(s.userError, "")
+            XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("quickprompts.json.bad").path))
+            XCTAssertNotEqual(s.noteUsed("builtin.doitforme"), "")
+            XCTAssertNotEqual(s.setEnabled("builtin.planpls", false), "")
+            XCTAssertNotEqual(s.remove("x"), "")
+            XCTAssertNotEqual(s.add(QuickPrompt(trigger: "zzz", text: "x")).error, "")
+            XCTAssertFalse(s.save())
+            XCTAssertEqual(try Data(contentsOf: file), contents)
+            XCTAssertEqual(s.find("builtin.planpls")?.enabled, true)  // refused edits don't linger in memory
+        }
+
+        let dir = tempDir()
+        let file = dir.appendingPathComponent("quickprompts.json")
+        let original = Data(#"{"version": 1, "prompts": [{"id": "h1", "trigger": "handmade", "text": "by hand"}]}"#.utf8)
+        try original.write(to: file)
+        let s = QuickPromptStore()
+        XCTAssertEqual(s.load(folder: dir, teamFile: ""), "")
+        XCTAssertEqual(s.noteUsed("h1"), "")
+        let bak = dir.appendingPathComponent("quickprompts.json.bak")
+        XCTAssertEqual(try Data(contentsOf: bak), original)
+        XCTAssertEqual(s.noteUsed("h1"), "")
+        XCTAssertEqual(try Data(contentsOf: bak), original)  // once per session
+        XCTAssertEqual(s.find("h1")?.uses, 2)
+    }
+
+    // ⌥⌫ deletes a word and ⌘⌫ a line: the typed buffer is forgotten, not shortened by one character, so a later
+    // expansion can't erase the person's text (Windows resets on Ctrl/Alt, src/quickprompts_win.cpp).
+    func testDeleteWithModifiersResetsMatcher() {
+        typealias K = QuickPromptsMac
+        XCTAssertEqual(K.keyAction(code: kVK_Delete, flags: []), .backspace)
+        XCTAssertEqual(K.keyAction(code: kVK_Delete, flags: .maskAlternate), .reset)
+        XCTAssertEqual(K.keyAction(code: kVK_Delete, flags: .maskCommand), .reset)
+        XCTAssertEqual(K.keyAction(code: kVK_Delete, flags: .maskShift), .reset)
+        XCTAssertEqual(K.keyAction(code: kVK_LeftArrow, flags: .maskAlternate), .reset)
+        XCTAssertEqual(K.keyAction(code: kVK_ForwardDelete, flags: .maskAlternate), .reset)
+        XCTAssertEqual(K.keyAction(code: kVK_Space, flags: []), .space)
+        XCTAssertEqual(K.keyAction(code: kVK_Space, flags: .maskShift), .typedSpace)
+        XCTAssertEqual(K.keyAction(code: kVK_ANSI_E, flags: .maskAlternate), .text)  // ⌥e: an accent, still typing
+
+        // "hello doitforme" then ⌥⌫ (the word is gone) then "x ": nothing expands; a plain ⌫ only drops a character.
+        var m = matcher(["doitforme"])
+        m.feed("hello doitform")
+        m.reset()  // what ⌥⌫ does now
+        XCTAssertTrue(m.feed("e ").isEmpty)
+        var n = matcher(["doitforme"])
+        XCTAssertEqual(n.feed("doitformx\u{8}e ").count, 1)
     }
 
     // The file on disk has the shape the Windows app reads (and a Windows-written file loads here).

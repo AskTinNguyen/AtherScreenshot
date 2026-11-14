@@ -92,6 +92,15 @@ final class QuickPromptsModel: ObservableObject {
         tags = p?.tags.joined(separator: " ") ?? ""
         loading = false
         if let p { updateStatus(p) }
+        showStoreError()
+    }
+
+    // While quickprompts.json can't be read nothing is saved: say so instead of "Saved".
+    private func showStoreError(_ err: String? = nil) {
+        let e = err ?? store.userError
+        guard !e.isEmpty else { return }
+        status = e
+        statusError = true
     }
 
     private func edited() {
@@ -146,7 +155,7 @@ final class QuickPromptsModel: ObservableObject {
         p.trigger = store.uniqueTrigger("newprompt")
         p.title = "New prompt"
         let r = store.add(p)
-        guard r.error.isEmpty else { return }
+        guard r.error.isEmpty else { return showStoreError(r.error) }
         query = ""
         select(r.id)
         focusTrigger += 1
@@ -164,7 +173,7 @@ final class QuickPromptsModel: ObservableObject {
         p.hotkey = ""
         p.enabled = true
         let r = store.add(p)
-        guard r.error.isEmpty else { return }
+        guard r.error.isEmpty else { return showStoreError(r.error) }
         rebuild()
         select(r.id)
         focusTrigger += 1
@@ -172,7 +181,8 @@ final class QuickPromptsModel: ObservableObject {
 
     func delete(confirm: (QuickPrompt) -> Bool) {
         guard let p = selected, !p.readOnly, confirm(p) else { return }
-        store.remove(p.id)
+        let e = store.remove(p.id)
+        guard e.isEmpty else { return showStoreError(e) }
         selected = nil
         select(nil)
         rebuild()
@@ -181,9 +191,10 @@ final class QuickPromptsModel: ObservableObject {
     func toggleEnabled() {
         guard let p = selected else { return }
         saveNow()
-        store.setEnabled(p.id, !p.enabled)
+        let e = store.setEnabled(p.id, !p.enabled)
         rebuild()
         selected = store.find(p.id)
+        if !e.isEmpty { return showStoreError(e) }
         if let s = selected { statusError = false; updateStatus(s) }
     }
 
