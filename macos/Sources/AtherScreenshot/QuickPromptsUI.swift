@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -248,7 +249,7 @@ struct QuickPromptsView: View {
         .background(c(Theme.bg))
         .foregroundColor(c(Theme.text))
         .frame(minWidth: 900, minHeight: 600)
-        .onChange(of: m.focusTrigger) { _ in DispatchQueue.main.async { triggerFocused = true } }
+        .onChange(of: m.focusTrigger) { DispatchQueue.main.async { triggerFocused = true } }
     }
 
     private var header: some View {
@@ -302,7 +303,7 @@ struct QuickPromptsView: View {
                     .padding(.horizontal, 8).padding(.bottom, 8)
                 }
                 .onAppear { if let id = m.selected?.id { proxy.scrollTo(id, anchor: .center) } }
-                .onChange(of: m.selected?.id) { id in if let id { withAnimation { proxy.scrollTo(id) } } }
+                .onChange(of: m.selected?.id) { _, id in if let id { withAnimation { proxy.scrollTo(id) } } }
             }
             Rectangle().fill(c(Theme.border)).frame(height: 1)
             HStack(spacing: 6) {
