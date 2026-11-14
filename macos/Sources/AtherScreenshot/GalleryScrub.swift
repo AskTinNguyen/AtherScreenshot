@@ -67,6 +67,8 @@ final class Scrubber: ObservableObject, @unchecked Sendable {
     private var done: [Bool] = []
     private var busy = false
     private var asset: Source?
+    private var release: DispatchWorkItem?
+    var releaseDelay: Double = 20   // seconds after the mouse leaves that the frames are let go (tests shorten it)
 
     // A video's decoder. Used by one decode at a time.
     private final class Source: @unchecked Sendable {
@@ -94,6 +96,8 @@ final class Scrubber: ObservableObject, @unchecked Sendable {
     // The mouse at `at` (0…1) along `u`'s timeline, on a tile `side` points across. Main thread.
     func scrub(_ u: URL, at: Double, side: CGFloat) {
         let a = min(1, max(0, at))
+        release?.cancel()
+        release = nil
         if url != u { url = u }
         if self.at != a { self.at = a }
         let px = ThumbCache.bucket(side)
@@ -110,10 +114,24 @@ final class Scrubber: ObservableObject, @unchecked Sendable {
         pump()
     }
 
-    // The mouse left `u`'s timeline: its poster comes back. Its frames stay, for coming back to it.
+    // The mouse left `u`'s timeline: its poster comes back and decoding stops. Its frames stay a little while, for
+    // coming back to it, then go (48 thumbnails of a video nobody is looking at).
     func end(_ u: URL? = nil) {
         guard url != nil, u == nil || u == url else { return }
         url = nil
+        release?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.url == nil else { return }
+            self.gen += 1   // a decode still running is dropped
+            self.source = nil
+            self.side = 0
+            self.asset = nil
+            self.pics = []
+            self.done = []
+            self.duration = 0
+        }
+        release = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + releaseDelay, execute: w)
     }
 
     var picture: CGImage? { url != nil && url == source ? Scrub.nearest(pics, Scrub.index(at)) : nil }
@@ -121,7 +139,7 @@ final class Scrubber: ObservableObject, @unchecked Sendable {
     // Decodes the next frame: the one under the mouse, else the next coarse-to-fine one. One at a time, so a fast
     // mouse never queues up work: by the time a frame is done, `want` is wherever the mouse is now.
     private func pump() {
-        guard !busy, let asset, !done.isEmpty else { return }
+        guard !busy, url != nil, let asset, !done.isEmpty else { return }   // nobody scrubbing: stop
         let k: Int
         if want >= 0 && want < done.count && !done[want] { k = want }
         else if let n = Scrub.order.first(where: { !done[$0] }) { k = n }

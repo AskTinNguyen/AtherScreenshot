@@ -78,6 +78,18 @@ final class GalleryScrubTests: XCTestCase {
         XCTAssertNil(s.picture, "another video's frames start over")
         try await until { s.picture != nil }
         XCTAssertGreaterThan(TestMedia.rgb(s.picture!, 5, 5).1, 0.8)
+
+        // A while after leaving, the frames go; leaving right away stops the decoding (at most the one running finishes).
+        s.releaseDelay = 0.3
+        s.end(v)
+        try await until { s.pics.isEmpty }
+        s.releaseDelay = 20
+        s.scrub(v, at: 0.5, side: 190)
+        s.end(v)
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertLessThanOrEqual(s.decoded, 1)
+        s.scrub(v, at: 0.5, side: 190)   // coming back: on it goes
+        try await until { s.decoded == Scrub.frames }
     }
 
     // On Windows, the thumbnails of recordings whose size isn't whole 16 × 16 blocks came out sheared into slanted
