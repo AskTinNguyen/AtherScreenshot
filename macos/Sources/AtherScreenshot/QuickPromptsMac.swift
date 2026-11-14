@@ -49,6 +49,8 @@ final class QuickPromptsMac {
         updateInputSource()
         wasTrusted = Self.accessibilityGranted
         apply()
+        // The app registered its hotkeys before the prompts were loaded: the prompts' own shortcuts join them now.
+        AppDelegate.shared?.registerHotkeys()
         // Picks up hand edits and the team file changing, and starts listening once Accessibility is allowed.
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -545,6 +547,7 @@ private final class Listener {
             return
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             matcher.reset()  // a click can move the caret
+            lock.withLock { seq += 1 }  // ...so an expansion still waiting must not paste at the new caret
             return
         case .keyDown: break
         default: return
