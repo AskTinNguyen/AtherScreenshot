@@ -23,6 +23,7 @@ private func C(_ c: NSColor) -> Color { Color(nsColor: c) }
 
 final class GalleryModel: ObservableObject {
     let lib: Library
+    let scrubber = Scrubber()   // the video tile being scrubbed (not published here: only the video tiles' layers redraw)
     @Published var scope: Scope = .all { didSet { if oldValue != scope { scopeChanged() } } }
     @Published var filter = Filter() { didSet { if oldValue != filter { recompute() } } }
     @Published var sort: GallerySort = .newest { didSet { recompute() } }
@@ -550,8 +551,11 @@ final class ThumbCache {
     static let shared = ThumbCache()
     private let cache = NSCache<NSString, NSImage>()
 
+    // The pixel size thumbnails of a tile `side` points across are made at.
+    static func bucket(_ side: CGFloat) -> Int { side <= 200 ? 256 : side <= 400 ? 512 : 1024 }
+
     func get(_ u: URL, side: CGFloat, done: @escaping (NSImage?) -> Void) {
-        let bucket = side <= 200 ? 256 : side <= 400 ? 512 : 1024
+        let bucket = Self.bucket(side)
         let key = "\(u.path)#\(bucket)" as NSString
         if let i = cache.object(forKey: key) { return done(i) }
         let req = QLThumbnailGenerator.Request(fileAt: u, size: CGSize(width: bucket, height: bucket), scale: 1, representationTypes: .thumbnail)
@@ -592,6 +596,7 @@ private struct Tile: View {
     var fill = true
     var caption = false
     @State private var hover = false
+    @State private var onTimeline = false   // the mouse is on this video's timeline, scrubbing it
 
     var body: some View {
         let m = model.lib.meta(url)
@@ -601,18 +606,13 @@ private struct Tile: View {
                 ThumbImage(url: url, side: max(width, height), fill: fill)
                     .frame(width: width, height: height)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                HStack(spacing: 4) {
-                    if MediaType.of(url) != .image { badge(MediaType.of(url) == .gif ? "GIF" : (m.duration.map(formatTime) ?? "MP4")) }
-                    if m.rating > 0 { badge(String(repeating: "★", count: m.rating)) }
-                    if let d = model.distances[url] { badge(String(format: "%.0f%%", similarity(d))) }
-                    if hover && !caption {
-                        Text(url.deletingPathExtension().lastPathComponent).font(.system(size: 10, weight: .medium)).lineLimit(1).truncationMode(.middle)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(.ultraThinMaterial, in: Capsule()).foregroundColor(.white)
+                if MediaType.of(url) == .video {
+                    ScrubLayer(scrubber: model.scrubber, url: url, width: width, height: height, fill: fill, hover: hover, length: m.duration) { kind, scrubbing, timeline in
+                        badgeRow(m, kind: kind, scrubbing: scrubbing, bottom: timeline ? 13 : 6)
                     }
+                } else {
+                    badgeRow(m, kind: MediaType.of(url) == .gif ? "GIF" : nil, scrubbing: false, bottom: 6)
                 }
-                .padding(6)
-                .frame(maxWidth: width, alignment: .leading)
             }
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(sel ? C(Theme.accent) : (model.focus == url ? Color.white.opacity(0.35) : Color.clear), lineWidth: sel ? 2.5 : 1)
                 .padding(-2))
@@ -630,7 +630,20 @@ private struct Tile: View {
                     .help(model.isExpanded(url) ? "Collapse versions" : "\(n) versions: the original and its edits. Click to show all.")
                 }
             }
-            .onHover { hover = $0 }
+            .onContinuousHover { phase in
+                // Over a video's timeline (the bottom of its tile), the frame at the mouse shows; off it, its poster again.
+                switch phase {
+                case .active(let p):
+                    if !hover { hover = true }
+                    let on = MediaType.of(url) == .video && Scrub.inZone(p, width: width, height: height)
+                    if on { model.scrubber.scrub(url, at: Double((p.x - 8) / max(1, width - 16)), side: max(width, height)) }
+                    else if onTimeline { model.scrubber.end(url) }
+                    if onTimeline != on { onTimeline = on }
+                case .ended:
+                    hover = false
+                    if onTimeline { model.scrubber.end(url); onTimeline = false }
+                }
+            }
             if caption {
                 Text(url.lastPathComponent).font(.system(size: 11)).foregroundColor(C(sel ? Theme.text : Theme.textDim)).lineLimit(1).truncationMode(.middle)
                     .frame(width: width, alignment: .leading)
@@ -648,9 +661,73 @@ private struct Tile: View {
         .id(url)
     }
 
+    // Badges, bottom left: type or duration (while scrubbing, the time there too), stars, similarity, and the name on hover.
+    private func badgeRow(_ m: ItemMeta, kind: String?, scrubbing: Bool, bottom: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            if let kind { badge(kind) }
+            if m.rating > 0 { badge(String(repeating: "★", count: m.rating)) }
+            if let d = model.distances[url] { badge(String(format: "%.0f%%", similarity(d))) }
+            if hover && !caption && !scrubbing {
+                Text(url.deletingPathExtension().lastPathComponent).font(.system(size: 10, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(.ultraThinMaterial, in: Capsule()).foregroundColor(.white)
+            }
+        }
+        .padding(.horizontal, 6).padding(.top, 6).padding(.bottom, bottom)
+        .frame(maxWidth: width, alignment: .leading)
+    }
+
     private func badge(_ s: String) -> some View {
-        Text(s).font(.system(size: 9, weight: .bold)).padding(.horizontal, 6).padding(.vertical, 2)
+        Text(s).font(.system(size: 9, weight: .bold)).monospacedDigit().padding(.horizontal, 6).padding(.vertical, 2)
             .background(.ultraThinMaterial, in: Capsule()).foregroundColor(.white)
+    }
+}
+
+// A video tile's scrubbing: the frame at the mouse over its poster, the timeline along its bottom (while hovered or
+// scrubbed), and its badges with the time there. It only draws: clicks, double-clicks and drags go to the tile.
+private struct ScrubLayer<Badges: View>: View {
+    @ObservedObject var scrubber: Scrubber
+    let url: URL
+    let width: CGFloat
+    let height: CGFloat
+    let fill: Bool
+    let hover: Bool
+    let length: Double?
+    // (the duration badge, scrubbing, the timeline shows) → the badge row
+    @ViewBuilder let badges: (String, Bool, Bool) -> Badges
+
+    var body: some View {
+        let scrubbing = scrubber.url == url
+        let timeline = (hover || scrubbing) && width > Scrub.minWidth
+        let total = length ?? (scrubbing ? scrubber.duration : 0)
+        let kind = scrubbing && total > 0 ? Scrub.badge(scrubber.at, length: total) : length.map(formatTime) ?? "MP4"
+        ZStack(alignment: .bottomLeading) {
+            if scrubbing, let pic = scrubber.picture {
+                ZStack {
+                    C(Theme.raised)
+                    Image(decorative: pic, scale: 1).resizable().interpolation(.high).aspectRatio(contentMode: fill ? .fill : .fit)
+                }
+                .frame(width: width, height: height)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .allowsHitTesting(false)
+            }
+            if timeline {
+                let track = width - 16
+                let x = CGFloat(scrubber.at) * track
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.6)).frame(width: track, height: 3)
+                    if scrubbing {
+                        Capsule().fill(C(Theme.accent)).frame(width: max(x, 3), height: 3)
+                        Capsule().fill(C(Theme.accent)).frame(width: 10, height: 11).offset(x: x - 5)
+                    }
+                }
+                .frame(width: track, height: 11, alignment: .leading)
+                .padding(.leading, 8)
+                .allowsHitTesting(false)
+            }
+            badges(kind, scrubbing, timeline)
+        }
+        .frame(width: width, height: height, alignment: .bottomLeading)
     }
 }
 

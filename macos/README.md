@@ -18,12 +18,12 @@ xcrun swift test      # unit tests; ATHER_TEST_OUT=<dir> also renders the editor
 
 Saving speed: `AtherScreenshot --bench-export <outDir> [tap] <clips…>` exports each clip in the same scenarios as the Windows bench (plain, edits, speed2, captions, light, long, gif) and prints time, frames and how each export ran; `tap` keeps frame hashes for `AtherScreenshot --bench-compare <dirA> <dirB>`. `ATHER_BENCH_ONLY=<scenario>`, `ATHER_ENCODERS=n` and `ATHER_GIF_PARTS=n` narrow or change a run.
 
-Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.5), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
+Requires Xcode (or the Command Line Tools). The version comes from `../src/version.h`, shared with the Windows build: `ATHER_VERSION_STR` is `CFBundleShortVersionString` (0.0.2) and `ATHER_BUILD_STR` is `CFBundleVersion` (0.0.2.9), which the updater compares. A re-release raises only the build. Builds are ad-hoc signed; set `SIGN_IDENTITY="Developer ID Application: …"` (and `NOTARY_PROFILE` for `package`) to sign and notarize.
 
 ## Permissions
 
 - **Screen & System Audio Recording** (required): macOS asks on first capture. Ad-hoc builds get a new signature on every rebuild, so macOS may ask again after rebuilding. Sign with a stable identity to avoid that.
-- **Accessibility**: only for scrolling capture (it posts scroll events) and for showing keystrokes in recordings.
+- **Accessibility**: only for scrolling capture (it posts scroll events), for showing keystrokes in recordings, and for QuickPrompts (spotting triggers and pasting).
 - **Microphone**: only when "Record microphone" is on (macOS 15 or later), or for bug reports' voice commands.
 - **Speech Recognition**: for Auto captions, and for bug reports' voice commands when you turn them on.
 
@@ -44,8 +44,13 @@ macOS reserves ⌘⇧3/4/5, so the defaults use ⌃⌥:
 | ⌃⌥H | Capture history |
 | ⌃⌥5 / ⌃⌥G | Record MP4 / GIF (press again to stop) |
 | ⌃⌥B | Bug report: start / stop |
+| ⌃⌥P | Insert a QuickPrompt (⌃⌥Space is macOS's keyboard switch) |
 
 All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.ather.screenshot`) under the same key names as `settings.ini`, so `defaults write com.ather.screenshot Uploader s3` works.
+
+## QuickPrompts
+
+Type a saved prompt's trigger and Space in any app, or press ⌃⌥P to pick one; palette → "QuickPrompts…" to edit them. Same `quickprompts.json` and team file as Windows (see the main README). Code: `QuickPrompts.swift` (model, matcher, placeholders, starters), `QuickPromptsMac.swift` (key tap and paste), `QuickPromptsUI.swift`.
 
 ## Editor extras
 
@@ -67,7 +72,7 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 
 - **Trim:** drag the yellow handles on the timeline, or press I and O at the playhead.
 - **Crop:** press C and drag on the video; pick Free, 16:9, 4:3, 1:1 or 9:16 to keep a shape.
-- **Speed** 0.5–4× (audio keeps its pitch) and **Mute**.
+- **Speed ▾** 0.5–4× (audio keeps its pitch) for the selected clip, else the one at the playhead; **Every clip at** sets them all. The saved video, its sound, Save GIF, Copy clip and the preview follow each clip's speed; the timeline still shows the footage at 1×, and the clip lane marks `2×`, `0.5×`. **Mute** removes the sound.
 - **Captions:** T adds one at the playhead; type in the field, drag it on the timeline to move it or its edges to retime it, choose top, middle or bottom and the text size. **Auto captions** transcribes the speech with macOS speech recognition (on this Mac when supported) and splits it into short captions.
 - **Markup (Add ▾):** text, speech bubbles, emoji (quick picks or the full emoji picker), arrows, boxes, ellipses, step numbers, blur or pixelate (to hide private info for a stretch of time), zoom (smoothly zooms into a box, shown while playing) and full-screen title cards. Each item has its own bar on the timeline: drag to move, drag its edges to retime. On the video, drag to move and drag the handles to resize. Shortcuts: A arrow, R box, E emoji, N step, X blur, Z zoom.
 - **Animation:** one menu per item. "Auto" picks a sensible style for the kind (arrows and boxes draw on, emoji and bubbles pop, text slides up, title cards fade); or choose Fade, Pop, Scale, Slide up, Wipe, Blur in, Draw on or Typewriter, which plays in and out. Optional while on screen: Pulse, Bounce, Shake or Ping. Advanced: a different exit, and apply to all items of the same kind. ▶ replays the item.
@@ -80,9 +85,15 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Any video:** open MP4, MOV, M4V or anything else AVFoundation reads (Open With in Finder, the palette's "Open a picture or video to edit…", or `AtherScreenshot edit <file>`). Phone videos stored sideways play, export and show in the gallery upright. A file whose frames this Mac can't decode is refused instead of opening blank.
 - **Save smaller** (next to Save GIF): Under 30 / 8 / 25 / 50 MB or Other size… saves the edit (trim, crop, speed, captions, markup) as a new MP4 in your captures that fits the size, the same way Compress does.
 - **Compress:** right-click a video or picture in the gallery › Compress › Under 30 / 8 / 25 / 50 MB (pictures: 2 / 1 / 5 MB) or Other size…, or the palette's "Compress a picture or video…". It writes `<name>_small.mp4` (H.264 + AAC, at a bit rate worked out from the size and the length, scaled to at most 1920 px) or `<name>_small.jpg` next to the original, and tries again smaller if it came out over. See "Compress to a smaller file" in the main README.
+- **Reverse:** with a clip selected, plays that clip end to start (picture and sound); with none, turns the whole timeline around (clips in the opposite order, each backwards, with markup, captions, videos on top and the trim mirrored). Press it again or ⌘Z to play forward. The backwards footage is written to `ather-reversed/` in the temp folder first, with a progress toast; reversed clips show `◀ reversed`.
+- **Flip ▾** (next to Crop) mirrors the selected clip (or video on top), else the clip at the playhead: left–right, upside down, or both. Markup lying wholly on that clip flips with it; the crop stays. The clip lane shows ↔ / ↕.
+- **Clip bin:** with more than one clip (or anything in it) a Bin lane sits above the clip lane. ⌫ on a clip, or dragging it up, takes it out (the last clip stays); drag a piece back down to where it should play (a marker shows where), double-click it or use Add at end; ⌫ in the bin deletes it. ⌘Z undoes each step; the bin is never saved.
+- **Videos on top:** Add ▾ › Video on top (picture in picture)… or Video side by side (split screen)…, a bin piece dragged to the bottom lane, or a video dropped there. Drag the box to move it; drag a corner or scroll over it to size it (Small, Medium, Large in its row). A split takes the left, right, top or bottom half, Fit or Fill. Its bar on the bottom lane moves it in time; its ends trim it. Videos on top are silent; Save, Save GIF, Copy clip, Copy frame and the preview all draw them.
+- **Loop** (next to Play, or ⌘L) plays the selected clip, or the trim, over and over.
+- **Guides ▾** (or a right click on the video): golden section, rule of thirds, phi grid, diagonals, Show all; G hides them and brings them back. **Monochrome view** shows the preview in black and white. Neither is ever saved.
 - **Join videos:** Add ▾ › Video clip… (⌘O) or drop videos on the editor to add them after the selected clip. Any shape works: each clip is fitted into the first video's frame with black bars. With two or more clips a clip lane appears above the thumbnails: click selects a clip, drag reorders it, and drag a selected clip's edge to trim it. The clip row offers Split at playhead (S), Earlier, Later and Remove. Captions and markup stay on their footage when clips move, split or go.
 
-Space plays, ←/→ step a frame (⇧ a second), S splits, ⇧-drag or ⇧I/⇧O mark a range, ⌘C copies it (or the selected clip, or the frame), ⌘⇧C copies the frame, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag, then clears the range.
+Space plays, ⌘L loops, G guides, ←/→ step a frame (⇧ a second), S splits, ⌫ takes a clip to the bin, ⇧-drag or ⇧I/⇧O mark a range, ⌘C copies it (or the selected clip, or the frame), ⌘⇧C copies the frame, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag, then clears the range.
 
 ## Bug reports
 

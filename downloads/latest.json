@@ -1,16 +1,16 @@
 {
-    "windows":  {
-                    "version":  "0.0.2.8",
-                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "512f6ce27f21e79e7541d06f31525f80e73ebda7c2e31618857d3ec247749846",
-                    "size":  4952576,
-                    "notes":  "QuickPrompts: type a trigger and Space in any app to paste a saved prompt, or press Ctrl+Alt+Space to pick one."
-                },
-    "macos":  {
-                  "version":  "0.0.2.5",
-                  "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-                  "sha256":  "09258a828089284686c9073938de109524fc2e45ecd9a7cbe227f03c0846c2e7",
-                  "size":  4258241,
-                  "notes":  "Copy a clip or frame from the video editor with ⌘C, collect captures in one editor tray, and make bug reports by saying \"bug start\" / \"bug stop\"."
-              }
+    "windows": {
+        "version": "0.0.2.8",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+        "sha256": "512f6ce27f21e79e7541d06f31525f80e73ebda7c2e31618857d3ec247749846",
+        "size": 4952576,
+        "notes": "QuickPrompts: type a trigger and Space in any app to paste a saved prompt, or press Ctrl+Alt+Space to pick one."
+    },
+    "macos": {
+        "version": "0.0.2.9",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+        "sha256": "e8ba1099c5e13a7b3110ebbbb2a87dae3b34669524f3af7d91acd6409e7bd8bf",
+        "size": 5028644,
+        "notes": "QuickPrompts start as soon as you allow Accessibility, and your macOS Text Replacements win over a trigger with the same name. Includes 0.0.2.8: QuickPrompts (\u2303\u2325P picker), the clip bin, picture in picture and split screen, flip, loop, guides, speed per clip and Reverse, and gallery scrubbing."
+    }
 }

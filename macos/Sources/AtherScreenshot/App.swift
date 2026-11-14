@@ -101,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.applicationIconImage = Logo.appIcon
+        DispatchQueue.global(qos: .utility).async { VideoReverse.prune(keep: [], maxAge: 86400) }   // reversed clips from earlier days
         Library.shared.loadIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = Logo.menuBarIcon
@@ -113,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.onChange = { [weak self] key in
             if key.hasPrefix("Hotkey.") { self?.registerHotkeys() }
             if key == "AllowAgents" || key == "AgentPort" { Agent.apply() }
+            if ["ExpandAsYouType", "SkipFullscreen", "ExcludedApps", "TeamFile"].contains(key) { QuickPromptsMac.shared.apply() }
             if ["VoiceCommands", "LogPaths", "PreRollSeconds", "LogMaxMB", "CloudVietnamese", "SaveFolder", "CaptureCursor", "Hotkey.BugReport"].contains(key) {
                 BugReports.shared.configure(.fromSettings())
             }
@@ -133,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Updater.cleanUp()  // only this, the running instance, clears an earlier update's leftovers
         Agent.apply()
         UpdateController.shared.start()
+        QuickPromptsMac.shared.start()
 
         if afterUpdate {
             Toast.shared.show("Updated to Ather Screenshot \(AppDelegate.version)", "Your settings, captures and gallery are just as you left them.", ms: 6000)
@@ -174,6 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UpdateController.shared.quitting = true  // a download finishing now must not install or relaunch
         Agent.stop()
         BugReports.shared.stop()
+        QuickPromptsMac.shared.stop()
         let finishWrites = {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
@@ -249,6 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     problems[c.cmd.rawValue] = "\(hk.display) is taken by macOS or another app"
                 }
             }
+            if QuickPromptsMac.shared.started { QuickPromptsMac.shared.registerHotkeys() }  // prompts' own shortcuts
         }
         HotkeyStatus.shared.problems = problems
         if !problems.isEmpty && !hotkeysSuspended && !reportedProblems {
@@ -351,6 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .toggleKeys: return s.bool("ShowKeys")
         case .toggleGamepad: return s.bool("ShowGamepad")
         case .toggleAgents: return s.bool("AllowAgents")
+        case .toggleQuickPrompts: return s.bool("ExpandAsYouType")
         case .toggleLogin: return SMAppService.mainApp.status == .enabled
         default: return nil
         }
@@ -453,6 +459,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Toast.shared.show("AI agents: Off")
             }
         case .copyAgentSetup: Agent.copySetup()
+        case .insertQuickPrompt: QuickPromptsMac.shared.showPicker()
+        case .openQuickPrompts: QuickPromptsWindow.show()
+        case .newQuickPrompt: QuickPromptsMac.shared.newPrompt()
+        case .newQuickPromptFromClipboard: QuickPromptsMac.shared.newFromClipboard()
+        case .toggleQuickPrompts:
+            let on = !s.bool("ExpandAsYouType")
+            QuickPromptsMac.shared.setTyping(on)
+            notifyToggle(c, on)
         case .settings: SettingsWindow.show()
         case .about: about()
         case .quit: NSApp.terminate(nil)

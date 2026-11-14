@@ -29,6 +29,11 @@ enum Cmd: String, CaseIterable {
     case editLast = "EditLastCapture"
     case openImage = "OpenImageInEditor"
     case compressFile = "CompressFile"
+    case insertQuickPrompt = "InsertQuickPrompt"
+    case openQuickPrompts = "OpenQuickPrompts"
+    case newQuickPrompt = "NewQuickPrompt"
+    case newQuickPromptFromClipboard = "NewQuickPromptFromClipboard"
+    case toggleQuickPrompts = "ToggleQuickPrompts"
     case fullscreen = "CaptureFullscreen"
     case monitor = "CaptureMonitor"
     case window = "CaptureWindow"
@@ -94,6 +99,11 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .editLast, title: "Annotate last capture", keywords: "edit editor draw markup", icon: "pencil.and.outline", hotkey: "", capture: false),
     CmdDef(cmd: .openImage, title: "Open a picture or video to edit…", keywords: "edit file annotate load image video mp4 mov import", icon: "photo", hotkey: "", capture: false),
     CmdDef(cmd: .compressFile, title: "Compress a picture or video…", keywords: "smaller shrink size mb discord email reduce file jpeg mp4", icon: "arrow.down.right.and.arrow.up.left", hotkey: "", capture: false),
+    CmdDef(cmd: .insertQuickPrompt, title: "Insert QuickPrompt…", keywords: "prompt snippet phrase text expand template paste ai agent claude chatgpt", icon: "text.insert", hotkey: "Ctrl+Alt+P", capture: false),
+    CmdDef(cmd: .openQuickPrompts, title: "QuickPrompts…", keywords: "prompt snippet phrase text expansion library triggers manage edit team", icon: "text.quote", hotkey: "", capture: false),
+    CmdDef(cmd: .newQuickPrompt, title: "New QuickPrompt…", keywords: "prompt snippet phrase text expansion add create trigger", icon: "plus.bubble", hotkey: "", capture: false),
+    CmdDef(cmd: .newQuickPromptFromClipboard, title: "Save clipboard as a QuickPrompt…", keywords: "prompt snippet phrase text expansion add create paste", icon: "doc.on.clipboard", hotkey: "", capture: false),
+    CmdDef(cmd: .toggleQuickPrompts, title: "Expand QuickPrompt triggers as I type", keywords: "toggle prompt snippet text expansion typing listen keyboard", icon: "keyboard.badge.ellipsis", hotkey: "", capture: false),
     CmdDef(cmd: .fullscreen, title: "Capture full screen", keywords: "all monitors desktop entire everything displays", icon: "rectangle.on.rectangle", hotkey: "Ctrl+Alt+3", capture: true),
     CmdDef(cmd: .monitor, title: "Capture current display", keywords: "monitor screen", icon: "display", hotkey: "Ctrl+Alt+Shift+3", capture: true),
     CmdDef(cmd: .window, title: "Capture active window", keywords: "app foreground focused", icon: "macwindow", hotkey: "Ctrl+Alt+W", capture: true),

@@ -270,7 +270,7 @@ final class ClipEditorTests: XCTestCase {
     func testClipLaneMouse() async throws {
         let e = try await twoClips()
         await MainActor.run {
-            let tl = e.timeline, y = tl.laneH / 2
+            let tl = e.timeline, y = tl.laneY + tl.laneH / 2
             let starts = VideoSequence.starts(e.edit.clips)
             let mid1 = tl.x(starts[1] + e.edit.clips[1].duration / 2)
             mouse(e, .leftMouseDown, CGPoint(x: mid1, y: y))
@@ -299,7 +299,7 @@ final class ClipEditorTests: XCTestCase {
     func testClipLaneEdgesKnobAndKeys() async throws {
         let e = try await twoClips()
         await MainActor.run {
-            let tl = e.timeline, y = tl.laneH / 2
+            let tl = e.timeline, y = tl.laneY + tl.laneH / 2
             e.selected = e.edit.clips[1].id
             let edge = tl.x(VideoSequence.starts(e.edit.clips)[1])
             mouse(e, .leftMouseDown, CGPoint(x: edge + 2, y: y))
@@ -312,16 +312,17 @@ final class ClipEditorTests: XCTestCase {
         await MainActor.run { e.seek(1) }
         try await until("at 1 s") { abs(e.now - 1) < 0.05 }
         await MainActor.run {
+            // Grab the knob where it is: the seek can land a frame or so off 1 s, more than the knob's 7 pt reach.
             let tl = e.timeline
-            mouse(e, .leftMouseDown, CGPoint(x: tl.x(1), y: 2))
-            mouse(e, .leftMouseDragged, CGPoint(x: tl.x(2), y: 2))
-            mouse(e, .leftMouseUp, CGPoint(x: tl.x(2), y: 2))
+            mouse(e, .leftMouseDown, CGPoint(x: tl.x(e.now), y: tl.laneY + 2))
+            mouse(e, .leftMouseDragged, CGPoint(x: tl.x(2), y: tl.laneY + 2))
+            mouse(e, .leftMouseUp, CGPoint(x: tl.x(2), y: tl.laneY + 2))
             XCTAssertEqual(e.edit.clips.count, 2, "no clip drag")
         }
         try await until("scrubbed to 2 s") { abs(e.now - 2) < 0.1 }
         // Mid-drag, Delete and ⌘Z do nothing; Esc cancels the drag.
         await MainActor.run {
-            let tl = e.timeline, y = tl.laneH / 2
+            let tl = e.timeline, y = tl.laneY + tl.laneH / 2
             let order = e.edit.clips.map(\.id)
             mouse(e, .leftMouseDown, CGPoint(x: tl.x(0.5), y: y))
             mouse(e, .leftMouseDragged, CGPoint(x: tl.x(0.5) + 40, y: y))
@@ -343,7 +344,7 @@ final class ClipEditorTests: XCTestCase {
         }
         try await until("short clip") { e.edit.clips[1].duration < 0.11 && e.duration < 3.2 }
         await MainActor.run {
-            let tl = e.timeline, y = tl.laneH / 2
+            let tl = e.timeline, y = tl.laneY + tl.laneH / 2
             e.selected = e.edit.clips[1].id
             let right = tl.x(e.duration)
             let before = e.edit.clips[1]

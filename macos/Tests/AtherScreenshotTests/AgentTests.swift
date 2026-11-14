@@ -108,7 +108,7 @@ final class AgentTests: XCTestCase {
         let tools = Agent.tools()
         XCTAssertEqual(tools.map(\.name), ["get_status", "list_windows", "take_screenshot", "start_recording", "stop_recording", "pause_recording",
                                            "add_marker", "list_captures", "get_capture", "get_video_frames", "read_text", "tag_capture",
-                                           "configure", "open_in_editor", "upload_capture", "run_command"])
+                                           "configure", "open_in_editor", "upload_capture", "list_quick_prompts", "run_command"])
         for t in tools {
             XCTAssertTrue(JSONSerialization.isValidJSONObject(t.schema), t.name)
             XCTAssertEqual(t.schema["type"] as? String, "object", t.name)

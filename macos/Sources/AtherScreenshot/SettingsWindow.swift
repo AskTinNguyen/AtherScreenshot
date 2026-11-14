@@ -11,6 +11,7 @@ private enum Kind {
     case folder
     case login
     case hotkey(Cmd)
+    case custom(String)  // a row drawn by its feature (QuickPromptsSettingsRow)
 }
 
 private struct Row: Identifiable {
@@ -70,6 +71,15 @@ private let rows: [Row] = {
         Row(key: "AllowAgents", title: "Allow AI agents (MCP): Claude Code, Codex and other agents on this Mac can take screenshots, record and search the gallery",
             section: "AI agents", keywords: "mcp claude codex agent automation llm", kind: .toggle),
         Row(key: "AgentPort", title: "Agent port (127.0.0.1 only)", section: "AI agents", keywords: "mcp", kind: .number(1024...65535, 1, ""), shownWhen: "AllowAgents"),
+        Row(key: "QuickPrompts.Open", title: "Your prompts and the team's", section: "QuickPrompts", keywords: "prompt snippet phrase text expansion library team", kind: .custom("open")),
+        Row(key: "QuickPrompts.Access", title: "Accessibility", section: "QuickPrompts", keywords: "permission privacy prompt keyboard", kind: .custom("access")),
+        Row(key: "ExpandAsYouType", title: "Expand triggers as I type: type a trigger and Space in any app. Keeps only the last few characters, in memory",
+            section: "QuickPrompts", keywords: "prompt snippet text expansion typing listen keyboard", kind: .toggle),
+        Row(key: "SkipFullscreen", title: "Not in fullscreen games (games keep what you type)", section: "QuickPrompts", keywords: "prompt game", kind: .toggle),
+        Row(key: "ExcludedApps", title: "Never expand in these apps (bundle ids or names, separated by ;)", section: "QuickPrompts", keywords: "prompt exclude password",
+            kind: .text("com.agilebits.onepassword7; KeePassXC", secure: false)),
+        Row(key: "TeamFile", title: "Team prompts file", section: "QuickPrompts", keywords: "prompt team shared",
+            kind: .text("A shared quickprompts-team.json (synced folder, network drive or repo)", secure: false)),
         Row(key: "StyledExport", title: "Styled export by default", section: "Editor", keywords: "gradient shadow rounded background", kind: .toggle),
         Row(key: "Uploader", title: "Uploader", section: "Upload", keywords: "share link",
             kind: .choice([("none", "None"), ("imgur", "Imgur"), ("custom", "Custom (multipart POST)"), ("s3", "S3 / R2 / MinIO")])),
@@ -89,7 +99,7 @@ private let rows: [Row] = {
     return r
 }()
 
-private let sections = ["General", "Capture", "Recording", "Bug reports", "Editor", "Gallery", "Upload", "AI agents", "Updates", "Shortcuts"]
+private let sections = ["General", "Capture", "Recording", "Bug reports", "Editor", "Gallery", "Upload", "AI agents", "QuickPrompts", "Updates", "Shortcuts"]
 
 struct SettingsView: View {
     @ObservedObject var s = Settings.shared
@@ -126,6 +136,7 @@ struct SettingsView: View {
                                 control(row).contextMenu {
                                     Button("Reset to default") {
                                         if case .login = row.kind { return }
+                                        if case .custom = row.kind { return }
                                         s.reset(row.key)
                                     }
                                 }
@@ -189,6 +200,8 @@ struct SettingsView: View {
                 AppDelegate.shared?.setLaunchAtLogin(on)
                 login = SMAppService.mainApp.status == .enabled
             })).tint(Color(nsColor: Theme.accent))
+        case .custom(let id):
+            QuickPromptsSettingsRow(id: id)
         case .hotkey(let cmd):
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
