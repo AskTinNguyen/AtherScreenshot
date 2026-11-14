@@ -780,11 +780,7 @@ enum Indexer {
                 r.w = Int(abs(s.width))
                 r.h = Int(abs(s.height))
             }
-            let gen = AVAssetImageGenerator(asset: asset)
-            gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 512, height: 512)
-            let at = CMTime(seconds: min(1, (r.duration ?? 0) / 2), preferredTimescale: 600)
-            frame = try? await gen.image(at: at).image
+            frame = await poster(asset, duration: r.duration ?? 0)
         case .image, .gif:
             guard let src = CGImageSourceCreateWithURL(u as CFURL, nil) else { return r }
             if let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
@@ -811,6 +807,14 @@ enum Indexer {
         r.feature = featurePrint(frame)
         if ocr { r.text = ((try? OCR.text(full ?? frame)) ?? "").replacingOccurrences(of: "\n", with: " ") }
         return r
+    }
+
+    // A video's frame for indexing (colors, hashes, OCR): at 1 s, or halfway through a shorter clip, at most 512 px.
+    static func poster(_ asset: AVAsset, duration: Double) async -> CGImage? {
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 512, height: 512)
+        return try? await gen.image(at: CMTime(seconds: min(1, duration / 2), preferredTimescale: 600)).image
     }
 
     static func featurePrint(_ img: CGImage) -> Data? {
