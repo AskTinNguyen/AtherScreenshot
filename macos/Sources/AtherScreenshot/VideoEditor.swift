@@ -208,6 +208,12 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private let stage = VideoStage()
     let timeline = Timeline()
     private let playButton = NSButton()
+    let loopButton = NSButton()
+    // Loop: playback goes round the selected clip (as much of it as is in the trim), else the trim, instead of stopping.
+    // A preview setting, not part of the edit; it stays on for the next video opened.
+    static var lastLoop = false
+    var loop = VideoEditor.lastLoop { didSet { VideoEditor.lastLoop = loop; syncLoop() } }
+    private(set) var loops = 0   // tests: times playback went round
     private let timeLabel = NSTextField(labelWithString: "")
     private let speedPopup = NSPopUpButton()
     private let captionsMenu = NSPopUpButton(frame: .zero, pullsDown: true)
@@ -410,11 +416,19 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         playButton.contentTintColor = Theme.text
         playButton.toolTip = "Play / pause (Space)"
         bind(playButton) { [weak self] in self?.togglePlay() }
+        loopButton.bezelStyle = .regularSquare
+        loopButton.isBordered = false
+        loopButton.wantsLayer = true
+        loopButton.layer?.cornerRadius = 6
+        loopButton.image = NSImage(systemSymbolName: "repeat", accessibilityDescription: "Loop")
+        loopButton.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
+        bind(loopButton) { [weak self] in self?.loop.toggle() }
+        syncLoop()
         timeLabel.font = Theme.mono(11)
         timeLabel.textColor = Theme.textDim
         timeLabel.maximumNumberOfLines = 2
 
-        for v in [top, stage, inspector, hint, playButton, timeLabel, timeline] as [NSView] {
+        for v in [top, stage, inspector, hint, playButton, loopButton, timeLabel, timeline] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
         }
@@ -436,6 +450,10 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             playButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
             playTop,
             playButton.widthAnchor.constraint(equalToConstant: 30),
+            loopButton.leadingAnchor.constraint(equalTo: playButton.trailingAnchor, constant: 6),
+            loopButton.centerYAnchor.constraint(equalTo: playButton.centerYAnchor),
+            loopButton.widthAnchor.constraint(equalToConstant: 30),
+            loopButton.heightAnchor.constraint(equalToConstant: 26),
             timeLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 10),
             timeLabel.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 10),
             timeline.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 100),
@@ -872,10 +890,16 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             } else { player.pause(); seek(edit.trimStart); playStateChanged() }
             return
         }
-        if player.rate != 0 && t >= edit.trimEnd - 0.01 {
-            player.pause()
-            seek(edit.trimStart)
-            playStateChanged()
+        if player.rate != 0 {
+            let (from, to) = loop ? loopRange : (edit.trimStart, edit.trimEnd)
+            if loop && t >= to - 0.01 {   // round again
+                loops += 1
+                seek(from)
+            } else if !loop && t >= edit.trimEnd - 0.01 {
+                player.pause()
+                seek(edit.trimStart)
+                playStateChanged()
+            }
         }
         timeline.needsDisplay = true
         stage.needsDisplay = true
@@ -886,10 +910,27 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         if player.rate != 0 {
             player.pause()
         } else {
-            if now < edit.trimStart || now >= edit.trimEnd - 0.05 { seek(edit.trimStart) }
+            let (from, to) = loop ? loopRange : (edit.trimStart, edit.trimEnd)
+            if now < from || now >= to - 0.05 { seek(from) }
             player.rate = Float(edit.speed)
         }
         playStateChanged()
+    }
+
+    var loopRange: (Double, Double) {
+        var a = edit.trimStart, b = edit.trimEnd
+        if let i = selectedClipIndex {
+            let c0 = VideoSequence.starts(edit.clips)[i], c1 = c0 + edit.clips[i].duration
+            if max(a, c0) < min(b, c1) - 0.05 { a = max(a, c0); b = min(b, c1) }
+        }
+        return (a, b)
+    }
+
+    private func syncLoop() {
+        loopButton.contentTintColor = loop ? Theme.accent : Theme.textDim
+        loopButton.layer?.backgroundColor = loop ? Theme.selected.cgColor : NSColor.clear.cgColor
+        loopButton.toolTip = loop ? "Loop is on (⌘L): plays the selected clip, or the trim, over and over"
+                                  : "Loop (⌘L): play the selected clip, or the trim, over and over"
     }
 
     private func playStateChanged() {
@@ -1255,6 +1296,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             case kVK_ANSI_S: save(gif: shift)
             case kVK_ANSI_C: shift ? copyFrame() : copyPicked()
             case kVK_ANSI_Z: undo()
+            case kVK_ANSI_L: loop.toggle()
             case kVK_ANSI_W: window.performClose(nil)
             default: return false
             }

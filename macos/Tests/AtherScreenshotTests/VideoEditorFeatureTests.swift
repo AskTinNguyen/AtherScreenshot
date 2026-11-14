@@ -234,4 +234,52 @@ final class VideoEditorFeatureTests: XCTestCase {
             close(e)
         }
     }
+
+    // MARK: loop
+
+    // Port of video_editor_loop: plays round the trim and round a selected clip; with Loop off playback stops at the end.
+    func testLoop() async throws {
+        let e = try await open(try await TestMedia.colors(seconds: 3))
+        await MainActor.run {
+            XCTAssertTrue(key(e, kVK_ANSI_L, cmd: true))
+            XCTAssertTrue(e.loop)
+            e.edit.trimStart = 0.5
+            e.edit.trimEnd = 1.2
+            e.togglePlay()
+        }
+        try await until("round the trim") { e.loops >= 1 }
+        await MainActor.run {
+            XCTAssertNotEqual(e.player.rate, 0, "still playing")
+            XCTAssertTrue(e.now >= 0.45 && e.now < 1.25)
+            e.togglePlay()
+            e.edit.trimStart = 0
+            e.edit.trimEnd = 3
+            e.seek(2)
+        }
+        let b0 = await MainActor.run { e.builds }
+        await MainActor.run { e.splitAtPlayhead() }   // [0–2, 2–3], the second selected
+        try await until("rebuilt") { e.builds > b0 }
+        await MainActor.run {
+            XCTAssertEqual(e.loopRange.0, 2, accuracy: 1e-6)
+            XCTAssertEqual(e.loopRange.1, 3, accuracy: 1e-6)
+            e.seek(2.6)
+            e.togglePlay()
+        }
+        let l0 = await MainActor.run { e.loops }
+        try await until("round the clip") { e.loops > l0 }
+        await MainActor.run { XCTAssertGreaterThanOrEqual(e.now, 1.95) }
+        await MainActor.run {
+            e.togglePlay()
+            e.loop = false
+            e.selected = nil
+            e.seek(2.7)
+            e.togglePlay()
+        }
+        let l1 = await MainActor.run { e.loops }
+        try await until("stops at the end") { e.player.rate == 0 }
+        await MainActor.run {
+            XCTAssertEqual(e.loops, l1, "didn't go round")
+            close(e)
+        }
+    }
 }
