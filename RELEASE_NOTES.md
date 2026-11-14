@@ -10,10 +10,10 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## Coming next (Windows): QuickPrompts
+## What's new in this update (Windows, build 0.0.2.8): QuickPrompts
 
 Save the prompts and phrases you type again and again, and insert them anywhere by typing a short trigger. The Mac app
-doesn't have it yet.
+stays at build 0.0.2.5 for now and doesn't have QuickPrompts yet.
 
 - **Type a trigger, then Space:** in any app, `doitforme` followed by Space turns into your saved prompt, line breaks and all. Only Space expands, so Enter never sends a half-finished message, and triggers match whole words only.
 - **Or pick one:** `Ctrl+Alt+Space` lists every prompt; type to search and press Enter to paste it where you were.
@@ -23,7 +23,7 @@ doesn't have it yet.
 - **Your clipboard stays yours:** prompts are pasted through the clipboard, which gets back what it held, and they stay out of Windows' clipboard history.
 - **What it listens to:** a welcome card explains it on first start. To spot triggers the app reads the keys you press, keeps only the last 64 characters in memory, and never saves, logs or shares them. It skips fullscreen games and apps you list. Turn it off in Settings › QuickPrompts; the picker keeps working.
 
-## What's new in this update (Windows, build 0.0.2.7)
+## Earlier update (Windows, build 0.0.2.7)
 
 In the video editor on Windows, each clip now has its own speed, and footage can play backwards. The Mac app stays at
 build 0.0.2.5 for now.
