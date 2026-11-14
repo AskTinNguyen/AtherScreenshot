@@ -283,6 +283,75 @@ final class VideoEditorFeatureTests: XCTestCase {
         }
     }
 
+    // Loop with no trim round a video whose length isn't a whole number of ticks (2.95 s at 20 fps): the end of the
+    // sequence wraps instead of pausing there. And round a 4× clip in the middle: the boundary at its end turns it
+    // round before it runs into the next clip.
+    func testLoopAtTheEndAndAtFastSpeed() async throws {
+        let src = try await TestMedia.clip(fps: 20, seconds: 2.95) { i, ctx in
+            ctx.setFillColor(NSColor(white: CGFloat(i % 20) / 20, alpha: 1).cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
+        }
+        let e = try await open(src)
+        await MainActor.run {
+            XCTAssertEqual(e.duration, 2.95, accuracy: 0.03)
+            e.loop = true
+            e.selected = nil
+            e.seek(2.5)
+            e.togglePlay()
+        }
+        try await until("round the whole video") { e.loops >= 1 }
+        await MainActor.run {
+            XCTAssertNotEqual(e.player.rate, 0, "still playing")
+            XCTAssertLessThan(e.now, 2.0, "back near the start")
+            e.togglePlay()
+            e.loop = false   // it carries over to the next editor opened
+            close(e)
+        }
+
+        let f = try await open(try await TestMedia.colors(seconds: 3))
+        await MainActor.run { f.seek(1) }
+        try await until("at 1 s") { abs(f.now - 1) < 0.05 }
+        var b0 = await MainActor.run { f.builds }
+        await MainActor.run { f.splitAtPlayhead() }
+        try await until("split at 1") { f.builds > b0 }
+        await MainActor.run { f.seek(2) }
+        try await until("at 2 s") { abs(f.now - 2) < 0.05 }
+        b0 = await MainActor.run { f.builds }
+        await MainActor.run { f.splitAtPlayhead() }   // [0–1, 1–2, 2–3]
+        try await until("split at 2") { f.builds > b0 }
+        b0 = await MainActor.run { f.builds }
+        await MainActor.run {
+            XCTAssertEqual(f.edit.clips.count, 3)
+            f.selected = f.edit.clips[1].id
+            f.setSpeed(4, every: false)
+        }
+        try await until("4×") { f.builds > b0 }
+        await MainActor.run {
+            XCTAssertEqual(f.edit.clips[1].speed, 4)
+            XCTAssertEqual(f.loopRange.0, 1, accuracy: 1e-6)
+            XCTAssertEqual(f.loopRange.1, 2, accuracy: 1e-6)
+            f.loop = true
+            f.seek(1)
+            f.togglePlay()
+        }
+        var most = 0.0
+        let end = Date().addingTimeInterval(8)
+        while Date() < end {
+            let (t, l) = await MainActor.run { (f.now, f.loops) }
+            most = max(most, t)
+            if l >= 3 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        await MainActor.run {
+            XCTAssertGreaterThanOrEqual(f.loops, 3, "went round")
+            XCTAssertNotEqual(f.player.rate, 0, "still playing")
+            f.togglePlay()
+            f.loop = false
+            close(f)
+        }
+        XCTAssertLessThan(most, 2.04, "never into the next clip")
+    }
+
     // MARK: guides
 
     // Port of video_composition_guide_lines: each guide's lines at its fractions, ending on the picture's edges, and the
@@ -690,6 +759,64 @@ final class VideoEditorFeatureTests: XCTestCase {
         }
         let ad = try await asset.loadTracks(withMediaType: .audio).first!.load(.timeRange).duration.seconds
         XCTAssertEqual(ad, 8, accuracy: 0.15)
+    }
+
+    // Sound shorter than the picture (it stops at 1.5 s of 3) and an in point of 0.5 s: reversed, the silence comes
+    // first and the sound last, in step with the picture (output 0–1.5 s silent, 1.5–2.5 s the tone).
+    func testReversedSoundKeepsItsPlace() async throws {
+        let src = try await TestMedia.clip(seconds: 3, tone: true, toneSeconds: 1.5) { _, ctx in
+            ctx.setFillColor(NSColor.gray.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
+        }
+        var c = try await VideoSource.probe(src)
+        XCTAssertTrue(c.hasAudio)
+        c.inPoint = 0.5
+        try? FileManager.default.removeItem(at: VideoReverse.path(for: c))
+        let r = try await VideoReverse.toggled(c)
+        XCTAssertEqual(r.duration, 2.5, accuracy: 0.05)
+        let asset = AVURLAsset(url: r.url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let o = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
+                                                                       AVLinearPCMIsNonInterleaved: false, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 1])
+        reader.add(o)
+        XCTAssertTrue(reader.startReading())
+        var pcm: [Float] = []
+        while let s = o.copyNextSampleBuffer() {
+            guard let bb = CMSampleBufferGetDataBuffer(s) else { continue }
+            let n = CMBlockBufferGetDataLength(bb) / 4
+            var chunk = [Float](repeating: 0, count: n)
+            chunk.withUnsafeMutableBytes { _ = CMBlockBufferCopyDataBytes(bb, atOffset: 0, dataLength: n * 4, destination: $0.baseAddress!) }
+            pcm += chunk
+        }
+        func rms(_ a: Double, _ b: Double) -> Float {
+            let lo = Int(a * 48000), hi = min(pcm.count, Int(b * 48000))
+            guard hi > lo else { return -1 }
+            return (pcm[lo..<hi].reduce(0) { $0 + $1 * $1 } / Float(hi - lo)).squareRoot()
+        }
+        XCTAssertLessThan(rms(0.1, 1.35), 0.01, "silent first: the source had no sound there")
+        XCTAssertGreaterThan(rms(1.7, 2.4), 0.1, "the tone at the end")
+    }
+
+    // The reversed-file cache: a source changed since (time, size) gets a new file; old ones nobody uses are deleted.
+    func testReversedFilesCacheKeyAndPrune() async throws {
+        let src = try await TestMedia.colors(seconds: 1)
+        let c = try await VideoSource.probe(src)
+        let p0 = VideoReverse.path(for: c)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-100)], ofItemAtPath: src.path)
+        XCTAssertNotEqual(VideoReverse.path(for: c), p0, "the file changed: not the same reversed file")
+        let fm = FileManager.default
+        let used = VideoReverse.folder.appendingPathComponent("test-used-\(UUID().uuidString).mp4")
+        let stale = VideoReverse.folder.appendingPathComponent("test-stale-\(UUID().uuidString).mp4")
+        let fresh = VideoReverse.folder.appendingPathComponent("test-fresh-\(UUID().uuidString).mp4")
+        for u in [used, stale, fresh] { try Data([1]).write(to: u) }
+        for u in [used, stale] { try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)], ofItemAtPath: u.path) }
+        VideoReverse.prune(keep: [used.path], maxAge: 60)
+        XCTAssertTrue(fm.fileExists(atPath: used.path), "an open editor uses it")
+        XCTAssertFalse(fm.fileExists(atPath: stale.path))
+        XCTAssertTrue(fm.fileExists(atPath: fresh.path), "just made: maybe for a reverse still going")
+        for u in [used, fresh] { try? fm.removeItem(at: u) }
     }
 
     // Port of the reverse half of video_editor_speed_per_clip_and_reverse: with a clip selected Reverse turns just it

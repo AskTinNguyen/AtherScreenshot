@@ -101,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.applicationIconImage = Logo.appIcon
+        DispatchQueue.global(qos: .utility).async { VideoReverse.prune(keep: [], maxAge: 86400) }   // reversed clips from earlier days
         Library.shared.loadIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = Logo.menuBarIcon

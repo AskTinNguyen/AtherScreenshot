@@ -5,9 +5,9 @@ import AppKit
 // Test videos, written to the temporary folder (never the captures or support folder).
 enum TestMedia {
     // `paint(frame, ctx)` draws each frame (top-left origin, stored size). `rotation`: the track's clockwise turn
-    // (a phone video stored sideways). `tone`: a 440 Hz sine on an audio track.
+    // (a phone video stored sideways). `tone`: a 440 Hz sine on an audio track, `toneSeconds` long (default: all of it).
     static func clip(w: Int = 640, h: Int = 360, fps: Int = 30, seconds: Double = 3, rotation: Int = 0, tone: Bool = false,
-                     paint: (Int, CGContext) -> Void) async throws -> URL {
+                     toneSeconds: Double? = nil, paint: (Int, CGContext) -> Void) async throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ather-clip-\(UUID().uuidString).mp4")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h])
@@ -25,7 +25,7 @@ enum TestMedia {
         writer.startSession(atSourceTime: .zero)
         // Video and sound go in interleaved: the writer stops taking one while the other lags too far behind.
         let n = Int(seconds * Double(fps))
-        let rate = 48000.0, total = Int(seconds * rate)
+        let rate = 48000.0, total = Int(min(seconds, toneSeconds ?? seconds) * rate)
         var at = 0
         for i in 0..<n {
             while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }

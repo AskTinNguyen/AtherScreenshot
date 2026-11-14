@@ -207,6 +207,10 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     var dirty = false
     private var undoStack: [VideoEdit] = []
     private var timeObserver: Any?
+    private var endObserver: Any?            // the boundary at the end of the loop / trim (output time)
+    private var endObserverAt: Double?
+    private var itemEndObserver: NSObjectProtocol?
+    private var wrapping = false             // a wrap's seek is in flight: don't go round twice
     private(set) var busy = false
     private var previewBox: RendererBox?
     private var previewComposition: AVVideoComposition?
@@ -218,6 +222,8 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     private var playingClips: [Clip] = []        // what the player's item was built from: maps its time to timeline time
     private(set) var builds = 0
     private(set) var reversing = false
+    private var reverseTask: Task<Void, Never>?
+    private var closed = false
     func setBusy(_ b: Bool, reversing r: Bool) { busy = b; reversing = r; syncReverse() }
     var lastReverseError: String?   // tests
     var lastWheelScale = Date.distantPast                    // tests: how many times the player was given a rebuilt sequence
@@ -310,6 +316,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             guard let self else { return }
             self.tick(VideoSequence.timelineTime(self.playingClips, t.seconds))
         }
+        // At the end of the sequence the player would pause on its own (and the tick never see the end): keep the
+        // rate and handle the end here, like the boundary at the loop's or the trim's end.
+        player.actionAtItemEnd = .none
+        itemEndObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] n in
+            guard let self, let item = n.object as? AVPlayerItem, item === self.player.currentItem else { return }
+            self.reachedEnd()
+        }
         changed()
     }
 
@@ -341,6 +354,7 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             player.replaceCurrentItem(with: item)
             await player.seek(to: CMTime(seconds: VideoSequence.outputTime(clips, min(max(0, at), duration)), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             if rate != 0 { player.rate = rate }
+            syncEndObserver(force: true)
             builds += 1
             timeline.needsDisplay = true
             stage.needsDisplay = true
@@ -517,7 +531,13 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         bind(b, run)
     }
 
-    func actionsKeep(_ a: MenuAction) { actions.append(a) }
+    // Keeps a menu item's action alive (menu items hold their target weakly). A menu rebuilt over and over passes
+    // its own tag and calls actionsDrop(tag) first, so the old ones don't pile up.
+    func actionsKeep(_ a: MenuAction, tag: Int = 0) {
+        if tag != 0 { a.tag = tag }
+        actions.append(a)
+    }
+    func actionsDrop(_ tag: Int) { actions.removeAll { $0.tag == tag } }
 
     private func bind(_ c: NSControl, _ run: @escaping () -> Void) {
         let a = MenuAction(run)
@@ -961,15 +981,9 @@ final class VideoEditor: NSObject, NSWindowDelegate {
             return
         }
         if player.rate != 0 {
-            let (from, to) = loop ? loopRange : (edit.trimStart, edit.trimEnd)
-            if loop && t >= to - 0.01 {   // round again
-                loops += 1
-                seek(from)
-            } else if !loop && t >= edit.trimEnd - 0.01 {
-                player.pause()
-                seek(edit.trimStart)
-                playStateChanged()
-            }
+            syncEndObserver()
+            let to = loop ? loopRange.1 : edit.trimEnd
+            if t >= to - 0.01 { reachedEnd() }
         }
         timeline.needsDisplay = true
         stage.needsDisplay = true
@@ -982,9 +996,40 @@ final class VideoEditor: NSObject, NSWindowDelegate {
         } else {
             let (from, to) = loop ? loopRange : (edit.trimStart, edit.trimEnd)
             if now < from || now >= to - 0.05 { seek(from) }
+            syncEndObserver()
             player.rate = 1   // each clip at its own speed
         }
         playStateChanged()
+    }
+
+    // Playback reached the end of the loop (round again) or of the trim (stop and go back to its start): from the
+    // boundary observer, the end of the sequence, or the tick, whichever sees it first.
+    private func reachedEnd() {
+        guard player.rate != 0, !wrapping else { return }
+        let from = loop ? loopRange.0 : edit.trimStart
+        if loop { loops += 1 } else { player.pause(); playStateChanged() }
+        wrapping = true
+        player.seek(to: CMTime(seconds: VideoSequence.outputTime(playingClips, min(max(0, from), duration)), preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            DispatchQueue.main.async { self?.wrapping = false }
+        }
+        timeline.needsDisplay = true
+        stage.needsDisplay = true
+        updateTime()
+    }
+
+    // A boundary time observer at the end (in the player's output time, so a 4× clip doesn't overshoot into the next
+    // one between ticks). Moved when the loop range, the trim or the sequence changes.
+    private func syncEndObserver(force: Bool = false) {
+        guard !playingClips.isEmpty else { return }
+        let to = loop ? loopRange.1 : edit.trimEnd
+        let at = max(0, VideoSequence.outputTime(playingClips, min(max(0, to), duration)) - 0.001)
+        guard force || endObserverAt.map({ abs($0 - at) > 1e-6 }) ?? true else { return }
+        if let endObserver { player.removeTimeObserver(endObserver) }
+        endObserverAt = at
+        endObserver = player.addBoundaryTimeObserver(forTimes: [NSValue(time: CMTime(seconds: at, preferredTimescale: 6000))], queue: .main) { [weak self] in
+            self?.reachedEnd()
+        }
     }
 
     var loopRange: (Double, Double) {
@@ -1419,7 +1464,26 @@ final class VideoEditor: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         player.pause()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
+        if let endObserver { player.removeTimeObserver(endObserver) }
+        endObserver = nil
+        if let itemEndObserver { NotificationCenter.default.removeObserver(itemEndObserver) }
+        closed = true
+        reverseTask?.cancel()
+        reverseTask = nil
         VideoEditor.instances.removeAll { $0 === self }
+        VideoEditor.pruneReversed()
+    }
+
+    // The reversed files no open editor uses any more (in its clips, bin, videos on top or undo steps) are deleted;
+    // not ones from the last minute, which a reverse still going in another editor may be about to use.
+    static func pruneReversed(maxAge: TimeInterval = 60) {
+        var keep = Set<String>()
+        for e in instances {
+            for ed in [e.edit] + e.undoStack {
+                for c in ed.clips + ed.bin + ed.overlays.map(\.clip) where c.reversed { keep.insert(c.path); keep.insert(c.url.resolvingSymlinksInPath().path) }
+            }
+        }
+        VideoReverse.prune(keep: keep, maxAge: maxAge)
     }
 }
 
@@ -2551,6 +2615,8 @@ extension VideoEditor {
     // The Guides menu (also on a right click on the video): each guide, Show all, G to hide, Monochrome view.
     func fillGuidesMenu(_ menu: NSMenu, title: Bool) {
         menu.removeAllItems()
+        let tag = title ? 4 : 5   // the Guides button's menu; the right click's (a new menu each time)
+        actionsDrop(tag)
         menu.autoenablesItems = false
         if title {
             menu.addItem(withTitle: "Guides", action: nil, keyEquivalent: "")
@@ -2559,7 +2625,7 @@ extension VideoEditor {
         func item(_ t: String, on: Bool, _ run: @escaping () -> Void) {
             let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
             let a = MenuAction(run)
-            actionsKeep(a)
+            actionsKeep(a, tag: tag)
             it.target = a
             it.state = on ? .on : .off
             menu.addItem(it)
@@ -2600,6 +2666,7 @@ extension VideoEditor {
     func syncSpeedMenu() {
         guard let menu = speedMenu.menu else { return }
         menu.removeAllItems()
+        actionsDrop(3)
         let k = speedTarget
         let cur = k.map { edit.clips[$0].speed } ?? 1
         menu.addItem(withTitle: "Speed " + VideoEdit.speedLabel(cur), action: nil, keyEquivalent: "")
@@ -2607,7 +2674,7 @@ extension VideoEditor {
         func item(_ menu: NSMenu, _ t: String, on: Bool, _ run: @escaping () -> Void) {
             let it = NSMenuItem(title: t, action: #selector(MenuAction.fire), keyEquivalent: "")
             let a = MenuAction(run)
-            actionsKeep(a)
+            actionsKeep(a, tag: 3)
             it.target = a
             it.state = on ? .on : .off
             menu.addItem(it)
@@ -2739,7 +2806,7 @@ extension VideoEditor {
         let before = edit.clips
         setBusy(true, reversing: true)
         let toast = Toast.shared.post("Reversing…", only != nil || before.count == 1 ? "Playing the clip end to start" : "The whole timeline, end to start", ms: 600_000)
-        Task { @MainActor in
+        reverseTask = Task { @MainActor [weak self] in
             var clips = before
             do {
                 let ks = only.map { [$0] } ?? Array(before.indices)
@@ -2748,12 +2815,17 @@ extension VideoEditor {
                         let pct = Int((Double(n) + p) * 100 / Double(ks.count))
                         DispatchQueue.main.async { Toast.shared.update(toast, body: "\(pct)%") }
                     }
+                    try Task.checkCancellation()
                 }
             } catch {
+                guard let self, !self.closed, !Task.isCancelled else { return Toast.shared.hide() }   // the editor closed: nothing to show
+                self.reverseTask = nil
                 self.setBusy(false, reversing: false)
-                lastReverseError = error.localizedDescription
+                self.lastReverseError = error.localizedDescription
                 return Toast.shared.show("Reverse failed", error.localizedDescription, ms: 8000)
             }
+            guard let self, !self.closed else { return Toast.shared.hide() }
+            self.reverseTask = nil
             self.setBusy(false, reversing: false)
             self.reverseDone(before: before, clips: clips, only: only)
         }
@@ -2762,6 +2834,7 @@ extension VideoEditor {
     // One undo step: the reversed clips in place. On the clip (or the timeline) markup and captions are mirrored in time,
     // so each shows over the same footage; the trim and the videos on top follow on a whole timeline.
     func reverseDone(before: [Clip], clips: [Clip], only: Int?) {
+        guard !closed else { return }
         guard edit.clips == before else { return Toast.shared.show("The clips changed while reversing", "Reverse again to play them backwards.", ms: 4000) }
         pushUndo()
         let starts = VideoSequence.starts(before)
