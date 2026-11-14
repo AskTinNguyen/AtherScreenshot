@@ -24,3 +24,16 @@ Append-only. Each user prompt verbatim, with credentials and machine paths redac
 ("Your suggestion" was: release to the team first, before a public update, because an always-on listener in an
 unsigned app may draw antivirus attention. Read as: ship as the staging pre-release, which the in-app updater never
 offers; a public release stays the owner's `package.bat publish`.)
+
+## L-4 (2026-11-14) | class: intent | -> rev 3 (content)
+
+> Now let's add the QuickPrompts starter content, i have a few to share with you ill send them in this thread
+
+## L-5 (2026-11-14) | class: intent | -> rev 3 (content)
+
+> Help me fill in the rest
+
+Followed by seven prompt texts (agent away 8 hours, level building, thermo-nuclear code review gate, Working
+Backwards, overnight run with a decision log, interior design rendering album, architecture exploration). They are in
+`BuiltinQuickPrompts()` in `src/quickprompts.cpp` as `awaypls`, `levelpls`, `nukepls`, `workbackpls`, `bedtimepls`,
+`interiorpls` and `archpls`, with spelling fixed (see progress.md, S6); the owner's originals are in the conversation.

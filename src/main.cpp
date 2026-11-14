@@ -2081,9 +2081,9 @@ ATHER_TEST(quickprompts_settings_commands_and_ui) {
     uh.typing = [] { return true; };
     uh.pickerHotkey = [] { return std::wstring(L"Ctrl+Alt+Space"); };
     std::vector<std::wstring> rows;
-    const BitmapPtr win = QuickPromptsSnapshot(uh, L"builtin.doitforme", &rows);
+    const BitmapPtr win = QuickPromptsSnapshot(uh, BuiltinQuickPrompts()[0].id, &rows);
     CHECK(win);
-    CHECK(rows.size() > 3 && rows[0] == L"# Team starters" && rows[1] == L"doitforme");
+    CHECK(rows.size() > 3 && rows[0] == L"# Team starters" && rows[1] == BuiltinQuickPrompts()[0].trigger);
     const BitmapPtr card = QuickPromptsWelcomeSnapshot(L"Ctrl+Alt+Space");
     CHECK(card);
     std::vector<std::wstring> ids;

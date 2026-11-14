@@ -217,6 +217,66 @@ const std::vector<QuickPrompt>& BuiltinQuickPrompts() {
             const wchar_t *id, *trigger, *title, *text, *tags;
         };
         static const B kB[] = {
+            // The team's own starters (from the owner, 2026-11-14), listed first.
+            {L"builtin.awaypls", L"awaypls", L"Away for 8 hours: full autonomy",
+             L"I'll be away from the computer for the next 8 hours, so don't stop to ask for my permission: proceed until "
+             L"the plan is thoroughly complete and validated with visual proofs. If you think any areas should be added to "
+             L"make it better and richer, or any tools should be installed and used to do your job better, go ahead and "
+             L"record your decision. You have full computer-use autonomy.",
+             L"agent autonomy overnight"},
+            {L"builtin.bedtimepls", L"bedtimepls", L"Overnight run with a decision log",
+             L"I'll be going to bed for the next 8 hours. I want you to keep working towards the outcomes outlined and keep "
+             L"pushing for quality. I authorize you with full permissions to make the decisions needed.\n\n"
+             L"Maintain a decision log in HTML for any out-of-the-ordinary decisions you have to make over the next 8 "
+             L"hours, so I can review it tomorrow.\n\n"
+             L"I entrust you with this responsibility. Godspeed.",
+             L"agent autonomy overnight log"},
+            {L"builtin.nukepls", L"nukepls", L"Thermo-nuclear code review gate",
+             L"Once you're done with the full implementation, accompanied by visual proofs, a thermo-nuclear code review "
+             L"must also be run by an Opus agent at extra-high effort, with all critical findings addressed. This is the "
+             L"condition for your Intent to be complete.",
+             L"agent review intent"},
+            {L"builtin.levelpls", L"levelpls", L"Build playable levels",
+             L"Use the /level-art-pass skill and the skills for 2D to 3D and level blockout to build these [Level Name] "
+             L"playable levels for [Biome Name].\n\n"
+             L"- The levels must be scale-accurate for gameplay.\n"
+             L"- Levels must use ActorIO for interactive traversal and puzzle elements, using the existing premade "
+             L"templates and puzzle example setups.\n"
+             L"- Levels should use the /s2-lighting skill to follow the Lighting Standards and capture the lighting and "
+             L"color moods closest to the reference image, adding effects like FogLite, artificial lighting and other "
+             L"forms of lighting, and MegaLights where required.\n"
+             L"- Levels must have hidden rooms and contraptions that reward the player on discovery.\n"
+             L"- Levels must be performant and optimized with best practices, even with a lot of objects and actors.\n"
+             L"- Levels must be set up following World Partition streaming.\n"
+             L"- Levels must be structured to allow for modularity.\n"
+             L"- Levels must focus on sense of scale and composition, and self-correct any inaccuracies in the reference "
+             L"images.\n"
+             L"- Levels should use blockout objects first to capture the composition, then add the detailed blockout with "
+             L"better, more realistic assets from the repo library where available.\n"
+             L"- Levels must take advantage of and use the existing enemies and bosses.\n"
+             L"- If your agents have access to Blender and the Tripo API, use them. If you need Blender, install it so "
+             L"agents can use it.\n\n"
+             L"When the level is complete, run a /level-art-pass loop with a fresh-eyes review agent. The visual quality "
+             L"must reach a score of 7/10 for the Intent to be complete.",
+             L"level art unreal blockout lighting"},
+            {L"builtin.workbackpls", L"workbackpls", L"Working Backwards plan",
+             L"Use Amazon's Working Backwards method: describe the outcomes that would make our players feel joy and value "
+             L"in [Feature]. Based on that, create a living document that details the plan to reach the ultimate outcome, "
+             L"and the features and UX/UI improvements we need to get there.",
+             L"product planning ux"},
+            {L"builtin.interiorpls", L"interiorpls", L"Interior design rendering album",
+             L"Based on these reference images, create a full interior design concept rendering album of [Number] images "
+             L"covering every interior aspect of a [Luxury Beach Boutique Resort Villa Hotel]: [Front Drop-off, "
+             L"Reception, Grand Welcome Entrance, Lift Lobby, Guest Lounge, Signature Restaurants, Room Corridor, Room "
+             L"Signage, Room Closet, Toilet, Bathtub, Bedroom, Minibar Cupboard, Room Balcony], across all room types.",
+             L"concept art images interior"},
+            {L"builtin.archpls", L"archpls", L"Architecture exploration (50 images)",
+             L"Based on the established building and level compositions, generate 50 images that focus on the "
+             L"architectural designs, covering all angles and key areas of each design. I want to explore the spectrum of "
+             L"colors and materials that are [Genre] but tastefully blended with [Genre], with touches of [Theme A], "
+             L"[Theme B] and [Theme C].",
+             L"concept art images architecture"},
+            // The first starters.
             {L"builtin.doitforme", L"doitforme", L"Do it for me",
              L"Please do this end to end:\n"
              L"1. Read the relevant code and docs first, so the change fits how this project already works.\n"

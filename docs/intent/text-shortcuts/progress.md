@@ -41,3 +41,7 @@
 - **Starter wording** is the rev 2 draft, tightened; the owner edits it before a public release.
 - **Backspace-to-undo** (D4, nice-to-have) isn't built.
 - **Version:** not changed (0.0.2 / 0.0.2.7). The team gets it from the staging pre-release; a numbered release is the owner's call.
+
+## Content
+
+- S6 (rev 3, 2026-11-14): the owner's seven prompts (L-5) added as built-in starters, listed first: `awaypls`, `bedtimepls`, `nukepls`, `levelpls`, `workbackpls`, `interiorpls`, `archpls` (19 starters in all). Triggers, titles and tags are the worker's. Wording kept, with spelling and grammar fixed: "inreractiv3" → "interactive", "form of Lightings" → "forms of lighting", "Megalights" → "MegaLights", "WorldSreamingPartitions" → "World Partition streaming", "If your Agents has" → "If your agents have", "wording towards" → "working towards", "I author you" → "I authorize you", "Ill"/"i" → "I'll"/"I"; the level prompt's requirements are a bulleted list. `[Bracketed]` words stay for people to fill in after pasting.
