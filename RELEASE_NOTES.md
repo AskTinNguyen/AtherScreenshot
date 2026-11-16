@@ -10,7 +10,16 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new in this update (Windows, build 0.0.2.11): Pen in the video editor
+## What's new in this update (Windows, build 0.0.2.12): why a video won't open
+
+When a video can't be opened on Windows, the app now says exactly why and what to do, instead of only "Can't open
+this video". The Mac app stays at build 0.0.2.9.
+
+- **10-bit or 4:2:2 H.264** (what many Sony, Canon and Panasonic cameras record, and some DaVinci Resolve or Premiere exports) and **ProRes**: Windows has no decoder for these. Export or convert the video to 8-bit H.264 (4:2:0) or HEVC to open it here.
+- **HEVC, AV1, VP9:** these need Microsoft's free extension from the Microsoft Store; the message names which one.
+- **Where it shows:** opening a video in the editor, adding a clip or a video on top, Compress, and the gallery's large preview.
+
+## Earlier update (Windows, build 0.0.2.11): Pen in the video editor
 
 Circle things on the video by hand, as quickly as you'd do it on a screenshot. The Mac app stays at build 0.0.2.9.
 
