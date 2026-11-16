@@ -23,6 +23,10 @@ struct VideoInfo {
 // Reads the video's size and length, and optionally the frame at `at` seconds scaled to `maxSide`.
 bool ProbeVideo(const std::wstring& path, VideoInfo* info, double at = -1, int maxSide = 0, BitmapPtr* frame = nullptr);
 
+// The codec of an MP4 or QuickTime file's video, as stored ("avc1", "hvc1", "apcn"…, lower case), read from the file
+// itself so it works when no decoder for it is installed. Empty when it can't be read.
+std::string VideoCodecTag(const std::wstring& path);
+
 // The image turned clockwise by 90, 180 or 270 degrees.
 BitmapPtr RotateBitmap(const Bitmap& src, int degrees);
 // `src` scaled to fit a w × h frame, centered on black (black bars where the shapes differ).

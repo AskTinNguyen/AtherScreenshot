@@ -950,6 +950,17 @@ private:
 
 }  // namespace
 
+std::string VideoCodecTag(const std::wstring& path) {
+    InFile f(path);
+    std::vector<uint8_t> ftyp, moov;
+    Track t;
+    // stsd: size, type, version and flags, entry count, then the first entry's size and format.
+    if (!ReadHead(f, &ftyp, &moov) || !ReadTrack(moov, Fcc("vide"), f.Size(), &t) || t.stsd.n < 24) return "";
+    std::string tag(reinterpret_cast<const char*>(t.stsd.p + 20), 4);
+    for (char& c : tag) c = (char)std::tolower((unsigned char)c);
+    return tag;
+}
+
 HRESULT JoinMp4(const std::wstring& path, const std::vector<std::wstring>& parts, const std::vector<int>& frames, int fps, const std::wstring& soundPart) {
     if (parts.empty() || parts.size() != frames.size() || fps <= 0) return E_INVALIDARG;
     std::vector<std::unique_ptr<InFile>> files;
