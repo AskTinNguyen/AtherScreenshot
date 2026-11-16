@@ -37,7 +37,7 @@ static std::optional<VRect> Intersect(const VRect& a, const VRect& b) {
 
 const wchar_t* KindLabel(MarkKind k) {
     static const wchar_t* const n[] = {L"Text", L"Speech bubble", L"Emoji", L"Arrow", L"Box", L"Ellipse", L"Step number",
-                                       L"Blur", L"Pixelate", L"Zoom", L"Title card"};
+                                       L"Blur", L"Pixelate", L"Zoom", L"Title card", L"Pen"};
     return n[(int)k];
 }
 
@@ -57,6 +57,7 @@ wchar_t KindKey(MarkKind k) {
         case MarkKind::Step: return L'N';
         case MarkKind::Blur: return L'X';
         case MarkKind::Zoom: return L'Z';
+        case MarkKind::Pen: return L'P';
         default: return 0;
     }
 }
@@ -74,6 +75,7 @@ wchar_t KindGlyph(MarkKind k) {
         case MarkKind::Pixelate: return 0xF0E2;  // grid
         case MarkKind::Zoom: return 0xE8A3;      // ZoomIn
         case MarkKind::Title: return 0xE8A1;     // card
+        case MarkKind::Pen: return 0xE76D;       // InkingTool
     }
     return 0xE710;
 }
@@ -82,6 +84,16 @@ bool KindIsLine(MarkKind k) { return k == MarkKind::Arrow; }
 bool KindHasText(MarkKind k) { return k == MarkKind::Text || k == MarkKind::Bubble || k == MarkKind::Emoji || k == MarkKind::Title; }
 bool KindIsRegion(MarkKind k) { return k == MarkKind::Blur || k == MarkKind::Pixelate || k == MarkKind::Zoom; }
 bool KindIsStroke(MarkKind k) { return k == MarkKind::Arrow || k == MarkKind::Box || k == MarkKind::Ellipse; }
+void FitPenBounds(Mark& m) {
+    if (m.pts.empty()) return;
+    VPoint lo = m.pts[0], hi = m.pts[0];
+    for (const auto& p : m.pts) {
+        lo = {std::min(lo.x, p.x), std::min(lo.y, p.y)};
+        hi = {std::max(hi.x, p.x), std::max(hi.y, p.y)};
+    }
+    m.a = lo;
+    m.b = hi;
+}
 double KindDefaultSeconds(MarkKind k) { return k == MarkKind::Title ? 2.5 : 3; }
 
 AnimStyle KindDefaultStyle(MarkKind k) {
@@ -112,6 +124,7 @@ std::vector<AnimStyle> KindStyles(MarkKind k) {
         case MarkKind::Blur:
         case MarkKind::Pixelate: return {A::None, A::Fade, A::BlurIn};
         case MarkKind::Zoom: return {};
+        case MarkKind::Pen: return {A::None, A::Fade, A::Pop};
     }
     return {};
 }
@@ -1523,6 +1536,13 @@ std::optional<Placed> FrameRenderer::MarkImage(const Mark& m, double reveal) con
             s.step = m.step;
             shape = s;
             break;
+        case MarkKind::Pen:
+            if (m.pts.empty()) return std::nullopt;
+            s.kind = annot::Kind::Pen;
+            for (const auto& p : m.pts) s.pts.push_back({(float)p.x, (float)p.y});
+            s.ax = (float)m.pts[0].x, s.ay = (float)m.pts[0].y, s.bx = (float)m.pts.back().x, s.by = (float)m.pts.back().y;
+            shape = s;
+            break;
         case MarkKind::Text: {
             const std::wstring shown = m.text.empty() && preview_ ? L"Text" : Typed(m.text, rv);
             if (shown.empty()) return std::nullopt;
@@ -1540,8 +1560,15 @@ std::optional<Placed> FrameRenderer::MarkImage(const Mark& m, double reveal) con
         if (m.kind == MarkKind::Text && !m.text.empty()) whole.text = m.text;  // typewriter: the box of the whole text, so it doesn't drift
         const annot::BoxF bb = annot::Bounds(whole);
         const VRect b = VRect{bb.x - 8 * u, bb.y - 8 * u, bb.w + 16 * u, bb.h + 16 * u}.Integral();
-        const std::wstring key = std::format(L"a|{}|{},{},{},{}|{}|{}|{}|{}|{}|{},{},{},{}", (int)m.kind, shape->ax, shape->ay, shape->bx, shape->by,
-                                             shape->color, shape->level, shape->text, shape->step, u, b.x, b.y, b.w, b.h);
+        uint64_t path = 1469598103934665603ull;  // pen: every point counts (FNV-1a)
+        for (const auto& p : shape->pts)
+            for (float f : {p.first, p.second}) {
+                uint32_t bits;
+                std::memcpy(&bits, &f, 4);
+                path = (path ^ bits) * 1099511628211ull;
+            }
+        const std::wstring key = std::format(L"a|{}|{},{},{},{}|{}|{}|{}|{}|{}|{},{},{},{}|{}|{}", (int)m.kind, shape->ax, shape->ay, shape->bx, shape->by,
+                                             shape->color, shape->level, shape->text, shape->step, u, b.x, b.y, b.w, b.h, shape->pts.size(), path);
         auto img = Cached(key, [&] {
             auto bmp = Blank((int)b.w, (int)b.h);
             if (bmp) annot::Draw(*bmp, *shape, (float)b.x, (float)b.y);

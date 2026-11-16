@@ -4246,6 +4246,11 @@ static Annot ToAnnot(const Shape& s) {
         case Kind::Ellipse: a.type = Tool::Ellipse; break;
         case Kind::Step: a.type = Tool::Step; break;
         case Kind::Text: a.type = Tool::Text; break;
+        case Kind::Pen: a.type = Tool::Pen; break;
+    }
+    if (s.kind == Kind::Pen && !s.pts.empty()) {
+        for (const auto& p : s.pts) a.pts.push_back(gp::PointF(p.first, p.second));
+        return a;
     }
     a.pts = {gp::PointF(s.ax, s.ay)};
     if (s.kind != Kind::Step && s.kind != Kind::Text) a.pts.push_back(gp::PointF(s.bx, s.by));
