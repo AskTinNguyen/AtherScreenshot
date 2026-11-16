@@ -10,6 +10,15 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## What's new in this update (Windows, build 0.0.2.10): MOV videos
+
+MOV videos (from iPhones, Macs and cameras) now work on Windows everywhere MP4 does. The Mac app already opened them
+and stays at build 0.0.2.9.
+
+- **What:** open, edit, compress and upload `.mov` files like `.mp4`: from the gallery, the video editor, "Add videos", the upload picker and "Open with" in Explorer.
+- **Uploads:** a `.mov` goes up as a QuickTime video (`video/quicktime`), so links play it in the browser where it can.
+- **When one won't open:** instead of only "Can't open this video", the message says why: **ProRes** video has no decoder on Windows (convert it to H.264 or HEVC first), and **HEVC**, **AV1** or **VP9** video needs Microsoft's free extension from the Microsoft Store.
+
 ## Mac fixes (build 0.0.2.9)
 
 - **QuickPrompts start working as soon as you allow Accessibility.** In 0.0.2.8, triggers didn't expand until the app was restarted if Accessibility was allowed after it started.
@@ -25,7 +34,7 @@ sections below; on the Mac, use ⌘ where Windows uses Ctrl.
 - **Video editor:** clip bin, picture in picture and split screen, Flip, Loop (⌘L), Guides (G) and the monochrome view, speed per clip and Reverse.
 - **Gallery:** move along the thin timeline at the bottom of a video tile to scrub it.
 
-## What's new in this update (Windows, build 0.0.2.8): QuickPrompts
+## Earlier update (Windows, build 0.0.2.8): QuickPrompts
 
 Save the prompts and phrases you type again and again, and insert them anywhere by typing a short trigger.
 
