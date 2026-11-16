@@ -2263,18 +2263,29 @@ public:
                 break;
             }
         double t = std::clamp(Now(), edit.trimStart, std::max(edit.trimStart, edit.trimEnd - 1e-3));
-        double next = t + 1 / 30.0;
+        double prev = t - 1 / 30.0, next = t + 1 / 30.0;
         if (!tframes.empty()) {
             const size_t n = tframes.Nearest(t);
             t = std::max(edit.trimStart, tframes.frames[n].t);
-            next = n + 1 < tframes.size() ? tframes.frames[n + 1].t : t + 1 / std::max(1.0, tframes.Fps(n));
+            const double step = 1 / std::max(1.0, tframes.Fps(n));
+            prev = n > 0 ? tframes.frames[n - 1].t : t - step;
+            next = n + 1 < tframes.size() ? tframes.frames[n + 1].t : t + step;
         }
-        m.start = t;
-        m.end = std::min(edit.trimEnd, g_penSeconds <= 0 ? next : t + g_penSeconds);
+        // One frame: from halfway since the frame before to halfway to the next, so it stays on that frame alone when
+        // the frame times are refined (estimated first, then read from the file) and at any rounding of them.
+        m.start = g_penSeconds <= 0 ? std::max(edit.trimStart, (prev + t) / 2) : t;
+        m.end = std::min(edit.trimEnd, g_penSeconds <= 0 ? (t + next) / 2 : t + g_penSeconds);
         if (m.end <= m.start) m.end = m.start + 1 / 30.0;
         edit.marks.push_back(m);
+        selected = m.id;  // its handles show: scale or turn it right away, or draw the next one
         Changed();
         if (std::fabs(Now() - t) > 1e-9) Seek(t);  // so the frame it's on is the one shown
+    }
+
+    // Where the turn handle of a selected pen stroke sits: above the middle of its top edge.
+    VPoint PenTurnHandle(const Mark& m) const {
+        const VRect r = m.Rect();
+        return {r.MidX(), r.y - 26 * s / std::max(0.01, ViewScale())};
     }
 
     std::vector<MenuItem> ListMenu(const std::vector<std::wstring>& labels, int current, const std::function<void(int)>& pick) {
@@ -2661,8 +2672,12 @@ public:
     // ---- stage geometry ----
 
     std::vector<VPoint> Handles(const Mark& m) const {
-        if (m.kind == MarkKind::Title || m.kind == MarkKind::Pen) return {};  // a stroke moves, but isn't resized
+        if (m.kind == MarkKind::Title) return {};
         if (KindIsLine(m.kind)) return {m.a, m.b};
+        if (m.kind == MarkKind::Pen) {  // corners scale it, the one above turns it
+            const VRect r = m.Rect();
+            return {{r.x, r.y}, {r.MaxX(), r.y}, {r.x, r.MaxY()}, {r.MaxX(), r.MaxY()}, PenTurnHandle(m)};
+        }
         const VRect r = m.Rect();
         return {{r.x, r.y}, {r.MaxX(), r.y}, {r.x, r.MaxY()}, {r.MaxX(), r.MaxY()}};
     }
@@ -2949,6 +2964,11 @@ public:
                 gp::RectF vr = ToView(r);
                 vr.Inflate(3 * s, 3 * s);
                 g.DrawRectangle(&pen, vr);
+            }
+            if (on && m.kind == MarkKind::Pen) {  // the stem up to the turn handle
+                const VRect r = m.Rect();
+                gp::Pen stem(A(accent), 1.5f * s);
+                g.DrawLine(&stem, ToView(VPoint{r.MidX(), r.y}), ToView(PenTurnHandle(m)));
             }
             if (on)
                 for (const VPoint& hpt : Handles(m)) {
@@ -3814,6 +3834,21 @@ public:
         const double slop = 8 * s / std::max(0.01, ViewScale());
         SetCapture(hwnd);
         if (penMode) {
+            if (auto mi = SelMark(); mi && edit.marks[*mi].kind == MarkKind::Pen && edit.marks[*mi].Active(Now())) {
+                const Mark& m = edit.marks[*mi];
+                const auto hs = Handles(m);
+                for (int i = 0; i < (int)hs.size(); ++i)
+                    if (std::hypot(hs[i].x - vp.x, hs[i].y - vp.y) <= slop) {
+                        PushUndo();
+                        drag = {};
+                        drag.kind = DragKind::Handle;
+                        drag.id = m.id;
+                        drag.handle = i;
+                        drag.mark = m;
+                        drag.from = vp;
+                        return;
+                    }
+            }
             drag = {};
             drag.kind = DragKind::Pen;
             penPts = {vp};
@@ -3870,6 +3905,7 @@ public:
                     drag.id = m.id;
                     drag.handle = i;
                     drag.mark = m;
+                    drag.from = vp;
                     return;
                 }
         }
@@ -4258,7 +4294,34 @@ public:
                 const Mark& o = drag.mark;
                 for (auto& m : edit.marks) {
                     if (m.id != drag.id) continue;
-                    if (KindIsLine(o.kind)) {
+                    if (o.kind == MarkKind::Pen) {
+                        const VRect r = o.Rect();
+                        if (drag.handle == 4) {  // turn around the middle
+                            const VPoint c{r.MidX(), r.MidY()};
+                            double a = std::atan2(vp.y - c.y, vp.x - c.x) - std::atan2(drag.from.y - c.y, drag.from.x - c.x);
+                            if (keys & MK_SHIFT) a = std::round(a / (3.14159265358979 / 12)) * (3.14159265358979 / 12);
+                            const double ca = std::cos(a), sa = std::sin(a);
+                            for (size_t k = 0; k < m.pts.size() && k < o.pts.size(); ++k) {
+                                const double dx = o.pts[k].x - c.x, dy = o.pts[k].y - c.y;
+                                m.pts[k] = {c.x + dx * ca - dy * sa, c.y + dx * sa + dy * ca};
+                            }
+                        } else {  // scale from the opposite corner
+                            const VPoint anchor{drag.handle % 2 == 0 ? r.MaxX() : r.x, drag.handle < 2 ? r.MaxY() : r.y};
+                            const VPoint corner{drag.handle % 2 == 0 ? r.x : r.MaxX(), drag.handle < 2 ? r.y : r.MaxY()};
+                            const double w0 = corner.x - anchor.x, h0 = corner.y - anchor.y;
+                            double sx = std::fabs(w0) < 1 ? 1 : (vp.x - anchor.x) / w0, sy = std::fabs(h0) < 1 ? 1 : (vp.y - anchor.y) / h0;
+                            if (!(keys & MK_SHIFT)) {  // keeps its shape; Shift stretches it freely
+                                const double k = std::fabs(w0) < 1 ? sy : std::fabs(h0) < 1 ? sx : std::max(sx, sy);
+                                sx = sy = k;
+                            }
+                            const double minSide = 6;  // video pixels: never squashed to nothing or turned inside out
+                            if (std::fabs(w0) >= 1) sx = std::max(sx, minSide / std::fabs(w0));
+                            if (std::fabs(h0) >= 1) sy = std::max(sy, minSide / std::fabs(h0));
+                            for (size_t k = 0; k < m.pts.size() && k < o.pts.size(); ++k)
+                                m.pts[k] = {anchor.x + (o.pts[k].x - anchor.x) * sx, anchor.y + (o.pts[k].y - anchor.y) * sy};
+                        }
+                        FitPenBounds(m);
+                    } else if (KindIsLine(o.kind)) {
                         (drag.handle == 0 ? m.a : m.b) = vp;
                     } else {
                         const VRect r = o.Rect();
@@ -6729,10 +6792,13 @@ ATHER_TEST(video_editor_pen_strokes) {
     const Mark m = e->edit.marks[0];
     CHECK(m.kind == MarkKind::Pen && m.pts.size() > 10);
     CHECK(m.Rect().w > 70 && m.Rect().w < 90 && m.Rect().h > 70);
-    CHECK_NEAR(m.start, e->tframes.frames[15].t, 1e-9);
-    CHECK_NEAR(m.end, e->tframes.frames[16].t, 1e-9);  // only frame 15
+    const auto& fr = e->tframes.frames;
+    CHECK(m.start > fr[14].t && m.start < fr[15].t && m.end > fr[15].t && m.end < fr[16].t);  // only frame 15, with room either side
     CHECK(m.Active(e->tframes.frames[15].t) && !m.Active(e->tframes.frames[16].t) && !m.Active(e->tframes.frames[14].t));
-    CHECK(!e->selected);  // not selected: the next stroke can follow right away
+    CHECK(e->selected == m.id);  // selected, so its handles show; a drag elsewhere still draws the next one
+    CHECK_EQ(e->Handles(m).size(), 5u);  // 4 corners to scale, 1 above to turn
+    Pump(300);  // the frame times read from the file may replace the estimated ones: still frame 15 alone
+    CHECK(m.Active(e->tframes.frames[15].t) && !m.Active(e->tframes.frames[16].t) && !m.Active(e->tframes.frames[14].t));
     // Drawn in the video on its frame only.
     auto drawn = [&](double t) {
         auto bmp = Bitmap::Create(640, 360);
@@ -6756,8 +6822,7 @@ ATHER_TEST(video_editor_pen_strokes) {
         DestroyWindow(e->hwnd);
         return;
     }
-    CHECK_NEAR(e->edit.marks[1].start, e->tframes.frames[16].t, 1e-9);
-    CHECK_NEAR(e->edit.marks[1].end, e->tframes.frames[17].t, 1e-9);
+    CHECK(e->edit.marks[1].Active(fr[16].t) && !e->edit.marks[1].Active(fr[15].t) && !e->edit.marks[1].Active(fr[17].t));
     CHECK_EQ(e->edit.marks[1].color, 3);
     // Longer: 1 s from the frame on screen.
     g_penSeconds = 1;
@@ -6779,6 +6844,35 @@ ATHER_TEST(video_editor_pen_strokes) {
     e->OnMouseUp();
     CHECK(std::fabs(e->edit.marks[1].pts[0].x - p0.x - 30) < 3 && std::fabs(e->edit.marks[1].pts[0].y - p0.y - 20) < 3);
     CHECK(std::fabs(e->edit.marks[1].Rect().x - (220 + 30)) < 4);
+    // Scale and turn, with the pen still on: the selected stroke's handles take the drag instead of drawing.
+    e->Key('P', {});
+    e->Select(e->edit.marks[1].id);
+    const size_t count = e->edit.marks.size();
+    auto drag = [&](VPoint from, VPoint to, WPARAM keys = MK_LBUTTON) {
+        const gp::PointF a = e->ToView(from), b = e->ToView(to);
+        e->OnMouseDown({(LONG)std::lround(a.X), (LONG)std::lround(a.Y)}, false);
+        e->OnMouseMove({(LONG)std::lround(b.X), (LONG)std::lround(b.Y)}, keys);
+        e->OnMouseUp();
+    };
+    const VRect r0 = e->edit.marks[1].Rect();
+    drag({r0.MaxX(), r0.MaxY()}, {r0.x + r0.w * 2, r0.y + r0.h * 1.5});  // bottom-right corner: twice as wide, shape kept
+    CHECK_EQ(e->edit.marks.size(), count);  // no new stroke
+    const VRect r1 = e->edit.marks[1].Rect();
+    CHECK(std::fabs(r1.x - r0.x) < 1 && std::fabs(r1.y - r0.y) < 1);  // from the opposite corner
+    CHECK(std::fabs(r1.w - r0.w * 2) < 2 && std::fabs(r1.h - r0.h * 2) < 2);
+    drag({r1.MaxX(), r1.MaxY()}, {r1.x + r1.w, r1.y + r1.h * 0.5}, MK_LBUTTON | MK_SHIFT);  // Shift: only flatter
+    const VRect r2 = e->edit.marks[1].Rect();
+    CHECK(std::fabs(r2.w - r1.w) < 2 && std::fabs(r2.h - r1.h * 0.5) < 2);
+    // Turn a quarter round (from the handle above to the right of the middle): wide becomes tall.
+    const Mark before = e->edit.marks[1];
+    const VPoint c{r2.MidX(), r2.MidY()};
+    drag(e->PenTurnHandle(before), {c.x + 200, c.y});
+    const VRect r3 = e->edit.marks[1].Rect();
+    CHECK(std::fabs(r3.w - r2.h) < 3 && std::fabs(r3.h - r2.w) < 3);
+    CHECK(std::fabs(r3.MidX() - c.x) < 2 && std::fabs(r3.MidY() - c.y) < 2);  // around its middle
+    e->Undo();
+    CHECK(e->edit.marks[1] == before);
+    e->Key('P', {});
     const gp::PointF inside = e->ToView(VPoint{290, 200});  // the middle of the moved loop
     e->OnMouseDown({(LONG)inside.X, (LONG)inside.Y}, false);
     e->OnMouseUp();
