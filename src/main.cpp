@@ -869,7 +869,8 @@ void Execute(int id, bool deferCapture, bool untrusted) {
             std::wstring dir = g_settings.CapturesFolder();
             OPENFILENAMEW ofn{sizeof(ofn)};
             ofn.hwndOwner = g_hwnd;
-            ofn.lpstrFilter = L"Images and videos\0*.png;*.jpg;*.jpeg;*.gif;*.mp4\0All files\0*.*\0";
+            const std::wstring filter = MediaFilter(true, true);
+            ofn.lpstrFilter = filter.c_str();
             ofn.lpstrFile = file;
             ofn.nMaxFile = MAX_PATH;
             ofn.lpstrInitialDir = dir.c_str();

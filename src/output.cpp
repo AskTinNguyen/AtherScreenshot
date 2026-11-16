@@ -444,7 +444,7 @@ std::vector<std::wstring> RecentCaptures(const std::wstring& base, size_t max, b
         std::sort(files.begin(), files.end(),
                   [](const Found& a, const Found& b) { return CompareFileTime(&a.written, &b.written) > 0; });
         for (const auto& f : files) {
-            const bool ok = includeRecordings ? HasExt(f.name, {L"png", L"jpg", L"jpeg", L"bmp", L"gif", L"mp4"})
+            const bool ok = includeRecordings ? HasExt(f.name, {L"png", L"jpg", L"jpeg", L"bmp", L"gif", L"mp4", L"mov", L"m4v"})
                                               : IsImageFile(f.name);
             if (!ok) continue;
             out.push_back(base + L"\\" + dir.name + L"\\" + f.name);

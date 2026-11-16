@@ -642,6 +642,24 @@ std::optional<Clip> ClipOf(const std::wstring& path) {
     return c;
 }
 
+std::wstring VideoFormatHint(const std::wstring& path) {
+    std::string tag = VideoCodecTag(path);
+    if (tag.empty()) {  // not an MP4 or QuickTime file: the stored type as Media Foundation names it, when it opens
+        EnsureMediaFoundation();
+        ComPtr<IMFSourceReader> r;
+        ComPtr<IMFMediaType> t;
+        GUID sub{};
+        if (SUCCEEDED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &r)) &&
+            SUCCEEDED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &t)) && SUCCEEDED(t->GetGUID(MF_MT_SUBTYPE, &sub)))
+            for (int i = 0; i < 4; ++i) tag += (char)std::tolower((unsigned char)((sub.Data1 >> (8 * i)) & 255));
+    }
+    if (tag.starts_with("apc") || tag.starts_with("ap4")) return L"ProRes video can't be decoded on Windows. Convert it to H.264 or HEVC first.";
+    if (tag == "hvc1" || tag == "hev1" || tag == "hevc") return L"HEVC video needs the HEVC Video Extensions from the Microsoft Store.";
+    if (tag == "av01") return L"AV1 video needs the AV1 Video Extension from the Microsoft Store.";
+    if (tag == "vp09" || tag == "vp90") return L"VP9 video needs the VP9 Video Extensions from the Microsoft Store.";
+    return L"";
+}
+
 std::vector<double> FrameTimes(const std::wstring& path) {
     EnsureMediaFoundation();
     std::vector<double> out;
@@ -3637,6 +3655,25 @@ ATHER_TEST(video_thumbnails_spread_over_the_clip) {
         CHECK(((th[0]->Bits()[0] >> 16) & 255) > 150);  // red first
         CHECK((th[5]->Bits()[0] & 255) > 150);          // blue last
     }
+}
+
+
+ATHER_TEST(video_mov_file_opens_like_mp4) {
+    // A QuickTime .mov holding H.264 (what phones and Mac screen recordings make) reads like an .mp4.
+    const std::wstring path = test::TempDir() + L"/clip.mov";
+    CHECK(WriteTestClip(path, 320, 180, 10, 1, true, 90));
+    CHECK(MediaTypeOf(path) == MediaType::Video && IsMediaFile(path));
+    const auto c = ClipOf(path);
+    CHECK(c && c->hasAudio);
+    VideoReader vr;
+    CHECK(vr.Open(path));
+    CHECK(vr.Size().cx == 180 && vr.Size().cy == 320);
+    BitmapPtr f;
+    double t = 0;
+    CHECK(vr.Read(&f, &t) && f);
+    CHECK(FrameTimes(path).size() == 10);
+    CHECK(VideoCodecTag(path) == "avc1");
+    CHECK(VideoFormatHint(path).empty());  // H.264 decodes everywhere: nothing to explain
 }
 
 }  // namespace ather

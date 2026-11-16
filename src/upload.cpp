@@ -34,6 +34,9 @@ std::wstring ContentType(const std::wstring& path) {
     if (ext == L"jpg" || ext == L"jpeg") return L"image/jpeg";
     if (ext == L"gif") return L"image/gif";
     if (ext == L"mp4") return L"video/mp4";
+    if (ext == L"m4v") return L"video/x-m4v";
+    if (ext == L"mov") return L"video/quicktime";
+    if (ext == L"webp") return L"image/webp";
     return L"application/octet-stream";
 }
 

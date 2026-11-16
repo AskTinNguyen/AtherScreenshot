@@ -73,6 +73,9 @@ Sequence SequenceOf(const std::wstring& source, const VideoEdit& e);
 // The time of every frame of a file's video in order (source seconds; decoding gives the frames these same times),
 // read from the file without decoding it. Empty when they can't be read.
 std::vector<double> FrameTimes(const std::wstring& path);
+// Why a video that won't open can't be read here, when it's a known format whose decoder Windows lacks or keeps in a
+// Store extension (ProRes, HEVC, AV1, VP9); empty otherwise. For the message shown instead of "Can't open this video".
+std::wstring VideoFormatHint(const std::wstring& path);
 // Review notes the app adds to a video's sidecar ("<video>.notes.json", see videoedit.h) by itself: AI agents' markers
 // and bug reports. Each time (and range end) moves to the frame on screen at that moment. Notes already there stay; a
 // sidecar that can't be read is left as it is (false).

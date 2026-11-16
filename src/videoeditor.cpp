@@ -5077,7 +5077,8 @@ bool OpenVideoEditor(const std::wstring& path) {
             std::erase(g_editors, e);
             delete e;
         }
-        ShowToast(L"Can't open this video", FileNameOf(path), nullptr, nullptr, 4000);
+        const std::wstring hint = VideoFormatHint(path);
+        ShowToast(L"Can't open this video", hint.empty() ? FileNameOf(path) : FileNameOf(path) + L"\n" + hint, nullptr, nullptr, hint.empty() ? 4000 : 8000);
         return false;
     }
     return true;
