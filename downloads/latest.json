@@ -1,16 +1,16 @@
 {
-    "windows": {
-        "version": "0.0.2.8",
-        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-        "sha256": "512f6ce27f21e79e7541d06f31525f80e73ebda7c2e31618857d3ec247749846",
-        "size": 4952576,
-        "notes": "QuickPrompts: type a trigger and Space in any app to paste a saved prompt, or press Ctrl+Alt+Space to pick one."
-    },
-    "macos": {
-        "version": "0.0.2.9",
-        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-        "sha256": "e8ba1099c5e13a7b3110ebbbb2a87dae3b34669524f3af7d91acd6409e7bd8bf",
-        "size": 5028644,
-        "notes": "QuickPrompts start as soon as you allow Accessibility, and your macOS Text Replacements win over a trigger with the same name. Includes 0.0.2.8: QuickPrompts (\u2303\u2325P picker), the clip bin, picture in picture and split screen, flip, loop, guides, speed per clip and Reverse, and gallery scrubbing."
-    }
+    "windows":  {
+                    "version":  "0.0.2.10",
+                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+                    "sha256":  "675390378a5db59348a0c905aec704c041533028ed359c22c5ae3b1e3dbf01a5",
+                    "size":  4978688,
+                    "notes":  "MOV videos from iPhones, Macs and cameras open like MP4 on Windows, with a clear reason when one cannot (ProRes, or a missing HEVC extension)."
+                },
+    "macos":  {
+                  "version":  "0.0.2.9",
+                  "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+                  "sha256":  "e8ba1099c5e13a7b3110ebbbb2a87dae3b34669524f3af7d91acd6409e7bd8bf",
+                  "size":  5028644,
+                  "notes":  "QuickPrompts start as soon as you allow Accessibility, and your macOS Text Replacements win over a trigger with the same name. Includes 0.0.2.8: QuickPrompts (⌃⌥P picker), the clip bin, picture in picture and split screen, flip, loop, guides, speed per clip and Reverse, and gallery scrubbing."
+              }
 }
