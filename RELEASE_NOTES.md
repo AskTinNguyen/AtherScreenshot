@@ -10,7 +10,17 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new in this update (Windows, build 0.0.2.12): why a video won't open
+## What's new in this update (Windows, build 0.0.2.13): scale and turn pen strokes
+
+The stroke you just drew with the Pen is selected right away, so you can size and turn it. The Mac app stays at build
+0.0.2.9.
+
+- **Scale:** drag a corner of the selected stroke. It keeps its shape; hold Shift to stretch it freely.
+- **Turn:** drag the round handle above it to rotate it around its middle; hold Shift for 15° steps.
+- **Keep drawing:** with the pen on, a drag anywhere else draws the next stroke, as before. With the pen off, click a stroke's line to select it and get the same handles.
+- **Fix:** a stroke set to last 1 frame no longer shows on the next frame too after the video finishes loading.
+
+## Earlier update (Windows, build 0.0.2.12): why a video won't open
 
 When a video can't be opened on Windows, the app now says exactly why and what to do, instead of only "Can't open
 this video". The Mac app stays at build 0.0.2.9.
@@ -26,7 +36,7 @@ Circle things on the video by hand, as quickly as you'd do it on a screenshot. T
 - **Draw:** **+ Add › Pen** (or press **P**), then drag on the video. The stroke shows as you draw, in its color and width. Press P or Esc to stop.
 - **How long it shows:** **+ Add › Pen lasts:** **1 frame** (only the frame you draw on), ½ s, 1 s or 3 s (the default).
 - **Frame by frame:** with 1 frame, circle, press → for the next frame, circle again. New strokes aren't selected, so the next one can follow at once, in the same color and width as the last.
-- **Change one:** with the pen off, click a stroke's line to select it (inside its loop doesn't); drag it to move it, set its color, width and Fade or Pop in the inspector, Del deletes it, Ctrl+Z undoes.
+- **Change one:** with the pen off, click a stroke's line to select it (inside its loop doesn't); drag it to move it, set its color, width and Fade or Pop in the inspector, Del deletes it, Ctrl+Z undoes. (From build 0.0.2.13 it can also be scaled and turned.)
 - **Where it shows:** in the preview, the saved video and GIF, like the rest of the markup. "Pen lasts" is remembered until the app closes.
 
 ## Earlier update (Windows, build 0.0.2.10): MOV videos
