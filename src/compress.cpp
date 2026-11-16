@@ -191,7 +191,8 @@ CompressResult CompressVideo(const std::wstring& path, double capBytes, Compress
     r.bytesBefore = FileBytes(path);
     const auto clip = ClipOf(path);  // upright size, length, and whether its sound decodes here
     if (!clip || clip->Duration() <= 0) {
-        r.error = L"Can't read this video.";
+        const std::wstring hint = VideoFormatHint(path);
+        r.error = hint.empty() ? L"Can't read this video." : hint;
         return r;
     }
     if (r.bytesBefore > 0 && r.bytesBefore <= capBytes) {

@@ -1176,12 +1176,17 @@ public:
     // Joins videos after the selected clip (or at the end). Any shape works: each is fitted into the frame.
     void AddClips(const std::vector<std::wstring>& paths) {
         std::vector<Clip> add;
-        std::wstring bad;
+        std::vector<std::wstring> bad;
         for (const auto& p : paths) {
             if (auto c = IsVideoFile(p) ? ClipOf(p) : std::nullopt) add.push_back(*c);
-            else bad += (bad.empty() ? L"" : L", ") + FileNameOf(p);
+            else bad.push_back(p);
         }
-        if (!bad.empty()) ShowToast(L"Can't add that as a video", bad, nullptr, nullptr, 4000);
+        if (bad.size() == 1) ShowToast(L"Can't add that as a video", IsVideoFile(bad[0]) ? VideoFailureText(bad[0]) : FileNameOf(bad[0]), nullptr, nullptr, 9000);
+        else if (!bad.empty()) {
+            std::wstring names;
+            for (const auto& b : bad) names += (names.empty() ? L"" : L", ") + FileNameOf(b);
+            ShowToast(L"Can't add those as videos", names, nullptr, nullptr, 5000);
+        }
         if (add.empty()) return;
         std::vector<Clip> clips = edit.clips;
         const size_t at = SelClipIndex() ? *SelClipIndex() + 1 : clips.size();
@@ -1204,7 +1209,7 @@ public:
                 AddOverlay(*c, t, OverlayLayout::Pip);
                 t += c->Duration();  // several: one after another
             } else {
-                ShowToast(L"Can't add that as a video", FileNameOf(p), nullptr, nullptr, 4000);
+                ShowToast(L"Can't add that as a video", IsVideoFile(p) ? VideoFailureText(p) : FileNameOf(p), nullptr, nullptr, 9000);
             }
         }
     }
@@ -1304,7 +1309,7 @@ public:
                                      layout == OverlayLayout::Pip ? L"Video to show in a box on top" : L"Video to show side by side");
         if (files.empty()) return;
         if (auto c = IsVideoFile(files[0]) ? ClipOf(files[0]) : std::nullopt) AddOverlay(*c, InsertTime(), layout);
-        else ShowToast(L"Can't add that as a video", FileNameOf(files[0]), nullptr, nullptr, 4000);
+        else ShowToast(L"Can't add that as a video", IsVideoFile(files[0]) ? VideoFailureText(files[0]) : FileNameOf(files[0]), nullptr, nullptr, 9000);
     }
     // Bin piece `i` goes on top from `at` (one undo step with taking it from the bin).
     void BinToOverlay(size_t i, double at) {
@@ -5218,8 +5223,8 @@ bool OpenVideoEditor(const std::wstring& path) {
             std::erase(g_editors, e);
             delete e;
         }
-        const std::wstring hint = VideoFormatHint(path);
-        ShowToast(L"Can't open this video", hint.empty() ? FileNameOf(path) : FileNameOf(path) + L"\n" + hint, nullptr, nullptr, hint.empty() ? 4000 : 8000);
+        const std::wstring why = VideoFailureText(path);
+        ShowToast(L"Can't open this video", why, nullptr, nullptr, why.find(L'\n') == std::wstring::npos ? 4000 : 9000);
         return false;
     }
     return true;

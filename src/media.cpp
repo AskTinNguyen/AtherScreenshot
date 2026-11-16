@@ -950,7 +950,8 @@ private:
 
 }  // namespace
 
-std::string VideoCodecTag(const std::wstring& path) {
+std::string VideoCodecTag(const std::wstring& path, int* profile) {
+    if (profile) *profile = 0;
     InFile f(path);
     std::vector<uint8_t> ftyp, moov;
     Track t;
@@ -958,6 +959,13 @@ std::string VideoCodecTag(const std::wstring& path) {
     if (!ReadHead(f, &ftyp, &moov) || !ReadTrack(moov, Fcc("vide"), f.Size(), &t) || t.stsd.n < 24) return "";
     std::string tag(reinterpret_cast<const char*>(t.stsd.p + 20), 4);
     for (char& c : tag) c = (char)std::tolower((unsigned char)c);
+    // H.264: the profile is the second byte of the avcC box inside the entry (after its version byte).
+    if (profile && (tag == "avc1" || tag == "avc3"))
+        for (size_t i = 24; i + 6 <= t.stsd.n; ++i)
+            if (std::memcmp(t.stsd.p + i, "avcC", 4) == 0) {
+                *profile = t.stsd.p[i + 5];
+                break;
+            }
     return tag;
 }
 

@@ -739,6 +739,7 @@ public:
     GifAnim gif;
     BitmapPtr previewImg;
     std::unique_ptr<VideoPlayer> previewVideo;  // a video in the preview plays
+    std::wstring previewWhy;  // a video that can't be shown: why (VideoFormatHint)
     std::wstring previewLoaded;
     double pvZoom = 0;  // 0 = fit
     double pvX = 0, pvY = 0;
@@ -2476,6 +2477,7 @@ void Gallery::PaintPreview(HDC dc) {
         KillTimer(hwnd, kTimerGif);
         KillTimer(hwnd, kTimerVideo);
         previewVideo.reset();
+        previewWhy.clear();
         gif = {};
         previewImg.reset();
         const MediaType mt = MediaTypeOf(u);
@@ -2494,6 +2496,7 @@ void Gallery::PaintPreview(HDC dc) {
                 previewVideo->Play();
                 SetTimer(hwnd, kTimerVideo, 15, nullptr);
             }
+            if (!previewImg && !previewVideo) previewWhy = VideoFormatHint(u);
         } else {
             previewImg = LoadImageFile(u);
         }
@@ -2551,7 +2554,14 @@ void Gallery::PaintPreview(HDC dc) {
             }, previewVideo ? L"Play" : L"Edit video (Enter)");
         }
     } else {
-        Text(dc, fUi, L"Can't show this file", area, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (previewWhy.empty()) {
+            Text(dc, fUi, L"Can't show this file", area, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            const int mid = (area.top + area.bottom) / 2;
+            Text(dc, fUi, L"Can't show this video", {area.left, mid - S(34), area.right, mid - S(8)}, theme::kText, DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
+            RECT why{std::max(area.left, (area.left + area.right) / 2 - S(300)), mid, std::min(area.right, (area.left + area.right) / 2 + S(300)), mid + S(60)};
+            Text(dc, fUi, previewWhy, why, theme::kMuted, DT_CENTER | DT_TOP | DT_WORDBREAK);
+        }
     }
     // Top bar.
     RECT top{0, 0, client.right, S(48)};
