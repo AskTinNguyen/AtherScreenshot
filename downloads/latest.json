@@ -1,10 +1,10 @@
 {
     "windows":  {
-                    "version":  "0.0.2.11",
+                    "version":  "0.0.2.12",
                     "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "85b6cec7a463bc8b00a36de1f62cfbdd9380c6cf00f265a0796bee3c3e4e1ac9",
-                    "size":  5005824,
-                    "notes":  "Video editor Pen: circle things on the video by hand (P), lasting just the frame you draw on, or 1/2 s, 1 s or 3 s."
+                    "sha256":  "680e2ac9c88b34ae8049f7458cd4a0848d2e0cd8827ad73cc12e127b8a3caeb6",
+                    "size":  5013504,
+                    "notes":  "When a video will not open, the app says why: 10-bit or 4:2:2 H.264 and ProRes need converting, HEVC/AV1/VP9 need a Microsoft Store extension."
                 },
     "macos":  {
                   "version":  "0.0.2.9",
