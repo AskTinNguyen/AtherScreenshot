@@ -65,6 +65,9 @@ const wchar_t* const kAspects[] = {L"Free", L"16:9", L"4:3", L"1:1", L"9:16"};
 const double kAspectValues[] = {0, 16.0 / 9, 4.0 / 3, 1, 9.0 / 16};
 
 std::wstring g_folder;
+// How long a pen stroke shows: 0 is one frame (the frame it was drawn on). Kept while the app runs.
+const double kPenSeconds[] = {0, 0.5, 1, 3};
+double g_penSeconds = 3;
 HICON g_icon = nullptr;
 std::wstring g_noteAuthor;  // remembered in settings; empty: Windows' display name
 std::function<void(const std::wstring&)> g_rememberAuthor;
@@ -533,6 +536,8 @@ public:
     bool dirty = false;
     std::optional<uint64_t> selected;
     bool cropping = false;
+    bool penMode = false;  // P: drags on the video draw freehand strokes
+    std::vector<VPoint> penPts;  // the stroke being drawn
     int aspect = 0;
     bool playing = false;
     double paused = 0;  // the playhead while paused
@@ -564,7 +569,7 @@ public:
     };
     std::optional<Span> marked;
 
-    enum class DragKind { None, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan, Range, BinMove, OverlayItem, OverlayBox };
+    enum class DragKind { None, Pen, Crop, Move, Handle, Caption, TrimStart, TrimEnd, Playhead, Item, ClipMove, ClipIn, ClipOut, Pan, Range, BinMove, OverlayItem, OverlayBox };
     struct Drag {
         DragKind kind = DragKind::None;
         VPoint from;
@@ -2187,8 +2192,16 @@ public:
         note.run = [this] { AddNote(); };
         v.push_back(note);
         v.push_back(MenuItem::Sep());
+        MenuItem pen;
+        pen.label = L"Pen: draw on the video\tP";
+        pen.checked = penMode;
+        pen.run = [this] { TogglePen(); };
+        v.push_back(pen);
+        v.push_back(PenLastsMenu());
+        v.push_back(MenuItem::Sep());
         for (int k = 0; k < kMarkKinds; ++k) {
             const MarkKind kind = (MarkKind)k;
+            if (kind == MarkKind::Pen) continue;  // drawn, not placed: above
             MenuItem it;
             it.label = KindLabel(kind);
             if (KindKey(kind)) it.label += std::wstring(L"\t") + KindKey(kind);
@@ -2197,6 +2210,66 @@ public:
             if (kind == MarkKind::Step || kind == MarkKind::Pixelate) v.push_back(MenuItem::Sep());
         }
         return v;
+    }
+
+    static std::wstring PenLastsLabel(double sec) {
+        if (sec <= 0) return L"1 frame";
+        return (sec == 0.5 ? std::wstring(L"\u00BD") : std::to_wstring((int)sec)) + L" s";
+    }
+    MenuItem PenLastsMenu() {
+        MenuItem m;
+        m.label = L"Pen lasts: " + PenLastsLabel(g_penSeconds);
+        for (double sec : kPenSeconds) {
+            MenuItem it;
+            it.label = PenLastsLabel(sec) + (sec <= 0 ? L"  (only the frame you draw on)" : L"");
+            it.checked = sec == g_penSeconds;
+            it.run = [this, sec] {
+                g_penSeconds = sec;
+                Invalidate();
+            };
+            m.sub.push_back(it);
+        }
+        return m;
+    }
+
+    void TogglePen() {
+        penMode = !penMode;
+        if (penMode) {
+            cropping = false;
+            Select(std::nullopt);
+            if (playing) Pause();
+        }
+        Invalidate();
+    }
+
+    // The stroke just drawn becomes a pen mark on the frame on screen, for "Pen lasts" (1 frame: only that one).
+    void AddPenStroke(std::vector<VPoint> pts) {
+        if (pts.empty()) return;
+        PushUndo();
+        Mark m;
+        m.kind = MarkKind::Pen;
+        m.pts = std::move(pts);
+        FitPenBounds(m);
+        for (auto it = edit.marks.rbegin(); it != edit.marks.rend(); ++it)  // the look of the last stroke
+            if (it->kind == MarkKind::Pen) {
+                m.color = it->color;
+                m.level = it->level;
+                m.style = it->style;
+                break;
+            }
+        double t = std::clamp(Now(), edit.trimStart, std::max(edit.trimStart, edit.trimEnd - 1e-3));
+        double next = t + 1 / 30.0;
+        if (!tframes.empty()) {
+            const size_t n = tframes.Nearest(t);
+            t = std::max(edit.trimStart, tframes.frames[n].t);
+            next = n + 1 < tframes.size() ? tframes.frames[n + 1].t : t + 1 / std::max(1.0, tframes.Fps(n));
+        }
+        m.start = t;
+        m.end = std::min(edit.trimEnd, g_penSeconds <= 0 ? next : t + g_penSeconds);
+        if (m.end <= m.start) m.end = m.start + 1 / 30.0;
+        edit.marks.push_back(m);
+        Changed();
+        if (std::fabs(Now() - t) > 1e-9) Seek(t);  // so the frame it's on is the one shown
     }
 
     std::vector<MenuItem> ListMenu(const std::vector<std::wstring>& labels, int current, const std::function<void(int)>& pick) {
@@ -2583,7 +2656,7 @@ public:
     // ---- stage geometry ----
 
     std::vector<VPoint> Handles(const Mark& m) const {
-        if (m.kind == MarkKind::Title) return {};
+        if (m.kind == MarkKind::Title || m.kind == MarkKind::Pen) return {};  // a stroke moves, but isn't resized
         if (KindIsLine(m.kind)) return {m.a, m.b};
         const VRect r = m.Rect();
         return {{r.x, r.y}, {r.MaxX(), r.y}, {r.x, r.MaxY()}, {r.MaxX(), r.MaxY()}};
@@ -2591,6 +2664,16 @@ public:
 
     bool Hit(const Mark& m, VPoint p, double slop) const {
         if (m.kind == MarkKind::Title) return true;
+        if (m.kind == MarkKind::Pen) {  // near the line itself, not anywhere inside the loop it draws
+            const double reach = slop * 1.5 + 4 * std::max(1.0, videoSize.cy / 720.0);
+            for (size_t i = 0; i < m.pts.size(); ++i) {
+                const VPoint a = m.pts[i], b = m.pts[std::min(i + 1, m.pts.size() - 1)];
+                const double dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+                const double k = l2 == 0 ? 0 : std::clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / l2, 0.0, 1.0);
+                if (std::hypot(p.x - (a.x + k * dx), p.y - (a.y + k * dy)) <= reach) return true;
+            }
+            return false;
+        }
         if (KindIsLine(m.kind)) {
             const double dx = m.b.x - m.a.x, dy = m.b.y - m.a.y, l2 = dx * dx + dy * dy;
             const double t = l2 == 0 ? 0 : std::clamp(((p.x - m.a.x) * dx + (p.y - m.a.y) * dy) / l2, 0.0, 1.0);
@@ -2813,6 +2896,33 @@ public:
                             (LONG)(v.X + v.Width / 2 + sz.cx / 2 + S(12)), (LONG)(v.Y + v.Height / 2 + sz.cy / 2 + S(6))};
             FillRR(g, pill, (float)S(8), gp::Color(140, 0, 0, 0));
             Text(dc, fUi, t, pill, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        if (penMode) {
+            if (penPts.size() > 1) {  // the stroke being drawn, in the color and width it will have
+                annot::Shape sh;
+                sh.kind = annot::Kind::Pen;
+                sh.unit = (float)std::max(1.0, videoSize.cy / 720.0);
+                for (auto it = edit.marks.rbegin(); it != edit.marks.rend(); ++it)
+                    if (it->kind == MarkKind::Pen) {
+                        sh.color = it->color;
+                        sh.level = it->level;
+                        break;
+                    }
+                const COLORREF col = annot::Color(sh.color);
+                gp::Pen live(gp::Color(255, GetRValue(col), GetGValue(col), GetBValue(col)), (float)(annot::StrokeWidth(sh) * ViewScale()));
+                live.SetStartCap(gp::LineCapRound);
+                live.SetEndCap(gp::LineCapRound);
+                live.SetLineJoin(gp::LineJoinRound);
+                std::vector<gp::PointF> line;
+                for (const auto& q : penPts) line.push_back(ToView(q));
+                g.DrawLines(&live, line.data(), (INT)line.size());
+            }
+            const std::wstring t = L"Pen: drag to draw  \u00B7  lasts " + PenLastsLabel(g_penSeconds) + L"  \u00B7  P or Esc to stop";
+            const SIZE sz = Measure(dc, fSmall, t);
+            const RECT pill{(LONG)(v.X + v.Width / 2 - sz.cx / 2 - S(10)), (LONG)(v.Y + S(10)), (LONG)(v.X + v.Width / 2 + sz.cx / 2 + S(10)),
+                            (LONG)(v.Y + S(10) + sz.cy + S(8))};
+            FillRR(g, pill, (float)S(8), gp::Color(150, 0, 0, 0));
+            Text(dc, fSmall, t, pill, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         const double now = Now();
         if (auto mi = SelMark()) {
@@ -3136,6 +3246,7 @@ public:
                 case MarkKind::Box:
                 case MarkKind::Ellipse:
                 case MarkKind::Step:
+                case MarkKind::Pen:
                     colorPopup(m.color, L"Color", [this](int i) { UpdateMark([i](Mark& x) { x.color = i; }); });
                     levelPopup(m.level);
                     break;
@@ -3214,7 +3325,7 @@ public:
         }
 
         if (parts.empty()) {
-            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · Shift+drag mark · Ctrl+C copy · G guides · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · drop videos to join",
+            Text(dc, fSmall, L"Space plays · I and O trim · S split · Del to bin · Shift+drag mark · Ctrl+C copy · G guides · M note · [ ] notes · T caption · A arrow · R box · E emoji · X blur · Z zoom · C crop · P pen · drop videos to join",
                  row, theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             // Measure by drawing off-screen first, then center the row.
@@ -3697,6 +3808,13 @@ public:
         const VPoint vp = ToVideo(pt);
         const double slop = 8 * s / std::max(0.01, ViewScale());
         SetCapture(hwnd);
+        if (penMode) {
+            drag = {};
+            drag.kind = DragKind::Pen;
+            penPts = {vp};
+            Invalidate();
+            return;
+        }
         // Overlay videos are drawn over the markup, so they're picked first; cropping still goes on around them (and
         // over one that isn't selected).
         if (const auto hit = OverlayAt(pt); hit && (!cropping || SelOverlay() == hit->first)) {
@@ -3968,6 +4086,14 @@ public:
         const double now = TT(p.x);
         const VPoint vp = ToVideo(p);
         switch (drag.kind) {
+            case DragKind::Pen: {
+                const double step = 1.5 / std::max(0.01, ViewScale());  // a point every 1.5 screen pixels or so
+                if (penPts.empty() || std::hypot(vp.x - penPts.back().x, vp.y - penPts.back().y) >= step) {
+                    penPts.push_back(vp);
+                    Invalidate();
+                }
+                break;
+            }
             case DragKind::TrimStart:
                 SetTrim(now, std::nullopt);
                 Seek(edit.trimStart);
@@ -4118,6 +4244,7 @@ public:
                     if (m.id == drag.id) {
                         m.a = {drag.mark.a.x + dx, drag.mark.a.y + dy};
                         m.b = {drag.mark.b.x + dx, drag.mark.b.y + dy};
+                        for (size_t k = 0; k < m.pts.size() && k < drag.mark.pts.size(); ++k) m.pts[k] = {drag.mark.pts[k].x + dx, drag.mark.pts[k].y + dy};
                     }
                 Changed();
                 break;
@@ -4179,6 +4306,13 @@ public:
     void OnMouseUp() {
 
         const Drag d = drag;
+        if (d.kind == DragKind::Pen) {
+            drag = {};
+            ReleaseCapture();
+            AddPenStroke(std::exchange(penPts, {}));
+            Invalidate();
+            return;
+        }
         if (d.kind == DragKind::Pan) {
             drag = {};
             ReleaseCapture();
@@ -4213,6 +4347,7 @@ public:
     void CancelDrag() {
         if (drag.kind == DragKind::None) return;
         if (drag.kind == DragKind::Range) marked = drag.before;
+        penPts.clear();
         drag = {};
         if (GetCapture() == hwnd) ReleaseCapture();
         Invalidate();
@@ -4272,10 +4407,11 @@ public:
             case 'N': AddMark(MarkKind::Step); break;
             case 'X': AddMark(MarkKind::Blur); break;
             case 'Z': AddMark(MarkKind::Zoom); break;
-            case 'C': cropping = !cropping; Invalidate(); break;
+            case 'C': cropping = !cropping; penMode = penMode && !cropping; Invalidate(); break;
             case 'M': AddNote(); break;
             case 'F': FitMagnifier(); break;
             case 'G': ToggleGuides(); break;
+            case 'P': TogglePen(); break;
             case VK_OEM_4: JumpNote(-1); break;  // [
             case VK_OEM_6: JumpNote(1); break;   // ]
             case VK_DELETE:
@@ -4285,7 +4421,8 @@ public:
                 else DeleteSelected();
                 break;
             case VK_ESCAPE:
-                if (marked) marked.reset();
+                if (penMode) penMode = false;
+                else if (marked) marked.reset();
                 else if (cropping) cropping = false;
                 else if (selected) Select(std::nullopt);
                 else if (selClip) SelectClip(std::nullopt);
@@ -4905,6 +5042,10 @@ LRESULT VideoEditor::Proc(UINT m, WPARAM w, LPARAM l) {
                 GetCursorPos(&p);
                 ScreenToClient(hwnd, &p);
                 const RECT st = StageRect();
+                if (penMode && PtInRect(&st, p)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+                    return TRUE;
+                }
                 if (const auto hit = PtInRect(&st, p) && !cropping ? OverlayAt(p) : std::nullopt; hit && !edit.overlays[hit->first].IsSplit()) {
                     const int k = hit->second;
                     SetCursor(LoadCursorW(nullptr, k == 0 ? IDC_SIZEALL : k == 1 || k == 4 ? IDC_SIZENWSE : IDC_SIZENESW));
@@ -6537,6 +6678,107 @@ ATHER_TEST(video_editor_guides) {
     VideoEditor::lastGuides = keepGuides;
     VideoEditor::lastGuidesOn = keepOn;
     VideoEditor::lastMono = keepMono;
+    e->dirty = false;
+    DestroyWindow(e->hwnd);
+}
+
+// Pen (P, or Add ▾ › Pen): a drag on the video draws a freehand stroke on the frame on screen. "Pen lasts 1 frame"
+// keeps it to that one frame, for circling something frame by frame; longer settings run from that frame. A stroke
+// is picked by its line (not the inside of its loop), moves with a drag, and is drawn in the saved video.
+ATHER_TEST(video_editor_pen_strokes) {
+    const std::wstring dir = test::TempDir();
+    const std::wstring a = dir + L"/a.mp4";
+    CHECK(WriteTestClip(a, 640, 360, 30, 2, false));
+    VideoEditor* e = OpenHidden(a, 1180, 760);
+    CHECK(e != nullptr);
+    if (!e) return;
+    const double keep = g_penSeconds;
+    for (int i = 0; i < 40 && e->tframes.empty(); ++i) Pump(50);
+    CHECK_EQ(e->tframes.size(), 60u);
+    if (e->tframes.size() < 20) {
+        DestroyWindow(e->hwnd);
+        return;
+    }
+    bool listed = false;
+    for (const auto& it : e->AddMenu()) listed = listed || it.label.starts_with(L"Pen: draw");
+    CHECK(listed);
+    e->GoToFrame(15);
+    e->Key('P', {});
+    CHECK(e->penMode);
+    g_penSeconds = 0;  // 1 frame
+    auto stroke = [&](double cx, double cy) {  // a loop of radius 40 video pixels around (cx, cy)
+        auto at = [&](double k) {
+            const gp::PointF q = e->ToView(VPoint{cx + 40 * std::cos(k), cy + 40 * std::sin(k)});
+            return POINT{(LONG)std::lround(q.X), (LONG)std::lround(q.Y)};
+        };
+        e->OnMouseDown(at(0), false);
+        for (int i = 1; i <= 24; ++i) e->OnMouseMove(at(i * 6.2832 / 24), MK_LBUTTON);
+        e->OnMouseUp();
+    };
+    stroke(200, 180);
+    CHECK_EQ(e->edit.marks.size(), 1u);
+    if (e->edit.marks.empty()) {
+        DestroyWindow(e->hwnd);
+        return;
+    }
+    const Mark m = e->edit.marks[0];
+    CHECK(m.kind == MarkKind::Pen && m.pts.size() > 10);
+    CHECK(m.Rect().w > 70 && m.Rect().w < 90 && m.Rect().h > 70);
+    CHECK_NEAR(m.start, e->tframes.frames[15].t, 1e-9);
+    CHECK_NEAR(m.end, e->tframes.frames[16].t, 1e-9);  // only frame 15
+    CHECK(m.Active(e->tframes.frames[15].t) && !m.Active(e->tframes.frames[16].t) && !m.Active(e->tframes.frames[14].t));
+    CHECK(!e->selected);  // not selected: the next stroke can follow right away
+    // Drawn in the video on its frame only.
+    auto drawn = [&](double t) {
+        auto bmp = Bitmap::Create(640, 360);
+        std::fill(bmp->Bits(), bmp->Bits() + 640 * 360, 0xFF000000u);
+        FrameRenderer(e->edit, {640, 360}, false).DrawEdits(*bmp, {0, 0}, t);
+        int lit = 0;
+        for (int k = 0; k < 24; ++k) {
+            const int x = (int)std::lround(200 + 40 * std::cos(k * 0.2618)), y = (int)std::lround(180 + 40 * std::sin(k * 0.2618));
+            lit += (bmp->Bits()[(size_t)y * 640 + x] & 0xFFFFFF) != 0;
+        }
+        return lit;
+    };
+    CHECK(drawn(e->tframes.frames[15].t) > 18);
+    CHECK_EQ(drawn(e->tframes.frames[16].t), 0);
+    // Step on and circle again: a second one-frame stroke, in the last one's color.
+    e->edit.marks[0].color = 3;
+    e->Key(VK_RIGHT, {});
+    stroke(260, 180);
+    CHECK_EQ(e->edit.marks.size(), 2u);
+    if (e->edit.marks.size() < 2) {
+        DestroyWindow(e->hwnd);
+        return;
+    }
+    CHECK_NEAR(e->edit.marks[1].start, e->tframes.frames[16].t, 1e-9);
+    CHECK_NEAR(e->edit.marks[1].end, e->tframes.frames[17].t, 1e-9);
+    CHECK_EQ(e->edit.marks[1].color, 3);
+    // Longer: 1 s from the frame on screen.
+    g_penSeconds = 1;
+    stroke(400, 200);
+    CHECK_EQ(e->edit.marks.size(), 3u);
+    if (e->edit.marks.size() == 3) CHECK_NEAR(e->edit.marks[2].end - e->edit.marks[2].start, 1.0, 1e-9);
+    e->Undo();
+    CHECK_EQ(e->edit.marks.size(), 2u);
+    // Esc leaves the pen; then a click on a stroke's line picks it and a drag moves it; inside its loop doesn't pick it.
+    e->Key(VK_ESCAPE, {});
+    CHECK(!e->penMode);
+    e->GoToFrame(16);
+    const gp::PointF on = e->ToView(VPoint{300, 180});
+    const VPoint p0 = e->edit.marks[1].pts[0];
+    e->OnMouseDown({(LONG)on.X, (LONG)on.Y}, false);
+    CHECK(e->selected == e->edit.marks[1].id);
+    const gp::PointF to = e->ToView(VPoint{330, 200});
+    e->OnMouseMove({(LONG)to.X, (LONG)to.Y}, MK_LBUTTON);
+    e->OnMouseUp();
+    CHECK(std::fabs(e->edit.marks[1].pts[0].x - p0.x - 30) < 3 && std::fabs(e->edit.marks[1].pts[0].y - p0.y - 20) < 3);
+    CHECK(std::fabs(e->edit.marks[1].Rect().x - (220 + 30)) < 4);
+    const gp::PointF inside = e->ToView(VPoint{290, 200});  // the middle of the moved loop
+    e->OnMouseDown({(LONG)inside.X, (LONG)inside.Y}, false);
+    e->OnMouseUp();
+    CHECK(!e->selected);  // missed the line: the selection goes
+    g_penSeconds = keep;
     e->dirty = false;
     DestroyWindow(e->hwnd);
 }

@@ -13,7 +13,7 @@ int Levels();
 float TextPx(int level);
 bool IsDark(COLORREF c);
 
-enum class Kind { Arrow, Rect, Ellipse, Step, Text };
+enum class Kind { Arrow, Rect, Ellipse, Step, Text, Pen };
 
 struct Shape {
     Kind kind = Kind::Arrow;
@@ -24,6 +24,7 @@ struct Shape {
     std::wstring text;
     int step = 1;
     float wrap = 0;  // text: wrap width (0 = none)
+    std::vector<std::pair<float, float>> pts;  // pen: the freehand stroke
 };
 
 struct BoxF {

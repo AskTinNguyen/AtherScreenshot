@@ -29,8 +29,8 @@ struct VRect {
 };
 VRect NormRect(VPoint a, VPoint b);
 
-enum class MarkKind { Text, Bubble, Emoji, Arrow, Box, Ellipse, Step, Blur, Pixelate, Zoom, Title };
-constexpr int kMarkKinds = 11;
+enum class MarkKind { Text, Bubble, Emoji, Arrow, Box, Ellipse, Step, Blur, Pixelate, Zoom, Title, Pen };
+constexpr int kMarkKinds = 12;
 enum class AnimStyle { Auto, None, Fade, Pop, Scale, Slide, Wipe, BlurIn, DrawOn, Typewriter };
 enum class Emphasis { None, Pulse, Bounce, Shake, Ping };
 enum class CaptionLook { Pill, Outline, Bar };
@@ -59,7 +59,8 @@ struct Mark {
     uint64_t id = NewItemId();
     MarkKind kind = MarkKind::Box;
     double start = 0, end = 3;
-    VPoint a, b;  // rect corners, or arrow tail → head
+    VPoint a, b;  // rect corners, or arrow tail → head; pen: the corners of its points' bounds
+    std::vector<VPoint> pts;  // pen: the stroke as drawn, in video pixels
     std::wstring text, subtitle;
     int color = 0;  // index into the editor palette
     int level = 2;
@@ -75,6 +76,9 @@ struct Mark {
     AnimStyle OutStyle() const;
     bool operator==(const Mark&) const = default;
 };
+
+// A pen mark's corners (a, b) set to the bounds of its points.
+void FitPenBounds(Mark& m);
 
 struct CaptionWord {
     double start = 0, end = 0;
