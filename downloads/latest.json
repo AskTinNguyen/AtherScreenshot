@@ -1,10 +1,10 @@
 {
     "windows":  {
-                    "version":  "0.0.2.12",
+                    "version":  "0.0.2.13",
                     "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "680e2ac9c88b34ae8049f7458cd4a0848d2e0cd8827ad73cc12e127b8a3caeb6",
-                    "size":  5013504,
-                    "notes":  "When a video will not open, the app says why: 10-bit or 4:2:2 H.264 and ProRes need converting, HEVC/AV1/VP9 need a Microsoft Store extension."
+                    "sha256":  "558fe82842f411b146155e2459269ba87c9fac4d0354453d7b4c9b5117a1ac4c",
+                    "size":  5019648,
+                    "notes":  "Pen strokes in the video editor can now be scaled (corners) and turned (handle above) right after you draw them."
                 },
     "macos":  {
                   "version":  "0.0.2.9",
