@@ -1,10 +1,10 @@
 {
     "windows":  {
-                    "version":  "0.0.2.10",
+                    "version":  "0.0.2.11",
                     "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "675390378a5db59348a0c905aec704c041533028ed359c22c5ae3b1e3dbf01a5",
-                    "size":  4978688,
-                    "notes":  "MOV videos from iPhones, Macs and cameras open like MP4 on Windows, with a clear reason when one cannot (ProRes, or a missing HEVC extension)."
+                    "sha256":  "85b6cec7a463bc8b00a36de1f62cfbdd9380c6cf00f265a0796bee3c3e4e1ac9",
+                    "size":  5005824,
+                    "notes":  "Video editor Pen: circle things on the video by hand (P), lasting just the frame you draw on, or 1/2 s, 1 s or 3 s."
                 },
     "macos":  {
                   "version":  "0.0.2.9",
