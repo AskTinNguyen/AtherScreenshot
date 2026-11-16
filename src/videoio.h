@@ -76,6 +76,10 @@ std::vector<double> FrameTimes(const std::wstring& path);
 // Why a video that won't open can't be read here, when it's a known format whose decoder Windows lacks or keeps in a
 // Store extension (ProRes, HEVC, AV1, VP9); empty otherwise. For the message shown instead of "Can't open this video".
 std::wstring VideoFormatHint(const std::wstring& path);
+// A file name for a "can't open" message, followed by why on the next line when VideoFormatHint knows.
+std::wstring VideoFailureText(const std::wstring& path);
+// The same for a codec tag as VideoCodecTag gives it, and an H.264 profile.
+std::wstring VideoFormatHintFor(const std::string& tag, int profile);
 // Review notes the app adds to a video's sidecar ("<video>.notes.json", see videoedit.h) by itself: AI agents' markers
 // and bug reports. Each time (and range end) moves to the frame on screen at that moment. Notes already there stay; a
 // sidecar that can't be read is left as it is (false).

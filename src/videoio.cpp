@@ -642,8 +642,34 @@ std::optional<Clip> ClipOf(const std::wstring& path) {
     return c;
 }
 
+std::wstring VideoFormatHintFor(const std::string& tag, int profile) {
+    const std::wstring convert = L" Export or convert it to 8-bit H.264 (4:2:0) or HEVC to open it here.";
+    if (tag.starts_with("apc") || tag.starts_with("ap4")) return L"ProRes video can't be decoded on Windows." + convert;
+    if (tag == "avc1" || tag == "avc3") {
+        if (profile == 110) return L"This H.264 video is 10-bit, which Windows can't decode." + convert;
+        if (profile == 122) return L"This H.264 video is 4:2:2 (as many cameras record), which Windows can't decode." + convert;
+        if (profile == 244 || profile == 44) return L"This H.264 video is 4:4:4, which Windows can't decode." + convert;
+        return L"";
+    }
+    if (tag == "hvc1" || tag == "hev1" || tag == "hevc") return L"HEVC video needs the HEVC Video Extensions from the Microsoft Store.";
+    if (tag == "av01") return L"AV1 video needs the AV1 Video Extension from the Microsoft Store.";
+    if (tag == "vp09" || tag == "vp90") return L"VP9 video needs the VP9 Video Extensions from the Microsoft Store.";
+    if (tag == "dvh1" || tag == "dvhe") return L"Dolby Vision video needs the HEVC Video Extensions from the Microsoft Store.";
+    // Anything else we can name: say which codec it is, so it can be looked up or converted.
+    const bool printable = tag.size() == 4 && std::all_of(tag.begin(), tag.end(), [](char c) { return c >= 32 && c < 127; });
+    if (printable && tag != "mp4v" && tag != "jpeg" && tag != "mjpg")
+        return L"Its video is stored as \"" + std::wstring(tag.begin(), tag.end()) + L"\", which Windows can't decode." + convert;
+    return L"";
+}
+
+std::wstring VideoFailureText(const std::wstring& path) {
+    const std::wstring hint = VideoFormatHint(path);
+    return hint.empty() ? FileNameOf(path) : FileNameOf(path) + L"\n" + hint;
+}
+
 std::wstring VideoFormatHint(const std::wstring& path) {
-    std::string tag = VideoCodecTag(path);
+    int profile = 0;
+    std::string tag = VideoCodecTag(path, &profile);
     if (tag.empty()) {  // not an MP4 or QuickTime file: the stored type as Media Foundation names it, when it opens
         EnsureMediaFoundation();
         ComPtr<IMFSourceReader> r;
@@ -653,11 +679,7 @@ std::wstring VideoFormatHint(const std::wstring& path) {
             SUCCEEDED(r->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &t)) && SUCCEEDED(t->GetGUID(MF_MT_SUBTYPE, &sub)))
             for (int i = 0; i < 4; ++i) tag += (char)std::tolower((unsigned char)((sub.Data1 >> (8 * i)) & 255));
     }
-    if (tag.starts_with("apc") || tag.starts_with("ap4")) return L"ProRes video can't be decoded on Windows. Convert it to H.264 or HEVC first.";
-    if (tag == "hvc1" || tag == "hev1" || tag == "hevc") return L"HEVC video needs the HEVC Video Extensions from the Microsoft Store.";
-    if (tag == "av01") return L"AV1 video needs the AV1 Video Extension from the Microsoft Store.";
-    if (tag == "vp09" || tag == "vp90") return L"VP9 video needs the VP9 Video Extensions from the Microsoft Store.";
-    return L"";
+    return VideoFormatHintFor(tag, profile);
 }
 
 std::vector<double> FrameTimes(const std::wstring& path) {
@@ -3672,8 +3694,19 @@ ATHER_TEST(video_mov_file_opens_like_mp4) {
     double t = 0;
     CHECK(vr.Read(&f, &t) && f);
     CHECK(FrameTimes(path).size() == 10);
-    CHECK(VideoCodecTag(path) == "avc1");
-    CHECK(VideoFormatHint(path).empty());  // H.264 decodes everywhere: nothing to explain
+    int profile = 0;
+    CHECK(VideoCodecTag(path, &profile) == "avc1");
+    CHECK(profile == 66 || profile == 77 || profile == 100);  // what Windows' own encoder makes
+    CHECK(VideoFormatHint(path).empty());  // 8-bit 4:2:0 H.264 decodes everywhere: nothing to explain
+    // What a file Windows can't decode is told, by its codec (camera and editor exports).
+    CHECK(VideoFormatHintFor("avc1", 110).find(L"10-bit") != std::wstring::npos);
+    CHECK(VideoFormatHintFor("avc1", 122).find(L"4:2:2") != std::wstring::npos);
+    CHECK(VideoFormatHintFor("avc1", 100).empty());
+    CHECK(VideoFormatHintFor("apcn", 0).find(L"ProRes") != std::wstring::npos);
+    CHECK(VideoFormatHintFor("hvc1", 0).find(L"HEVC Video Extensions") != std::wstring::npos);
+    CHECK(VideoFormatHintFor("dnxh", 0).find(L"\"dnxh\"") != std::wstring::npos);
+    CHECK(VideoFormatHintFor("", 0).empty());
 }
+
 
 }  // namespace ather
