@@ -121,13 +121,13 @@ final class AgentTests: XCTestCase {
             p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(l, $0, len) == 0 && listen(l, 4) == 0 && getsockname(l, $0, &len) == 0 }
         }
         XCTAssertTrue(bound)
-        var wait = timeval(tv_sec: 5, tv_usec: 0)  // the fake's accept gives up if the bridge stops early
-        setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &wait, socklen_t(MemoryLayout<timeval>.size))
         let body = #"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
         var heard = ""
         let done = DispatchSemaphore(value: 0)
         Thread {
             for answer in [#"{"nonce":"0123456789abcdef"}"#, #"{"jsonrpc":"2.0","id":1,"result":{}}"#] {
+                var ready = pollfd(fd: l, events: Int16(POLLIN), revents: 0)
+                guard poll(&ready, 1, 5000) > 0 else { break }  // the bridge stopped early: don't hang the test
                 let c = accept(l, nil, nil)
                 guard c >= 0 else { break }
                 var got = ""
@@ -146,7 +146,7 @@ final class AgentTests: XCTestCase {
             done.signal()
         }.start()
         let (status, resp) = MCP.post(port: Int(UInt16(bigEndian: a.sin_port)), token: "s3cret-agent-token", body: Data(body.utf8), timeout: 5)
-        done.wait()
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
         XCTAssertEqual(status, MCP.impostor)
         XCTAssertTrue(resp.isEmpty)
         XCTAssertTrue(heard.contains("POST /mcp"))  // it was asked…
