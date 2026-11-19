@@ -159,6 +159,7 @@ void ToggleBugReport();     // the shortcut and the palette
 bool CopyLastBugReport();   // bug.png, clip.mp4, bug.md and up to 10 logs on the clipboard as files
 void OpenBugReportsFolder();
 bool BugVoiceListening();
+void RestartBugVoiceListening();  // retries the configured local listener; never turns voice on implicitly
 bool BugReportsBusy();      // bundles or clips still being written (quitting waits for them)
 void StopBugReports();      // quitting: stops listening
 // The recording `recording` (a RecordingId()) ended: clips for its bugs. The recorder calls it; tests too.

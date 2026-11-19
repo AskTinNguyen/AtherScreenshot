@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "common.h"
+#include <xinput.h>
 
 namespace ather {
 
@@ -21,27 +22,37 @@ struct PadState {
 enum class PadCorner { TopLeft, TopRight, BottomLeft, BottomRight };
 PadCorner ParsePadCorner(const std::wstring& s);  // "topleft"… (any case); bottom right otherwise
 
-// Holds every press seen between two frames, so a tap shorter than a frame still shows in one.
+// Holds every press seen between frames; recordings also keep buttons/triggers readable for a minimum time.
 class PadLatch {
 public:
+    explicit PadLatch(DWORD minVisibleMs = 0) : minVisibleMs_(minVisibleMs) {}
     void Feed(const PadState& s);
     PadState Take();  // what to draw now; then starts over from the current state
+    void DiscardHistory();  // keep live controls, discard between-frame presses and visibility holds
 
 private:
     PadState cur_, held_;
+    DWORD minVisibleMs_;
+    ULONGLONG buttonUntil_[16]{};
+    ULONGLONG ltUntil_ = 0, rtUntil_ = 0;
+    float ltPeak_ = 0, rtPeak_ = 0;
 };
 
-// Polls the first connected controller about 250 times a second on its own thread.
+// Polls connected controllers about 250 times a second and follows the most recently used one.
 class GamepadPoller {
 public:
-    GamepadPoller();
+    // Optional native reader lets integration tests drive the same polling/conversion path without a driver.
+    using StateReader = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    explicit GamepadPoller(StateReader reader = nullptr);
     ~GamepadPoller();
     PadState Take();
+    void DiscardHistory();  // used at pause/resume boundaries
 
 private:
     void Run();
+    StateReader reader_;
     std::mutex m_;
-    PadLatch latch_;
+    PadLatch latch_{120};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
