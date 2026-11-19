@@ -209,7 +209,7 @@ std::string Server::Handle(const std::string& body, const std::function<void(std
         return RpcResponse(id, std::move(r)).Dump();
     }
     if (method == "tools/call") {
-        if (onUse) onUse("");
+        if (onUse) onUse(std::nullopt);
         Json r = Call(params, onUi);
         if (r.IsNull()) return RpcError(id, -32602, "Unknown tool: " + params["name"].Str()).Dump();
         return RpcResponse(id, std::move(r)).Dump();
@@ -247,18 +247,32 @@ std::string Sign(const std::string& token, const char* purpose, const std::strin
     return Hex(HmacSha256(token, std::string("ather-mcp ") + purpose + "\n" + nonce + "\n" + body));
 }
 
-// "<issued ms>.<random>.<signature>": the app checks its own nonces without keeping the ones it hands out, so
-// asking for many (no token needed) can't push out the one the bridge is about to use.
-std::string IssueNonce(const std::string& token, uint64_t nowMs) {
-    BYTE rnd[16] = {};
-    BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    const std::string body = std::to_string(nowMs) + "." + Hex(std::string((const char*)rnd, sizeof(rnd)));
-    return body + "." + Sign(token, "nonce", body, "");
+namespace {
+
+std::string RandomBytes(size_t n) {  // "" when the system has none to give
+    std::string b(n, '\0');
+    return BCRYPT_SUCCESS(BCryptGenRandom(nullptr, (PUCHAR)b.data(), (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG)) ? b : std::string();
 }
 
-bool UseNonce(const std::string& token, const std::string& nonce, uint64_t nowMs) {
+const std::string& NonceKey() {
+    static const std::string key = RandomBytes(32);
+    return key;
+}
+
+}  // namespace
+
+// "<issued ms>.<random>.<signature>": the app checks its own nonces without keeping the ones it hands out, so
+// asking for many (no token needed) can't push out the one the bridge is about to use.
+std::string IssueNonce(uint64_t nowMs) {
+    const std::string rnd = RandomBytes(16);
+    if (rnd.empty() || NonceKey().empty()) return {};
+    const std::string body = std::to_string(nowMs) + "." + Hex(rnd);
+    return body + "." + Sign(NonceKey(), "nonce", body, "");
+}
+
+bool UseNonce(const std::string& nonce, uint64_t nowMs) {
     const size_t dot = nonce.rfind('.');
-    if (token.empty() || dot == std::string::npos || !SameSecret(nonce.substr(dot + 1), Sign(token, "nonce", nonce.substr(0, dot), "")))
+    if (NonceKey().empty() || dot == std::string::npos || !SameSecret(nonce.substr(dot + 1), Sign(NonceKey(), "nonce", nonce.substr(0, dot), "")))
         return false;
     const uint64_t issued = strtoull(nonce.c_str(), nullptr, 10);
     if (issued > nowMs || nowMs - issued > kNonceLifeMs) return false;
@@ -334,7 +348,7 @@ int CheckHttpRequest(const HttpRequest& r, int port, const std::string& token) {
     if (r.path != "/mcp" && r.path != "/mcp/") return 404;
     if (const std::string nonce = r.Header("x-ather-nonce"); !nonce.empty())
         return !token.empty() && SameSecret(r.Header("x-ather-signature"), Sign(token, "request", nonce, r.body)) &&
-                       UseNonce(token, nonce, GetTickCount64())
+                       UseNonce(nonce, GetTickCount64())
                    ? 0
                    : 401;
     const std::string auth = r.Header("authorization");
@@ -415,8 +429,10 @@ void ServeConnection(SOCKET s, std::shared_ptr<Server> server, int port, std::st
         return Respond(s, refuse, {}, refuse == 401 ? "WWW-Authenticate: Bearer\r\n" : "");
     if (req.path == "/mcp/nonce") {
         if (req.method != "GET") return Respond(s, 405, {}, "Allow: GET\r\n");
+        const std::string nonce = IssueNonce(GetTickCount64());
+        if (nonce.empty()) return Respond(s, 503, {}, "Retry-After: 1\r\n");
         Json j = Json::Object();
-        j.Set("nonce", IssueNonce(token, GetTickCount64()));
+        j.Set("nonce", nonce);
         return Respond(s, 200, j.Dump());
     }
     if (req.method != "POST") return Respond(s, 405, {}, "Allow: POST\r\n");  // no server-to-client stream, no sessions
@@ -788,19 +804,19 @@ ATHER_TEST(mcp_http_round_trip) {
 
 ATHER_TEST(mcp_signed_requests) {
     const uint64_t t = 5000000;
-    const std::string n = IssueNonce("tok", t);
-    CHECK(!UseNonce("other", n, t));        // made with another token
-    CHECK(!UseNonce("tok", n + "0", t));    // altered
-    CHECK(!UseNonce("tok", n, t + 61000));  // too old
-    CHECK(UseNonce("tok", n, t + 1000));
-    CHECK(!UseNonce("tok", n, t + 2000));   // only once
+    const std::string n = IssueNonce(t);
+    CHECK(!UseNonce("5000000.0123456789abcdef0123456789abcdef.00", t));  // not one of ours
+    CHECK(!UseNonce(n + "0", t));    // altered
+    CHECK(!UseNonce(n, t + 61000));  // too old
+    CHECK(UseNonce(n, t + 1000));
+    CHECK(!UseNonce(n, t + 2000));   // only once
     CHECK(Sign("tok", "request", n, "{}") != Sign("tok", "reply", n, "{}"));
     HttpRequest r;
     r.method = "POST";
     r.path = "/mcp";
     r.body = "{}";
     r.headers = {{"host", "127.0.0.1:4000"}};
-    const std::string fresh = IssueNonce("tok", GetTickCount64());
+    const std::string fresh = IssueNonce(GetTickCount64());
     r.headers.emplace_back("x-ather-nonce", fresh);
     r.headers.emplace_back("x-ather-signature", Sign("tok", "request", fresh, "{}"));
     HttpRequest tampered = r;
@@ -850,8 +866,8 @@ ATHER_TEST(mcp_bridge_never_gives_an_impostor_the_token) {
     });
     std::string resp;
     CHECK_EQ(HttpPost(ntohs(a.sin_port), "s3cret-agent-token", body, &resp, 5000), kImpostor);
+    closesocket(l);  // wakes the fake's accept if the bridge gave up early
     fake.join();
-    closesocket(l);
     CHECK(resp.empty());
     CHECK(heard.find("POST /mcp") != std::string::npos);  // it was asked…
     CHECK(heard.find("s3cret-agent-token") == std::string::npos);  // …without the token

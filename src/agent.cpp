@@ -649,16 +649,16 @@ void ListCapturesTool(const Json& args, Reply reply) {
     });
 }
 
-// \\server\share\…, //server/…, \\?\… and \\.\… paths. Even checking whether one exists connects to that server and
-// hands it this user's Windows sign-in (NTLM), so they're refused before anything looks at them.
-bool IsNetworkOrDevicePath(const std::wstring& path) {
-    auto slash = [](wchar_t c) { return c == L'\\' || c == L'/'; };
-    return path.size() >= 2 && slash(path[0]) && slash(path[1]);
+// Only C:\… style paths. Anything else (\\server\share, //server, \\?\UNC\…, \??\UNC\…, devices, relative paths) could
+// reach a network server, and just checking whether the file exists hands that server this user's Windows sign-in
+// (NTLM), so those are refused before anything looks at them.
+bool IsDrivePath(const std::wstring& path) {
+    return path.size() >= 3 && (path[0] | 0x20) >= L'a' && (path[0] | 0x20) <= L'z' && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
 }
 
 bool CheckMediaPath(const std::wstring& path, std::string* error) {
     if (path.empty()) return *error = "Pass the file's path (list_captures gives them).", false;
-    if (IsNetworkOrDevicePath(path)) return *error = "Network and device paths aren't allowed: " + ToUtf8(path), false;
+    if (!IsDrivePath(path)) return *error = "Pass a full path on this PC's drives, like C:\\…: " + ToUtf8(path), false;
     if (!FileExists(path)) return *error = "File not found: " + ToUtf8(path), false;
     if (!IsMediaFile(path)) return *error = "Not a picture or video: " + ToUtf8(path), false;
     return true;
@@ -1205,10 +1205,11 @@ std::shared_ptr<mcp::Server> MakeAgentServer(AgentHost host) {
     g_host = std::move(host);
     auto server = std::make_shared<mcp::Server>(mcp::ServerInfo{"ather-screenshot", "Ather Screenshot", ATHER_BUILD_STR, kInstructions},
                                                 AgentTools());
-    server->onUse = [](const std::string& client) {
-        RunOnUi([name = FromUtf8(client)] {
-            // Each client that says who it is, once per 10 minutes; and any agent at work after 10 minutes without a
-            // notice, so one that skips `initialize` can't go unseen.
+    server->onUse = [](const std::optional<std::string>& client) {
+        RunOnUi([name = client ? (client->empty() ? std::wstring(L"AI agent") : FromUtf8(*client)) : std::wstring()] {
+            // Each client that says who it is (initialize), once per 10 minutes; and any tool call after 10 minutes
+            // without a notice, so one that skips `initialize` is seen. A notice, not a gate: a second agent working
+            // within 10 minutes of the first one's notice isn't announced again.
             static std::map<std::wstring, ULONGLONG> told;
             static ULONGLONG anyTold = 0;
             const ULONGLONG now = GetTickCount64();
@@ -1348,9 +1349,10 @@ ATHER_TEST(agent_notes_never_overwrite) {
 ATHER_TEST(agent_refuses_network_paths) {
     std::string err;
     for (const wchar_t* p : {L"\\\\attacker.invalid\\s\\a.png", L"//attacker.invalid/s/a.png", L"/\\attacker.invalid\\a.png",
-                             L"\\\\?\\UNC\\attacker.invalid\\s\\a.png", L"\\\\.\\pipe\\a.png"}) {
+                             L"\\\\?\\UNC\\attacker.invalid\\s\\a.png", L"\\??\\UNC\\attacker.invalid\\s\\a.png",
+                             L"\\\\.\\pipe\\a.png", L"C:a.png", L"a.png"}) {
         CHECK(!CheckMediaPath(p, &err));
-        CHECK(err.rfind("Network and device paths", 0) == 0);
+        CHECK(err.rfind("Pass a full path", 0) == 0);
     }
     CHECK(!CheckMediaPath(L"C:\\no such folder\\a.png", &err));
     CHECK(err.rfind("File not found", 0) == 0);

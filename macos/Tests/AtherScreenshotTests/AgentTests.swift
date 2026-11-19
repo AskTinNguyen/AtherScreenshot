@@ -84,14 +84,14 @@ final class AgentTests: XCTestCase {
 
     func testSignedRequests() {
         let t: UInt64 = 5_000_000
-        let n = MCP.issueNonce("tok", now: t)
-        XCTAssertFalse(MCP.useNonce("other", n, now: t))        // made with another token
-        XCTAssertFalse(MCP.useNonce("tok", n + "0", now: t))    // altered
-        XCTAssertFalse(MCP.useNonce("tok", n, now: t + 61_000))  // too old
-        XCTAssertTrue(MCP.useNonce("tok", n, now: t + 1000))
-        XCTAssertFalse(MCP.useNonce("tok", n, now: t + 2000))   // only once
+        let n = MCP.issueNonce(now: t)
+        XCTAssertFalse(MCP.useNonce("5000000.0123456789abcdef0123456789abcdef.00", now: t))  // not one of ours
+        XCTAssertFalse(MCP.useNonce(n + "0", now: t))    // altered
+        XCTAssertFalse(MCP.useNonce(n, now: t + 61_000))  // too old
+        XCTAssertTrue(MCP.useNonce(n, now: t + 1000))
+        XCTAssertFalse(MCP.useNonce(n, now: t + 2000))   // only once
         XCTAssertNotEqual(MCP.sign("tok", "request", n, Data("{}".utf8)), MCP.sign("tok", "reply", n, Data("{}".utf8)))
-        let fresh = MCP.issueNonce("tok")
+        let fresh = MCP.issueNonce()
         var r = MCP.HTTPRequest(method: "POST", path: "/mcp", body: Data("{}".utf8))
         r.headers = [("host", "127.0.0.1:4000"), ("x-ather-nonce", fresh), ("x-ather-signature", MCP.sign("tok", "request", fresh, Data("{}".utf8)))]
         var tampered = r
@@ -121,6 +121,8 @@ final class AgentTests: XCTestCase {
             p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(l, $0, len) == 0 && listen(l, 4) == 0 && getsockname(l, $0, &len) == 0 }
         }
         XCTAssertTrue(bound)
+        var wait = timeval(tv_sec: 5, tv_usec: 0)  // the fake's accept gives up if the bridge stops early
+        setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &wait, socklen_t(MemoryLayout<timeval>.size))
         let body = #"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
         var heard = ""
         let done = DispatchSemaphore(value: 0)

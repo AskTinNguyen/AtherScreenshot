@@ -84,9 +84,9 @@ enum MCP {
     final class Server {
         let info: ServerInfo
         let tools: [Tool]
-        // An agent is at work: on `initialize` with the name it gives, on every tool call with "" (a client may skip
-        // `initialize`, so it's no proof anyone was told). On the request's thread.
-        var onUse: ((String) -> Void)?
+        // An agent is at work: on `initialize` with the name it gives ("" when none), and on every tool call with nil
+        // (a client may skip `initialize`, so it's no proof anyone was told). On the request's thread.
+        var onUse: ((String?) -> Void)?
         // How tool work reaches the main thread; tests run it inline.
         var onMain: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) }
 
@@ -139,7 +139,7 @@ enum MCP {
                 }
                 return MCP.encode(response(id, ["tools": list]))
             case "tools/call":
-                onUse?("")
+                onUse?(nil)
                 let name = params["name"] as? String ?? ""
                 guard let tool = tools.first(where: { $0.name == name }) else { return MCP.encode(failure(id, -32602, "Unknown tool: \(name)")) }
                 return MCP.encode(response(id, call(tool, params["arguments"] as? JSON ?? [:])))
@@ -232,7 +232,7 @@ enum MCP {
         guard r.path == "/mcp" || r.path == "/mcp/" else { return 404 }
         let nonce = r.header("x-ather-nonce")
         if !nonce.isEmpty {
-            return !token.isEmpty && sameSecret(r.header("x-ather-signature"), sign(token, "request", nonce, r.body)) && useNonce(token, nonce) ? 0 : 401
+            return !token.isEmpty && sameSecret(r.header("x-ather-signature"), sign(token, "request", nonce, r.body)) && useNonce(nonce) ? 0 : 401
         }
         let auth = r.header("authorization")
         guard auth.lowercased().hasPrefix("bearer "), sameSecret(String(auth.dropFirst(7)).trimmingCharacters(in: .whitespaces), token) else { return 401 }
@@ -259,21 +259,25 @@ enum MCP {
     static let nonceLife: UInt64 = 60_000
     static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 
+    // Nonces are the app's own: signed with a key made when it started, so the bridge can't be talked into signing a
+    // request for a nonce that anything else made, and nonces from before a restart are void.
+    private static let nonceKey = (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+
     // "<issued ms>.<random>.<signature>": the app checks its own nonces without keeping the ones it hands out, so
     // asking for many (no token needed) can't push out the one the bridge is about to use.
-    static func issueNonce(_ token: String, now: UInt64 = nowMs()) -> String {
+    static func issueNonce(now: UInt64 = nowMs()) -> String {
         let random = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
         let body = "\(now).\(random)"
-        return body + "." + sign(token, "nonce", body, Data())
+        return body + "." + sign(nonceKey, "nonce", body, Data())
     }
 
     private static let usedLock = NSLock()
     private static var used: [String: UInt64] = [:]  // nonces used in the last minute: each works once
 
-    // True once for a nonce issueNonce made with this token in the last minute; it can't be used again.
-    static func useNonce(_ token: String, _ nonce: String, now: UInt64 = nowMs()) -> Bool {
-        guard !token.isEmpty, let dot = nonce.lastIndex(of: "."),
-              sameSecret(String(nonce[nonce.index(after: dot)...]), sign(token, "nonce", String(nonce[..<dot]), Data())),
+    // True once for a nonce this run of the app issued in the last minute; it can't be used again.
+    static func useNonce(_ nonce: String, now: UInt64 = nowMs()) -> Bool {
+        guard let dot = nonce.lastIndex(of: "."),
+              sameSecret(String(nonce[nonce.index(after: dot)...]), sign(nonceKey, "nonce", String(nonce[..<dot]), Data())),
               let issued = UInt64(nonce.prefix { $0 != "." }), issued <= now, now - issued <= nonceLife else { return false }
         usedLock.lock()
         defer { usedLock.unlock() }
@@ -455,7 +459,7 @@ enum MCP {
             if refuse != 0 { return MCP.respond(c, refuse, extra: refuse == 401 ? "WWW-Authenticate: Bearer\r\n" : "") }
             if r.path == "/mcp/nonce" {
                 guard r.method == "GET" else { return MCP.respond(c, 405, extra: "Allow: GET\r\n") }
-                return MCP.respond(c, 200, MCP.encode(["nonce": MCP.issueNonce(token)]))
+                return MCP.respond(c, 200, MCP.encode(["nonce": MCP.issueNonce()]))
             }
             guard r.method == "POST" else { return MCP.respond(c, 405, extra: "Allow: POST\r\n") }  // no stream, no sessions
             let out = server.handle(r.body)

@@ -812,9 +812,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !trusted {
             let lower = args.map { $0.lowercased() }
             // Nothing sent off the Mac, and no letting AI agents in (turning the agent server on, or putting its
-            // token on the clipboard).
+            // token on the clipboard). Judged by the command it resolves to, as run below, so an alias can't slip by.
+            let named = kCliNames[lower[0]] ?? Cmd.allCases.first { $0.rawValue.lowercased() == lower[0] }
             let sends = lower.contains("--upload") || ["upload", "edit", "pin"].contains(lower[0])
-                || [Cmd.regionUpload, .uploadLast, .uploadFile, .toggleAgents, .copyAgentSetup].contains { $0.rawValue.lowercased() == lower[0] }
+                || [Cmd.regionUpload, .uploadLast, .uploadFile, .toggleAgents, .copyAgentSetup].contains { $0 == named }
             if sends {
                 return Toast.shared.show("Blocked a request from a link or another app", "“\(args.joined(separator: " "))” can only be run from the command line.", ms: 8000)
             }

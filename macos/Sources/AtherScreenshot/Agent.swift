@@ -41,9 +41,11 @@ enum Agent {
     static func makeServer() -> MCP.Server {
         let srv = MCP.Server(info: .init(name: "ather-screenshot", title: "Ather Screenshot", version: build, instructions: instructions), tools: tools())
         srv.onUse = { name in
+            let name = name.map { $0.isEmpty ? "AI agent" : $0 } ?? ""
             DispatchQueue.main.async {
-                // Each client that says who it is, once per 10 minutes; and any agent at work after 10 minutes
-                // without a notice, so one that skips `initialize` can't go unseen.
+                // Each client that says who it is (initialize), once per 10 minutes; and any tool call after 10
+                // minutes without a notice, so one that skips `initialize` is seen. A notice, not a gate: a second
+                // agent working within 10 minutes of the first one's notice isn't announced again.
                 func recent(_ d: Date?) -> Bool { d.map { Date().timeIntervalSince($0) < 600 } ?? false }
                 if !name.isEmpty { client = name }
                 if name.isEmpty ? recent(anyTold) : recent(told[name]) { return }

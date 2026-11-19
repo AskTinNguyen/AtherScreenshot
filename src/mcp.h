@@ -1,4 +1,6 @@
 #pragma once
+#include <optional>
+
 #include "common.h"
 #include "json.h"
 
@@ -41,9 +43,9 @@ public:
     // `onUi` runs work on the UI thread.
     std::string Handle(const std::string& body, const std::function<void(std::function<void()>)>& onUi) const;
     const std::vector<Tool>& Tools() const { return tools_; }
-    // An agent is at work: on `initialize` with the name it gives, on every tool call with "" (a client may skip
-    // `initialize`, so it's no proof anyone was told). Called on the request's thread.
-    std::function<void(const std::string& client)> onUse;
+    // An agent is at work: on `initialize` with the name it gives ("" when none), and on every tool call with
+    // nullopt (a client may skip `initialize`, so it's no proof anyone was told). Called on the request's thread.
+    std::function<void(const std::optional<std::string>& client)> onUse;
 
 private:
     Json Call(const Json& params, const std::function<void(std::function<void()>)>& onUi) const;
@@ -76,9 +78,11 @@ int CheckHttpRequest(const HttpRequest& r, int port, const std::string& token);
 // X-Ather-Signature = Sign(token, "request", nonce, body), and relays only replies whose X-Ather-Signature is
 // Sign(token, "reply", nonce, body). Clients that connect by URL send Authorization: Bearer <token> instead.
 std::string Sign(const std::string& token, const char* purpose, const std::string& nonce, const std::string& body);  // hex
-std::string IssueNonce(const std::string& token, uint64_t nowMs);
-// True once for a nonce IssueNonce made with this token in the last minute; it can't be used again.
-bool UseNonce(const std::string& token, const std::string& nonce, uint64_t nowMs);
+// Nonces are the app's own: signed with a key made when it started, so the bridge can't be talked into signing a
+// request for a nonce that anything else made, and nonces from before a restart are void. "" if no random number.
+std::string IssueNonce(uint64_t nowMs);
+// True once for a nonce this run of the app issued in the last minute; it can't be used again.
+bool UseNonce(const std::string& nonce, uint64_t nowMs);
 
 // ---- stdio ----
 
