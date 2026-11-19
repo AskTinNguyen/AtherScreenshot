@@ -4,15 +4,18 @@
 #include <ws2tcpip.h>
 
 #include <objbase.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <thread>
 
+#include "net.h"
 #include "selftest.h"
 
 #pragma comment(lib, "ws2_32")
@@ -168,7 +171,7 @@ std::string Server::Handle(const std::string& body, const std::function<void(std
         std::string version = kProtocolVersions[0];
         for (const char* v : kProtocolVersions)
             if (params["protocolVersion"].Str() == v) version = v;
-        if (onInitialize) onInitialize(params["clientInfo"]["name"].Str());
+        if (onUse) onUse(params["clientInfo"]["name"].Str());
         Json tools = Json::Object();
         tools.Set("listChanged", false);
         Json caps = Json::Object();
@@ -206,6 +209,7 @@ std::string Server::Handle(const std::string& body, const std::function<void(std
         return RpcResponse(id, std::move(r)).Dump();
     }
     if (method == "tools/call") {
+        if (onUse) onUse(std::nullopt);
         Json r = Call(params, onUi);
         if (r.IsNull()) return RpcError(id, -32602, "Unknown tool: " + params["name"].Str()).Dump();
         return RpcResponse(id, std::move(r)).Dump();
@@ -235,8 +239,49 @@ bool SameSecret(const std::string& a, const std::string& b) {  // constant time 
 }
 
 constexpr size_t kMaxRequest = 8 << 20;
+constexpr uint64_t kNonceLifeMs = 60 * 1000;
 
 }  // namespace
+
+std::string Sign(const std::string& token, const char* purpose, const std::string& nonce, const std::string& body) {
+    return Hex(HmacSha256(token, std::string("ather-mcp ") + purpose + "\n" + nonce + "\n" + body));
+}
+
+namespace {
+
+std::string RandomBytes(size_t n) {  // "" when the system has none to give
+    std::string b(n, '\0');
+    return BCRYPT_SUCCESS(BCryptGenRandom(nullptr, (PUCHAR)b.data(), (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG)) ? b : std::string();
+}
+
+const std::string& NonceKey() {
+    static const std::string key = RandomBytes(32);
+    return key;
+}
+
+}  // namespace
+
+// "<issued ms>.<random>.<signature>": the app checks its own nonces without keeping the ones it hands out, so
+// asking for many (no token needed) can't push out the one the bridge is about to use.
+std::string IssueNonce(uint64_t nowMs) {
+    const std::string rnd = RandomBytes(16);
+    if (rnd.empty() || NonceKey().empty()) return {};
+    const std::string body = std::to_string(nowMs) + "." + Hex(rnd);
+    return body + "." + Sign(NonceKey(), "nonce", body, "");
+}
+
+bool UseNonce(const std::string& nonce, uint64_t nowMs) {
+    const size_t dot = nonce.rfind('.');
+    if (NonceKey().empty() || dot == std::string::npos || !SameSecret(nonce.substr(dot + 1), Sign(NonceKey(), "nonce", nonce.substr(0, dot), "")))
+        return false;
+    const uint64_t issued = strtoull(nonce.c_str(), nullptr, 10);
+    if (issued > nowMs || nowMs - issued > kNonceLifeMs) return false;
+    static std::mutex m;
+    static std::map<std::string, uint64_t> used;  // nonces used in the last minute: each works once
+    std::lock_guard<std::mutex> lock(m);
+    for (auto it = used.begin(); it != used.end();) it = nowMs - it->second > kNonceLifeMs ? used.erase(it) : std::next(it);
+    return used.emplace(nonce, issued).second;
+}
 
 std::string HttpRequest::Header(const char* name) const {
     for (const auto& [k, v] : headers)
@@ -299,7 +344,13 @@ int CheckHttpRequest(const HttpRequest& r, int port, const std::string& token) {
     if (host != "127.0.0.1:" + p && host != "localhost:" + p && host != "127.0.0.1" && host != "localhost") return 403;
     const std::string origin = Lower(r.Header("origin"));
     if (!origin.empty() && origin != "http://127.0.0.1:" + p && origin != "http://localhost:" + p) return 403;
+    if (r.path == "/mcp/nonce") return 0;  // gives out nothing but a nonce, which is no use without the token
     if (r.path != "/mcp" && r.path != "/mcp/") return 404;
+    if (const std::string nonce = r.Header("x-ather-nonce"); !nonce.empty())
+        return !token.empty() && SameSecret(r.Header("x-ather-signature"), Sign(token, "request", nonce, r.body)) &&
+                       UseNonce(nonce, GetTickCount64())
+                   ? 0
+                   : 401;
     const std::string auth = r.Header("authorization");
     if (auth.size() < 7 || Lower(auth.substr(0, 7)) != "bearer " || !SameSecret(Trim(auth.substr(7)), token)) return 401;
     return 0;
@@ -376,12 +427,22 @@ void ServeConnection(SOCKET s, std::shared_ptr<Server> server, int port, std::st
     if (bad) return Respond(s, 400);
     if (const int refuse = CheckHttpRequest(req, port, token))
         return Respond(s, refuse, {}, refuse == 401 ? "WWW-Authenticate: Bearer\r\n" : "");
+    if (req.path == "/mcp/nonce") {
+        if (req.method != "GET") return Respond(s, 405, {}, "Allow: GET\r\n");
+        const std::string nonce = IssueNonce(GetTickCount64());
+        if (nonce.empty()) return Respond(s, 503, {}, "Retry-After: 1\r\n");
+        Json j = Json::Object();
+        j.Set("nonce", nonce);
+        return Respond(s, 200, j.Dump());
+    }
     if (req.method != "POST") return Respond(s, 405, {}, "Allow: POST\r\n");  // no server-to-client stream, no sessions
     const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const std::string out = server->Handle(req.body, [](std::function<void()> fn) { RunOnUi(std::move(fn)); });
     if (SUCCEEDED(co)) CoUninitialize();
-    if (out.empty()) Respond(s, 202);
-    else Respond(s, 200, out);
+    // A signed request gets a signed reply: the bridge relays nothing else.
+    const std::string nonce = req.Header("x-ather-nonce");
+    const std::string proof = nonce.empty() ? "" : "X-Ather-Signature: " + Sign(token, "reply", nonce, out) + "\r\n";
+    Respond(s, out.empty() ? 202 : 200, out, proof.c_str());
 }
 
 }  // namespace
@@ -456,35 +517,68 @@ int HttpPort() {
     return g_http.port;
 }
 
-int HttpPost(int port, const std::string& token, const std::string& body, std::string* response, int timeoutMs) {
-    response->clear();
-    if (!EnsureWinsock()) return kNotListening;
+namespace {
+
+struct Answer {
+    int status = kNotListening;  // or 0: accepted, but no answer
+    std::string signature, body;
+};
+
+// Sends one request to 127.0.0.1:port and reads the answer to the end (the server closes after one response).
+Answer Exchange(int port, const std::string& request, int timeoutMs) {
+    Answer out;
+    if (!EnsureWinsock()) return out;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return kNotListening;
+    if (s == INVALID_SOCKET) return out;
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons((u_short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) {
         closesocket(s);
-        return kNotListening;
+        return out;
     }
+    out.status = 0;
     DWORD timeout = (DWORD)timeoutMs;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    const std::string p = std::to_string(port);
-    SendAll(s, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:" + p + "\r\nAuthorization: Bearer " + token +
-                   "\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: " +
-                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+    SendAll(s, request);
     std::string raw;
     char buf[16384];
     for (int n; (n = recv(s, buf, sizeof(buf), 0)) > 0;) raw.append(buf, n);
     closesocket(s);
-    // "HTTP/1.1 200 OK\r\n…\r\n\r\n<body>": the server always closes after one response.
-    if (raw.compare(0, 5, "HTTP/") != 0) return 0;
+    // "HTTP/1.1 200 OK\r\n…\r\n\r\n<body>"
     const size_t sp = raw.find(' '), end = raw.find("\r\n\r\n");
-    if (sp == std::string::npos || end == std::string::npos) return 0;
-    *response = raw.substr(end + 4);
-    return atoi(raw.c_str() + sp + 1);
+    if (raw.compare(0, 5, "HTTP/") != 0 || sp == std::string::npos || end == std::string::npos) return out;
+    for (size_t p = raw.find("\r\n"); p < end;) {
+        const size_t next = raw.find("\r\n", p + 2);
+        const std::string line = raw.substr(p + 2, next - p - 2);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos && Lower(Trim(line.substr(0, colon))) == "x-ather-signature") out.signature = Trim(line.substr(colon + 1));
+        p = next;
+    }
+    out.body = raw.substr(end + 4);
+    out.status = atoi(raw.c_str() + sp + 1);
+    return out;
+}
+
+}  // namespace
+
+int HttpPost(int port, const std::string& token, const std::string& body, std::string* response, int timeoutMs) {
+    response->clear();
+    const std::string host = "Host: 127.0.0.1:" + std::to_string(port) + "\r\n";
+    const Answer n = Exchange(port, "GET /mcp/nonce HTTP/1.1\r\n" + host + "Connection: close\r\n\r\n", 10000);
+    if (n.status != 200) return n.status;
+    const std::string nonce = Json::Parse(n.body)["nonce"].Str();
+    if (nonce.empty() || nonce.find_first_not_of("0123456789abcdef.") != std::string::npos) return kImpostor;
+    const Answer a = Exchange(port, "POST /mcp HTTP/1.1\r\n" + host + "X-Ather-Nonce: " + nonce + "\r\nX-Ather-Signature: " +
+                                        Sign(token, "request", nonce, body) +
+                                        "\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n"
+                                        "Content-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body,
+                              timeoutMs);
+    if (a.status != 200 && a.status != 202) return a.status;
+    if (!SameSecret(a.signature, Sign(token, "reply", nonce, a.body))) return kImpostor;
+    *response = a.body;
+    return a.status;
 }
 
 // ---- stdio ----
@@ -537,6 +631,12 @@ int RunStdioBridge(int port, const std::string& token, const std::function<bool(
                   "Settings (AI agents), or run \"Allow AI agents (MCP)\" from its command palette (Ctrl+Alt+K).";
         else if (status == 0)
             why = "Ather Screenshot closed the connection before answering (it quit, or the call took over 15 minutes).";
+        else if (status == kImpostor)
+            why = "Something other than Ather Screenshot is answering on port " + std::to_string(port) +
+                  " (it couldn't prove it has the agent token), so its answer was ignored. Quit that program, or pick "
+                  "another port in Ather Screenshot's Settings (AI agents).";
+        else if (status == 404)
+            why = "The running Ather Screenshot is an older version. Quit it and start it again, then try again.";
         else if (status == 401 || status == 403)
             why = "Ather Screenshot refused the connection (the agent token didn't match). Restart Ather Screenshot and try again.";
         else if (status == 503)
@@ -700,6 +800,77 @@ ATHER_TEST(mcp_http_round_trip) {
     StopHttp();
     CHECK(!HttpRunning());
     CHECK_EQ(HttpPost(port, "tok", R"({"jsonrpc":"2.0","id":1,"method":"ping"})", &resp, 1000), kNotListening);
+}
+
+ATHER_TEST(mcp_signed_requests) {
+    const uint64_t t = 5000000;
+    const std::string n = IssueNonce(t);
+    CHECK(!UseNonce("5000000.0123456789abcdef0123456789abcdef.00", t));  // not one of ours
+    CHECK(!UseNonce(n + "0", t));    // altered
+    CHECK(!UseNonce(n, t + 61000));  // too old
+    CHECK(UseNonce(n, t + 1000));
+    CHECK(!UseNonce(n, t + 2000));   // only once
+    CHECK(Sign("tok", "request", n, "{}") != Sign("tok", "reply", n, "{}"));
+    HttpRequest r;
+    r.method = "POST";
+    r.path = "/mcp";
+    r.body = "{}";
+    r.headers = {{"host", "127.0.0.1:4000"}};
+    const std::string fresh = IssueNonce(GetTickCount64());
+    r.headers.emplace_back("x-ather-nonce", fresh);
+    r.headers.emplace_back("x-ather-signature", Sign("tok", "request", fresh, "{}"));
+    HttpRequest tampered = r;
+    tampered.body = "[]";
+    CHECK_EQ(CheckHttpRequest(tampered, 4000, "tok"), 401);
+    CHECK_EQ(CheckHttpRequest(r, 4000, "other"), 401);
+    CHECK_EQ(CheckHttpRequest(r, 4000, "tok"), 0);
+    CHECK_EQ(CheckHttpRequest(r, 4000, "tok"), 401);  // replayed
+    HttpRequest ask;
+    ask.path = "/mcp/nonce";
+    ask.headers = {{"host", "127.0.0.1:4000"}};
+    CHECK_EQ(CheckHttpRequest(ask, 4000, "tok"), 0);
+    ask.headers.emplace_back("origin", "https://evil.example");
+    CHECK_EQ(CheckHttpRequest(ask, 4000, "tok"), 403);  // web pages can't even ask
+}
+
+// Another program on the port (on a shared PC, another user's) answers like the app. It must never see the token,
+// and its answers must never reach the agent.
+ATHER_TEST(mcp_bridge_never_gives_an_impostor_the_token) {
+    CHECK(EnsureWinsock());
+    SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(l, (sockaddr*)&a, sizeof(a)) == 0 && listen(l, 4) == 0);
+    int len = sizeof(a);
+    getsockname(l, (sockaddr*)&a, &len);
+    const char* body = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+    std::string heard;
+    std::thread fake([&] {
+        const std::string answers[] = {R"({"nonce":"0123456789abcdef"})", R"({"jsonrpc":"2.0","id":1,"result":{}})"};
+        for (const auto& answer : answers) {
+            SOCKET c = accept(l, nullptr, nullptr);
+            if (c == INVALID_SOCKET) return;
+            std::string got;
+            char buf[4096];
+            while (got.find("\r\n\r\n") == std::string::npos || (got.rfind("POST", 0) == 0 && got.find(body) == std::string::npos)) {
+                const int n = recv(c, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                got.append(buf, n);
+            }
+            heard += got;
+            SendAll(c, "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(answer.size()) + "\r\nConnection: close\r\n\r\n" + answer);
+            shutdown(c, SD_SEND);
+            closesocket(c);
+        }
+    });
+    std::string resp;
+    CHECK_EQ(HttpPost(ntohs(a.sin_port), "s3cret-agent-token", body, &resp, 5000), kImpostor);
+    closesocket(l);  // wakes the fake's accept if the bridge gave up early
+    fake.join();
+    CHECK(resp.empty());
+    CHECK(heard.find("POST /mcp") != std::string::npos);  // it was asked…
+    CHECK(heard.find("s3cret-agent-token") == std::string::npos);  // …without the token
 }
 
 }  // namespace ather::mcp

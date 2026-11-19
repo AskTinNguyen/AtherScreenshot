@@ -649,8 +649,16 @@ void ListCapturesTool(const Json& args, Reply reply) {
     });
 }
 
+// Only C:\… style paths. Anything else (\\server\share, //server, \\?\UNC\…, \??\UNC\…, devices, relative paths) could
+// reach a network server, and just checking whether the file exists hands that server this user's Windows sign-in
+// (NTLM), so those are refused before anything looks at them.
+bool IsDrivePath(const std::wstring& path) {
+    return path.size() >= 3 && (path[0] | 0x20) >= L'a' && (path[0] | 0x20) <= L'z' && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
+}
+
 bool CheckMediaPath(const std::wstring& path, std::string* error) {
     if (path.empty()) return *error = "Pass the file's path (list_captures gives them).", false;
+    if (!IsDrivePath(path)) return *error = "Pass a full path on this PC's drives, like C:\\…: " + ToUtf8(path), false;
     if (!FileExists(path)) return *error = "File not found: " + ToUtf8(path), false;
     if (!IsMediaFile(path)) return *error = "Not a picture or video: " + ToUtf8(path), false;
     return true;
@@ -1197,14 +1205,21 @@ std::shared_ptr<mcp::Server> MakeAgentServer(AgentHost host) {
     g_host = std::move(host);
     auto server = std::make_shared<mcp::Server>(mcp::ServerInfo{"ather-screenshot", "Ather Screenshot", ATHER_BUILD_STR, kInstructions},
                                                 AgentTools());
-    server->onInitialize = [](const std::string& client) {
-        RunOnUi([name = client.empty() ? std::wstring(L"AI agent") : FromUtf8(client)] {
-            static std::map<std::wstring, ULONGLONG> announced;  // once per client per 10 minutes
-            g_client = name;
-            ULONGLONG& last = announced[name];
-            if (last && GetTickCount64() - last < 10 * 60 * 1000) return;
-            last = GetTickCount64();
-            ShowToast(name + L" connected", L"It can take screenshots and record with Ather Screenshot. Turn this off in Settings › AI agents.",
+    server->onUse = [](const std::optional<std::string>& client) {
+        RunOnUi([name = client ? (client->empty() ? std::wstring(L"AI agent") : FromUtf8(*client)) : std::wstring()] {
+            // Each client that says who it is (initialize), once per 10 minutes; and any tool call after 10 minutes
+            // without a notice, so one that skips `initialize` is seen. A notice, not a gate: a second agent working
+            // within 10 minutes of the first one's notice isn't announced again.
+            static std::map<std::wstring, ULONGLONG> told;
+            static ULONGLONG anyTold = 0;
+            const ULONGLONG now = GetTickCount64();
+            auto recent = [now](ULONGLONG t) { return t && now - t < 10 * 60 * 1000; };
+            if (!name.empty()) g_client = name;
+            if (name.empty() ? recent(anyTold) : recent(told[name])) return;
+            anyTold = now;
+            if (!name.empty()) told[name] = now;
+            ShowToast(name.empty() ? L"An AI agent is using Ather Screenshot" : name + L" connected",
+                      L"It can take screenshots and record with Ather Screenshot. Turn this off in Settings › AI agents.",
                       nullptr, nullptr, 5000);
         });
     };
@@ -1329,6 +1344,18 @@ ATHER_TEST(agent_notes_never_overwrite) {
     CHECK(!WriteMarkers(b, {{0.5, L"x", NoteKind::Issue}}, L"t", 30));
     CHECK_EQ(read(NotesPath(b)), std::string("first"));
     CHECK(!WriteMarkers(dir + L"\\c.gif", {{1, L"x", NoteKind::Issue}}, L"t", 15));  // GIFs have no notes
+}
+
+ATHER_TEST(agent_refuses_network_paths) {
+    std::string err;
+    for (const wchar_t* p : {L"\\\\attacker.invalid\\s\\a.png", L"//attacker.invalid/s/a.png", L"/\\attacker.invalid\\a.png",
+                             L"\\\\?\\UNC\\attacker.invalid\\s\\a.png", L"\\??\\UNC\\attacker.invalid\\s\\a.png",
+                             L"\\\\.\\pipe\\a.png", L"C:a.png", L"a.png"}) {
+        CHECK(!CheckMediaPath(p, &err));
+        CHECK(err.rfind("Pass a full path", 0) == 0);
+    }
+    CHECK(!CheckMediaPath(L"C:\\no such folder\\a.png", &err));
+    CHECK(err.rfind("File not found", 0) == 0);
 }
 
 }  // namespace ather

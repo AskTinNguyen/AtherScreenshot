@@ -1370,12 +1370,14 @@ CliRequest ParseCli(const std::vector<std::wstring>& args) {
     return req;
 }
 
-// What an untrusted request may not do at all: send anything off the machine, or touch files.
-bool CliTouchesFiles(const CliRequest& req) {
+// What an untrusted request may not do at all: send anything off the machine, touch files, or let AI agents in
+// (turning the agent server on, or putting its token on the clipboard).
+bool CliNeedsTerminal(const CliRequest& req) {
     if (!req.file.empty() || req.after == After::Upload) return true;
     switch (req.cmd) {
         case CmdRegionUpload: case CmdUploadLast: case CmdUploadFile: case CmdEditLast: case CmdPinLast:
-        case CmdOpenLast: case CmdOpenImage: case CmdCompressFile: case CmdRenameLast: return true;
+        case CmdOpenLast: case CmdOpenImage: case CmdCompressFile: case CmdRenameLast:
+        case CmdToggleAgents: case CmdCopyAgentSetup: return true;
     }
     for (const auto& a : req.args)
         if (_wcsicmp(a.c_str(), L"--upload") == 0 || _wcsicmp(a.c_str(), L"/upload") == 0) return true;
@@ -1405,7 +1407,7 @@ void RunCli(const CliRequest& req, bool trusted) {
     const bool openWith = !trusted && !req.fromLink && req.cmd == CmdEditLast && !req.file.empty() && req.after == After::Default &&
                           req.args.size() == 1;
     if (!trusted && !openWith) {
-        if (CliTouchesFiles(req))
+        if (CliNeedsTerminal(req))
             return ShowToast(L"Blocked a request from a link or another app",
                              L"“" + JoinArgs(req.args) + L"” can only be run from a command prompt.", nullptr, nullptr, 8000),
                    void();
@@ -1921,15 +1923,16 @@ ATHER_TEST(cli_link_arguments) {
 }
 
 ATHER_TEST(cli_untrusted_requests_never_touch_files) {
-    // Blocked outright: uploads, and anything that edits, pins or opens files.
+    // Blocked outright: uploads, anything that edits, pins or opens files, and letting AI agents in.
     for (const auto& args : std::vector<std::vector<std::wstring>>{
              {L"upload"}, {L"region", L"--upload"}, {L"CaptureRegionUpload"}, {L"UploadFile"}, {L"edit"}, {L"pin"},
-             {L"open"}, {L"OpenImageInEditor"}, {L"RenameLastCapture"}, {L"edit", L"C:\\Windows\\win.ini"}})
-        CHECK(CliTouchesFiles(ParseCli(args)));
+             {L"open"}, {L"OpenImageInEditor"}, {L"RenameLastCapture"}, {L"edit", L"C:\\Windows\\win.ini"},
+             {L"ToggleAiAgents"}, {L"CopyAiAgentSetup"}})
+        CHECK(CliNeedsTerminal(ParseCli(args)));
     // Allowed after confirmation: captures, including --pin / --edit of the new capture.
     for (const auto& args : std::vector<std::vector<std::wstring>>{
              {L"region"}, {L"region", L"--pin"}, {L"fullscreen", L"--edit"}, {L"record"}, {L"history"}, {L"stop"}})
-        CHECK(!CliTouchesFiles(ParseCli(args)));
+        CHECK(!CliNeedsTerminal(ParseCli(args)));
     CHECK_EQ(ParseCli({L"region", L"--pin"}).after, After::Pin);
     CHECK_EQ(ParseCli({L"gallery"}).cmd, (int)CmdHistory);
     CHECK(!ParseCli({L"nonsense"}).error.empty());
@@ -1938,7 +1941,7 @@ ATHER_TEST(cli_untrusted_requests_never_touch_files) {
     const CliRequest unc = ParseCli(SplitArgs(L"AtherScreenshot.exe \"atherscreenshot://region?x=//attacker.invalid/s/a.png\"", &link));
     CHECK(link);
     CHECK(unc.file == L"//attacker.invalid/s/a.png");
-    CHECK(CliTouchesFiles(unc));
+    CHECK(CliNeedsTerminal(unc));
     CHECK(!LooksLikePath(L"--pin") && !LooksLikePath(L"/pin") && LooksLikePath(L"a.png") && LooksLikePath(L"C:\\x"));
     // "Open with": a bare path opens it in the editor.
     CHECK_EQ(ParseCli({L"C:\\shots\\a.png"}).cmd, (int)CmdEditLast);
