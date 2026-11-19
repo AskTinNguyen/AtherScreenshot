@@ -82,6 +82,75 @@ final class AgentTests: XCTestCase {
         XCTAssertFalse(MCP.isBool(parsed?["b"]))
     }
 
+    func testSignedRequests() {
+        let t: UInt64 = 5_000_000
+        let n = MCP.issueNonce("tok", now: t)
+        XCTAssertFalse(MCP.useNonce("other", n, now: t))        // made with another token
+        XCTAssertFalse(MCP.useNonce("tok", n + "0", now: t))    // altered
+        XCTAssertFalse(MCP.useNonce("tok", n, now: t + 61_000))  // too old
+        XCTAssertTrue(MCP.useNonce("tok", n, now: t + 1000))
+        XCTAssertFalse(MCP.useNonce("tok", n, now: t + 2000))   // only once
+        XCTAssertNotEqual(MCP.sign("tok", "request", n, Data("{}".utf8)), MCP.sign("tok", "reply", n, Data("{}".utf8)))
+        let fresh = MCP.issueNonce("tok")
+        var r = MCP.HTTPRequest(method: "POST", path: "/mcp", body: Data("{}".utf8))
+        r.headers = [("host", "127.0.0.1:4000"), ("x-ather-nonce", fresh), ("x-ather-signature", MCP.sign("tok", "request", fresh, Data("{}".utf8)))]
+        var tampered = r
+        tampered.body = Data("[]".utf8)
+        XCTAssertEqual(MCP.check(tampered, port: 4000, token: "tok"), 401)
+        XCTAssertEqual(MCP.check(r, port: 4000, token: "other"), 401)
+        XCTAssertEqual(MCP.check(r, port: 4000, token: "tok"), 0)
+        XCTAssertEqual(MCP.check(r, port: 4000, token: "tok"), 401)  // replayed
+        var ask = MCP.HTTPRequest(method: "GET", path: "/mcp/nonce")
+        ask.headers = [("host", "127.0.0.1:4000")]
+        XCTAssertEqual(MCP.check(ask, port: 4000, token: "tok"), 0)
+        ask.headers.append(("origin", "https://evil.example"))
+        XCTAssertEqual(MCP.check(ask, port: 4000, token: "tok"), 403)  // web pages can't even ask
+    }
+
+    // Another program on the port (on a shared Mac, another user's) answers like the app. It must never see the
+    // token, and its answers must never reach the agent.
+    func testBridgeNeverGivesAnImpostorTheToken() throws {
+        let l = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(l) }
+        var a = sockaddr_in()
+        a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        a.sin_family = sa_family_t(AF_INET)
+        a.sin_addr.s_addr = in_addr_t(0x7F00_0001).bigEndian
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &a) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(l, $0, len) == 0 && listen(l, 4) == 0 && getsockname(l, $0, &len) == 0 }
+        }
+        XCTAssertTrue(bound)
+        let body = #"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        var heard = ""
+        let done = DispatchSemaphore(value: 0)
+        Thread {
+            for answer in [#"{"nonce":"0123456789abcdef"}"#, #"{"jsonrpc":"2.0","id":1,"result":{}}"#] {
+                let c = accept(l, nil, nil)
+                guard c >= 0 else { break }
+                var got = ""
+                var buf = [UInt8](repeating: 0, count: 4096)
+                while !got.contains("\r\n\r\n") || (got.hasPrefix("POST") && !got.contains(body)) {
+                    let n = recv(c, &buf, buf.count, 0)
+                    if n <= 0 { break }
+                    got += String(decoding: buf[0..<n], as: UTF8.self)
+                }
+                heard += got
+                let reply = "HTTP/1.1 200 OK\r\nContent-Length: \(answer.utf8.count)\r\nConnection: close\r\n\r\n" + answer
+                _ = reply.withCString { send(c, $0, strlen($0), 0) }
+                shutdown(c, SHUT_WR)
+                close(c)
+            }
+            done.signal()
+        }.start()
+        let (status, resp) = MCP.post(port: Int(UInt16(bigEndian: a.sin_port)), token: "s3cret-agent-token", body: Data(body.utf8), timeout: 5)
+        done.wait()
+        XCTAssertEqual(status, MCP.impostor)
+        XCTAssertTrue(resp.isEmpty)
+        XCTAssertTrue(heard.contains("POST /mcp"))  // it was asked…
+        XCTAssertFalse(heard.contains("s3cret-agent-token"))  // …without the token
+    }
+
     func testHttpRoundTrip() throws {
         let http = MCP.HTTPServer(server: testServer(), token: "tok")
         try http.start(port: 0)

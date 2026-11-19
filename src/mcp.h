@@ -41,7 +41,9 @@ public:
     // `onUi` runs work on the UI thread.
     std::string Handle(const std::string& body, const std::function<void(std::function<void()>)>& onUi) const;
     const std::vector<Tool>& Tools() const { return tools_; }
-    std::function<void(const std::string& client)> onInitialize;  // a client connected (called on the request's thread)
+    // An agent is at work: on `initialize` with the name it gives, on every tool call with "" (a client may skip
+    // `initialize`, so it's no proof anyone was told). Called on the request's thread.
+    std::function<void(const std::string& client)> onUse;
 
 private:
     Json Call(const Json& params, const std::function<void(std::function<void()>)>& onUi) const;
@@ -65,8 +67,18 @@ struct HttpRequest {
 };
 // Parses the head and body of one request; false while incomplete. `bad` is set for malformed requests.
 bool ParseHttpRequest(const std::string& raw, HttpRequest* out, bool* bad);
-// 0 when the request may go on, else the HTTP status to refuse it with.
+// 0 when the request may go on, else the HTTP status to refuse it with. A signed request uses up its nonce.
 int CheckHttpRequest(const HttpRequest& r, int port, const std::string& token);
+
+// ---- signed requests: how `--mcp` talks to the app ----
+// The bridge never sends the token: whatever answers on the port would get it, and on a shared PC that can be
+// another user's program. It fetches a one-time nonce (GET /mcp/nonce), sends X-Ather-Nonce with
+// X-Ather-Signature = Sign(token, "request", nonce, body), and relays only replies whose X-Ather-Signature is
+// Sign(token, "reply", nonce, body). Clients that connect by URL send Authorization: Bearer <token> instead.
+std::string Sign(const std::string& token, const char* purpose, const std::string& nonce, const std::string& body);  // hex
+std::string IssueNonce(const std::string& token, uint64_t nowMs);
+// True once for a nonce IssueNonce made with this token in the last minute; it can't be used again.
+bool UseNonce(const std::string& token, const std::string& nonce, uint64_t nowMs);
 
 // ---- stdio ----
 
@@ -74,9 +86,11 @@ int CheckHttpRequest(const HttpRequest& r, int port, const std::string& token);
 // it isn't running and says whether it did. Returns the process exit code.
 int RunStdioBridge(int port, const std::string& token, const std::function<bool()>& startApp);
 
-// POSTs `body` to 127.0.0.1:port/mcp. Returns the HTTP status and the response body; kNotListening when nobody
-// accepted the connection, 0 when it was accepted but no answer came (dropped, or timed out).
+// POSTs `body` to 127.0.0.1:port/mcp, signed. Returns the HTTP status and the response body; kNotListening when
+// nobody accepted the connection, 0 when it was accepted but no answer came (dropped, or timed out), kImpostor when
+// whatever answered couldn't sign its reply (so it isn't this user's Ather Screenshot).
 constexpr int kNotListening = -1;
+constexpr int kImpostor = -2;
 int HttpPost(int port, const std::string& token, const std::string& body, std::string* response, int timeoutMs);
 
 }  // namespace ather::mcp

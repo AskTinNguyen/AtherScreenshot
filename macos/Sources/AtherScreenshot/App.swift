@@ -811,8 +811,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let first = args.first, !first.isEmpty else { return }
         if !trusted {
             let lower = args.map { $0.lowercased() }
+            // Nothing sent off the Mac, and no letting AI agents in (turning the agent server on, or putting its
+            // token on the clipboard).
             let sends = lower.contains("--upload") || ["upload", "edit", "pin"].contains(lower[0])
-                || [Cmd.regionUpload, .uploadLast, .uploadFile].contains { $0.rawValue.lowercased() == lower[0] }
+                || [Cmd.regionUpload, .uploadLast, .uploadFile, .toggleAgents, .copyAgentSetup].contains { $0.rawValue.lowercased() == lower[0] }
             if sends {
                 return Toast.shared.show("Blocked a request from a link or another app", "“\(args.joined(separator: " "))” can only be run from the command line.", ms: 8000)
             }

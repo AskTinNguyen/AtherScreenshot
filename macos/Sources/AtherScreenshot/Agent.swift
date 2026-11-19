@@ -8,7 +8,8 @@ enum Agent {
     private static let s = Settings.shared
     private static var server: MCP.HTTPServer?
     private static var client = "AI agent"  // the last client that connected (note author)
-    private static var announced: [String: Date] = [:]
+    private static var told: [String: Date] = [:]  // when each named client was announced
+    private static var anyTold: Date?  // when any agent was
 
     // MARK: lifecycle
 
@@ -39,12 +40,17 @@ enum Agent {
 
     static func makeServer() -> MCP.Server {
         let srv = MCP.Server(info: .init(name: "ather-screenshot", title: "Ather Screenshot", version: build, instructions: instructions), tools: tools())
-        srv.onInitialize = { name in
+        srv.onUse = { name in
             DispatchQueue.main.async {
-                client = name.isEmpty ? "AI agent" : name
-                if let last = announced[client], Date().timeIntervalSince(last) < 600 { return }
-                announced[client] = Date()
-                Toast.shared.show("\(client) connected", "It can take screenshots and record with Ather Screenshot. Turn this off in Settings › AI agents.", ms: 5000)
+                // Each client that says who it is, once per 10 minutes; and any agent at work after 10 minutes
+                // without a notice, so one that skips `initialize` can't go unseen.
+                func recent(_ d: Date?) -> Bool { d.map { Date().timeIntervalSince($0) < 600 } ?? false }
+                if !name.isEmpty { client = name }
+                if name.isEmpty ? recent(anyTold) : recent(told[name]) { return }
+                anyTold = Date()
+                if !name.isEmpty { told[name] = Date() }
+                Toast.shared.show(name.isEmpty ? "An AI agent is using Ather Screenshot" : "\(name) connected",
+                                  "It can take screenshots and record with Ather Screenshot. Turn this off in Settings › AI agents.", ms: 5000)
             }
         }
         return srv

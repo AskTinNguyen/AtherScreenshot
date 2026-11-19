@@ -649,8 +649,16 @@ void ListCapturesTool(const Json& args, Reply reply) {
     });
 }
 
+// \\server\share\…, //server/…, \\?\… and \\.\… paths. Even checking whether one exists connects to that server and
+// hands it this user's Windows sign-in (NTLM), so they're refused before anything looks at them.
+bool IsNetworkOrDevicePath(const std::wstring& path) {
+    auto slash = [](wchar_t c) { return c == L'\\' || c == L'/'; };
+    return path.size() >= 2 && slash(path[0]) && slash(path[1]);
+}
+
 bool CheckMediaPath(const std::wstring& path, std::string* error) {
     if (path.empty()) return *error = "Pass the file's path (list_captures gives them).", false;
+    if (IsNetworkOrDevicePath(path)) return *error = "Network and device paths aren't allowed: " + ToUtf8(path), false;
     if (!FileExists(path)) return *error = "File not found: " + ToUtf8(path), false;
     if (!IsMediaFile(path)) return *error = "Not a picture or video: " + ToUtf8(path), false;
     return true;
@@ -1197,14 +1205,20 @@ std::shared_ptr<mcp::Server> MakeAgentServer(AgentHost host) {
     g_host = std::move(host);
     auto server = std::make_shared<mcp::Server>(mcp::ServerInfo{"ather-screenshot", "Ather Screenshot", ATHER_BUILD_STR, kInstructions},
                                                 AgentTools());
-    server->onInitialize = [](const std::string& client) {
-        RunOnUi([name = client.empty() ? std::wstring(L"AI agent") : FromUtf8(client)] {
-            static std::map<std::wstring, ULONGLONG> announced;  // once per client per 10 minutes
-            g_client = name;
-            ULONGLONG& last = announced[name];
-            if (last && GetTickCount64() - last < 10 * 60 * 1000) return;
-            last = GetTickCount64();
-            ShowToast(name + L" connected", L"It can take screenshots and record with Ather Screenshot. Turn this off in Settings › AI agents.",
+    server->onUse = [](const std::string& client) {
+        RunOnUi([name = FromUtf8(client)] {
+            // Each client that says who it is, once per 10 minutes; and any agent at work after 10 minutes without a
+            // notice, so one that skips `initialize` can't go unseen.
+            static std::map<std::wstring, ULONGLONG> told;
+            static ULONGLONG anyTold = 0;
+            const ULONGLONG now = GetTickCount64();
+            auto recent = [now](ULONGLONG t) { return t && now - t < 10 * 60 * 1000; };
+            if (!name.empty()) g_client = name;
+            if (name.empty() ? recent(anyTold) : recent(told[name])) return;
+            anyTold = now;
+            if (!name.empty()) told[name] = now;
+            ShowToast(name.empty() ? L"An AI agent is using Ather Screenshot" : name + L" connected",
+                      L"It can take screenshots and record with Ather Screenshot. Turn this off in Settings › AI agents.",
                       nullptr, nullptr, 5000);
         });
     };
@@ -1329,6 +1343,17 @@ ATHER_TEST(agent_notes_never_overwrite) {
     CHECK(!WriteMarkers(b, {{0.5, L"x", NoteKind::Issue}}, L"t", 30));
     CHECK_EQ(read(NotesPath(b)), std::string("first"));
     CHECK(!WriteMarkers(dir + L"\\c.gif", {{1, L"x", NoteKind::Issue}}, L"t", 15));  // GIFs have no notes
+}
+
+ATHER_TEST(agent_refuses_network_paths) {
+    std::string err;
+    for (const wchar_t* p : {L"\\\\attacker.invalid\\s\\a.png", L"//attacker.invalid/s/a.png", L"/\\attacker.invalid\\a.png",
+                             L"\\\\?\\UNC\\attacker.invalid\\s\\a.png", L"\\\\.\\pipe\\a.png"}) {
+        CHECK(!CheckMediaPath(p, &err));
+        CHECK(err.rfind("Network and device paths", 0) == 0);
+    }
+    CHECK(!CheckMediaPath(L"C:\\no such folder\\a.png", &err));
+    CHECK(err.rfind("File not found", 0) == 0);
 }
 
 }  // namespace ather

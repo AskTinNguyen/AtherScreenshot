@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 #if canImport(Darwin)
 import Darwin
@@ -10,7 +11,7 @@ private let kSockStream = Int32(SOCK_STREAM.rawValue)
 // Model Context Protocol (https://modelcontextprotocol.io) for AI agents such as Claude Code or Codex.
 // The running app serves it over Streamable HTTP on 127.0.0.1 (plain JSON responses, no SSE, no sessions);
 // `AtherScreenshot --mcp` is a stdio server for agents that start one, relaying to the running app.
-// Foundation only (no AppKit), the same protocol and checks as the Windows app's mcp.cpp.
+// Foundation and CryptoKit only (no AppKit), the same protocol and checks as the Windows app's mcp.cpp.
 enum MCP {
     typealias JSON = [String: Any]
     // A CallToolResult: ["content": [...], "structuredContent"?: [...], "isError"?: true]. Exactly once, any thread.
@@ -83,7 +84,9 @@ enum MCP {
     final class Server {
         let info: ServerInfo
         let tools: [Tool]
-        var onInitialize: ((String) -> Void)?  // a client connected (its name), on the request's thread
+        // An agent is at work: on `initialize` with the name it gives, on every tool call with "" (a client may skip
+        // `initialize`, so it's no proof anyone was told). On the request's thread.
+        var onUse: ((String) -> Void)?
         // How tool work reaches the main thread; tests run it inline.
         var onMain: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) }
 
@@ -119,7 +122,7 @@ enum MCP {
             case "initialize":
                 let asked = params["protocolVersion"] as? String ?? ""
                 let version = MCP.protocolVersions.contains(asked) ? asked : MCP.protocolVersions[0]
-                onInitialize?((params["clientInfo"] as? JSON)?["name"] as? String ?? "")
+                onUse?((params["clientInfo"] as? JSON)?["name"] as? String ?? "")
                 var r: JSON = [
                     "protocolVersion": version,
                     "capabilities": ["tools": ["listChanged": false]],
@@ -136,6 +139,7 @@ enum MCP {
                 }
                 return MCP.encode(response(id, ["tools": list]))
             case "tools/call":
+                onUse?("")
                 let name = params["name"] as? String ?? ""
                 guard let tool = tools.first(where: { $0.name == name }) else { return MCP.encode(failure(id, -32602, "Unknown tool: \(name)")) }
                 return MCP.encode(response(id, call(tool, params["arguments"] as? JSON ?? [:])))
@@ -224,7 +228,12 @@ enum MCP {
         guard ["127.0.0.1:\(port)", "localhost:\(port)", "127.0.0.1", "localhost"].contains(host) else { return 403 }
         let origin = r.header("origin").lowercased()
         if !origin.isEmpty && origin != "http://127.0.0.1:\(port)" && origin != "http://localhost:\(port)" { return 403 }
+        if r.path == "/mcp/nonce" { return 0 }  // gives out nothing but a nonce, which is no use without the token
         guard r.path == "/mcp" || r.path == "/mcp/" else { return 404 }
+        let nonce = r.header("x-ather-nonce")
+        if !nonce.isEmpty {
+            return !token.isEmpty && sameSecret(r.header("x-ather-signature"), sign(token, "request", nonce, r.body)) && useNonce(token, nonce) ? 0 : 401
+        }
         let auth = r.header("authorization")
         guard auth.lowercased().hasPrefix("bearer "), sameSecret(String(auth.dropFirst(7)).trimmingCharacters(in: .whitespaces), token) else { return 401 }
         return 0
@@ -234,6 +243,42 @@ enum MCP {
         let x = Array(a.utf8), y = Array(b.utf8)
         guard x.count == y.count, !x.isEmpty else { return false }
         return zip(x, y).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+    }
+
+    // MARK: signed requests: how `--mcp` talks to the app
+
+    // The bridge never sends the token: whatever answers on the port would get it, and on a shared Mac that can be
+    // another user's program. It fetches a one-time nonce (GET /mcp/nonce), sends X-Ather-Nonce with
+    // X-Ather-Signature = sign(token, "request", nonce, body), and relays only replies whose X-Ather-Signature is
+    // sign(token, "reply", nonce, body). Clients that connect by URL send Authorization: Bearer <token> instead.
+    static func sign(_ token: String, _ purpose: String, _ nonce: String, _ body: Data) -> String {
+        let message = Data("ather-mcp \(purpose)\n\(nonce)\n".utf8) + body
+        return HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: Data(token.utf8))).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static let nonceLife: UInt64 = 60_000
+    static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
+
+    // "<issued ms>.<random>.<signature>": the app checks its own nonces without keeping the ones it hands out, so
+    // asking for many (no token needed) can't push out the one the bridge is about to use.
+    static func issueNonce(_ token: String, now: UInt64 = nowMs()) -> String {
+        let random = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+        let body = "\(now).\(random)"
+        return body + "." + sign(token, "nonce", body, Data())
+    }
+
+    private static let usedLock = NSLock()
+    private static var used: [String: UInt64] = [:]  // nonces used in the last minute: each works once
+
+    // True once for a nonce issueNonce made with this token in the last minute; it can't be used again.
+    static func useNonce(_ token: String, _ nonce: String, now: UInt64 = nowMs()) -> Bool {
+        guard !token.isEmpty, let dot = nonce.lastIndex(of: "."),
+              sameSecret(String(nonce[nonce.index(after: dot)...]), sign(token, "nonce", String(nonce[..<dot]), Data())),
+              let issued = UInt64(nonce.prefix { $0 != "." }), issued <= now, now - issued <= nonceLife else { return false }
+        usedLock.lock()
+        defer { usedLock.unlock() }
+        used = used.filter { now >= $0.value && now - $0.value <= nonceLife }
+        return used.updateValue(issued, forKey: nonce) == nil
     }
 
     private static func statusText(_ s: Int) -> String {
@@ -408,9 +453,16 @@ enum MCP {
             let r = req!
             let refuse = MCP.check(r, port: port, token: token)
             if refuse != 0 { return MCP.respond(c, refuse, extra: refuse == 401 ? "WWW-Authenticate: Bearer\r\n" : "") }
+            if r.path == "/mcp/nonce" {
+                guard r.method == "GET" else { return MCP.respond(c, 405, extra: "Allow: GET\r\n") }
+                return MCP.respond(c, 200, MCP.encode(["nonce": MCP.issueNonce(token)]))
+            }
             guard r.method == "POST" else { return MCP.respond(c, 405, extra: "Allow: POST\r\n") }  // no stream, no sessions
             let out = server.handle(r.body)
-            if out.isEmpty { MCP.respond(c, 202) } else { MCP.respond(c, 200, out) }
+            // A signed request gets a signed reply: the bridge relays nothing else.
+            let nonce = r.header("x-ather-nonce")
+            let proof = nonce.isEmpty ? "" : "X-Ather-Signature: \(MCP.sign(token, "reply", nonce, Data(out.utf8)))\r\n"
+            MCP.respond(c, out.isEmpty ? 202 : 200, out, extra: proof)
         }
     }
 
@@ -420,21 +472,36 @@ enum MCP {
     }
     static func failed(_ s: String) -> Failure { Failure(message: s) }
 
-    // POSTs `body` to 127.0.0.1:port/mcp: the HTTP status and the response body. notListening when nobody accepted
-    // the connection, 0 when it was accepted but no answer came (dropped, or timed out).
+    // POSTs `body` to 127.0.0.1:port/mcp, signed: the HTTP status and the response body. notListening when nobody
+    // accepted the connection, 0 when it was accepted but no answer came (dropped, or timed out), impostor when
+    // whatever answered couldn't sign its reply (so it isn't this user's Ather Screenshot).
     static let notListening = -1
+    static let impostor = -2
     static func post(port: Int, token: String, body: Data, timeout: Int) -> (Int, Data) {
-        guard (1...65535).contains(port) else { return (notListening, Data()) }
+        let host = "Host: 127.0.0.1:\(port)\r\n"
+        let n = exchange(port: port, Data(("GET /mcp/nonce HTTP/1.1\r\n" + host + "Connection: close\r\n\r\n").utf8), timeout: 10)
+        guard n.status == 200 else { return (n.status, Data()) }
+        let nonce = ((try? JSONSerialization.jsonObject(with: n.body)) as? JSON)?["nonce"] as? String ?? ""
+        guard !nonce.isEmpty, nonce.allSatisfy({ "0123456789abcdef.".contains($0) }) else { return (impostor, Data()) }
+        let head = "POST /mcp HTTP/1.1\r\n" + host + "X-Ather-Nonce: \(nonce)\r\nX-Ather-Signature: \(sign(token, "request", nonce, body))\r\n"
+            + "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        let a = exchange(port: port, Data(head.utf8) + body, timeout: timeout)
+        guard a.status == 200 || a.status == 202 else { return (a.status, Data()) }
+        guard sameSecret(a.signature, sign(token, "reply", nonce, a.body)) else { return (impostor, Data()) }
+        return (a.status, a.body)
+    }
+
+    // Sends one request to 127.0.0.1:port and reads the answer to the end (the server closes after one response).
+    private static func exchange(port: Int, _ request: Data, timeout: Int) -> (status: Int, signature: String, body: Data) {
+        guard (1...65535).contains(port) else { return (notListening, "", Data()) }
         let s = socket(AF_INET, kSockStream, 0)
-        guard s >= 0 else { return (notListening, Data()) }
+        guard s >= 0 else { return (notListening, "", Data()) }
         defer { close(s) }
         var addr = loopback(port)
         let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-        guard ok == 0 else { return (notListening, Data()) }
+        guard ok == 0 else { return (notListening, "", Data()) }
         setTimeout(s, seconds: timeout)
-        let head = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nAuthorization: Bearer \(token)\r\nContent-Type: application/json\r\n"
-            + "Accept: application/json, text/event-stream\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-        sendAll(s, Data(head.utf8) + body)
+        sendAll(s, request)
         var raw = Data()
         var buf = [UInt8](repeating: 0, count: 16384)
         while true {
@@ -442,10 +509,15 @@ enum MCP {
             if n <= 0 { break }
             raw.append(buf, count: n)
         }
-        // "HTTP/1.1 200 OK\r\n…\r\n\r\n<body>": the server always closes after one response.
-        guard raw.starts(with: Data("HTTP/".utf8)), let end = raw.range(of: Data("\r\n\r\n".utf8)) else { return (0, Data()) }
-        let status = String(decoding: raw[..<end.lowerBound], as: UTF8.self).split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0
-        return (status, Data(raw[end.upperBound...]))
+        // "HTTP/1.1 200 OK\r\n…\r\n\r\n<body>"
+        guard raw.starts(with: Data("HTTP/".utf8)), let end = raw.range(of: Data("\r\n\r\n".utf8)) else { return (0, "", Data()) }
+        let lines = String(decoding: raw[..<end.lowerBound], as: UTF8.self).components(separatedBy: "\r\n")
+        let status = lines[0].split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0
+        let signature = lines.dropFirst().compactMap { l -> String? in
+            guard let c = l.firstIndex(of: ":"), l[..<c].trimmingCharacters(in: .whitespaces).lowercased() == "x-ather-signature" else { return nil }
+            return l[l.index(after: c)...].trimmingCharacters(in: .whitespaces)
+        }.first ?? ""
+        return (status, signature, Data(raw[end.upperBound...]))
     }
 
     // MARK: stdio
@@ -496,6 +568,8 @@ enum MCP {
             case 0: why = "Ather Screenshot closed the connection before answering (it quit, or the call took over 15 minutes)."
             case 503: why = "Ather Screenshot is busy with other agent calls. Try again in a moment."
             case 401, 403: why = "Ather Screenshot refused the connection (the agent token didn't match). Restart Ather Screenshot and try again."
+            case impostor: why = "Something other than Ather Screenshot is answering on port \(port) (it couldn't prove it has the agent token), so its answer was ignored. Quit that program, or pick another port in Ather Screenshot's Settings (AI agents)."
+            case 404: why = "The running Ather Screenshot is an older version. Quit it and start it again, then try again."
             default: why = "Ather Screenshot answered with HTTP \(status)."
             }
             emit(encode(["jsonrpc": "2.0", "id": id, "error": ["code": -32000, "message": why]]))
