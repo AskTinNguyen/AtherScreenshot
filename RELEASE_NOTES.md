@@ -10,7 +10,17 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new in this update (Windows, build 0.0.2.13): scale and turn pen strokes
+## What's new in this update (build 0.0.2.14): safer connections for AI agents
+
+AI agents (MCP) connect more safely, and nothing changes in how you set them up. The Mac app is at build 0.0.2.14;
+Windows stays at build 0.0.2.13 until its 0.0.2.14 is published.
+
+- **The token stays home:** the `--mcp` connection your agent starts no longer sends the agent token. It proves itself with a one-time code, and it ignores any answer that doesn't come from Ather Screenshot. Another program on the same port (another user's, on a shared computer) learns nothing it can use and can't answer for the app.
+- **You always see it:** the "AI agent connected" notice also shows when an agent takes screenshots or records without introducing itself first.
+- **Links can't let agents in:** an `atherscreenshot://` link or another app can no longer turn on "Allow AI agents" or copy the agent setup (which holds the token). Do those from the menu, the command palette or Settings.
+- **Windows: drive paths only:** the agent tools that open a file take only paths on this PC's drives, like `C:\…`, so an agent can't be steered into connecting to another computer with your Windows sign-in. If your captures folder is a `\\server\share` path, map it to a drive letter for agents.
+
+## Earlier update (Windows, build 0.0.2.13): scale and turn pen strokes
 
 The stroke you just drew with the Pen is selected right away, so you can size and turn it. The Mac app stays at build
 0.0.2.9.
