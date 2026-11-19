@@ -1,16 +1,16 @@
 {
-    "windows":  {
-                    "version":  "0.0.2.13",
-                    "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
-                    "sha256":  "558fe82842f411b146155e2459269ba87c9fac4d0354453d7b4c9b5117a1ac4c",
-                    "size":  5019648,
-                    "notes":  "Pen strokes in the video editor can now be scaled (corners) and turned (handle above) right after you draw them."
-                },
-    "macos":  {
-                  "version":  "0.0.2.9",
-                  "url":  "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-                  "sha256":  "e8ba1099c5e13a7b3110ebbbb2a87dae3b34669524f3af7d91acd6409e7bd8bf",
-                  "size":  5028644,
-                  "notes":  "QuickPrompts start as soon as you allow Accessibility, and your macOS Text Replacements win over a trigger with the same name. Includes 0.0.2.8: QuickPrompts (⌃⌥P picker), the clip bin, picture in picture and split screen, flip, loop, guides, speed per clip and Reverse, and gallery scrubbing."
-              }
+    "windows": {
+        "version": "0.0.2.13",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-Setup-0.0.2.exe",
+        "sha256": "558fe82842f411b146155e2459269ba87c9fac4d0354453d7b4c9b5117a1ac4c",
+        "size": 5019648,
+        "notes": "Pen strokes in the video editor can now be scaled (corners) and turned (handle above) right after you draw them."
+    },
+    "macos": {
+        "version": "0.0.2.14",
+        "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
+        "sha256": "bc126e5055570214ea7cb7ad719a1b4d4c4c4aee2a165b354176e10207ac6ac3",
+        "size": 5046986,
+        "notes": "AI agents connect more safely: the --mcp bridge never sends the agent token, links can't turn agents on, and you're told whenever an agent is at work."
+    }
 }
