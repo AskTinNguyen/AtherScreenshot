@@ -3,8 +3,8 @@
 - Working under rev: 2
 - Worker: root; controller subtask: controller
 - Current step: rev 2 release/full validation PASS; every acceptance item met
-- Next step: owner review/merge of the local feature branch; no merge authority in this contract
-- PR: none (local implementation)
+- Next step: owner review of draft PR #25; no merge authority in this contract
+- PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/25 (draft, base main)
 
 | Item | Verdict | Evidence |
 | --- | --- | --- |
@@ -65,3 +65,5 @@ Copied that freshly built executable to external `test-build\AtherScreenshot.exe
 The owner explicitly requested installation and a draft PR into main with a simple English description. Backed up the old installed executable outside the repo, sent the existing app's trusted `quit` command, observed its exit without forced termination, copied the tested release binary into the existing per-user install location, and started that installed path again. The replacement SHA256 matches the tested build (`E512174C077675707AF31F2486382159E19371BF29890A78025E47CAC82435A7`); the new installed process was observed running. No settings/data migration or manual real-support-folder edit was performed. This supersedes the earlier no-replacement boundary only for the user's expressly authorized local installation. No version bump, public release or merge.
 
 Fetched origin/main before preparing the PR; no new upstream commits beyond this branch's baseline were present. Source and tests remain unchanged since the complete passing release run; this step only adds installation/PR records.
+
+Direct push to origin was denied: the local GitHub account `canhnguyenngoc` has READ access to the public upstream repo. Created its fork and pushed this exact branch to `playtest-fork/intent/playtest-input-feedback`. The GitHub connector was unavailable, so GitHub CLI created draft PR #25 into `AskTinNguyen/AtherScreenshot:main`, titled **Fix controller highlights and bug voice feedback**, with the requested simple English description. No merge was performed.
