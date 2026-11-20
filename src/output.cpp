@@ -13,6 +13,8 @@
 #include <set>
 #include <thread>
 
+#include "selftest.h"
+
 using Microsoft::WRL::ComPtr;
 
 namespace ather {
@@ -21,7 +23,35 @@ namespace ather {
 static std::mutex g_reservedMu;
 static std::set<std::wstring> g_reserved;
 
+HWND ClipboardOwner(HWND preferred) {
+    if (preferred) return preferred;
+    struct ThreadOwner {
+        HWND window = nullptr;
+        ~ThreadOwner() { if (window) DestroyWindow(window); }
+    };
+    thread_local ThreadOwner owner;
+    if (!owner.window)
+        owner.window = CreateWindowExW(0, L"STATIC", L"Ather clipboard owner", 0, 0, 0, 0, 0,
+                                      HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    return owner.window;
+}
+
+ATHER_TEST(clipboard_writes_without_visible_window_have_a_thread_owner) {
+    const HWND owner = ClipboardOwner(nullptr);
+    CHECK(owner != nullptr);
+    CHECK(IsWindow(owner));
+    CHECK_EQ(GetWindowThreadProcessId(owner, nullptr), GetCurrentThreadId());
+    CHECK(!IsWindowVisible(owner));
+    CHECK(ClipboardOwner(nullptr) == owner);
+    HWND supplied = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
+    CHECK(supplied != nullptr);
+    CHECK(ClipboardOwner(supplied) == supplied);
+    DestroyWindow(supplied);
+}
+
 static bool OpenClipboardRetry(HWND owner) {
+    owner = ClipboardOwner(owner);
+    if (!owner) return false;
     for (int i = 0; i < 20; ++i) {
         if (OpenClipboard(owner)) return true;
         Sleep(5);
@@ -125,8 +155,7 @@ bool CopyImageToClipboard(HWND owner, const Bitmap& source, bool withPng) {
         GlobalFree(g);
         return false;
     }
-    EmptyClipboard();
-    bool ok = SetClipboardData(CF_DIB, g) != nullptr;
+    bool ok = EmptyClipboard() && SetClipboardData(CF_DIB, g) != nullptr;
     if (!ok) GlobalFree(g);
     if (ok && !png.empty()) {
         if (HGLOBAL pg = GlobalAlloc(GMEM_MOVEABLE, png.size())) {
@@ -149,8 +178,7 @@ bool CopyTextToClipboard(HWND owner, const std::wstring& text) {
         GlobalFree(g);
         return false;
     }
-    EmptyClipboard();
-    bool ok = SetClipboardData(CF_UNICODETEXT, g) != nullptr;
+    bool ok = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, g) != nullptr;
     CloseClipboard();
     if (!ok) GlobalFree(g);
     return ok;
@@ -174,8 +202,7 @@ bool CopyFilesToClipboard(HWND owner, const std::vector<std::wstring>& paths) {
         GlobalFree(g);
         return false;
     }
-    EmptyClipboard();
-    bool ok = SetClipboardData(CF_HDROP, g) != nullptr;
+    bool ok = EmptyClipboard() && SetClipboardData(CF_HDROP, g) != nullptr;
     CloseClipboard();
     if (!ok) GlobalFree(g);
     return ok;

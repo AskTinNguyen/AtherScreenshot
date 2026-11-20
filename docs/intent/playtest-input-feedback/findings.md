@@ -23,3 +23,15 @@ Final release full suite produced `176 tests, 2916 checks, 8 failed`: the same s
 ## F5 — physical/acoustic validation boundary
 
 The owner explicitly requested simulation while away. The controller demo uses injected native XInput responses and a synthetic backdrop through the real poller, renderer, recorder, encoder and decoder. The voice demo uses synthetic status transitions through the production HUD painter; a separate actual SAPI synthesized-speech test covers accepted commands. Neither establishes physical controller/Steam Input compatibility or recognition of the owner's microphone/accent. No new dependency or voice service was introduced.
+
+## F6 — rev 2: playback end clock
+
+The source player advances/stops within 20 ms of a clip out-point, while the editor checks its loop boundary within 10 ms. The last sequence clock still exposed the stopped engine's slightly early position, so the editor could stop instead of looping. A new native real-player test with source trim [0.5, 1.0] reproduced `finished sequence clock=0.489065, duration=0.500000` before the fix. A successfully finished sequence now reports its exact timeline duration; seeks clear the end state, and failed engines retain their error position. Both this regression (`1 tests, 5 checks, 0 failed`) and `video_editor_loop` (`1 tests, 15 checks, 0 failed`) pass in the focused debug run after the fix.
+
+## F7 — rev 2: clipboard ownership and remaining access denial
+
+`OpenClipboard(NULL)` followed by `EmptyClipboard` leaves a NULL owner and can make `SetClipboardData` fail, as documented by Microsoft: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard . The app's no-window copy paths and QuickPrompts now resolve a persistent per-thread message-only owner; image/text/file writes also check `EmptyClipboard` before handing memory to Windows. The native owner regression failed three checks with the former NULL pass-through and now passes all seven checks.
+
+This does not explain or remove the host's earlier failure at **OpenClipboard itself**: an independent C#/Win32 probe with a valid HWND still receives error 5. The same happens in a small native executable, after reopening the existing station, and on a temporary private station/desktop. The diagnostic restores/closes its own handles; no host ACL, policy or service was changed. The session reports Active, the input/thread desktops are Default, AppContainer is false, and queried job UI restrictions are zero. The cause of the access denial is still unestablished; do not label it a locked desktop, policy denial or application lock without further proof.
+
+Correction to earlier commentary: `GetOpenClipboardWindow()==NULL` does **not** establish that nobody has the clipboard open; an application can open it with a NULL HWND. Microsoft documents this explicitly: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getopenclipboardwindow . The external `clipboard-diagnostic.log` retains the reproducible API results. Integration assertions remain unchanged and the full-suite gate must stay open while they fail.

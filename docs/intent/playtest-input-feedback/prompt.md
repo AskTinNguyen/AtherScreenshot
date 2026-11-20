@@ -1,6 +1,6 @@
 # Playtest input feedback
 
-- Rev: 1
+- Rev: 2
 - Status: active
 - Area: Recording
 - Base: a686c12
@@ -8,6 +8,8 @@
 ## Goal
 
 Make controller presses visible in recorded video and make local voice bug commands observable and recoverable. The owner is away and explicitly authorized autonomous diagnosis, simulated tests, implementation and a demo video.
+
+Rev 2 also covers diagnosing and fixing all eight remaining native self-test failures (clipboard integrations and video playback loop), with the full test suite as the acceptance gate. Preserve actual clipboard/file/decoded-frame assertions; do not skip or weaken failures to obtain a green result.
 
 ## Design
 
@@ -23,6 +25,7 @@ Keep the native Windows implementation and existing hotkey workflow. Poll connec
 | A4 | File and live commands use the same acceptance policy; terminated streams do not remain falsely listening | gate: test.bat |
 | A5 | Synthetic demo video uses the production rendering/recording path and clearly identifies simulated input | build; review |
 | A6 | Instructions, limitations and actual validation are documented | review |
+| A7 | Clipboard integrations and selected-clip playback loop pass together with the entire native suite | gate: test.bat |
 
 ## Boundaries
 

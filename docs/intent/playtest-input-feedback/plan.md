@@ -16,3 +16,5 @@
 ## Execution outcome (2026-11-20)
 
 Implementation, synthetic demos, focused release checks and independent review are finished. Microphone retry is exposed; input selection stays with Windows/SAPI defaults rather than adding saved configuration. Release build succeeds. The complete suite remains red on clipboard/player failures that reproduce on baseline; exact evidence is in progress.md. Keep acceptance A1–A4 open under the repository contract and leave the local feature branch unmerged.
+
+Rev 2 fixes the playback end-clock mismatch and NULL clipboard write ownership, with observed RED/GREEN native regressions. Release full validation is now `178 tests, 2928 checks, 7 failed`: loop and feature checks pass, native clipboard access remains denied even in standalone probes. Resolve that host prerequisite before claiming the seven integrations or the complete gate pass. The user's normal desktop copy/paste clarification remains pending.

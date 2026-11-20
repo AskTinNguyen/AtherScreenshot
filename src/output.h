@@ -3,6 +3,9 @@
 
 namespace ather {
 
+// Clipboard writes need a window owner even when initiated without a visible app window.
+HWND ClipboardOwner(HWND preferred);
+
 // Pixels are premultiplied BGRA. An image with transparency is copied flattened onto white (CF_DIB) and also
 // as "PNG" with its alpha, which most apps prefer. `withPng`: an opaque one goes as "PNG" too.
 bool CopyImageToClipboard(HWND owner, const Bitmap& img, bool withPng = false);

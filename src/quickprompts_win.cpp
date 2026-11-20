@@ -263,6 +263,8 @@ void After(int ms, std::function<void()> fn) {
 // ---- clipboard ----
 
 bool OpenClip(HWND owner) {
+    owner = ClipboardOwner(owner);
+    if (!owner) return false;
     for (int i = 0; i < 40; ++i) {
         if (OpenClipboard(owner)) return true;
         Sleep(5);

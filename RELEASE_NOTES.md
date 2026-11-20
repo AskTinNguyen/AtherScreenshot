@@ -12,6 +12,8 @@
 
 ## Coming in the next update (Windows)
 
+- Loop playback now reaches the exact end of a finished sequence, avoiding intermittent stops at the last selected clip.
+- Clipboard writes initiated without a visible window use a persistent hidden owner; failed clipboard clears are handled before publishing image, text or file data.
 - Controller recordings follow the active controller instead of an idle first slot; short button/trigger taps stay visible for 120 ms.
 - Bug voice has a persistent microphone/signal/recognition panel and elapsed **BUG STARTED** badge. Failed streams reconnect, rejected commands explain what happened, and Settings offers **Restart listener** after changing the default input. Speech stays local; Windows Vietnamese transcription is unchanged.
 
