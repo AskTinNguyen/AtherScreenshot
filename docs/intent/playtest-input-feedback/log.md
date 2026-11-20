@@ -13,3 +13,11 @@
 Asked whether normal Notepad/Explorer copy and paste worked on this machine. Owner answered:
 
 > Có, copy/paste bình thường
+
+## 2026-11-20 — installation and draft PR authorization
+
+> Cài vào cho máy của tôi luôn đi
+
+> Và mở draft PR vào main các thay đổi trên, dùng simple English để mô tả nhé
+
+The explicit installation request authorizes gracefully stopping the old running copy, replacing the installed executable, and restarting it. Existing settings/data are preserved. The user also authorizes pushing the feature branch and opening a draft PR into main; it does not authorize merging or publishing a release.
