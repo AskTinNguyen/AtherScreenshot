@@ -2,19 +2,19 @@
 
 - Working under rev: 2
 - Worker: root; controller subtask: controller
-- Current step: rev 2 release/full validation complete; seven native clipboard integrations remain blocked
-- Next step: establish why this host denies OpenClipboard (ordinary desktop copy/paste clarification pending), then rerun the unchanged integration assertions
+- Current step: rev 2 release/full validation PASS; every acceptance item met
+- Next step: owner review/merge of the local feature branch; no merge authority in this contract
 - PR: none (local implementation)
 
 | Item | Verdict | Evidence |
 | --- | --- | --- |
-| A1 | open | Functional tests pass, including active second slot, drift/gradual analog, ownership changes and short taps; acceptance requires the full-suite gate below |
-| A2 | open | Decoded MP4 verifies pressed/released states for 20 actions and pause/resume; acceptance requires the full-suite gate below |
-| A3 | open | Voice status/panel tests pass; root opened bugstarted-panel.png; full-suite gate still unmet |
-| A4 | open | SAPI synthesized speech, shared command policy and ended-stream reconnect tests pass; full-suite gate still unmet |
+| A1 | met | Full release test.bat: 178 tests, 2942 checks, 0 failed; active second slot, drift/gradual analog, ownership changes and short taps pass |
+| A2 | met | Same full run verifies decoded MP4 pressed/released states for all 20 actions and pause/resume; zero stale paused highlights |
+| A3 | met | Same full run passes all voice status/panel tests; root opened bugstarted-panel.png |
+| A4 | met | Same full run passes actual SAPI synthesized speech, shared confidence policy and ended-stream reconnect regressions |
 | A5 | met | Release build printed Built build\\AtherScreenshot.exe; controller-simulated-input.mp4 uses production recorder/encoder; voice-status-demo.mp4 uses production HUD painter. Simulations explicitly labelled. Root inspected decoded A/released images and BUG STARTED panel. Read-only review by review agent, 2026-11-20, final source revision including DiscardHistory/pause tests: no material findings |
 | A6 | met | README guide/features and next release notes updated; findings document limits; external HUONG-DAN.md explains demos, separate build, input/retry and physical/acoustic limitations |
-| A7 | open | Added RED/GREEN regressions for a valid clipboard window owner and the exact finished sequence clock; native clipboard integration still reports access denied independently of this app |
+| A7 | met | Full release test.bat exited 0: 178 tests, 2942 checks, 0 failed. All seven original clipboard integrations and video_editor_loop pass; no skip reported |
 
 ## Evidence folder
 
@@ -51,3 +51,11 @@ The unrelated standalone Win32 clipboard probe still fails at OpenClipboard with
 Final rev 2 `test.bat` release run: `178 tests, 2928 checks, 7 failed`, exit 24, in `rev2-full-tests.log`. The loop test, both new regressions, all voice tests and all decoded controller tests pass. The remaining failures are exactly the seven clipboard cases listed in F4; a foreground-dependent QuickPrompts test still reports a skip. Acceptance A7 and the full-suite gate remain open. No assertion was skipped, weakened or replaced with a simulated clipboard.
 
 Root self-review of the final rev 2 diff, 2026-11-20: checked natural versus failed playback end states, resetting the end state on seek, per-thread owner lifetime, and allocation ownership when EmptyClipboard fails. Release builds retain only the two pre-existing C4706 warnings. Updated portable artifact SHA256: `16DA460608E95F3246E4D28507E171DE016D9ABE0C6742EA7BE257340CB1B399`. External `Run-SelfTests.cmd` allows the same executable/assertions to be run directly from an ordinary desktop session and records `selftest-interactive.log`.
+
+## Step 5 — access restored; full gate PASS
+
+After the owner confirmed ordinary desktop copy/paste worked, the same standalone clipboard probe succeeded (both NULL and valid owner; error 0), followed by the unchanged QuickPrompts integration (`1 tests, 8 checks, 0 failed`). No source, permissions, ACL, services or running owner apps were changed to restore access. The exact cause of the earlier denial remains unproven.
+
+Ran fresh complete `test.bat` against production source commit `404b025`: release build printed `Built build\AtherScreenshot.exe`; command exit **0**; `178 tests, 2942 checks, 0 failed`, `Result: PASS`. Every original failing clipboard case and the loop test passes. The previously foreground-skipped QuickPrompts test also executes successfully; this run reports **no skips**. Log: `D:\App\AtherScreenshot-artifacts\playtest-input-feedback\rev2-access-restored-full-tests.log`. Earlier failed runs remain as historical evidence, superseded by this result for the current gate.
+
+Copied that freshly built executable to external `test-build\AtherScreenshot.exe`; both SHA256 values match `E512174C077675707AF31F2486382159E19371BF29890A78025E47CAC82435A7`. Updated the Vietnamese guide. All A1–A7 are met; intent stays active until the owner merges, as required by the project contract. No merge, release, version change, real-support-folder edit, or replacement of the owner's running app was performed. Physical controller and live accent/microphone validation limits remain as stated in F5.

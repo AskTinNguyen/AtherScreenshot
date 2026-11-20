@@ -7,3 +7,9 @@
 ## 2026-11-20 — intent amendment, rev 2
 
 > Fix luôn các ca lỗi đó đi
+
+## 2026-11-20 — clarification, rev 2
+
+Asked whether normal Notepad/Explorer copy and paste worked on this machine. Owner answered:
+
+> Có, copy/paste bình thường
