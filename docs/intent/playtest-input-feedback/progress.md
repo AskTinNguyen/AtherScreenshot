@@ -1,9 +1,9 @@
 # Progress
 
-- Working under rev: 2
+- Working under rev: 3
 - Worker: root; controller subtask: controller
-- Current step: rev 2 release/full validation PASS; every acceptance item met
-- Next step: owner review of draft PR #25; no merge authority in this contract
+- Current step: short Windows voice commands verified and installed; full suite has seven recurring clipboard failures
+- Next step: update draft PR #25; full-suite gate remains open; no merge authority in this contract
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/25 (draft, base main)
 
 | Item | Verdict | Evidence |
@@ -14,7 +14,8 @@
 | A4 | met | Same full run passes actual SAPI synthesized speech, shared confidence policy and ended-stream reconnect regressions |
 | A5 | met | Release build printed Built build\\AtherScreenshot.exe; controller-simulated-input.mp4 uses production recorder/encoder; voice-status-demo.mp4 uses production HUD painter. Simulations explicitly labelled. Root inspected decoded A/released images and BUG STARTED panel. Read-only review by review agent, 2026-11-20, final source revision including DiscardHistory/pause tests: no material findings |
 | A6 | met | README guide/features and next release notes updated; findings document limits; external HUONG-DAN.md explains demos, separate build, input/retry and physical/acoustic limitations |
-| A7 | met | Full release test.bat exited 0: 178 tests, 2942 checks, 0 failed. All seven original clipboard integrations and video_editor_loop pass; no skip reported |
+| A7 | open | Historical rev 2 full pass: 178 tests, 2942 checks. Latest rev 3 release: 179 tests, 2940 checks, 7 failed (clipboard integrations); exit 24 |
+| A8 | open | Release parser: 1 test, 9 checks, 0 failed; voice: 7 tests, 69 checks, 0 failed. Short parser/SAPI also pass in the full suite, whose clipboard gate remains open |
 
 ## Evidence folder
 
@@ -67,3 +68,15 @@ The owner explicitly requested installation and a draft PR into main with a simp
 Fetched origin/main before preparing the PR; no new upstream commits beyond this branch's baseline were present. Source and tests remain unchanged since the complete passing release run; this step only adds installation/PR records.
 
 Direct push to origin was denied: the local GitHub account `canhnguyenngoc` has READ access to the public upstream repo. Created its fork and pushed this exact branch to `playtest-fork/intent/playtest-input-feedback`. The GitHub connector was unavailable, so GitHub CLI created draft PR #25 into `AskTinNguyen/AtherScreenshot:main`, titled **Fix controller highlights and bug voice feedback**, with the requested simple English description. No merge was performed.
+
+## Step 7 — rev 3 short Windows voice commands
+
+The owner requested "bug" and "stop". Added a real parser regression that failed on the old behavior (three assertions), and changed the actual SAPI generated speech fixture to the short commands, which initially produced no recognized commands and failed. Production now registers the short grammar, parses one-word command spans without losing the following description word, and retains longer phrases plus "bug cancel" for compatibility. Updated Windows Settings/template comments, tray tooltip, toast, voice HUD, README and next release notes; macOS behavior is unchanged.
+
+Debug focused results: parser `1 tests, 9 checks, 0 failed`; SAPI `1 tests, 13 checks, 0 failed`. SAPI heard two consecutive `bug → description → stop` reports, with normal command confidence. RED/GREEN logs are external `short-commands-red.log`, `short-speech-red.log`, `short-commands-green.log`, `short-speech-green.log`. Live microphone/accent validation limits remain; no new service or dependency.
+
+The first full run exposed a test-only HUD lookup collision with the installed app: global FindWindow could find another process's panel. Scoped the regression to the current module's panel, asserted its owning PID, and retained focus/style/capture-exclusion/destruction assertions. Focused release results with the installed app still running: `7 tests, 69 checks, 0 failed` (`short-voice-final-focused.log`); parser `1 tests, 9 checks, 0 failed` (`short-parser-final-focused.log`).
+
+Final fresh `test.bat` built release successfully, then exited **24**: `179 tests, 2940 checks, 7 failed`, `Result: FAIL`, with a foreground-dependent QuickPrompts skip. Log: `short-commands-final-full-tests.log`. The seven failures are the recurring clipboard integrations; all short-command/SAPI, voice HUD, controller/decoded-video, and playback-loop checks pass. No clipboard assertions were skipped or weakened. The same standalone native clipboard probe again reports OpenClipboard error 5; the cause remains unproven and no host ACL/service/security change was made. A1–A6 evidence above refers to historical rev 2 unless supplemented here; A7/A8 full-suite acceptance stays open.
+
+Updated the installed executable under the existing authorization: backed up the prior exe as `installed-backup/AtherScreenshot-before-short-commands.exe`, gracefully quit the old app, copied the fresh release and restarted the installed path. Observed PID 29744 at `C:\Users\Admin\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe`. Built, installed and external portable exe SHA256 values all match `CF557C0E0C8CF3DC1A912896D41638197B251041AAC7B38157C59F0058EF3B06`. No manual settings/data changes; no force termination.

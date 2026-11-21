@@ -1,6 +1,6 @@
 # Playtest input feedback
 
-- Rev: 2
+- Rev: 3
 - Status: active
 - Area: Recording
 - Base: a686c12
@@ -10,6 +10,8 @@
 Make controller presses visible in recorded video and make local voice bug commands observable and recoverable. The owner is away and explicitly authorized autonomous diagnosis, simulated tests, implementation and a demo video.
 
 Rev 2 also covers diagnosing and fixing all eight remaining native self-test failures (clipboard integrations and video playback loop), with the full test suite as the acceptance gate. Preserve actual clipboard/file/decoded-frame assertions; do not skip or weaken failures to obtain a green result.
+
+Rev 3 makes the Windows voice commands shorter: say "bug" to start and "stop" to save. Update the grammar, command parsing, HUD, tray/settings text and Windows guide. Keep the existing hotkey and "bug cancel" command. Existing longer commands remain accepted for compatibility, while all visible Windows instructions teach the new short commands. macOS behavior is outside this Windows change.
 
 ## Design
 
@@ -26,6 +28,7 @@ Keep the native Windows implementation and existing hotkey workflow. Poll connec
 | A5 | Synthetic demo video uses the production rendering/recording path and clearly identifies simulated input | build; review |
 | A6 | Instructions, limitations and actual validation are documented | review |
 | A7 | Clipboard integrations and selected-clip playback loop pass together with the entire native suite | gate: test.bat |
+| A8 | Windows accepts spoken "bug" and "stop", preserves the first description word, and displays the short command instructions | gate: test.bat |
 
 ## Boundaries
 

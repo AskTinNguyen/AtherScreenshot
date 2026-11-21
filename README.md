@@ -50,7 +50,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
-| 🐞 **Bug reports** | Say "bug start", describe the bug, say "bug stop": one folder with the screenshot and what you said on it, a clip of the recording, your narration and the game's logs. Windows shows live voice status and a persistent **BUG STARTED** badge ([how](#bug-reports)) |
+| 🐞 **Bug reports** | On Windows, say "bug", describe the bug, say "stop": one folder with the screenshot and what you said on it, a clip of the recording, your narration and the game's logs. Windows shows live voice status and a persistent **BUG STARTED** badge ([how](#bug-reports)) |
 | 🔍 **Review video** | Step 60 fps recordings frame by frame, leave notes on exact frames, and save a review video with the notes in it for another team (Windows) |
 | 📋 **Copy a clip** | Mark part of a video and press `Ctrl+C` (`⌘C`): it's saved as an MP4 and put on the clipboard, ready to paste into Slack. Or copy the frame on screen as a picture |
 | 🗂️ **Gallery** | Tags, collections, smart folders, ratings, duplicates, find similar, version stacks and before/after compare |
@@ -170,21 +170,21 @@ Select a region, or use "Record a window", which follows one window wherever it 
 
 ### Bug reports
 
-For playtests: while the game is recorded, say "bug start", describe the bug, then say "bug stop". Ather Screenshot makes one folder for the bug, and you keep playing.
+For playtests on Windows: while the game is recorded, say "bug", describe the bug, then say "stop". Ather Screenshot makes one folder for the bug, and you keep playing.
 
-- **Start and stop:** say "bug start" and "bug stop", or press `Ctrl+Alt+B` once to start and again to stop ("Bug report: start / stop" in the palette). "Bug cancel" throws the bug away. A bug left open stops itself after 2 minutes. A short "Bug started" / "Bug saved" notification shows each step without taking focus from the game.
-- **Listening is opt-in:** turn on Settings › Bug reports › **Listen for "bug start" / "bug stop"** (`[Bugs] VoiceCommands`). It keeps the microphone open while it's on, and the tray icon's tooltip says so. Windows speech recognition does the listening on this PC; nothing is uploaded. The shortcut works with listening off, but then nothing you say is written down.
+- **Start and stop (Windows):** say "bug" and "stop", or press `Ctrl+Alt+B` once to start and again to stop ("Bug report: start / stop" in the palette). "Bug cancel" throws the bug away. A bug left open stops itself after 2 minutes. A short "Bug started" / "Bug saved" notification shows each step without taking focus from the game.
+- **Listening is opt-in:** turn on Settings › Bug reports › **Listen for "bug" / "stop"** (`[Bugs] VoiceCommands`). It keeps the microphone open while it's on, and the tray icon's tooltip says so. Windows speech recognition does the listening on this PC; nothing is uploaded. The shortcut works with listening off, but then nothing you say is written down.
 - **Voice status (Windows):** a persistent, click-through panel shows the recognizer's input name and language, a microphone-level meter, and the last recognized or rejected phrase. With no signal, check the Windows default input; after changing it, use **Retry bug voice input → Restart listener** in Settings or **Restart bug voice listener** in the command palette. A disconnected/failed recognition stream shows **Reconnecting** and retries with bounded backoff. Low-confidence commands are shown with a repeat/shortcut hint instead of silently disappearing. The panel reports the recognition input; `voice.wav` and recording narration use the Windows default capture device, which may differ from a SAPI-selected input.
 - **Bug badge (Windows):** **BUG STARTED** and elapsed time stay visible until you stop or cancel the bug; saving remains visible while evidence is written. The panel does not activate or intercept the game window and is excluded from recordings. Speak the English command clearly, pause, then describe the issue; an installed English recognizer is needed for these commands. This does not add Vietnamese transcription support on Windows. The hotkey remains available when speech is not understood.
 - **What's in the folder** (`<captures>\Bugs\<date time> <first words>\`):
-  - `bug.png`: the screenshot from "bug start" with a bar along the bottom: `BUG · date time · app`, then what you said (up to 6 lines).
+  - `bug.png`: the screenshot from "bug" with a bar along the bottom: `BUG · date time · app`, then what you said (up to 6 lines).
   - `screenshot.png`: the same screenshot without the bar. It shows what's being recorded, or else the monitor with the game.
-  - `clip.mp4`: with a recording running, from 10 s before "bug start" (`[Bugs] PreRollSeconds`) to "bug stop", with what you said as captions. A recording can't be read while it runs, so the clip is made when you stop it; until then `bug.md` says "Clip: when the recording stops". Pauses are left out of the times, as in the recording.
-  - `voice.wav`: what the microphone heard between "bug start" and "bug stop", so nothing is lost, also in a language Windows can't write down.
+  - `clip.mp4`: with a recording running, from 10 s before "bug" (`[Bugs] PreRollSeconds`) to "stop", with what you said as captions. A recording can't be read while it runs, so the clip is made when you stop it; until then `bug.md` says "Clip: when the recording stops". Pauses are left out of the times, as in the recording.
+  - `voice.wav`: what the microphone heard between "bug" and "stop", so nothing is lost, also in a language Windows can't write down.
   - `logs\`: the game's logs (below).
   - `bug.md` for people and `bug.json` for tools: the title (the first sentence), time, app and window, what was said with each word's time, the recording and the bug's place in it, and the files.
 - **Game logs:** Settings › Bug reports › **Game log paths** (`[Bugs] LogPaths`) takes files, folders or wildcards separated by `;`, with environment variables, e.g. `%LOCALAPPDATA%\MyGame\Saved\Logs\*.log`.
-  - At "bug stop" each file named is copied, also while the game is still writing it.
+  - At "stop" each file named is copied, also while the game is still writing it.
   - From a folder or wildcard come the files changed in the last 30 minutes, or the newest one if none was (at most 20).
   - A log over `[Bugs] LogMaxMB` (20 MB) keeps only its end, and `bug.json` says so. A path that matches nothing is listed in `bug.md`.
 - **In the recording:** each bug is also an Issue note over its stretch of the recording (`<video>.notes.json`), so the video editor shows it on its frames.
@@ -428,7 +428,7 @@ How the Windows app differs from the Mac app:
   - System audio and microphone are mixed into one AAC track (two tracks on the Mac).
   - The game controller overlay reads XInput pads (Xbox and compatible; PlayStation through Steam Input or DS4Windows). The Mac reads Xbox, PlayStation and MFi pads directly.
 - **Bug reports:**
-  - Windows recognizes "bug start" / "bug stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses on-device speech recognition.
+  - Windows recognizes "bug" / "stop" with Windows speech recognition (a command grammar plus dictation); the Mac uses "bug start" / "bug stop" with on-device speech recognition.
   - Only the Mac offers "Transcribe Vietnamese with Apple's servers" (`CloudVietnamese`, off by default): at "bug stop" it writes `voice.wav` down as Vietnamese on the Mac when the Mac can, and sends it to Apple only when it can't. Windows' offline dictation doesn't know Vietnamese, so Windows bugs keep `voice.wav`.
   - On the Mac, the bug's Issue note is saved with the recording for the Windows video editor (the Mac editor has no review notes yet).
 - **QuickPrompts:**

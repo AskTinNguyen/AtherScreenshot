@@ -13,7 +13,7 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
     switch (s.phase) {
         case BugVoicePhase::Off: l.detail = L"Voice commands off"; break;
         case BugVoicePhase::Starting: l.detail = L"Starting microphone and speech recognition"; break;
-        case BugVoicePhase::Listening: l.detail = L"Listening for “bug start” / “bug stop”"; break;
+        case BugVoicePhase::Listening: l.detail = L"Listening for “bug” / “stop”"; break;
         case BugVoicePhase::Reconnecting: l.detail = L"Reconnecting microphone"; break;
         case BugVoicePhase::Unavailable: l.detail = L"Voice unavailable"; break;
     }
@@ -24,7 +24,7 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
     if (s.bugOpen) {
         const int elapsed = (int)std::clamp(now - s.bugStarted, 0.0, 5999.0);
         l.title = std::format(L"BUG STARTED  {:02}:{:02}", elapsed / 60, elapsed % 60);
-        l.action = L"Stop and save: " + key + (s.phase == BugVoicePhase::Listening ? L" or say “bug stop”" : L"");
+        l.action = L"Stop and save: " + key + (s.phase == BugVoicePhase::Listening ? L" or say “stop”" : L"");
     } else if (s.saving) {
         l.title = L"SAVING BUG…";
         l.action = L"Your bug report is being saved";
@@ -218,8 +218,11 @@ ATHER_TEST(bug_voice_panel_preserves_focus_and_uses_production_painter) {
     BugVoiceStatus s; s.phase = BugVoicePhase::Listening;
     s.microphone = L"Synthetic microphone"; s.language = L"English (US)";
     UpdateBugVoiceStatus(s);
-    HWND testPanel = FindWindowW(L"AtherBugVoicePanel", nullptr);
+    HWND testPanel = panel;  // the test process's HUD, independent of an already running app's HUD
     CHECK(testPanel && IsWindowVisible(testPanel));
+    DWORD panelProcess = 0;
+    GetWindowThreadProcessId(testPanel, &panelProcess);
+    CHECK_EQ(panelProcess, GetCurrentProcessId());
     if (testPanel) {
         const auto style = GetWindowLongPtrW(testPanel, GWL_EXSTYLE);
         CHECK((style & WS_EX_NOACTIVATE) != 0);
@@ -242,10 +245,13 @@ ATHER_TEST(bug_voice_panel_preserves_focus_and_uses_production_painter) {
     auto image = BugVoicePanelSnapshot(s, 100);
     CHECK(image && image->Width() >= 340 && image->Height() >= 140);
     HideBugVoicePanel();
-    CHECK(!FindWindowW(L"AtherBugVoicePanel", nullptr));
+    CHECK(!IsWindow(testPanel));
+    CHECK(panel == nullptr);
     UpdateBugVoiceStatus(s);
-    CHECK(FindWindowW(L"AtherBugVoicePanel", nullptr) != nullptr);
+    CHECK(panel != nullptr && IsWindow(panel));
+    testPanel = panel;
     UpdateBugVoiceStatus({});
-    CHECK(!FindWindowW(L"AtherBugVoicePanel", nullptr));
+    CHECK(!IsWindow(testPanel));
+    CHECK(panel == nullptr);
 }
 }  // namespace ather

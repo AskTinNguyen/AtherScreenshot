@@ -128,16 +128,25 @@ std::wstring Lower(std::wstring s) {
 
 double BugClock() { return GetTickCount64() / 1000.0; }
 
-BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at) {
+BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at, size_t* after) {
     for (size_t i = from; i < words.size(); ++i) {
         const std::wstring w = Bare(words[i].text);
-        if (w != L"bug" || i + 1 == words.size()) continue;
-        if (const BugCommand c = CommandWord(Bare(words[i + 1].text)); c != BugCommand::None) {
-            if (at) *at = i;
-            return c;
+        BugCommand c = w == L"bug" ? BugCommand::Start : w == L"stop" ? BugCommand::Stop : BugCommand::None;
+        size_t length = 1;
+        // Keep the longer commands as aliases, and prefer "bug cancel" over a new start.
+        if (w == L"bug" && i + 1 < words.size()) {
+            if (const auto legacy = CommandWord(Bare(words[i + 1].text)); legacy != BugCommand::None) {
+                c = legacy;
+                length = 2;
+            }
         }
+        if (c == BugCommand::None) continue;
+        if (at) *at = i;
+        if (after) *after = i + length;
+        return c;
     }
     if (at) *at = words.size();
+    if (after) *after = words.size();
     return BugCommand::None;
 }
 
@@ -185,8 +194,8 @@ BugEvent BugTracker::Finish() {
 std::vector<BugEvent> BugTracker::Heard(const std::vector<CaptionWord>& words) {
     std::vector<BugEvent> out;
     for (size_t i = 0;;) {
-        size_t at = 0;
-        const BugCommand c = FindBugCommand(words, i, &at);
+        size_t at = 0, after = 0;
+        const BugCommand c = FindBugCommand(words, i, &at, &after);
         for (size_t k = i; k < at; ++k) {
             if (open_ && words[k].start >= open_->start - 1e-6) open_->words.push_back(words[k]);
             else if (!open_ && closing_ && words[k].start < closing_->stop) closing_->words.push_back(words[k]);  // said before the shortcut
@@ -208,7 +217,7 @@ std::vector<BugEvent> BugTracker::Heard(const std::vector<CaptionWord>& words) {
             out.push_back({BugEvent::Cancelled, *open_});
             open_.reset();
         }
-        i = at + 2;
+        i = after;
     }
     return out;
 }
@@ -722,7 +731,7 @@ void ClearSpEvent(SPEVENT& ev) {
 }
 
 // The voice commands' recognizer: SAPI in-process with the default engine (as auto captions use), the command grammar
-// ("bug start", "bug stop", "bug cancel") always on and dictation while a bug is open. Input: the default microphone, or
+// ("bug", "stop", "bug cancel", plus longer aliases) always on and dictation while a bug is open. Input: the default microphone, or
 // a 16 kHz mono WAV (tests). Times: BugClock() for the microphone, the file's own seconds for a file.
 class VoiceCommands {
 public:
@@ -806,7 +815,7 @@ public:
         SPSTATEHANDLE top = nullptr;
         if (SUCCEEDED(hr)) hr = ctx_->CreateGrammar(kCommands, &cmd_);
         if (SUCCEEDED(hr)) hr = cmd_->GetRule(L"BugCommand", 0, SPRAF_TopLevel | SPRAF_Active, TRUE, &top);
-        for (const wchar_t* phrase : {L"bug start", L"bug stop", L"bug cancel"})
+        for (const wchar_t* phrase : {L"bug", L"stop", L"bug start", L"bug stop", L"bug cancel"})
             if (SUCCEEDED(hr)) hr = cmd_->AddWordTransition(top, nullptr, phrase, L" ", SPWT_LEXICAL, 1.0f, nullptr);
         if (SUCCEEDED(hr)) hr = cmd_->Commit(0);
         // Auto-pause: after a command the engine waits until dictation is switched to match, so the words right after
@@ -1127,7 +1136,7 @@ void OnStarted(const Bug& bug) {
     a.starts[bug.id] = s;
     if (bug.recording) WatchRecording(bug.recording);
     ShowToast(L"Bug started",
-              a.listening ? L"Describe it, then say “bug stop” (or press " + HotkeyHint() + L")." : L"Press " + HotkeyHint() + L" again to save it.",
+              a.listening ? L"Describe it, then say “stop” (or press " + HotkeyHint() + L")." : L"Press " + HotkeyHint() + L" again to save it.",
               nullptr, nullptr, 3000);
 }
 
@@ -1570,6 +1579,25 @@ int DarkPixels(const Bitmap& img, RECT r) {  // dark pixels in `r`: a caption's 
 
 }  // namespace
 
+ATHER_TEST(bug_short_voice_commands_keep_description_words) {
+    BugTracker tr;
+    auto events = tr.Heard(Said(10, L"Bug, the door is stuck Stop. ignored afterwards"));
+    CHECK(events.size() == 2);
+    if (events.size() == 2) {
+        CHECK(events[0].kind == BugEvent::Started);
+        CHECK(events[1].kind == BugEvent::Stopped);
+        CHECK(events[1].bug.Description() == L"the door is stuck");
+        CHECK_NEAR(events[1].bug.start, 10, 0.001);
+    }
+    CHECK(!tr.Busy());
+    CHECK(tr.Heard(Said(20, L"stop")).empty());
+    events = tr.Heard(Said(30, L"bug"));
+    CHECK(events.size() == 1 && tr.IsOpen());
+    tr.Heard(Said(31, L"the camera is broken"));
+    events = tr.Heard(Said(32, L"STOP!"));
+    CHECK(events.size() == 1 && events[0].bug.Description() == L"the camera is broken");
+}
+
 ATHER_TEST(bug_commands_and_words_by_voice) {
     BugTracker tr;
     CHECK(tr.Tick(0, 0, 0).empty());
@@ -1598,8 +1626,8 @@ ATHER_TEST(bug_commands_and_words_by_voice) {
     ev = tr.Heard(Said(41, L"BUG Stop"));
     CHECK(ev.size() == 1 && ev[0].kind == BugEvent::Stopped && ev[0].bug.words.empty());
     size_t at = 0;
-    CHECK(FindBugCommand(Said(0, L"a bugs start bug"), 0, &at) == BugCommand::None && at == 4);
-    CHECK(FindBugCommand(Said(0, L"bug bug cancel"), 0, &at) == BugCommand::Cancel && at == 1);
+    CHECK(FindBugCommand(Said(0, L"a bugs start debugging"), 0, &at) == BugCommand::None && at == 4);
+    CHECK(FindBugCommand(Said(0, L"bug bug cancel"), 1, &at) == BugCommand::Cancel && at == 1);
 }
 
 ATHER_TEST(bug_shortcut_keeps_late_words_and_stops_itself) {
@@ -1935,7 +1963,7 @@ ATHER_TEST(bug_without_a_recording_has_no_clip) {
     CHECK(Has(ReadAll(d.folder + L"\\bug.md"), L"**Clip:** none: the recording was discarded"));
 }
 
-// "Bug start … the door does not open … bug stop" made by Windows text-to-speech, through the same recognizer setup the
+// "Bug … the door does not open … stop" made by Windows text-to-speech, through the same recognizer setup the
 // app listens to the microphone with (command grammar, dictation while a bug is open), bound to the file instead.
 ATHER_TEST(bug_voice_commands_from_speech) {
     const std::wstring wav = test::TempDir() + L"\\bug-speech.wav";
@@ -1947,9 +1975,9 @@ ATHER_TEST(bug_voice_commands_from_speech) {
     if (SUCCEEDED(hr)) hr = stream->BindToFile(wav.c_str(), SPFM_CREATE_ALWAYS, &SPDFID_WaveFormatEx, &wfx, 0);
     if (SUCCEEDED(hr)) hr = voice->SetOutput(stream.Get(), TRUE);
     if (SUCCEEDED(hr))
-        hr = voice->Speak(L"<silence msec=\"700\"/>Bug start.<silence msec=\"1200\"/>The door does not open.<silence msec=\"1200\"/>"
-                          L"Bug stop.<silence msec=\"350\"/>Bug start.<silence msec=\"350\"/>The camera is broken."
-                          L"<silence msec=\"350\"/>Bug stop.<silence msec=\"700\"/>",
+        hr = voice->Speak(L"<silence msec=\"700\"/>Bug.<silence msec=\"1200\"/>The door does not open.<silence msec=\"1200\"/>"
+                          L"Stop.<silence msec=\"350\"/>Bug.<silence msec=\"350\"/>The camera is broken."
+                          L"<silence msec=\"350\"/>Stop.<silence msec=\"700\"/>",
                           SPF_IS_XML, nullptr);
     if (stream) stream->Close();
     if (FAILED(hr)) {

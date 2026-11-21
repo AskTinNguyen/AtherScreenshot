@@ -21,3 +21,7 @@ Asked whether normal Notepad/Explorer copy and paste worked on this machine. Own
 > Và mở draft PR vào main các thay đổi trên, dùng simple English để mô tả nhé
 
 The explicit installation request authorizes gracefully stopping the old running copy, replacing the installed executable, and restarting it. Existing settings/data are preserved. The user also authorizes pushing the feature branch and opening a draft PR into main; it does not authorize merging or publishing a release.
+
+## 2026-11-21 — intent amendment, rev 3
+
+> Tôi muốn sửa lệnh Bug start và Bug stop, đổi thành Bug và stop thôi cho ngắn gọn

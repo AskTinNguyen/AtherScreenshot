@@ -12,6 +12,7 @@
 
 ## Coming in the next update (Windows)
 
+- Say "bug" to start a voice bug report and "stop" to save it. Settings and live hints show the shorter commands.
 - Loop playback now reaches the exact end of a finished sequence, avoiding intermittent stops at the last selected clip.
 - Clipboard writes initiated without a visible window use a persistent hidden owner; failed clipboard clears are handled before publishing image, text or file data.
 - Controller recordings follow the active controller instead of an idle first slot; short button/trigger taps stay visible for 120 ms.

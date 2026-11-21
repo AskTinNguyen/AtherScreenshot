@@ -41,3 +41,11 @@ Correction to earlier commentary: `GetOpenClipboardWindow()==NULL` does **not** 
 The owner confirmed ordinary Notepad/Explorer copy/paste works. Before any additional source or host change, rerunning the same standalone probe succeeded for both NULL and valid HWND (`OpenClipboard=True, error=0`), and the unchanged release executable passed `quickprompts_clipboard_round_trip_keeps_formats`: `1 tests, 8 checks, 0 failed`. Evidence: `clipboard-after-owner-confirmation.log`, `clipboard-after-owner-test.log`. The host access state demonstrably changed; the cause of the earlier denial is not proven. Do not attribute recovery to a new code fix, a policy change, unlocking the screen or a service restart.
 
 Fresh complete release `test.bat` then exited 0: `178 tests, 2942 checks, 0 failed`, with no skips. All seven clipboard cases and the loop case pass on production source `404b025`. Evidence: `rev2-access-restored-full-tests.log`. This resolves the acceptance blocker; it does not establish the earlier access denial's cause.
+
+## F8 — rev 3: short command spans and independent HUD tests
+
+The parser formerly required two command words and advanced by two words. One-word commands therefore need both a grammar change and an explicit end index, or the first description word would be lost. Parser and actual SAPI generated-speech RED/GREEN tests verify "bug" / "stop" and preserve the description. Longer aliases remain accepted.
+
+A full release run while the installed app was running exposed a global FindWindow lookup in the HUD test. It could select the installed app's panel. The test now uses its own module panel and checks the current PID while retaining production painter/focus/style/destruction coverage.
+
+Latest rev 3 full release result is `179 tests, 2940 checks, 7 failed`, exit 24; all seven are recurring clipboard integrations. Focused voice is `7 tests, 69 checks, 0 failed`, parser `1 test, 9 checks, 0 failed`; both also pass in the full run. The historical rev 2 full PASS does not establish a current full PASS. Native OpenClipboard error 5 has recurred; its cause remains unproven.

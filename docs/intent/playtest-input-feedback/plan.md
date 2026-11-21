@@ -20,3 +20,10 @@ Implementation, synthetic demos, focused release checks and independent review a
 Rev 2 fixes the playback end-clock mismatch and NULL clipboard write ownership, with observed RED/GREEN native regressions. Release full validation is now `178 tests, 2928 checks, 7 failed`: loop and feature checks pass, native clipboard access remains denied even in standalone probes. Resolve that host prerequisite before claiming the seven integrations or the complete gate pass. The user's normal desktop copy/paste clarification remains pending.
 
 Final validation supersedes the earlier blocked result: after the owner's clarification, native clipboard access succeeded without another source/host change. Fresh complete `test.bat` exited 0 with `178 tests, 2942 checks, 0 failed`, no skips. All acceptance items are met. Branch and updated portable build are ready for owner review; leave unmerged/unpublished under the project contract. The earlier denial's precise cause remains unknown.
+
+## Rev 3 — shorter Windows commands (2026-11-21)
+
+1. Reproduce missing one-word commands in the parser and actual SAPI generated-speech tests.
+2. Accept "bug" / "stop", preserve command spans and description words, and update visible Windows instructions. Retain longer aliases and "bug cancel".
+3. Run focused release voice/parser checks and the full release suite, recording any recurring clipboard access denial without weakening assertions.
+4. Under the owner's existing authorization, update the installed executable, verify its hash and running path, and update draft PR #25 into main. Preserve settings/data; leave unmerged and unpublished.

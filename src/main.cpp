@@ -1557,9 +1557,9 @@ int RunAgentBridge() {
 
 // ---- tray ----
 
-std::wstring TrayTip() {  // says when the microphone is open for "bug start"
+std::wstring TrayTip() {  // says when the microphone is open for "bug"
     return std::wstring(kProductName) + L"\nCommands: " + g_settings.Hotkey(L"CommandPalette") +
-           (BugVoiceListening() ? L"\nListening for “bug start”" : L"");
+           (BugVoiceListening() ? L"\nListening for “bug”" : L"");
 }
 
 void UpdateTrayTip() {
@@ -1997,7 +1997,7 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     std::vector<std::wstring> shown;
     const BitmapPtr img = SettingsSnapshot(h, L"bug", &shown);
     CHECK(img);
-    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug start” / “bug stop”", L"Game log paths", L"Clip starts before “bug start”",
+    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug” / “stop”", L"Game log paths", L"Clip starts before “bug”",
                                L"Largest log copied", L"Shortcuts", L"Bug report: start / stop", L"Copy last bug report", L"Open bug reports folder"})
         CHECK(std::find(shown.begin(), shown.end(), row) != shown.end());
     wchar_t out[MAX_PATH];

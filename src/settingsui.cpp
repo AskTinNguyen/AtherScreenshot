@@ -186,7 +186,7 @@ void Window::Build() {
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
     header(L"Bug reports");
-    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug start” / “bug stop”",
+    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug” / “stop”",
         L"Local English commands. Shows microphone level, heard speech and a persistent bug badge", L"0");
     {
         Row* r = add(Kind::Action, L"Bugs", L"RestartVoice", L"Retry bug voice input",
@@ -196,7 +196,7 @@ void Window::Build() {
     }
     add(Kind::Text, L"Bugs", L"LogPaths", L"Game log paths",
         L"Separate with ;  e.g. %LOCALAPPDATA%\\MyGame\\Saved\\Logs\\*.log", L"");
-    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug start”", L"Seconds of the recording before the bug", L"10", 0, 120);
+    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug”", L"Seconds of the recording before the bug", L"10", 0, 120);
     add(Kind::Number, L"Bugs", L"LogMaxMB", L"Largest log copied", L"MB; a bigger log keeps only its end", L"20", 1, 1024);
 
     header(L"Scrolling capture & editor");
