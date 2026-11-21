@@ -119,6 +119,7 @@ enum Cmd : int {
     CmdBugReport,
     CmdCopyLastBug,
     CmdOpenBugsFolder,
+    CmdRestartBugVoice,
     CmdInsertQuickPrompt,
     CmdOpenQuickPrompts,
     CmdNewQuickPrompt,
@@ -151,6 +152,7 @@ const CmdDef kCmds[] = {
     {CmdBugReport, L"BugReport", L"Bug report: start / stop", L"bug issue playtest report voice clip logs game qa", 0xEBE8, L"Ctrl+Alt+B", true},
     {CmdCopyLastBug, L"CopyLastBugReport", L"Copy last bug report", L"bug clipboard paste slack files clip logs", 0xE8C8, L"", false},
     {CmdOpenBugsFolder, L"OpenBugReportsFolder", L"Open bug reports folder", L"bug explorer directory files bundles", 0xE838, L"", false},
+    {CmdRestartBugVoice, L"RestartBugVoice", L"Restart bug voice listener", L"bug microphone voice speech retry reconnect input", 0xE72C, L"", false},
     {CmdInsertQuickPrompt, L"InsertQuickPrompt", L"Insert QuickPrompt…", L"prompt snippet phrase text expand template paste ai agent claude chatgpt", 0xE8BD, L"Ctrl+Alt+Space", false},
     {CmdOpenQuickPrompts, L"OpenQuickPrompts", L"QuickPrompts…", L"prompt snippet phrase text expansion library triggers manage edit team", 0xE8BD, L"", false},
     {CmdNewQuickPrompt, L"NewQuickPrompt", L"New QuickPrompt…", L"prompt snippet phrase text expansion add create trigger", 0xE710, L"", false},
@@ -1175,6 +1177,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdBugReport: ToggleBugReport(); break;
         case CmdCopyLastBug: CopyLastBugReport(); break;
         case CmdOpenBugsFolder: OpenBugReportsFolder(); break;
+        case CmdRestartBugVoice: RestartBugVoiceListening(); break;
         case CmdInsertQuickPrompt: ShowQuickPromptPicker(); break;
         case CmdOpenQuickPrompts: OpenQuickPrompts(); break;
         case CmdNewQuickPrompt: OpenQuickPrompts(L"new"); break;
@@ -1554,9 +1557,9 @@ int RunAgentBridge() {
 
 // ---- tray ----
 
-std::wstring TrayTip() {  // says when the microphone is open for "bug start"
+std::wstring TrayTip() {  // says when the microphone is open for "bug"
     return std::wstring(kProductName) + L"\nCommands: " + g_settings.Hotkey(L"CommandPalette") +
-           (BugVoiceListening() ? L"\nListening for “bug start”" : L"");
+           (BugVoiceListening() ? L"\nListening for “bug”" : L"");
 }
 
 void UpdateTrayTip() {
@@ -1994,7 +1997,7 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     std::vector<std::wstring> shown;
     const BitmapPtr img = SettingsSnapshot(h, L"bug", &shown);
     CHECK(img);
-    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug start” / “bug stop”", L"Game log paths", L"Clip starts before “bug start”",
+    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug” / “stop”", L"Game log paths", L"Clip starts before “bug”",
                                L"Largest log copied", L"Shortcuts", L"Bug report: start / stop", L"Copy last bug report", L"Open bug reports folder"})
         CHECK(std::find(shown.begin(), shown.end(), row) != shown.end());
     wchar_t out[MAX_PATH];

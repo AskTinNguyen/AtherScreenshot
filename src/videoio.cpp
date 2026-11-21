@@ -2610,6 +2610,10 @@ double SequencePlayer::Now() const {
     if (cur_ >= seq_.clips.size()) return seq_.Duration();
     const Clip& c = seq_.clips[cur_];
     const VideoPlayer* p = Cur();
+    // Advance stops just before the source out-point to avoid leaking the next clip's frame.
+    // A successfully finished timeline must still reach its exact end; otherwise the editor's
+    // tighter loop boundary can mistake that early stop for a playback failure.
+    if (ended_ && p && !p->Failed()) return seq_.Duration();
     return starts_[cur_] + (p ? std::clamp(p->Now() - c.in, 0.0, c.Duration()) : 0);
 }
 
@@ -2770,6 +2774,33 @@ bool WriteTestClip(const std::wstring& path, int w, int h, int fps, double secon
 }
 
 // ---------- tests (VideoTests.swift) ----------
+
+ATHER_TEST(video_sequence_finished_position_reaches_trimmed_clip_end) {
+    const std::wstring path = test::TempDir() + L"/playback.mp4";
+    CHECK(WriteTestClip(path, 160, 90, 30, 2, false));
+    auto clip = ClipOf(path);
+    CHECK(clip);
+    if (!clip) return;
+    clip->in = 0.5;
+    clip->out = 1.0;  // end inside the source, so the engine itself hasn't reached EOF
+    Sequence sequence{{*clip}, {160, 90}};
+    auto player = SequencePlayer::Open(sequence, nullptr, 0, nullptr);
+    CHECK(player != nullptr);
+    if (!player) return;
+    player->Seek(0.46);
+    player->Play();
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    do {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        double t = 0;
+        player->NewFrame(&t);
+        Sleep(1);
+    } while (player->Playing() && GetTickCount64() < deadline);
+    CHECK(!player->Playing());
+    test::Note("finished sequence clock=" + std::to_string(player->Now()) + ", duration=" + std::to_string(sequence.Duration()));
+    CHECK_NEAR(player->Now(), sequence.Duration(), 0.000001);
+}
 
 // Clips of different files and shapes play back to back: cut points, black bars, sound only where there is some.
 ATHER_TEST(video_sequence_joins_clips_into_one_video) {

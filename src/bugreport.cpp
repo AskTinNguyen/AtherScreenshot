@@ -4,6 +4,9 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wrl/client.h>
+#include <mmsystem.h>
+
+#pragma comment(lib, "winmm.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +21,7 @@
 #include <thread>
 
 #include "audio.h"
+#include "bugvoice.h"
 #include "capture.h"
 #include "json.h"
 #include "library.h"
@@ -124,16 +128,25 @@ std::wstring Lower(std::wstring s) {
 
 double BugClock() { return GetTickCount64() / 1000.0; }
 
-BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at) {
+BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at, size_t* after) {
     for (size_t i = from; i < words.size(); ++i) {
         const std::wstring w = Bare(words[i].text);
-        if (w != L"bug" || i + 1 == words.size()) continue;
-        if (const BugCommand c = CommandWord(Bare(words[i + 1].text)); c != BugCommand::None) {
-            if (at) *at = i;
-            return c;
+        BugCommand c = w == L"bug" ? BugCommand::Start : w == L"stop" ? BugCommand::Stop : BugCommand::None;
+        size_t length = 1;
+        // Keep the longer commands as aliases, and prefer "bug cancel" over a new start.
+        if (w == L"bug" && i + 1 < words.size()) {
+            if (const auto legacy = CommandWord(Bare(words[i + 1].text)); legacy != BugCommand::None) {
+                c = legacy;
+                length = 2;
+            }
         }
+        if (c == BugCommand::None) continue;
+        if (at) *at = i;
+        if (after) *after = i + length;
+        return c;
     }
     if (at) *at = words.size();
+    if (after) *after = words.size();
     return BugCommand::None;
 }
 
@@ -181,8 +194,8 @@ BugEvent BugTracker::Finish() {
 std::vector<BugEvent> BugTracker::Heard(const std::vector<CaptionWord>& words) {
     std::vector<BugEvent> out;
     for (size_t i = 0;;) {
-        size_t at = 0;
-        const BugCommand c = FindBugCommand(words, i, &at);
+        size_t at = 0, after = 0;
+        const BugCommand c = FindBugCommand(words, i, &at, &after);
         for (size_t k = i; k < at; ++k) {
             if (open_ && words[k].start >= open_->start - 1e-6) open_->words.push_back(words[k]);
             else if (!open_ && closing_ && words[k].start < closing_->stop) closing_->words.push_back(words[k]);  // said before the shortcut
@@ -204,7 +217,7 @@ std::vector<BugEvent> BugTracker::Heard(const std::vector<CaptionWord>& words) {
             out.push_back({BugEvent::Cancelled, *open_});
             open_.reset();
         }
-        i = at + 2;
+        i = after;
     }
     return out;
 }
@@ -688,6 +701,28 @@ void FinishBugClip(BugBundle& b, const RecordResult& r, double preRoll) {
 // ---- voice: SAPI commands and dictation, and the microphone for voice.wav ----
 
 namespace {
+bool AcceptVoiceResult(bool command, int confidence) {
+    return !command || confidence != SP_LOW_CONFIDENCE;
+}
+double VoiceRetrySeconds(unsigned failures) {
+    return std::min(30.0, (double)(1u << std::min(failures, 5u)));
+}
+}  // namespace
+
+ATHER_TEST(bug_voice_policy_is_identical_for_files_and_microphones) {
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE));
+    CHECK(AcceptVoiceResult(true, SP_NORMAL_CONFIDENCE));
+    CHECK(AcceptVoiceResult(true, SP_HIGH_CONFIDENCE));
+    CHECK(AcceptVoiceResult(false, SP_LOW_CONFIDENCE));
+}
+
+ATHER_TEST(bug_voice_retry_is_bounded_without_busy_looping) {
+    CHECK(VoiceRetrySeconds(0) >= 1);
+    CHECK(VoiceRetrySeconds(1) > VoiceRetrySeconds(0));
+    CHECK(VoiceRetrySeconds(100) == 30);
+}
+
+namespace {
 
 void ClearSpEvent(SPEVENT& ev) {
     if (ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) reinterpret_cast<IUnknown*>(ev.lParam)->Release();
@@ -696,7 +731,7 @@ void ClearSpEvent(SPEVENT& ev) {
 }
 
 // The voice commands' recognizer: SAPI in-process with the default engine (as auto captions use), the command grammar
-// ("bug start", "bug stop", "bug cancel") always on and dictation while a bug is open. Input: the default microphone, or
+// ("bug", "stop", "bug cancel", plus longer aliases) always on and dictation while a bug is open. Input: the default microphone, or
 // a 16 kHz mono WAV (tests). Times: BugClock() for the microphone, the file's own seconds for a file.
 class VoiceCommands {
 public:
@@ -704,7 +739,16 @@ public:
         std::vector<CaptionWord> words;
         bool command = false;  // from the command grammar (otherwise dictation)
         int confidence = 0;    // SP_LOW_CONFIDENCE, SP_NORMAL_CONFIDENCE or SP_HIGH_CONFIDENCE
+        bool accepted = true;
     };
+    struct Signal {
+        int level = 0;
+        bool speech = false;
+        double levelAt = 0;
+        unsigned rejections = 0;
+    } signal;
+    std::wstring microphone, language;
+    HRESULT streamError = S_OK;
 
     ~VoiceCommands() {
         if (rec_) rec_->SetRecoState(SPRST_INACTIVE);
@@ -713,6 +757,18 @@ public:
     bool Open(const std::wstring& wav, std::wstring* error) {
         rec_.Attach(NewSpeechRecognizer(error));
         if (!rec_) return false;
+        // Display the recognizer's own input, not the independently selected narration device.
+        ComPtr<ISpObjectToken> engine;
+        if (SUCCEEDED(rec_->GetRecognizer(&engine))) {
+            ComPtr<ISpDataKey> attributes;
+            LPWSTR locale = nullptr;
+            if (SUCCEEDED(engine->OpenKey(L"Attributes", &attributes)) && SUCCEEDED(attributes->GetStringValue(L"Language", &locale))) {
+                const LCID id = wcstoul(locale, nullptr, 16);
+                wchar_t name[128]{};
+                if (GetLocaleInfoW(id, LOCALE_SENGLISHLANGUAGENAME, name, (int)std::size(name))) language = name;
+            }
+            CoTaskMemFree(locale);
+        }
         file_ = !wav.empty();
         HRESULT hr = S_OK;
         if (file_) {
@@ -737,15 +793,29 @@ public:
                 if (error) *error = L"There's no microphone to listen to (Settings › System › Sound › Input).";
                 return false;
             }
+            LPWSTR name = nullptr;
+            if (SUCCEEDED(token->GetStringValue(nullptr, &name)) && name) microphone = L"SAPI input: " + std::wstring(name);
+            CoTaskMemFree(name);
+            ComPtr<ISpStreamFormat> input;
+            ComPtr<ISpMMSysAudio> audio;
+            UINT device = WAVE_MAPPER;
+            WAVEINCAPSW caps{};
+            if (SUCCEEDED(rec_->GetInputStream(&input)) && SUCCEEDED(input.As(&audio)) &&
+                SUCCEEDED(audio->GetDeviceId(&device)) && device != WAVE_MAPPER &&
+                waveInGetDevCapsW(device, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
+                microphone = caps.szPname;
         }
+        if (microphone.empty()) microphone = file_ ? L"Synthetic audio file (test)" : L"SAPI input (device name unavailable)";
         if (SUCCEEDED(hr)) hr = rec_->CreateRecoContext(&ctx_);
-        const ULONGLONG interest = SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_END_SR_STREAM);
+        const ULONGLONG interest = SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_END_SR_STREAM) |
+            SPFEI(SPEI_SR_AUDIO_LEVEL) | SPFEI(SPEI_SOUND_START) | SPFEI(SPEI_SOUND_END) |
+            SPFEI(SPEI_PHRASE_START) | SPFEI(SPEI_FALSE_RECOGNITION);
         if (SUCCEEDED(hr)) hr = ctx_->SetNotifyWin32Event();
         if (SUCCEEDED(hr)) hr = ctx_->SetInterest(interest, interest);
         SPSTATEHANDLE top = nullptr;
         if (SUCCEEDED(hr)) hr = ctx_->CreateGrammar(kCommands, &cmd_);
         if (SUCCEEDED(hr)) hr = cmd_->GetRule(L"BugCommand", 0, SPRAF_TopLevel | SPRAF_Active, TRUE, &top);
-        for (const wchar_t* phrase : {L"bug start", L"bug stop", L"bug cancel"})
+        for (const wchar_t* phrase : {L"bug", L"stop", L"bug start", L"bug stop", L"bug cancel"})
             if (SUCCEEDED(hr)) hr = cmd_->AddWordTransition(top, nullptr, phrase, L" ", SPWT_LEXICAL, 1.0f, nullptr);
         if (SUCCEEDED(hr)) hr = cmd_->Commit(0);
         // Auto-pause: after a command the engine waits until dictation is switched to match, so the words right after
@@ -767,7 +837,11 @@ public:
     HANDLE Event() const { return ctx_ ? ctx_->GetNotifyEventHandle() : nullptr; }
     bool Dictation() const { return dictation_; }
     void SetDictation(bool on) {
-        if (dict_ && on != dictation_ && SUCCEEDED(dict_->SetDictationState(on ? SPRS_ACTIVE : SPRS_INACTIVE))) dictation_ = on;
+        if (dict_ && on != dictation_) {
+            const HRESULT hr = dict_->SetDictationState(on ? SPRS_ACTIVE : SPRS_INACTIVE);
+            if (SUCCEEDED(hr)) dictation_ = on;
+            else { ended_ = true; streamError = hr; }
+        }
     }
 
     // What was recognized since the last call (waiting up to `waitMs` for something); false once a file has ended.
@@ -777,8 +851,24 @@ public:
         if (waitMs) ctx_->WaitForNotifyEvent(waitMs);
         SPEVENT ev{};
         ULONG got = 0;
-        while (SUCCEEDED(ctx_->GetEvents(1, &ev, &got)) && got == 1) {
-            if (ev.eEventId == SPEI_END_SR_STREAM) ended_ = true;
+        for (;;) {
+            const HRESULT eventResult = ctx_->GetEvents(1, &ev, &got);
+            if (FAILED(eventResult)) { ended_ = true; streamError = eventResult; break; }
+            if (got != 1) break;
+            if (ev.eEventId == SPEI_SR_AUDIO_LEVEL) {
+                signal.level = std::clamp((int)ev.wParam, 0, 100);
+                signal.levelAt = BugClock();
+            }
+            if (ev.eEventId == SPEI_SOUND_START || ev.eEventId == SPEI_PHRASE_START) signal.speech = true;
+            if (ev.eEventId == SPEI_SOUND_END) signal.speech = false;
+            if (ev.eEventId == SPEI_FALSE_RECOGNITION) {
+                ++signal.rejections;
+                signal.speech = false;
+            }
+            if (ev.eEventId == SPEI_END_SR_STREAM) {
+                ended_ = true;
+                streamError = (HRESULT)ev.lParam;
+            }
             if (ev.eEventId == SPEI_RECOGNITION && ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) {
                 auto* r = reinterpret_cast<ISpRecoResult*>(ev.lParam);
                 SPRECORESULTTIMES times{};
@@ -800,14 +890,22 @@ public:
                         }
                     }
                     CoTaskMemFree(ph);
-                    const bool unsure = h.command && !file_ && h.confidence == SP_LOW_CONFIDENCE;
+                    // File tests and microphone commands deliberately use the same policy.
+                    // Dictation may also contain a stop/start phrase; it must not bypass the guard.
+                    const bool command = h.command || FindBugCommand(h.words, 0, nullptr) != BugCommand::None;
+                    h.accepted = AcceptVoiceResult(command, h.confidence);
+                    const bool unsure = !h.accepted;
                     if (h.command && !unsure) {
                         const BugCommand c = FindBugCommand(h.words, 0, nullptr);
                         if (c != BugCommand::None) SetDictation(c == BugCommand::Start);
                     }
-                    if (h.command && autoPause_) ctx_->Resume(0);
-                    if (!unsure) out->push_back(std::move(h));
+                    out->push_back(std::move(h));  // rejected words still explain why no command ran
                 }
+            }
+            // Resume even if a result's metadata couldn't be decoded or its confidence was too low.
+            if ((ev.eEventId == SPEI_RECOGNITION || ev.eEventId == SPEI_FALSE_RECOGNITION) && (ev.wParam & SPREF_AutoPause)) {
+                const HRESULT hr = ctx_->Resume(0);
+                if (FAILED(hr)) { ended_ = true; streamError = hr; }
             }
             ClearSpEvent(ev);
         }
@@ -872,6 +970,8 @@ struct Listener {  // VoiceCommands on a thread of its own
     std::thread thread;
     HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr), wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     std::atomic<int> dictation{0};
+    const uint64_t generation;
+    explicit Listener(uint64_t id) : generation(id) {}
     ~Listener() {
         SetEvent(stop);
         if (thread.joinable()) thread.join();
@@ -899,7 +999,11 @@ struct BugApp {
     BugTracker tracker;
     std::map<uint64_t, StartInfo> starts;  // by bug id
     std::unique_ptr<Listener> listener;
-    bool listening = false, voiceTried = false, dictationWanted = false;
+    bool listening = false, dictationWanted = false;
+    BugVoiceStatus voiceStatus;
+    uint64_t listenerGeneration = 0;
+    unsigned voiceFailures = 0;
+    double retryAt = 0;
     UINT_PTR timer = 0;
     std::map<uint64_t, RecordingBugs> recordings;
     uint64_t watched = 0;
@@ -913,6 +1017,7 @@ BugApp& App() {
 
 // Tests drive the recording clock: {RecordingId(), RecordingSeconds()}.
 std::function<std::pair<uint64_t, double>()> g_testRecording;
+std::wstring g_testVoiceInput;  // self-tests supply a WAV; never open a real microphone
 
 std::pair<uint64_t, double> RecordingNow() {
     if (g_testRecording) return g_testRecording();
@@ -937,6 +1042,15 @@ void Work(std::function<void()> job, std::function<void()> then) {
 }
 
 void Handle(const std::vector<BugEvent>& events);
+void StartListening();
+
+void PublishVoiceStatus() {
+    BugApp& a = App();
+    a.voiceStatus.bugOpen = a.tracker.IsOpen();
+    a.voiceStatus.saving = (a.tracker.Busy() && !a.tracker.IsOpen()) || a.busy.load() > 0;
+    a.voiceStatus.hotkey = a.opt.hotkey;
+    UpdateBugVoiceStatus(a.voiceStatus);
+}
 
 void SyncListening() {
     BugApp& a = App();
@@ -946,9 +1060,11 @@ void SyncListening() {
         SetEvent(a.listener->wake);
     }
     a.dictationWanted = want;
-    const bool tick = a.listening || a.tracker.Busy();
+    const bool tick = a.opt.voice || a.tracker.Busy() || a.busy.load() > 0;
     if (tick && !a.timer) {
         a.timer = SetTimer(nullptr, 0, 250, [](HWND, UINT, UINT_PTR, DWORD) {
+            BugApp& a = App();
+            if (a.opt.voice && !a.listener && a.retryAt > 0 && BugClock() >= a.retryAt) StartListening();
             const auto [rec, secs] = RecordingNow();
             Handle(App().tracker.Tick(BugClock(), rec, secs));
         });
@@ -956,6 +1072,7 @@ void SyncListening() {
         KillTimer(nullptr, a.timer);
         a.timer = 0;
     }
+    PublishVoiceStatus();
 }
 
 void NoteInGallery(const BugBundle& b, const std::vector<std::wstring>& names) {
@@ -991,6 +1108,7 @@ std::wstring HotkeyHint() {
 void OnStarted(const Bug& bug) {
     BugApp& a = App();
     StartInfo s;
+    a.voiceStatus.bugStarted = bug.start;
     s.wall = NowEpoch() - (BugClock() - bug.start);
     HWND fg = GetForegroundWindow();
     if (fg && !IsOwnWindow(fg)) {
@@ -1018,7 +1136,7 @@ void OnStarted(const Bug& bug) {
     a.starts[bug.id] = s;
     if (bug.recording) WatchRecording(bug.recording);
     ShowToast(L"Bug started",
-              a.listening ? L"Describe it, then say “bug stop” (or press " + HotkeyHint() + L")." : L"Press " + HotkeyHint() + L" again to save it.",
+              a.listening ? L"Describe it, then say “stop” (or press " + HotkeyHint() + L")." : L"Press " + HotkeyHint() + L" again to save it.",
               nullptr, nullptr, 3000);
 }
 
@@ -1092,48 +1210,126 @@ void Handle(const std::vector<BugEvent>& events) {
     SyncListening();
 }
 
-void ListenerStarted(Listener* l, bool ok, const std::wstring& error) {
+bool IsCurrentListener(Listener* l, uint64_t generation) {
+    return App().listener.get() == l && App().listener && App().listener->generation == generation;
+}
+
+void ListenerFailed(Listener* l, uint64_t generation, const std::wstring& error) {
     BugApp& a = App();
-    if (l != a.listener.get()) return;
-    if (!ok) {
-        a.listener.reset();
-        ShowToast(L"Voice commands aren't available", error + L"\nThe " + HotkeyHint() + L" shortcut still makes bug reports.", nullptr, nullptr, 9000);
-        return;
-    }
+    if (!IsCurrentListener(l, generation)) return;
+    a.listening = false;
+    a.voiceStatus.phase = BugVoicePhase::Reconnecting;
+    a.voiceStatus.audioLevel = 0;
+    a.voiceStatus.speech = false;
+    a.voiceStatus.message = error;
+    a.retryAt = BugClock() + VoiceRetrySeconds(a.voiceFailures++);
+    a.listener.reset();  // worker has queued this notification and is exiting; join before reopening
+    SyncListening();
+    if (a.host.listeningChanged) a.host.listeningChanged();
+}
+
+void ListenerStarted(Listener* l, uint64_t generation, const std::wstring& microphone, const std::wstring& language) {
+    BugApp& a = App();
+    if (!IsCurrentListener(l, generation)) return;
     a.listening = true;
+    a.retryAt = 0;
+    a.voiceStatus.phase = BugVoicePhase::Listening;
+    a.voiceStatus.startedAt = BugClock();
+    a.voiceStatus.microphone = microphone;
+    a.voiceStatus.language = language;
+    a.voiceStatus.message.clear();
     a.dictationWanted = false;
     SyncListening();
     if (a.host.listeningChanged) a.host.listeningChanged();
 }
 
-void OnHeard(Listener* l, const std::vector<VoiceCommands::Heard>& heard) {
+void OnSignal(Listener* l, uint64_t generation, VoiceCommands::Signal signal, bool rejected) {
     BugApp& a = App();
-    if (l != a.listener.get()) return;
+    if (!IsCurrentListener(l, generation)) return;
+    a.voiceStatus.audioLevel = signal.level;
+    a.voiceStatus.levelAt = signal.levelAt;
+    if ((signal.level > 0 && BugClock() - signal.levelAt < 1) || signal.speech) a.voiceStatus.signalAt = BugClock();
+    a.voiceStatus.speech = signal.speech;
+    if (rejected) {
+        a.voiceStatus.rejected = true;
+        a.voiceStatus.lastHeard = L"Speech not understood";
+        a.voiceStatus.heardAt = BugClock();
+    }
+    PublishVoiceStatus();
+}
+
+void OnHeard(Listener* l, uint64_t generation, const std::vector<VoiceCommands::Heard>& heard) {
+    BugApp& a = App();
+    if (!IsCurrentListener(l, generation)) return;
     const auto [rec, secs] = RecordingNow();
     Handle(a.tracker.Tick(BugClock(), rec, secs));
-    for (const auto& h : heard) Handle(a.tracker.Heard(h.words));
+    for (const auto& h : heard) {
+        std::wstring text;
+        for (const auto& w : h.words) text += (text.empty() ? L"" : L" ") + w.text;
+        a.voiceStatus.lastHeard = text;
+        a.voiceStatus.rejected = !h.accepted;
+        a.voiceStatus.heardAt = BugClock();
+        a.voiceStatus.speech = false;
+        if (h.accepted) Handle(a.tracker.Heard(h.words));
+    }
+    PublishVoiceStatus();
 }
 
 void StartListening() {
     BugApp& a = App();
-    a.listener = std::make_unique<Listener>();
+    a.retryAt = 0;
+    a.voiceStatus.phase = a.voiceFailures ? BugVoicePhase::Reconnecting : BugVoicePhase::Starting;
+    a.voiceStatus.startedAt = BugClock();
+    a.listener = std::make_unique<Listener>(++a.listenerGeneration);
     Listener* l = a.listener.get();
-    l->thread = std::thread([l] {
+    const uint64_t generation = l->generation;
+    const std::wstring input = g_testVoiceInput;
+    PublishVoiceStatus();
+    l->thread = std::thread([l, generation, input] {
         const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         {
             VoiceCommands vc;
             std::wstring err;
-            const bool ok = vc.Open(L"", &err);
-            RunOnUi([l, ok, err] { ListenerStarted(l, ok, err); });
+            const bool ok = vc.Open(input, &err);
+            if (ok) RunOnUi([l, generation, microphone = vc.microphone, language = vc.language] {
+                ListenerStarted(l, generation, microphone, language);
+            });
             HANDLE wait[3] = {l->stop, l->wake, vc.Event()};
+            unsigned rejections = 0;
+            double lastPost = 0;
+            bool healthy = false;
+            const double openedAt = BugClock();
             while (ok) {
-                const DWORD w = WaitForMultipleObjects(3, wait, FALSE, INFINITE);
-                if (w == WAIT_OBJECT_0 || w == WAIT_FAILED) break;
+                const DWORD w = WaitForMultipleObjects(3, wait, FALSE, 500);
+                if (w == WAIT_OBJECT_0) break;
+                if (w == WAIT_FAILED) {
+                    err = std::format(L"Microphone event failed (0x{:08X}). Check the default input device.", GetLastError());
+                    break;
+                }
                 if (w == WAIT_OBJECT_0 + 1) vc.SetDictation(l->dictation != 0);
                 std::vector<VoiceCommands::Heard> heard;
-                vc.Next(0, &heard);
-                if (!heard.empty()) RunOnUi([l, heard = std::move(heard)] { OnHeard(l, heard); });
+                const bool more = vc.Next(0, &heard);
+                const double now = BugClock();
+                if (now - lastPost >= 0.1 || rejections != vc.signal.rejections) {
+                    RunOnUi([l, generation, signal = vc.signal, rejected = rejections != vc.signal.rejections] {
+                        OnSignal(l, generation, signal, rejected);
+                    });
+                    rejections = vc.signal.rejections;
+                    lastPost = now;
+                }
+                if (!heard.empty()) RunOnUi([l, generation, heard = std::move(heard)] { OnHeard(l, generation, heard); });
+                if (!more) {
+                    err = FAILED(vc.streamError) ? std::format(L"Microphone disconnected (0x{:08X}).", (unsigned long)vc.streamError)
+                                                : L"Microphone stream ended. Check the default input device.";
+                    break;
+                }
+                // Reset backoff only after a stream has stayed healthy, not after an open/close loop.
+                if (!healthy && now - openedAt >= 30) {
+                    healthy = true;
+                    RunOnUi([l, generation] { if (IsCurrentListener(l, generation)) App().voiceFailures = 0; });
+                }
             }
+            if (!err.empty()) RunOnUi([l, generation, err] { ListenerFailed(l, generation, err); });
         }
         if (SUCCEEDED(co)) CoUninitialize();
     });
@@ -1146,16 +1342,37 @@ void ConfigureBugReports(const BugReportOptions& o, const BugReportHost& h) {
     a.opt = o;
     a.host = h;
     if (!o.voice) {
-        a.voiceTried = false;
+        a.voiceFailures = 0;
+        a.retryAt = 0;
+        a.voiceStatus.phase = BugVoicePhase::Off;
+        a.voiceStatus.audioLevel = 0;
+        a.voiceStatus.speech = false;
         if (a.listener) {
             a.listener.reset();
             a.listening = false;
             if (a.host.listeningChanged) a.host.listeningChanged();
         }
-    } else if (!a.listener && !a.voiceTried) {  // a missing recognizer or microphone is said once, not at every reload
-        a.voiceTried = true;
+    } else if (!a.listener && !a.retryAt) {
         StartListening();
     }
+    SyncListening();
+}
+
+void RestartBugVoiceListening() {
+    BugApp& a = App();
+    if (!a.opt.voice) {
+        ShowToast(L"Bug voice is off", L"Enable listening in Settings > Bug reports first. The shortcut still works.", nullptr, nullptr, 5000);
+        return;
+    }
+    a.listener.reset();
+    a.listening = false;
+    a.voiceFailures = 0;
+    a.retryAt = 0;
+    a.voiceStatus.message.clear();
+    a.voiceStatus.lastHeard.clear();
+    a.voiceStatus.audioLevel = 0;
+    a.voiceStatus.signalAt = a.voiceStatus.levelAt = 0;
+    StartListening();
     SyncListening();
 }
 
@@ -1237,6 +1454,11 @@ void StopBugReports() {
     Handle(a.tracker.Tick(now + BugTracker::kGrace, rec, secs));
     a.listener.reset();
     a.listening = false;
+    a.opt.voice = false;
+    a.retryAt = 0;
+    a.voiceStatus = {};
+    UpdateBugVoiceStatus(a.voiceStatus);
+    HideBugVoicePanel();
     a.starts.clear();  // stops the microphone
     if (a.timer) KillTimer(nullptr, a.timer);
     a.timer = 0;
@@ -1357,6 +1579,25 @@ int DarkPixels(const Bitmap& img, RECT r) {  // dark pixels in `r`: a caption's 
 
 }  // namespace
 
+ATHER_TEST(bug_short_voice_commands_keep_description_words) {
+    BugTracker tr;
+    auto events = tr.Heard(Said(10, L"Bug, the door is stuck Stop. ignored afterwards"));
+    CHECK(events.size() == 2);
+    if (events.size() == 2) {
+        CHECK(events[0].kind == BugEvent::Started);
+        CHECK(events[1].kind == BugEvent::Stopped);
+        CHECK(events[1].bug.Description() == L"the door is stuck");
+        CHECK_NEAR(events[1].bug.start, 10, 0.001);
+    }
+    CHECK(!tr.Busy());
+    CHECK(tr.Heard(Said(20, L"stop")).empty());
+    events = tr.Heard(Said(30, L"bug"));
+    CHECK(events.size() == 1 && tr.IsOpen());
+    tr.Heard(Said(31, L"the camera is broken"));
+    events = tr.Heard(Said(32, L"STOP!"));
+    CHECK(events.size() == 1 && events[0].bug.Description() == L"the camera is broken");
+}
+
 ATHER_TEST(bug_commands_and_words_by_voice) {
     BugTracker tr;
     CHECK(tr.Tick(0, 0, 0).empty());
@@ -1385,8 +1626,8 @@ ATHER_TEST(bug_commands_and_words_by_voice) {
     ev = tr.Heard(Said(41, L"BUG Stop"));
     CHECK(ev.size() == 1 && ev[0].kind == BugEvent::Stopped && ev[0].bug.words.empty());
     size_t at = 0;
-    CHECK(FindBugCommand(Said(0, L"a bugs start bug"), 0, &at) == BugCommand::None && at == 4);
-    CHECK(FindBugCommand(Said(0, L"bug bug cancel"), 0, &at) == BugCommand::Cancel && at == 1);
+    CHECK(FindBugCommand(Said(0, L"a bugs start debugging"), 0, &at) == BugCommand::None && at == 4);
+    CHECK(FindBugCommand(Said(0, L"bug bug cancel"), 1, &at) == BugCommand::Cancel && at == 1);
 }
 
 ATHER_TEST(bug_shortcut_keeps_late_words_and_stops_itself) {
@@ -1722,7 +1963,7 @@ ATHER_TEST(bug_without_a_recording_has_no_clip) {
     CHECK(Has(ReadAll(d.folder + L"\\bug.md"), L"**Clip:** none: the recording was discarded"));
 }
 
-// "Bug start … the door does not open … bug stop" made by Windows text-to-speech, through the same recognizer setup the
+// "Bug … the door does not open … stop" made by Windows text-to-speech, through the same recognizer setup the
 // app listens to the microphone with (command grammar, dictation while a bug is open), bound to the file instead.
 ATHER_TEST(bug_voice_commands_from_speech) {
     const std::wstring wav = test::TempDir() + L"\\bug-speech.wav";
@@ -1734,8 +1975,9 @@ ATHER_TEST(bug_voice_commands_from_speech) {
     if (SUCCEEDED(hr)) hr = stream->BindToFile(wav.c_str(), SPFM_CREATE_ALWAYS, &SPDFID_WaveFormatEx, &wfx, 0);
     if (SUCCEEDED(hr)) hr = voice->SetOutput(stream.Get(), TRUE);
     if (SUCCEEDED(hr))
-        hr = voice->Speak(L"<silence msec=\"700\"/>Bug start.<silence msec=\"1200\"/>The door does not open.<silence msec=\"1200\"/>"
-                          L"Bug stop.<silence msec=\"700\"/>",
+        hr = voice->Speak(L"<silence msec=\"700\"/>Bug.<silence msec=\"1200\"/>The door does not open.<silence msec=\"1200\"/>"
+                          L"Stop.<silence msec=\"350\"/>Bug.<silence msec=\"350\"/>The camera is broken."
+                          L"<silence msec=\"350\"/>Stop.<silence msec=\"700\"/>",
                           SPF_IS_XML, nullptr);
     if (stream) stream->Close();
     if (FAILED(hr)) {
@@ -1759,13 +2001,13 @@ ATHER_TEST(bug_voice_commands_from_speech) {
             heard += h.command ? std::format("[command, confidence {}]", h.confidence) : std::string("[dictation]");
             for (const auto& w : h.words) heard += std::format(" {}@{:.2f}", ToUtf8(w.text), w.start);
             heard += " | ";
-            for (auto& e : tr.Heard(h.words)) events.push_back(std::move(e));
+            if (h.accepted) for (auto& e : tr.Heard(h.words)) events.push_back(std::move(e));
         }
         if (!more) break;
     }
     test::Out("  heard: " + heard + "\n");
     test::Note("heard: " + heard);
-    CHECK(events.size() >= 2);
+    CHECK(events.size() >= 4);  // consecutive reports, including shorter pauses, use the live confidence guard
     if (events.size() < 2) return;
     CHECK(events[0].kind == BugEvent::Started);
     const auto stop = std::find_if(events.begin(), events.end(), [](const BugEvent& e) { return e.kind == BugEvent::Stopped; });
@@ -1778,6 +2020,37 @@ ATHER_TEST(bug_voice_commands_from_speech) {
     CHECK(said.find(L"bug") == std::wstring::npos);  // the commands aren't part of it
     CHECK(stop->bug.start < stop->bug.stop);
     for (const auto& w : stop->bug.words) CHECK(w.start >= stop->bug.start && w.start < stop->bug.stop);
+    const auto second = std::find_if(stop + 1, events.end(), [](const BugEvent& e) { return e.kind == BugEvent::Stopped; });
+    CHECK(second != events.end());
+    if (second != events.end()) CHECK(LowerText(second->bug.Description()).find(L"camera") != std::wstring::npos);
+}
+
+ATHER_TEST(bug_voice_ended_stream_clears_listening_and_schedules_reconnect) {
+    StartUiDispatcher();
+    BugApp& a = App();
+    StopBugReports();
+    g_testVoiceInput = test::TempDir() + L"\\silence.wav";
+    CHECK(WriteWav16(g_testVoiceInput, std::vector<int16_t>(8000, 0), 16000, false));
+    a.opt.voice = true;
+    a.voiceFailures = 0;
+    StartListening();
+    // Real SAPI file end goes through the same worker + UI callback as microphone disconnection.
+    CHECK(PumpUntil([&] { return !a.listener && a.retryAt > 0; }, 10000));
+    CHECK(!BugVoiceListening());
+    CHECK(CurrentBugVoiceStatus().phase == BugVoicePhase::Reconnecting);
+    CHECK(!CurrentBugVoiceStatus().message.empty());
+    CHECK(a.voiceFailures == 1);
+    CHECK(a.retryAt > BugClock());
+    // A stale worker callback must not modify the replacement listener or listening state.
+    const uint64_t oldGeneration = a.listenerGeneration;
+    a.listener = std::make_unique<Listener>(++a.listenerGeneration);
+    a.listening = true;
+    ListenerFailed(a.listener.get(), oldGeneration, L"stale failure");
+    CHECK(a.listening);
+    StopBugReports();
+    CHECK(CurrentBugVoiceStatus().phase == BugVoicePhase::Off);
+    CHECK(!BugVoiceListening());
+    g_testVoiceInput.clear();
 }
 
 // Through the app's side: the shortcut, the screenshot, the bundle, the clip when the recording stops, Copy last bug

@@ -80,22 +80,56 @@ PadCorner ParsePadCorner(const std::wstring& s) {
 
 void PadLatch::Feed(const PadState& s) {
     cur_ = s;
+    if (!s.connected) {
+        held_ = s;
+        std::fill(std::begin(buttonUntil_), std::end(buttonUntil_), 0);
+        ltUntil_ = rtUntil_ = 0;
+        ltPeak_ = rtPeak_ = 0;
+        return;
+    }
     held_.buttons |= s.buttons;
     held_.lt = std::max(held_.lt, s.lt);
     held_.rt = std::max(held_.rt, s.rt);
     // A stick flick between two frames shows at its widest.
     if (s.lx * s.lx + s.ly * s.ly >= held_.lx * held_.lx + held_.ly * held_.ly) held_.lx = s.lx, held_.ly = s.ly;
     if (s.rx * s.rx + s.ry * s.ry >= held_.rx * held_.rx + held_.ry * held_.ry) held_.rx = s.rx, held_.ry = s.ry;
+    if (minVisibleMs_) {
+        const ULONGLONG now = GetTickCount64();
+        for (int i = 0; i < 16; ++i)
+            if (s.buttons & (1u << i)) buttonUntil_[i] = now + minVisibleMs_;
+        const auto trigger = [&](float v, float& peak, ULONGLONG& until) {
+            if (v > 0 && (v >= peak || now >= until)) {
+                peak = v;
+                until = now + minVisibleMs_;
+            }
+        };
+        trigger(s.lt, ltPeak_, ltUntil_);
+        trigger(s.rt, rtPeak_, rtUntil_);
+    }
 }
 
 PadState PadLatch::Take() {
     PadState out = held_;
     out.connected = cur_.connected;
+    if (minVisibleMs_ && out.connected) {
+        const ULONGLONG now = GetTickCount64();
+        for (int i = 0; i < 16; ++i)
+            if (now < buttonUntil_[i]) out.buttons |= (WORD)(1u << i);
+        if (now < ltUntil_) out.lt = std::max(out.lt, ltPeak_);
+        if (now < rtUntil_) out.rt = std::max(out.rt, rtPeak_);
+    }
     held_ = cur_;
     return out;
 }
 
-GamepadPoller::GamepadPoller() : thread_([this] { Run(); }) {}
+void PadLatch::DiscardHistory() {
+    held_ = cur_;
+    std::fill(std::begin(buttonUntil_), std::end(buttonUntil_), 0);
+    ltUntil_ = rtUntil_ = 0;
+    ltPeak_ = rtPeak_ = 0;
+}
+
+GamepadPoller::GamepadPoller(StateReader reader) : reader_(reader ? reader : XInputGetState), thread_([this] { Run(); }) {}
 
 GamepadPoller::~GamepadPoller() {
     stop_ = true;
@@ -107,28 +141,75 @@ PadState GamepadPoller::Take() {
     return latch_.Take();
 }
 
+void GamepadPoller::DiscardHistory() {
+    std::lock_guard lock(m_);
+    latch_.DiscardHistory();
+}
+
 void GamepadPoller::Run() {
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer) timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     int slot = -1;
     ULONGLONG lastScan = 0;
+    std::array<PadState, XUSER_MAX_COUNT> previous{};
+    std::array<PadState, XUSER_MAX_COUNT> analogReference{};
+    bool firstScan = true;
     while (!stop_) {
+        const int priorSlot = slot;
         PadState s;
-        // Asking an empty slot is slow, so look for a controller once a second and then only read that one.
-        if (slot < 0 && GetTickCount64() - lastScan >= 1000) {
-            lastScan = GetTickCount64();
-            for (DWORD i = 0; i < XUSER_MAX_COUNT && slot < 0; ++i) {
-                XINPUT_STATE x{};
-                if (XInputGetState(i, &x) == ERROR_SUCCESS) slot = (int)i;
-            }
-        }
-        if (slot >= 0) {
+        std::array<PadState, XUSER_MAX_COUNT> states{};
+        std::array<bool, XUSER_MAX_COUNT> activity{};
+        const ULONGLONG now = GetTickCount64();
+        const bool scan = firstScan || now - lastScan >= 1000;
+        if (scan) lastScan = now;
+        firstScan = false;
+        // Empty slots can be slow. Probe them once a second, but always sample every connected pad:
+        // an idle virtual controller in slot 0 must not hide the controller the player is actually using.
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+            if (!previous[i].connected && !scan) continue;
             XINPUT_STATE x{};
-            if (XInputGetState((DWORD)slot, &x) == ERROR_SUCCESS) s = FromXInput(x.Gamepad);
-            else slot = -1;
+            if (reader_(i, &x) != ERROR_SUCCESS) {
+                analogReference[i] = {};
+                continue;
+            }
+            const PadState& p = previous[i];
+            PadState& n = states[i] = FromXInput(x.Gamepad);
+            // Ownership changes only on a press or a deliberate analog movement, not on release,
+            // packet-number churn, dead-zone noise or small stick drift on an idle controller.
+            auto& ref = analogReference[i];
+            // Compare with the last meaningful position, not the previous 4 ms sample: a slow
+            // trigger pull or stick sweep must accumulate enough movement to claim the overlay too.
+            const auto moved = [](float ax, float ay, float& bx, float& by) {
+                if (ax * ax + ay * ay < 0.04f) { bx = by = 0; return false; }
+                if ((ax - bx) * (ax - bx) + (ay - by) * (ay - by) < 0.0225f) return false;
+                bx = ax; by = ay;
+                return true;
+            };
+            const auto pulled = [](float v, float& prior) {
+                if (v < 0.1f) { prior = 0; return false; }
+                if (v < prior) { prior = v; return false; }
+                if (v - prior < 0.1f) return false;
+                prior = v;
+                return true;
+            };
+            // Evaluate every axis even when another control already changed, to keep all references current.
+            const bool left = moved(n.lx, n.ly, ref.lx, ref.ly), right = moved(n.rx, n.ry, ref.rx, ref.ry);
+            const bool lt = pulled(n.lt, ref.lt), rt = pulled(n.rt, ref.rt);
+            activity[i] = (n.buttons & ~p.buttons) != 0 || left || right || lt || rt;
         }
+        if (slot >= 0 && !states[slot].connected) slot = -1;
+        if (slot < 0)
+            for (int i = 0; i < XUSER_MAX_COUNT; ++i)
+                if (states[i].connected) { slot = i; break; }
+        // Simultaneous activity keeps ownership stable; otherwise the next deliberate action takes over.
+        if (slot >= 0 && !activity[slot])
+            for (int i = 0; i < XUSER_MAX_COUNT; ++i)
+                if (activity[i]) { slot = i; break; }
+        if (slot >= 0) s = states[slot];
+        previous = states;
         {
             std::lock_guard lock(m_);
+            if (slot != priorSlot) latch_ = PadLatch(120);  // don't merge two controllers' held highlights
             latch_.Feed(s);
         }
         LARGE_INTEGER due;

@@ -9,6 +9,7 @@
 #include <cwctype>
 
 #include "logo.h"
+#include "bugreport.h"
 #include "output.h"
 #include "settings.h"
 #include "toast.h"
@@ -185,11 +186,17 @@ void Window::Build() {
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
     header(L"Bug reports");
-    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug start” / “bug stop”",
-        L"Then describe the bug and say “bug stop”. Keeps the microphone open; nothing leaves this PC", L"0");
+    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug” / “stop”",
+        L"Local English commands. Shows microphone level, heard speech and a persistent bug badge", L"0");
+    {
+        Row* r = add(Kind::Action, L"Bugs", L"RestartVoice", L"Retry bug voice input",
+                     L"After changing Windows default microphone; listening must already be enabled", L"");
+        r->get = [] { return std::wstring(L"Restart listener"); };
+        r->set = [](const std::wstring&) { RestartBugVoiceListening(); };
+    }
     add(Kind::Text, L"Bugs", L"LogPaths", L"Game log paths",
         L"Separate with ;  e.g. %LOCALAPPDATA%\\MyGame\\Saved\\Logs\\*.log", L"");
-    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug start”", L"Seconds of the recording before the bug", L"10", 0, 120);
+    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug”", L"Seconds of the recording before the bug", L"10", 0, 120);
     add(Kind::Number, L"Bugs", L"LogMaxMB", L"Largest log copied", L"MB; a bigger log keeps only its end", L"20", 1, 1024);
 
     header(L"Scrolling capture & editor");

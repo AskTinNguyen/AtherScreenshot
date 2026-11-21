@@ -56,9 +56,9 @@ public:
     double compressVideoMB = 30, compressPictureMB = 2;
 
     // bug reports ([Bugs], see bugreport.h)
-    bool bugVoice = false;       // VoiceCommands: listen for "bug start" / "bug stop" (keeps the microphone open)
+    bool bugVoice = false;       // VoiceCommands: listen for "bug" / "stop" (keeps the microphone open)
     std::wstring bugLogPaths;    // LogPaths: files, folders or wildcards, separated by ;
-    int bugPreRollSeconds = 10;  // PreRollSeconds: the clip starts this long before "bug start"
+    int bugPreRollSeconds = 10;  // PreRollSeconds: the clip starts this long before "bug"
     int bugLogMaxMB = 20;        // LogMaxMB: a bigger log keeps only its end
 
     // gallery

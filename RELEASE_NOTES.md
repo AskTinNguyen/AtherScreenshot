@@ -10,6 +10,14 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
+## Coming in the next update (Windows)
+
+- Say "bug" to start a voice bug report and "stop" to save it. Settings and live hints show the shorter commands.
+- Loop playback now reaches the exact end of a finished sequence, avoiding intermittent stops at the last selected clip.
+- Clipboard writes initiated without a visible window use a persistent hidden owner; failed clipboard clears are handled before publishing image, text or file data.
+- Controller recordings follow the active controller instead of an idle first slot; short button/trigger taps stay visible for 120 ms.
+- Bug voice has a persistent microphone/signal/recognition panel and elapsed **BUG STARTED** badge. Failed streams reconnect, rejected commands explain what happened, and Settings offers **Restart listener** after changing the default input. Speech stays local; Windows Vietnamese transcription is unchanged.
+
 ## What's new in this update (build 0.0.2.14): safer connections for AI agents
 
 AI agents (MCP) connect more safely, and nothing changes in how you set them up. The Mac app is at build 0.0.2.14;
