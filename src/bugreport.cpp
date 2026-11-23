@@ -50,7 +50,7 @@ std::wstring Bare(const std::wstring& w) {
 
 BugCommand CommandWord(const std::wstring& bare) {
     if (bare == L"start") return BugCommand::Start;
-    if (bare == L"stop") return BugCommand::Stop;
+    if (bare == L"done" || bare == L"stop") return BugCommand::Stop;
     if (bare == L"cancel") return BugCommand::Cancel;
     return BugCommand::None;
 }
@@ -131,7 +131,7 @@ double BugClock() { return GetTickCount64() / 1000.0; }
 BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at, size_t* after) {
     for (size_t i = from; i < words.size(); ++i) {
         const std::wstring w = Bare(words[i].text);
-        BugCommand c = w == L"bug" ? BugCommand::Start : w == L"stop" ? BugCommand::Stop : BugCommand::None;
+        BugCommand c = w == L"bug" ? BugCommand::Start : (w == L"done" || w == L"stop") ? BugCommand::Stop : BugCommand::None;
         size_t length = 1;
         // Keep the longer commands as aliases, and prefer "bug cancel" over a new start.
         if (w == L"bug" && i + 1 < words.size()) {
@@ -825,7 +825,7 @@ public:
         SPSTATEHANDLE top = nullptr;
         if (SUCCEEDED(hr)) hr = ctx_->CreateGrammar(kCommands, &cmd_);
         if (SUCCEEDED(hr)) hr = cmd_->GetRule(L"BugCommand", 0, SPRAF_TopLevel | SPRAF_Active, TRUE, &top);
-        for (const wchar_t* phrase : {L"bug", L"stop", L"bug start", L"bug stop", L"bug cancel"})
+        for (const wchar_t* phrase : {L"bug", L"done", L"stop", L"bug start", L"bug stop", L"bug cancel"})
             if (SUCCEEDED(hr)) hr = cmd_->AddWordTransition(top, nullptr, phrase, L" ", SPWT_LEXICAL, 1.0f, nullptr);
         if (SUCCEEDED(hr)) hr = cmd_->Commit(0);
         ComPtr<ISpRecoGrammar2> commands2;
@@ -943,13 +943,13 @@ private:
 class VoiceTape {
 public:
     ~VoiceTape() { Stop(); }
-    bool Start() {
+    bool Start(float microphoneGainDb) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         clock_.freq = f.QuadPart;
         clock_.start = RecClock::Now();
         std::wstring err;
-        if (!cap_.Open(false, true, &err, nullptr)) return false;
+        if (!cap_.Open(false, true, &err, nullptr, microphoneGainDb)) return false;
         cap_.Run(&clock_, [this](const int16_t* pcm, uint32_t frames, int64_t) {
             for (uint32_t i = 0; i < frames && pcm_.size() < kMax; ++i) {  // 48 kHz stereo → 16 kHz mono
                 sum_ += pcm[i * 2] + pcm[i * 2 + 1];
@@ -1144,12 +1144,12 @@ void OnStarted(const Bug& bug) {
     s.shot = std::async(std::launch::async, [rc = s.area, cursor = a.opt.cursor] { return CaptureScreen(rc, cursor); }).share();
     if (a.listening) {
         s.tape = std::make_shared<VoiceTape>();
-        if (!s.tape->Start()) s.tape.reset();
+        if (!s.tape->Start(a.opt.microphoneGainDb)) s.tape.reset();
     }
     a.starts[bug.id] = s;
     if (bug.recording) WatchRecording(bug.recording);
     ShowToast(L"Bug started",
-              a.listening ? L"Describe it, then say “stop” (or press " + HotkeyHint() + L")." : L"Press " + HotkeyHint() + L" again to save it.",
+              a.listening ? L"Describe it, then say “done” (or press " + HotkeyHint() + L")." : L"Press " + HotkeyHint() + L" again to save it.",
               nullptr, nullptr, 3000);
 }
 
@@ -1594,7 +1594,7 @@ int DarkPixels(const Bitmap& img, RECT r) {  // dark pixels in `r`: a caption's 
 
 ATHER_TEST(bug_short_voice_commands_keep_description_words) {
     BugTracker tr;
-    auto events = tr.Heard(Said(10, L"Bug, the door is stuck Stop. ignored afterwards"));
+    auto events = tr.Heard(Said(10, L"Bug, the door is stuck Done. ignored afterwards"));
     CHECK(events.size() == 2);
     if (events.size() == 2) {
         CHECK(events[0].kind == BugEvent::Started);
@@ -1603,11 +1603,11 @@ ATHER_TEST(bug_short_voice_commands_keep_description_words) {
         CHECK_NEAR(events[1].bug.start, 10, 0.001);
     }
     CHECK(!tr.Busy());
-    CHECK(tr.Heard(Said(20, L"stop")).empty());
+    CHECK(tr.Heard(Said(20, L"done")).empty());
     events = tr.Heard(Said(30, L"bug"));
     CHECK(events.size() == 1 && tr.IsOpen());
     tr.Heard(Said(31, L"the camera is broken"));
-    events = tr.Heard(Said(32, L"STOP!"));
+    events = tr.Heard(Said(32, L"DONE!"));
     CHECK(events.size() == 1 && events[0].bug.Description() == L"the camera is broken");
 }
 
@@ -1989,8 +1989,8 @@ ATHER_TEST(bug_voice_commands_from_speech) {
     if (SUCCEEDED(hr)) hr = voice->SetOutput(stream.Get(), TRUE);
     if (SUCCEEDED(hr))
         hr = voice->Speak(L"<silence msec=\"700\"/>Bug.<silence msec=\"1200\"/>The door does not open.<silence msec=\"1200\"/>"
-                          L"Stop.<silence msec=\"350\"/>Bug.<silence msec=\"350\"/>The camera is broken."
-                          L"<silence msec=\"350\"/>Stop.<silence msec=\"700\"/>",
+                          L"Done.<silence msec=\"350\"/>Bug.<silence msec=\"350\"/>The camera is broken."
+                          L"<silence msec=\"350\"/>Done.<silence msec=\"700\"/>",
                           SPF_IS_XML, nullptr);
     if (stream) stream->Close();
     if (FAILED(hr)) {

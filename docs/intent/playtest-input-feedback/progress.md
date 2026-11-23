@@ -1,9 +1,9 @@
 # Progress
 
-- Working under rev: 4
+- Working under rev: 5
 - Worker: root; controller subtask: controller
-- Current step: rev 4 exact release binary passes all 183 tests and is installed/running; updating draft PR #25
-- Next step: owner hardware/accent review; leave PR draft and unmerged
+- Current step: rev 5 release built, feature checks pass and exact binary installed/running; full gate remains open on an intermittent QuickPrompts integration
+- Next step: update draft PR #25 and owner live voice/gain review; leave unmerged
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/25 (draft, base main)
 
 | Item | Verdict | Evidence |
@@ -14,11 +14,14 @@
 | A4 | met | Same full run passes actual SAPI synthesized speech, shared confidence policy and ended-stream reconnect regressions |
 | A5 | met | Release build printed Built build\\AtherScreenshot.exe; controller-simulated-input.mp4 uses production recorder/encoder; voice-status-demo.mp4 uses production HUD painter. Simulations explicitly labelled. Root inspected decoded A/released images and BUG STARTED panel. Read-only review by review agent, 2026-11-20, final source revision including DiscardHistory/pause tests: no material findings |
 | A6 | met | README guide/features and next release notes updated; findings document limits; external HUONG-DAN.md explains demos, separate build, input/retry and physical/acoustic limitations |
-| A7 | met | Latest exact-binary release full run: 183 tests, 2984 checks, 0 failed, exit 0, no skips; all clipboard integrations and playback loop pass |
+| A7 | open | Historical rev 4 full pass; latest rev 5 exact-binary full run: 185 tests, 3001 checks, 1 failed (QuickPrompts text integration), exit 3; unchanged focused retry passes |
 | A8 | met | Same full run passes short-command parser and actual SAPI generated-speech reports |
 | A9 | met | Observed RED for low-confidence explicit stop; GREEN in final full release run; start/dictation guard assertions preserved |
 | A10 | met | Observed RED for stale speech feedback/input labels; final full release passes labels, focus/capture styles and controller-only HUD lifecycle; root inspected synthetic snapshots |
 | A11 | met | Observed RED for background-neutral reader and 330 px layout; final full release passes all 10 gamepad tests, decoded 20-action MP4 and pause/resume |
+| A12 | open | Done parser and actual SAPI RED observed, focused debug GREEN: parser 1 test/9 checks; voice 11 tests/95 checks; release gate pending |
+| A13 | open | Recording-only badge RED observed; focused debug lifecycle GREEN; recorder starts it only at capture and hides on stop/completion |
+| A14 | open | Mic boost RED observed; focused debug 1 test/8 checks GREEN; default 0 dB preserved, range/default assertions added to Settings integration |
 
 ## Evidence folder
 
@@ -103,3 +106,21 @@ The final-source release build succeeds with only the two existing C4706 warning
 Final exact-binary validation supersedes the transient failed run: `test.bat --nobuild` exits **0**, `183 tests, 2984 checks, 0 failed`, `Result: PASS`, **no skips** (`rev4-final-no-build-full-tests.log`). It runs the freshly built final release, not an older binary. All clipboard assertions pass unchanged. A1–A11 are met by this final run plus the labelled synthetic visual review; physical USB/Bluetooth/Steam Input and live accent remain unverified.
 
 Under the owner's existing install authorization, backed up the installed rev 3 exe as `installed-backup/AtherScreenshot-before-live-input-indicators.exe`, gracefully quit PID 29744 without force termination, copied the final release to the installed and portable paths, and restarted the installed app. Observed PID **40264** at `C:\Users\Admin\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe`. All three SHA256 values match **2E308F45EB388A38E9B089CB184C1D779FDD0AE4ABADE8B7DA3ACCEFE3FB1773**. Settings/data were preserved. No version, dependency, driver, host ACL/service, release or merge changes.
+
+## Step 9 — rev 5: Done, recording-only badge and configurable mic gain
+
+Owner approved Bug / Done and requested that the microphone/controller badge appear only during recording. For louder recorded descriptions, owner explicitly chose unchanged defaults with a Settings control.
+
+RED: parser fails three assertions for Done; SAPI hears Done only as dictation and does not finish reports (`done-parser-red.log`, `done-speech-red.log`). After adding grammar/parser support, actual SAPI recognizes two Bug/description/Done reports with normal confidence. Focused debug voice: **11 tests, 95 checks, 0 failed**; parser **1 test, 9 checks, 0 failed**. Old stop aliases remain; all visible Windows instructions teach Done.
+
+RED recording-only badge fails four idle/stop assertions (`recording-hud-red.log`); the same test now passes. A UI-thread recording gate opens at BeginCapture and closes at StopRecording or the shared completion callback, covering normal/automatic stop, failure, discard and cancelled countdown. Pause remains part of the recording session. Listening can stay on while its badge is hidden. Existing capture exclusion, focus and controller-only panel tests remain.
+
+RED mic gain fails boost/saturation expectations (`mic-gain-red.log`); GREEN is **1 test, 8 checks, 0 failed** (`mic-gain-green.log`). Recording Settings expose MicrophoneGainDb 0..20, default **0**, with persistence/clamp checks. The value is snapshotted into regular/MCP recording options and bug VoiceTape; shared WASAPI capture applies it only to microphone samples before resampling. A soft knee limits boosted peaks. System loopback, default 0 dB samples, Windows input volume and SAPI recognition are unchanged. New recordings/reports use the changed value. Release/full validation is running; do not claim the previous rev 4 pass as a rev 5 pass.
+
+First complete rev 5 release: `185 tests, 3001 checks, 1 failed`, exit **1**, no skip. Only `video_editor_copies_the_selected_clip` fails its clipboard file-list comparison. Immediate unchanged focused retry: `1 test, 11 checks, 0 failed`. All new functionality passes. No source, clipboard assertion or host policy was changed to obtain the focused pass; exact-binary full no-build rerun is in progress. Earlier transient clipboard failure causes remain unproven.
+
+Final exact-binary full rerun (`done-hud-gain-final-full.log`): **185 tests, 3001 checks, 1 failed**, exit **3**, no skip. The clip-copy comparison now passes; only `quickprompts_paste_into_text_boxes` fails three text/caret assertions. Its immediate unchanged focused retry passes **1 test, 8 checks, 0 failed** (`done-quickprompts-retry.log`). All Done parser/SAPI, recording HUD, gain, controller/video, and playback-loop checks pass in both full runs. No full PASS is claimed for rev 5; A7 and full-gate acceptance stay open. No test assertion was skipped or weakened and no host ACL/service/volume was changed. These transient integration failures' cause remains unproven.
+
+Installed the exact release under existing authorization after backing up rev 4 as `installed-backup/AtherScreenshot-before-done-and-recording-gain.exe`. Gracefully quit old PID 40264, replaced installed/portable exe, restarted and observed PID **46556** at `C:\Users\Admin\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe`. Build, installed and portable SHA256 match **52DEC8DBE9C4A43E2D9C94A532A1CB066F83C0C6CEE5805FB4BDF21CC59452A5**. Settings/data preserved; default microphone gain remains 0 dB. No force termination, merge, release, version or dependency change.
+
+Read-only post-install checks: FindWindow for AtherBugVoicePanel returns 0 while the installed app is idle; its real settings file contains MicrophoneGainDb=0. No manual support-folder edits were performed.

@@ -180,6 +180,8 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"RecordCursor=1\r\n"
         L"RecordSystemAudio=1\r\n"
         L"RecordMicrophone=0\r\n"
+        L"; Microphone boost for narration and bug voice.wav only (0..20 dB); 0 keeps the original level\r\n"
+        L"MicrophoneGainDb=0\r\n"
         L"CountdownSeconds=3\r\n"
         L"ShowClicks=1\r\n"
         L"; Shows typed keys in the video. Off by default: it would also show passwords you type.\r\n"
@@ -209,7 +211,7 @@ void Settings::WriteTemplate(const std::vector<HotkeyDef>& defs) const {
         L"AllowAgents=0\r\n"
         L"AgentPort=47821\r\n"
         L"\r\n[Bugs]\r\n"
-        L"; Bug reports: listen for \"bug\" / \"stop\" (keeps the microphone open while on)\r\n"
+        L"; Bug reports: listen for \"bug\" / \"done\" (keeps the microphone open while on)\r\n"
         L"VoiceCommands=0\r\n"
         L"; Game logs copied into each bug: files, folders or wildcards separated by ;, e.g. %LOCALAPPDATA%\\MyGame\\Saved\\Logs\\*.log\r\n"
         L"LogPaths=\r\n"
@@ -270,6 +272,7 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
         {L"Capture", L"AutoRedact", L"0"},
         {L"Recording", L"RecordSystemAudio", L"1"},
         {L"Recording", L"RecordMicrophone", L"0"},
+        {L"Recording", L"MicrophoneGainDb", L"0"},
         {L"Recording", L"CountdownSeconds", L"3"},
         {L"Recording", L"ShowClicks", L"1"},
         {L"Recording", L"ShowKeys", L"0"},
@@ -323,6 +326,7 @@ bool Settings::Load(const std::vector<HotkeyDef>& defs) {
     recordCursor = GetBool(L"Recording", L"RecordCursor", true);
     systemAudio = GetBool(L"Recording", L"RecordSystemAudio", true);
     microphone = GetBool(L"Recording", L"RecordMicrophone", false);
+    microphoneGainDb = std::clamp(_wtoi(Get(L"Recording", L"MicrophoneGainDb", L"0").c_str()), 0, 20);
     countdownSeconds = std::clamp(_wtoi(Get(L"Recording", L"CountdownSeconds", L"3").c_str()), 0, 10);
     showClicks = GetBool(L"Recording", L"ShowClicks", true);
     showKeys = GetBool(L"Recording", L"ShowKeys", false);

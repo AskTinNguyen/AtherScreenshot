@@ -6,6 +6,8 @@
 
 namespace ather {
 
+float ApplyMicrophoneGain(float sample, float gainDb);
+
 // Shared recording timeline in QPC ticks; paused time is excluded so audio and video stay in sync.
 struct RecClock {
     int64_t freq = 1;
@@ -45,7 +47,7 @@ public:
     ~AudioCapture();
     // Opens the devices. Returns false (with a reason) if none of the requested sources could be opened;
     // a single unavailable source is reported through `warning` instead.
-    bool Open(bool systemAudio, bool microphone, std::wstring* error, std::wstring* warning);
+    bool Open(bool systemAudio, bool microphone, std::wstring* error, std::wstring* warning, float microphoneGainDb = 0);
     void Run(const RecClock* clock, Callback cb);  // starts the capture thread
     void Stop();                                   // flushes and joins
 

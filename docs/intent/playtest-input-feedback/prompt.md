@@ -1,6 +1,6 @@
 # Playtest input feedback
 
-- Rev: 4
+- Rev: 5
 - Status: active
 - Area: Recording
 - Base: a686c12
@@ -14,6 +14,10 @@ Rev 2 also covers diagnosing and fixing all eight remaining native self-test fai
 Rev 3 makes the Windows voice commands shorter: say "bug" to start and "stop" to save. Update the grammar, command parsing, HUD, tray/settings text and Windows guide. Keep the existing hotkey and "bug cancel" command. Existing longer commands remain accepted for compatibility, while all visible Windows instructions teach the new short commands. macOS behavior is outside this Windows change.
 
 Rev 4 addresses the owner's report that "bug" opens but "stop" does not save, and controller buttons remain unlit. Show an explicit live microphone signal indicator and controller connection/input feedback on screen, including idle/disconnected states. Enlarge the controller in recordings by 50%, subject to small-frame bounds. The owner uses an Xbox controller over USB and Bluetooth with Steam Input enabled. Preserve local recognition and record honest hardware validation limits.
+
+Rev 5 follows the owner's approval to replace the visible save command with "done", keeping "bug" to start. Register and parse "done", teach Bug / Done in Windows HUD, Settings and documentation, preserve old stop aliases and the existing confidence policy, validate with actual SAPI generated speech, then update the authorized installed app and draft PR. This change does not establish the cause of the owner's live speech failure or guarantee accent recognition.
+
+Rev 5 also includes the owner's follow-up: show the mic/controller badge only during recording. Add configurable microphone gain for recorded descriptions, preserving the default level (owner chose default unchanged, adjustable in Settings). Gain applies to WASAPI narration and bug voice.wav, not Windows system volume or SAPI recognition; use soft limiting for boosted microphone peaks.
 
 ## Design
 
@@ -34,6 +38,9 @@ Keep the native Windows implementation and existing hotkey workflow. Poll connec
 | A9 | An open report accepts a low-confidence explicit stop command, without allowing low-confidence starts or incidental dictation | gate: test.bat |
 | A10 | On-screen input HUD distinguishes mic level, recognizing speech, controller disconnected/connected/receiving/idle; old heard text does not hide new speech | gate: test.bat; snapshot |
 | A11 | Recorded controller is 50% larger at normal frame sizes and real alternate input is retained when another reader returns neutral | gate: test.bat; decoded MP4 |
+| A12 | Windows accepts "bug" / "done", preserves the description, and teaches the new save command while old stop aliases remain valid | gate: test.bat |
+| A13 | HUD is hidden outside recordings and recording lifecycle starts/hides it for normal stop, failure, discard and completion | gate: test.bat; review |
+| A14 | Mic gain defaults to 0 dB, is adjustable in Settings, preserves game audio and limits boosted mic peaks in narration and voice.wav | gate: test.bat; review |
 
 ## Boundaries
 

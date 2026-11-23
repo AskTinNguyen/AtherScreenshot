@@ -15,7 +15,7 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
     switch (s.phase) {
         case BugVoicePhase::Off: l.detail = L"Voice commands off"; break;
         case BugVoicePhase::Starting: l.detail = L"Starting microphone and speech recognition"; break;
-        case BugVoicePhase::Listening: l.detail = L"Listening for “bug” / “stop”"; break;
+        case BugVoicePhase::Listening: l.detail = L"Listening for “bug” / “done”"; break;
         case BugVoicePhase::Reconnecting: l.detail = L"Reconnecting microphone"; break;
         case BugVoicePhase::Unavailable: l.detail = L"Voice unavailable"; break;
     }
@@ -26,7 +26,7 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
     if (s.bugOpen) {
         const int elapsed = (int)std::clamp(now - s.bugStarted, 0.0, 5999.0);
         l.title = std::format(L"BUG STARTED  {:02}:{:02}", elapsed / 60, elapsed % 60);
-        l.action = L"Stop and save: " + key + (s.phase == BugVoicePhase::Listening ? L" or say “stop”" : L"");
+        l.action = L"Stop and save: " + key + (s.phase == BugVoicePhase::Listening ? L" or say “done”" : L"");
     } else if (s.saving) {
         l.title = L"SAVING BUG…";
         l.action = L"Your bug report is being saved";
@@ -77,6 +77,7 @@ constexpr int kPanelWidth = 420, kPanelHeight = 300;
 std::mutex statusMutex;
 BugVoiceStatus status;
 HWND panel = nullptr;
+bool recordingHudActive = false;
 std::unique_ptr<GamepadPoller> controllerMonitor;
 double lastControllerInput = 0;
 int lastControllerSlot = -1;
@@ -160,6 +161,10 @@ void ConfigureGamepadIndicator(bool enabled) {
     }
     UpdateBugVoiceStatus(CurrentBugVoiceStatus());
 }
+void SetInputHudRecording(bool recording) {
+    recordingHudActive = recording;
+    UpdateBugVoiceStatus(CurrentBugVoiceStatus());
+}
 void HideBugVoicePanel() {
     if (panel) {
         KillTimer(panel, 1);
@@ -172,7 +177,7 @@ void UpdateBugVoiceStatus(const BugVoiceStatus& s) {
         std::lock_guard lock(statusMutex);
         status = s;
     }
-    if (!DescribeBugVoice(CurrentBugVoiceStatus(), GetTickCount64() / 1000.0).visible) {
+    if (!recordingHudActive || !DescribeBugVoice(CurrentBugVoiceStatus(), GetTickCount64() / 1000.0).visible) {
         HideBugVoicePanel();
         return;
     }
@@ -292,6 +297,7 @@ ATHER_TEST(bug_voice_input_indicators_distinguish_connection_signal_and_idle) {
 }
 
 ATHER_TEST(bug_voice_panel_preserves_focus_and_uses_production_painter) {
+    SetInputHudRecording(true);
     const HWND foreground = GetForegroundWindow();
     const HWND active = GetActiveWindow();
     BugVoiceStatus s; s.phase = BugVoicePhase::Listening;
@@ -335,6 +341,7 @@ ATHER_TEST(bug_voice_panel_preserves_focus_and_uses_production_painter) {
 }
 
 ATHER_TEST(bug_voice_controller_indicator_stays_visible_with_voice_off) {
+    SetInputHudRecording(true);
     UpdateBugVoiceStatus({});
     const HWND foreground = GetForegroundWindow();
     ConfigureGamepadIndicator(true);
@@ -347,5 +354,25 @@ ATHER_TEST(bug_voice_controller_indicator_stays_visible_with_voice_off) {
     ConfigureGamepadIndicator(false);
     CHECK(!CurrentBugVoiceStatus().controllerEnabled);
     CHECK(panel == nullptr);
+    SetInputHudRecording(false);
+}
+
+ATHER_TEST(bug_voice_badge_is_only_visible_during_recording) {
+    SetInputHudRecording(false);
+    BugVoiceStatus s; s.phase = BugVoicePhase::Listening;
+    UpdateBugVoiceStatus(s);
+    CHECK(panel == nullptr);
+    SetInputHudRecording(true);
+    CHECK(panel && IsWindowVisible(panel));
+    SetInputHudRecording(false);
+    CHECK(panel == nullptr);
+    ConfigureGamepadIndicator(true);
+    CHECK(panel == nullptr);
+    SetInputHudRecording(true);
+    CHECK(panel && IsWindowVisible(panel));
+    SetInputHudRecording(false);
+    CHECK(panel == nullptr);
+    ConfigureGamepadIndicator(false);
+    UpdateBugVoiceStatus({});
 }
 }  // namespace ather

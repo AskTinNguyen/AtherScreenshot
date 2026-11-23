@@ -14,6 +14,7 @@ struct RecordOptions {
     bool cursor = true;
     bool systemAudio = false;  // MP4 only
     bool microphone = false;   // MP4 only
+    float microphoneGainDb = 0;  // microphone only, 0..20 dB; system audio is unchanged
     bool gpuCapture = true;    // Windows.Graphics.Capture when possible, GDI otherwise
     bool showClicks = false;
     bool showKeys = false;

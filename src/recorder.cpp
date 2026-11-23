@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "audio.h"
+#include "bugvoice.h"
 #include "capture.h"
 #include "inputviz.h"
 #include "media.h"
@@ -198,7 +199,7 @@ void Run(Session* s) {
     bool withAudio = false;
     if (SUCCEEDED(hr) && s->opt.format == RecordFormat::Mp4 && (s->opt.systemAudio || s->opt.microphone)) {
         std::wstring aerr;
-        withAudio = audio.Open(s->opt.systemAudio, s->opt.microphone, &aerr, &res.warning);
+        withAudio = audio.Open(s->opt.systemAudio, s->opt.microphone, &aerr, &res.warning, s->opt.microphoneGainDb);
         if (!withAudio) res.warning += aerr;
     }
 
@@ -569,6 +570,7 @@ void BeginCapture() {
         DwmFlush();  // make sure the countdown is off screen before the first frame
     }
     g_state = State::Recording;
+    SetInputHudRecording(true);
     StartInputViz(g_session->opt.showClicks, g_session->opt.showKeys);
     g_session->thread = std::thread(Run, g_session);
 }
@@ -610,6 +612,7 @@ bool StartRecording(const RecordOptions& opt, std::function<void(const RecordRes
         }
     }
     s->done = [done](const RecordResult& r) {
+        SetInputHudRecording(false);
         DestroyChrome();
         StopInputViz();
         if (done) done(r);
@@ -645,6 +648,7 @@ void StopRecording(bool discard) {
     g_session->discard = discard;
     g_session->stop = true;
     g_state = State::Finalizing;
+    SetInputHudRecording(false);
     StopInputViz();
     DestroyChrome();
 }

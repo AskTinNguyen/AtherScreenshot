@@ -28,6 +28,7 @@ void UpdateBugVoiceStatus(const BugVoiceStatus& status);
 BugVoiceStatus CurrentBugVoiceStatus();
 void HideBugVoicePanel();
 void ConfigureGamepadIndicator(bool enabled);
+void SetInputHudRecording(bool recording);
 // The same painter as the live HUD, independent of its capture exclusion.
 BitmapPtr BugVoicePanelSnapshot(const BugVoiceStatus& status, double now);
 

@@ -8,21 +8,21 @@
 
 namespace ather {
 
-// Bug reports for playtests (README "Bug reports"). "Bug" … "stop", said (Settings › Bug reports, opt-in) or
+// Bug reports for playtests (README "Bug reports"). "Bug" … "done", said (Settings › Bug reports, opt-in) or
 // with the BugReport shortcut, make one folder, <captures>\Bugs\<yyyy-MM-dd HH-mm-ss> <first words>\, holding:
 //   bug.png         the screenshot from "bug" with what was said burnt in as a bar along the bottom
 //   screenshot.png  the same screenshot as it was
 //   voice.wav       what the microphone heard in between (with voice commands on)
 //   logs\…          the game's logs ([Bugs] LogPaths)
 //   bug.md, bug.json
-//   clip.mp4        with a recording running: from 10 s before "bug" to "stop", the words as captions. Cut once
+//   clip.mp4        with a recording running: from 10 s before "bug" to "done", the words as captions. Cut once
 //                   the recording stops (its file can't be read before); the bug is also an Issue note on the recording.
 // Mac: macos/Sources/AtherScreenshot/BugReport.swift.
 
 // ---- the bug logic: timed events in, what happened out (no microphone, screen or clock of its own) ----
 
 enum class BugCommand { None, Start, Stop, Cancel };
-// First "bug", "stop" or "bug cancel" (case/punctuation ignored); longer start/stop aliases also work.
+// First "bug", "done" or "bug cancel" (case/punctuation ignored); longer start/stop aliases also work.
 // at is the first command word; after is the first description word after the whole command.
 BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at, size_t* after = nullptr);
 
@@ -148,6 +148,7 @@ struct BugReportOptions {
     int logMaxMB = 20;        // [Bugs] LogMaxMB
     bool cursor = false;      // the mouse cursor in the screenshot
     std::wstring hotkey;      // the BugReport shortcut, for the notifications
+    float microphoneGainDb = 0;
 };
 struct BugReportHost {
     HWND owner = nullptr;                                // the clipboard's

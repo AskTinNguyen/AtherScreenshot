@@ -513,7 +513,7 @@ void ApplyEditorDefaults() {
     ApplyAgents();  // start or stop the MCP server to match
     ApplyQuickPrompts();
     ConfigureBugReports({g_settings.CapturesFolder(), g_settings.bugVoice, g_settings.bugLogPaths, g_settings.bugPreRollSeconds,
-                         g_settings.bugLogMaxMB, g_settings.captureCursor, g_settings.Hotkey(L"BugReport")},
+                         g_settings.bugLogMaxMB, g_settings.captureCursor, g_settings.Hotkey(L"BugReport"), (float)g_settings.microphoneGainDb},
                         {g_hwnd, [](const std::wstring& path) { OpenPath(path); }, [] { UpdateTrayTip(); }});
 }
 
@@ -762,6 +762,7 @@ void BeginRecording(RecordFormat fmt, const RECT& rect, HWND window, const std::
     o.cursor = g_settings.recordCursor;
     o.systemAudio = g_settings.systemAudio;
     o.microphone = g_settings.microphone;
+    o.microphoneGainDb = (float)g_settings.microphoneGainDb;
     o.gpuCapture = g_settings.gpuCapture;
     o.showClicks = g_settings.showClicks;
     o.showKeys = g_settings.showKeys;
@@ -1989,6 +1990,14 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     s.Load(HotkeyDefs());
     CHECK(s.Hotkey(L"BugReport") == L"Ctrl+Shift+F9" && s.bugVoice && s.bugLogPaths == L"%TEMP%\\Game\\*.log");
     CHECK(s.bugPreRollSeconds == 120 && s.bugLogMaxMB == 5);  // clamped
+    CHECK(s.microphoneGainDb == 0);
+    s.WriteString(L"Recording", L"MicrophoneGainDb", L"6");
+    s.Load(HotkeyDefs());
+    CHECK(s.microphoneGainDb == 6);
+    s.WriteString(L"Recording", L"MicrophoneGainDb", L"999");
+    s.Load(HotkeyDefs());
+    CHECK(s.microphoneGainDb == 20);
+    s.WriteString(L"Recording", L"MicrophoneGainDb", L"0");
     s.WriteString(L"Hotkeys", L"BugReport", L"Ctrl+Alt+B");
     s.WriteBool(L"Bugs", L"VoiceCommands", false);
     s.WriteString(L"Bugs", L"LogPaths", L"");
@@ -2003,7 +2012,7 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     std::vector<std::wstring> shown;
     const BitmapPtr img = SettingsSnapshot(h, L"bug", &shown);
     CHECK(img);
-    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug” / “stop”", L"Game log paths", L"Clip starts before “bug”",
+    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug” / “done”", L"Game log paths", L"Clip starts before “bug”",
                                L"Largest log copied", L"Shortcuts", L"Bug report: start / stop", L"Copy last bug report", L"Open bug reports folder"})
         CHECK(std::find(shown.begin(), shown.end(), row) != shown.end());
     wchar_t out[MAX_PATH];

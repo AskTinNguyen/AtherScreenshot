@@ -174,6 +174,8 @@ void Window::Build() {
     add(Kind::Number, L"Recording", L"CountdownSeconds", L"Countdown", L"Seconds before recording starts (0 = none)", L"3", 0, 10);
     add(Kind::Toggle, L"Recording", L"RecordSystemAudio", L"Record system audio", L"What you hear, into the MP4", L"1");
     add(Kind::Toggle, L"Recording", L"RecordMicrophone", L"Record microphone", L"Default input device, mixed in", L"0");
+    add(Kind::Number, L"Recording", L"MicrophoneGainDb", L"Microphone gain (dB)",
+        L"Narration and bug voice.wav; 0 = unchanged, +6 ≈ 2×. Soft limiter on boosted mic peaks; SAPI input unchanged", L"0", 0, 20);
     add(Kind::Toggle, L"Recording", L"RecordCursor", L"Record mouse cursor", L"", L"1");
     add(Kind::Toggle, L"Recording", L"ShowClicks", L"Show clicks", L"Ripples where you click", L"1");
     add(Kind::Toggle, L"Recording", L"ShowKeys", L"Show keystrokes", L"Careful: also shows passwords you type", L"0");
@@ -186,7 +188,7 @@ void Window::Build() {
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
     header(L"Bug reports");
-    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug” / “stop”",
+    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug” / “done”",
         L"Local English commands. Shows microphone level, heard speech and a persistent bug badge", L"0");
     {
         Row* r = add(Kind::Action, L"Bugs", L"RestartVoice", L"Retry bug voice input",

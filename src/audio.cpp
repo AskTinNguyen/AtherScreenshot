@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <thread>
 #include <vector>
+#include <cmath>
+#include "selftest.h"
 
 #include <ks.h>
 #include <ksmedia.h>
@@ -14,6 +16,26 @@
 using Microsoft::WRL::ComPtr;
 
 namespace ather {
+
+float ApplyMicrophoneGain(float sample, float gainDb) {
+    gainDb = std::clamp(gainDb, 0.f, 20.f);
+    if (gainDb == 0) return sample;  // preserve the existing recording level exactly
+    const float boosted = sample * std::pow(10.f, gainDb / 20.f);
+    const float magnitude = std::abs(boosted);
+    // Soft knee above -0.9 dBFS, rather than hard-clipping amplified microphone peaks.
+    return magnitude <= 0.9f ? boosted : std::copysign(0.9f + 0.1f * std::tanh((magnitude - 0.9f) / 0.1f), boosted);
+}
+
+ATHER_TEST(audio_microphone_gain_preserves_default_and_limits_boost) {
+    CHECK_NEAR(ApplyMicrophoneGain(0.2f, 0), 0.2, 0.00001);
+    CHECK_NEAR(ApplyMicrophoneGain(-0.2f, 0), -0.2, 0.00001);
+    CHECK_NEAR(ApplyMicrophoneGain(0.1f, 6), 0.199526, 0.0001);
+    CHECK_NEAR(ApplyMicrophoneGain(-0.1f, 6), -0.199526, 0.0001);
+    CHECK(ApplyMicrophoneGain(0.8f, 20) <= 1);
+    CHECK(ApplyMicrophoneGain(-0.8f, 20) >= -1);
+    CHECK(ApplyMicrophoneGain(0.8f, 20) > 0.9f);
+    CHECK(ApplyMicrophoneGain(-0.8f, 20) < -0.9f);
+}
 
 namespace {
 
@@ -23,6 +45,7 @@ struct Source {
     ComPtr<IAudioCaptureClient> capture;
     WAVEFORMATEX* wf = nullptr;
     bool isFloat = false;
+    float microphoneGainDb = 0;
     int channels = 2, bits = 32, rate = 48000;
     std::vector<float> pending;  // stereo frames at the device rate, not yet resampled
     double pos = 0;              // resampler read position within `pending`
@@ -83,6 +106,10 @@ struct Source {
                         const BYTE* f = data + (size_t)i * stride;
                         l = Sample(f);
                         r = channels > 1 ? Sample(f + bytesPer) : l;
+                        if (microphoneGainDb > 0) {
+                            l = ApplyMicrophoneGain(l, microphoneGainDb);
+                            r = ApplyMicrophoneGain(r, microphoneGainDb);
+                        }
                     }
                     pending.push_back(l);
                     pending.push_back(r);
@@ -128,9 +155,10 @@ struct AudioCapture::Impl {
 AudioCapture::AudioCapture() : impl_(std::make_unique<Impl>()) {}
 AudioCapture::~AudioCapture() { Stop(); }
 
-bool AudioCapture::Open(bool systemAudio, bool microphone, std::wstring* error, std::wstring* warning) {
+bool AudioCapture::Open(bool systemAudio, bool microphone, std::wstring* error, std::wstring* warning, float microphoneGainDb) {
     auto add = [&](EDataFlow flow, bool loopback, const wchar_t* name) {
         auto s = std::make_unique<Source>();
+        s->microphoneGainDb = loopback ? 0.f : std::clamp(microphoneGainDb, 0.f, 20.f);
         HRESULT hr = s->Open(flow, loopback);
         if (SUCCEEDED(hr)) {
             impl_->sources.push_back(std::move(s));

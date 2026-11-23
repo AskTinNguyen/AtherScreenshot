@@ -32,3 +32,20 @@ The explicit installation request authorizes gracefully stopping the old running
 > Controller input cũng không được highlight, cũng cần indicator trên màn hình biết được controller đang được connected và nhận input, scale controller image overlay trên video lên 50% nữa
 
 Owner clarified: Xbox controller, USB and sometimes Bluetooth; support both. Steam Input is enabled.
+
+## 2026-11-23 — intent amendment, rev 5
+
+Owner reports voice still only hears "bug" and asks for an easier short command. Proposed keeping "Bug" to start and using the one-syllable "Done" to save, with no promise that a word change alone solves the live listener problem. Owner approved:
+
+> Ok nhé, update dùm tôi
+
+Existing authorization to update the local installation and draft PR remains in effect.
+
+Follow-up:
+
+> Cái badge info trên màn hình ghi nhận tín hiệu micro và controller connected, nên chỉ hiện khi recording
+> Bạn có thể ghi nhận mic với volume lớn hơn không? để ghi nhận mô tả cho rõ
+
+Asked whether to default to +6 dB, +10 dB, or preserve the level and expose Settings. Owner chose:
+
+> Giữ mặc định, cho chỉnh trong Settings

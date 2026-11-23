@@ -12,9 +12,10 @@
 
 ## Coming in the next update (Windows)
 
+- Show the mic/controller badge only while recording. Add Microphone gain (dB) in Recording Settings for narration and bug voice.wav, default 0 dB, with soft limiting on boosted mic peaks. SAPI recognition and Windows volume are unchanged.
 - Show explicit live/quiet microphone and controller connection/input indicators. Prefer stop commands over dictation and accept a low-confidence explicit stop for an open report.
 - Compare system XInput readers for neutral background input and enlarge the recorded controller by 50%, within small-frame bounds.
-- Say "bug" to start a voice bug report and "stop" to save it. Settings and live hints show the shorter commands.
+- Say "bug" to start a voice bug report and "done" to save it (old stop aliases still work). Settings and live hints show the shorter commands.
 - Loop playback now reaches the exact end of a finished sequence, avoiding intermittent stops at the last selected clip.
 - Clipboard writes initiated without a visible window use a persistent hidden owner; failed clipboard clears are handled before publishing image, text or file data.
 - Controller recordings follow the active controller instead of an idle first slot; short button/trigger taps stay visible for 120 ms.
