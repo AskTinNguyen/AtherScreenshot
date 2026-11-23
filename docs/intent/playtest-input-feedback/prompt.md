@@ -1,6 +1,6 @@
 # Playtest input feedback
 
-- Rev: 5
+- Rev: 6
 - Status: active
 - Area: Recording
 - Base: a686c12
@@ -20,6 +20,8 @@ Rev 5 follows the owner's approval to replace the visible save command with "don
 Rev 5 also includes the owner's follow-up: show the mic/controller badge only during recording. Add configurable microphone gain for recorded descriptions, preserving the default level (owner chose default unchanged, adjustable in Settings). Gain applies to WASAPI narration and bug voice.wav, not Windows system volume or SAPI recognition; use soft limiting for boosted microphone peaks.
 
 ## Design
+
+Rev 6 follows the owner's report that speech is still difficult and Settings cannot open. Reproduce hidden Settings reopening, restore visibility explicitly, and handle a hidden-launch first-show override. Accept an isolated low-confidence finish returned by dictation only while a report is open; preserve the start and embedded-description guards. Add bounded local recognition metadata for subsequent live diagnosis, without diagnostic audio/transcripts. Install and update the existing draft PR under the owner's authorization. Do not claim that a synthetic voice pass establishes live accent reliability.
 
 Keep the native Windows implementation and existing hotkey workflow. Poll connected controllers for meaningful activity, keep brief presses visible, and verify the encoded video rather than only the drawing function. Show a persistent, non-activating voice panel with the recognition microphone, audio meter, recognized/rejected speech, listening/reconnecting state and a Bug started badge until the report closes. Keep speech processing local. Preserve low-confidence protection but explain rejected commands; recover a terminated recognition stream instead of leaving stale listening state.
 
@@ -41,6 +43,8 @@ Keep the native Windows implementation and existing hotkey workflow. Poll connec
 | A12 | Windows accepts "bug" / "done", preserves the description, and teaches the new save command while old stop aliases remain valid | gate: test.bat |
 | A13 | HUD is hidden outside recordings and recording lifecycle starts/hides it for normal stop, failure, discard and completion | gate: test.bat; review |
 | A14 | Mic gain defaults to 0 dB, is adjustable in Settings, preserves game audio and limits boosted mic peaks in narration and voice.wav | gate: test.bat; review |
+| A15 | Settings is visible after hidden launch/reopen and can close and reopen normally | gate: test.bat |
+| A16 | An isolated low-confidence dictation Done/Stop saves an open report; starts and embedded commands retain the guard | gate: test.bat |
 
 ## Boundaries
 

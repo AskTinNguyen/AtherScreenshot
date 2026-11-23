@@ -49,3 +49,9 @@ Follow-up:
 Asked whether to default to +6 dB, +10 dB, or preserve the level and expose Settings. Owner chose:
 
 > Giữ mặc định, cho chỉnh trong Settings
+
+## Rev 6 owner report
+
+> Vẫn chưa được, rất khó nhận được lệnh, tôi không thể mở setting menu không hiểu vì sao?
+
+Continue diagnosis, fixes, local installation and draft PR updates under the existing authorization. No new command word substitution is treated as a live recognition fix.

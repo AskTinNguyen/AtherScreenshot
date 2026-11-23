@@ -12,6 +12,7 @@
 #include "bugreport.h"
 #include "output.h"
 #include "settings.h"
+#include "selftest.h"
 #include "toast.h"
 
 using Microsoft::WRL::ComPtr;
@@ -816,7 +817,7 @@ void ShowSettingsWindow(const SettingsUiHost& host) {
     if (g_win) {
         g_win->host = host;
         g_win->Load();
-        if (IsIconic(g_win->hwnd)) ShowWindow(g_win->hwnd, SW_RESTORE);
+        ShowWindow(g_win->hwnd, IsIconic(g_win->hwnd) ? SW_RESTORE : SW_SHOW);
         ForceForeground(g_win->hwnd);
         InvalidateRect(g_win->hwnd, nullptr, FALSE);
         return;
@@ -856,6 +857,33 @@ void ShowSettingsWindow(const SettingsUiHost& host) {
     DwmSetWindowAttribute(W->hwnd, DWMWA_CAPTION_COLOR, &cap, sizeof(cap));
     SetTimer(W->hwnd, 1, 530, nullptr);
     ShowWithoutFlash(W->hwnd, true);
+    // A hidden launcher can supply SW_HIDE for the process's first ShowWindow call.
+    // Settings is an explicit user action, so make sure that first-show override did not hide it.
+    if (!IsWindowVisible(W->hwnd)) {
+        ShowWindow(W->hwnd, SW_SHOW);
+        ForceForeground(W->hwnd);
+    }
+}
+
+ATHER_TEST(settings_reopens_a_hidden_window) {
+    Settings settings;
+    SettingsUiHost host;
+    host.settings = &settings;
+    ShowSettingsWindow(host);
+    CHECK(g_win && IsWindow(g_win->hwnd));
+    CHECK(g_win && IsWindowVisible(g_win->hwnd));
+    if (!g_win) return;
+    HWND window = g_win->hwnd;
+    ShowWindow(window, SW_HIDE);
+    CHECK(!IsWindowVisible(window));
+    ShowSettingsWindow(host);
+    CHECK(g_win && g_win->hwnd == window);
+    CHECK(IsWindowVisible(window));
+    DestroyWindow(window);
+    CHECK(!g_win);
+    ShowSettingsWindow(host);
+    CHECK(g_win && IsWindowVisible(g_win->hwnd));
+    if (g_win) DestroyWindow(g_win->hwnd);
 }
 
 }  // namespace ather

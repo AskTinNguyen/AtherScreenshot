@@ -701,14 +701,35 @@ void FinishBugClip(BugBundle& b, const RecordResult& r, double preRoll) {
 // ---- voice: SAPI commands and dictation, and the microphone for voice.wav ----
 
 namespace {
-bool AcceptVoiceResult(bool command, int confidence, BugCommand action = BugCommand::None, bool open = false, bool grammar = false) {
+bool AcceptVoiceResult(bool command, int confidence, BugCommand action = BugCommand::None, bool open = false, bool grammar = false,
+                       bool standalone = false) {
     // Saving an already open report is safe even when a short, accented "stop" scores low.
-    // Only the explicit command grammar gets this exception, never incidental dictation or a new start.
-    if (open && grammar && action == BugCommand::Stop) return true;
+    // Dictation competes with the command grammar after Bug. An isolated Done/Stop is also intentional;
+    // a low-confidence command embedded in a description, or a new start, keeps the normal guard.
+    if (open && (grammar || standalone) && action == BugCommand::Stop) return true;
     return !command || confidence != SP_LOW_CONFIDENCE;
 }
 double VoiceRetrySeconds(unsigned failures) {
     return std::min(30.0, (double)(1u << std::min(failures, 5u)));
+}
+
+// Local metadata only: no audio, transcript, description or game/window names.
+// Bound disk use even when the mic repeatedly rejects noisy game audio.
+void TraceBugVoice(const std::wstring& event) {
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    const std::wstring path = SupportFolder() + L"\\bug-voice-diagnostics.log";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER length{};
+    if (GetFileSizeEx(file, &length) && length.QuadPart >= 65536) {
+        SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+        SetEndOfFile(file);
+    } else SetFilePointer(file, 0, nullptr, FILE_END);
+    const std::string line = std::format("{} {}\r\n", IsoUtc(NowEpoch()), ToUtf8(event));
+    DWORD wrote = 0;
+    WriteFile(file, line.data(), (DWORD)line.size(), &wrote, nullptr);
+    CloseHandle(file);
 }
 }  // namespace
 
@@ -724,6 +745,25 @@ ATHER_TEST(bug_voice_stop_can_save_an_open_report_at_low_confidence) {
     CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, false, true));
     CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Start, true, true));
     CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, true, false));
+}
+
+ATHER_TEST(bug_voice_isolated_finish_from_dictation_can_save_at_low_confidence) {
+    CHECK(AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, true, false, true));
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, true, false, false));
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, false, false, true));
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Start, false, false, true));
+    auto accepts = [](const std::vector<CaptionWord>& words) {
+        size_t at = 0, after = 0;
+        const BugCommand action = FindBugCommand(words, 0, &at, &after);
+        return AcceptVoiceResult(true, SP_LOW_CONFIDENCE, action, true, false,
+                                 action != BugCommand::None && at == 0 && after == words.size());
+    };
+    CHECK(accepts({{0, 1, L"Done."}}));
+    CHECK(accepts({{0, 1, L"Stop!"}}));
+    CHECK(accepts({{0, 1, L"Bug"}, {1, 2, L"stop."}}));
+    CHECK(!accepts({{0, 1, L"not"}, {1, 2, L"done"}, {2, 3, L"yet"}}));
+    CHECK(!accepts({{0, 1, L"done"}, {1, 2, L"loading"}}));
+    CHECK(!accepts({{0, 1, L"bug"}}));
 }
 
 ATHER_TEST(bug_voice_retry_is_bounded_without_busy_looping) {
@@ -816,6 +856,7 @@ public:
                 microphone = caps.szPname;
         }
         if (microphone.empty()) microphone = file_ ? L"Synthetic audio file (test)" : L"SAPI input (device name unavailable)";
+        TraceBugVoice(L"input=" + microphone + L" language=" + language);
         if (SUCCEEDED(hr)) hr = rec_->CreateRecoContext(&ctx_);
         const ULONGLONG interest = SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_END_SR_STREAM) |
             SPFEI(SPEI_SR_AUDIO_LEVEL) | SPFEI(SPEI_SOUND_START) | SPFEI(SPEI_SOUND_END) |
@@ -877,6 +918,7 @@ public:
             if (ev.eEventId == SPEI_FALSE_RECOGNITION) {
                 ++signal.rejections;
                 signal.speech = false;
+                TraceBugVoice(std::format(L"rejected-by-engine level={} report-open={}", signal.level, dictation_));
             }
             if (ev.eEventId == SPEI_END_SR_STREAM) {
                 ended_ = true;
@@ -905,9 +947,13 @@ public:
                     CoTaskMemFree(ph);
                     // File tests and microphone commands deliberately use the same policy.
                     // Dictation may also contain a stop/start phrase; it must not bypass the guard.
-                    const BugCommand action = FindBugCommand(h.words, 0, nullptr);
+                    size_t at = 0, after = 0;
+                    const BugCommand action = FindBugCommand(h.words, 0, &at, &after);
+                    const bool standalone = action != BugCommand::None && at == 0 && after == h.words.size();
                     const bool command = h.command || action != BugCommand::None;
-                    h.accepted = AcceptVoiceResult(command, h.confidence, action, dictation_, h.command);
+                    h.accepted = AcceptVoiceResult(command, h.confidence, action, dictation_, h.command, standalone);
+                    TraceBugVoice(std::format(L"result source={} confidence={} action={} standalone={} accepted={} report-open={} words={}",
+                        h.command ? L"command" : L"dictation", h.confidence, (int)action, standalone, h.accepted, dictation_, h.words.size()));
                     const bool unsure = !h.accepted;
                     if (!unsure && action != BugCommand::None) {
                         SetDictation(action == BugCommand::Start);

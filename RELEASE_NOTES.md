@@ -12,6 +12,8 @@
 
 ## Coming in the next update (Windows)
 
+- Settings opens again if its window was hidden, including a first launch from a hidden background process.
+- An isolated Done/Stop can save an open report when returned as low-confidence dictation. Add bounded local voice diagnostic metadata without recording descriptions or audio in the diagnostic log.
 - Show the mic/controller badge only while recording. Add Microphone gain (dB) in Recording Settings for narration and bug voice.wav, default 0 dB, with soft limiting on boosted mic peaks. SAPI recognition and Windows volume are unchanged.
 - Show explicit live/quiet microphone and controller connection/input indicators. Prefer stop commands over dictation and accept a low-confidence explicit stop for an open report.
 - Compare system XInput readers for neutral background input and enlarge the recorded controller by 50%, within small-frame bounds.
