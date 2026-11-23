@@ -445,6 +445,8 @@ How the Windows app differs from the Mac app:
 
 ## Build from source
 
+For an optional offline voice experiment, see the [Sherpa keyword trial](tools/sherpa_trial.md). It runs separately from the app; the tested small models did not reliably recognize the owner's live Bug/Done sample and have not replaced SAPI.
+
 **Windows** (Visual Studio with the C++ workload, found automatically through vswhere):
 
 ```

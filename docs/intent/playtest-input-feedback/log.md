@@ -55,3 +55,19 @@ Asked whether to default to +6 dB, +10 dB, or preserve the level and expose Sett
 > Vẫn chưa được, rất khó nhận được lệnh, tôi không thể mở setting menu không hiểu vì sao?
 
 Continue diagnosis, fixes, local installation and draft PR updates under the existing authorization. No new command word substitution is treated as a live recognition fix.
+
+## Rev 7 owner approval
+
+> Ok, thử với Sherpa trước nhé, ưu tiên free model nhé
+
+The owner selects an offline Sherpa trial. This authorizes the necessary isolated test runtime/model downloads despite the repo's general no-third-party-dependencies guideline. It does not authorize publishing models or personal recordings.
+
+> Khi nào tôi nên bắt đầu, báo tối biết
+
+The owner waited for the explicit BẮT ĐẦU message and then confirmed:
+
+> đã nói xong
+
+An earlier trial is excluded from recognition scoring because the owner clarified:
+
+> làm lại nha, tôi đang focus việc khác, giờ thử lại được

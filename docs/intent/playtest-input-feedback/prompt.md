@@ -1,6 +1,6 @@
 # Playtest input feedback
 
-- Rev: 6
+- Rev: 7
 - Status: active
 - Area: Recording
 - Base: a686c12
@@ -20,6 +20,8 @@ Rev 5 follows the owner's approval to replace the visible save command with "don
 Rev 5 also includes the owner's follow-up: show the mic/controller badge only during recording. Add configurable microphone gain for recorded descriptions, preserving the default level (owner chose default unchanged, adjustable in Settings). Gain applies to WASAPI narration and bug voice.wav, not Windows system volume or SAPI recognition; use soft limiting for boosted microphone peaks.
 
 ## Design
+
+Rev 7 is an isolated offline Sherpa trial under the owner's explicit choice of Sherpa and free models. Evaluate official Apache-declared English BPE and phoneme KWS weights with generated positive/negative speech, saved local evidence and a bounded owner-confirmed live sample. Provide a repeatable runner and measured results before promoting a recognizer to the app. This approval covers required isolated test dependencies; no runtime/models or personal media are distributed in the PR. A negative trial result is recorded honestly rather than shipped as a recognition fix.
 
 Rev 6 follows the owner's report that speech is still difficult and Settings cannot open. Reproduce hidden Settings reopening, restore visibility explicitly, and handle a hidden-launch first-show override. Accept an isolated low-confidence finish returned by dictation only while a report is open; preserve the start and embedded-description guards. Add bounded local recognition metadata for subsequent live diagnosis, without diagnostic audio/transcripts. Install and update the existing draft PR under the owner's authorization. Do not claim that a synthetic voice pass establishes live accent reliability.
 

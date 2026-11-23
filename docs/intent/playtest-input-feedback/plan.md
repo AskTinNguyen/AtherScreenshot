@@ -53,3 +53,15 @@ Outcome: release builds, all feature checks pass, installed exact tested binary 
 Reproduce hidden-window reopen and the isolated low-confidence dictation finish filter before production changes. Explicitly show hidden Settings and recover from hidden-launch first-show behavior. Accept only whole-utterance dictation save commands at low confidence while a report is open, keeping start/embedded guards. Add bounded metadata for live diagnosis with no transcript/audio. Run focused and full release checks, then gracefully replace the authorized installation and update draft PR #25. Live mic/accent proof remains open.
 
 Rev 6 outcome: hidden-window regression and focused release voice/Settings tests pass. Full release has one recurring QuickPrompts clipboard assertion failure, passing on an unchanged focused retry; full acceptance remains open. Exact tested exe installed, and the Settings CLI now yields a visible installed Settings window by native metadata. Live owner speech/accent reliability remains unverified; use bounded metadata for the next reproduction.
+
+## Rev 7 — isolated Sherpa trial
+
+Owner approved trying Sherpa first, preferring a free model. Design: use official English GigaSpeech 3.3M INT8 KWS weights and CPU runtime, with only Bug/Done keywords. Evaluate saved authorized local microphone evidence plus generated positive/negative utterances, then offer a short live dry run. Never upload audio or commit personal samples. Keep the installed app listening unchanged during dry-run evaluation; do not wire an unmeasured recognizer into bug creation. Model archive README declares Apache License 2.0; retain source, version and hashes in the trial report. Runtime and Python dependencies are isolated outside the repository.
+
+Trial implementation plan (sequential, no agents):
+- [x] Check official runtime/model source and free license declaration; pin runtime 2.0.3 and archive provenance.
+- [x] Write a small standalone runner with actual model positive/negative checks. No report-state/debounce logic or app trigger is needed for the isolated trial; do not add an unused production state machine.
+- [x] Tokenize custom Bug/Done with the supplied BPE model and the newer model's phoneme lexicon; run real inference on generated Bug/Done and negative Mom/background-like phrases, without treating TTS as accent proof.
+- [x] Run the same engine on the owner's existing local voice.wav samples; report detections without printing descriptions or changing recordings.
+- [x] Run a bounded, announced live dry run on the VR P10 mic, reporting only keyword events, peak signal, CPU timing and dropped blocks. No background service or endless recording.
+- [x] Record exact results and a usable local replay launcher. Decision: do not integrate these tested models into the native backend; real microphone samples did not pass. Include code/docs only in the existing draft PR update.
