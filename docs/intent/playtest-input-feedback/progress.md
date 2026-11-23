@@ -1,9 +1,9 @@
 # Progress
 
-- Working under rev: 3
+- Working under rev: 4
 - Worker: root; controller subtask: controller
-- Current step: short Windows voice commands verified and installed; full suite has seven recurring clipboard failures
-- Next step: update draft PR #25; full-suite gate remains open; no merge authority in this contract
+- Current step: rev 4 exact release binary passes all 183 tests and is installed/running; updating draft PR #25
+- Next step: owner hardware/accent review; leave PR draft and unmerged
 - PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/25 (draft, base main)
 
 | Item | Verdict | Evidence |
@@ -14,8 +14,11 @@
 | A4 | met | Same full run passes actual SAPI synthesized speech, shared confidence policy and ended-stream reconnect regressions |
 | A5 | met | Release build printed Built build\\AtherScreenshot.exe; controller-simulated-input.mp4 uses production recorder/encoder; voice-status-demo.mp4 uses production HUD painter. Simulations explicitly labelled. Root inspected decoded A/released images and BUG STARTED panel. Read-only review by review agent, 2026-11-20, final source revision including DiscardHistory/pause tests: no material findings |
 | A6 | met | README guide/features and next release notes updated; findings document limits; external HUONG-DAN.md explains demos, separate build, input/retry and physical/acoustic limitations |
-| A7 | open | Historical rev 2 full pass: 178 tests, 2942 checks. Latest rev 3 release: 179 tests, 2940 checks, 7 failed (clipboard integrations); exit 24 |
-| A8 | open | Release parser: 1 test, 9 checks, 0 failed; voice: 7 tests, 69 checks, 0 failed. Short parser/SAPI also pass in the full suite, whose clipboard gate remains open |
+| A7 | met | Latest exact-binary release full run: 183 tests, 2984 checks, 0 failed, exit 0, no skips; all clipboard integrations and playback loop pass |
+| A8 | met | Same full run passes short-command parser and actual SAPI generated-speech reports |
+| A9 | met | Observed RED for low-confidence explicit stop; GREEN in final full release run; start/dictation guard assertions preserved |
+| A10 | met | Observed RED for stale speech feedback/input labels; final full release passes labels, focus/capture styles and controller-only HUD lifecycle; root inspected synthetic snapshots |
+| A11 | met | Observed RED for background-neutral reader and 330 px layout; final full release passes all 10 gamepad tests, decoded 20-action MP4 and pause/resume |
 
 ## Evidence folder
 
@@ -80,3 +83,23 @@ The first full run exposed a test-only HUD lookup collision with the installed a
 Final fresh `test.bat` built release successfully, then exited **24**: `179 tests, 2940 checks, 7 failed`, `Result: FAIL`, with a foreground-dependent QuickPrompts skip. Log: `short-commands-final-full-tests.log`. The seven failures are the recurring clipboard integrations; all short-command/SAPI, voice HUD, controller/decoded-video, and playback-loop checks pass. No clipboard assertions were skipped or weakened. The same standalone native clipboard probe again reports OpenClipboard error 5; the cause remains unproven and no host ACL/service/security change was made. A1–A6 evidence above refers to historical rev 2 unless supplemented here; A7/A8 full-suite acceptance stays open.
 
 Updated the installed executable under the existing authorization: backed up the prior exe as `installed-backup/AtherScreenshot-before-short-commands.exe`, gracefully quit the old app, copied the fresh release and restarted the installed path. Observed PID 29744 at `C:\Users\Admin\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe`. Built, installed and external portable exe SHA256 values all match `CF557C0E0C8CF3DC1A912896D41638197B251041AAC7B38157C59F0058EF3B06`. No manual settings/data changes; no force termination.
+
+## Step 8 — rev 4: live stop and input feedback
+
+Owner reports that "bug" activates but "stop" does not save and controller buttons remain unlit; uses Xbox over USB/Bluetooth with Steam Input enabled. The installed hash matched the rev 3 build, so this is not attributed to an old installation.
+
+Observed RED: explicit low-confidence stop while open is rejected; last-heard text hides new recognizing-speech feedback (`rev4-voice-red.log`); normal-frame pad width is not 330 px (`rev4-scale-red.log`); a connected-neutral primary hides actual alternate-reader input (`rev4-background-red.log`); live/idle/disconnected mic/controller labels are absent (`rev4-indicators-red.log`).
+
+Implemented a narrow confidence exception for an explicit command-grammar stop while open, command-rule priority over dictation, and dictation synchronization for accepted embedded commands. Start/cancel/dictation confidence guards remain. The input HUD shows explicit MIC LIVE/quiet percentage, current speech, and controller connection/slot, controls and last-input age. Show game controller enables monitoring before recording too; its poller cannot consume recorder taps. The recorder and HUD share native reader selection logic, comparing Windows' system legacy XInput when primary data is neutral/unavailable. No driver or dependency install. Size is 330 DPI-scaled pixels rather than 220, with existing small-frame caps.
+
+Focused debug: voice `9 tests, 82 checks, 0 failed`; gamepad `10 tests, 100 checks, 0 failed`. Logs `rev4-voice-green.log`, `rev4-gamepad-green.log`. The actual SAPI synthesized file recognizes two complete reports. All 20 simulated actions show both lit and released states in decoded MP4; pause/resume has zero stale highlights. Root visually inspected `input-hud-live.png`, `input-hud-disconnected.png`, and `rev4-controller/controller-a-decoded.png`. New synthetic controller video is in `rev4-controller/controller-simulated-input.mp4`.
+
+Read-only native probe: Xbox/XInput slot 0 connected under both Windows readers; neither returned buttons at probe time, all other slots disconnected (`rev4-native-xinput-probe.log`). This does not reproduce the owner's actual presses, prove focus suppression on this machine, or establish that the legacy mitigation bypasses the owner's Steam Input configuration. Physical USB/Bluetooth, game focus and accent remain manual validation limits. Full release suite is running; do not claim current full PASS yet.
+
+First complete rev 4 release run passed: `183 tests, 2984 checks, 0 failed`, exit **0**, no skips (`rev4-release-full-tests.log`). All seven prior clipboard integrations pass again, without changes to clipboard source, host permissions or services in rev 4. The previous denial's cause remains unknown. Self-review then removed a harmless new int-to-WORD warning in the control-name table and explicitly stops the controller monitor before quit-time report/save callbacks; final release/full validation is running on that exact source. It retains the same confidence and input behavior.
+
+The final-source release build succeeds with only the two existing C4706 warnings. Its first full run returned exit **2**, `183 tests, 2982 checks, 1 failed`: only `video_editor_copies_the_frame_on_screen` failed its DIB/PNG clipboard comparison. All feature tests passed. Immediate focused retry of that unchanged binary passes `1 test, 29 checks, 0 failed` (`rev4-frame-copy-retry.log`). No assertions or source were changed; a full no-build rerun is in progress. Do not attribute this transient comparison failure to a known clipboard holder or access policy without evidence.
+
+Final exact-binary validation supersedes the transient failed run: `test.bat --nobuild` exits **0**, `183 tests, 2984 checks, 0 failed`, `Result: PASS`, **no skips** (`rev4-final-no-build-full-tests.log`). It runs the freshly built final release, not an older binary. All clipboard assertions pass unchanged. A1–A11 are met by this final run plus the labelled synthetic visual review; physical USB/Bluetooth/Steam Input and live accent remain unverified.
+
+Under the owner's existing install authorization, backed up the installed rev 3 exe as `installed-backup/AtherScreenshot-before-live-input-indicators.exe`, gracefully quit PID 29744 without force termination, copied the final release to the installed and portable paths, and restarted the installed app. Observed PID **40264** at `C:\Users\Admin\AppData\Local\Programs\AtherScreenshot\AtherScreenshot.exe`. All three SHA256 values match **2E308F45EB388A38E9B089CB184C1D779FDD0AE4ABADE8B7DA3ACCEFE3FB1773**. Settings/data were preserved. No version, dependency, driver, host ACL/service, release or merge changes.

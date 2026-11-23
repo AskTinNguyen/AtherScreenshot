@@ -701,7 +701,10 @@ void FinishBugClip(BugBundle& b, const RecordResult& r, double preRoll) {
 // ---- voice: SAPI commands and dictation, and the microphone for voice.wav ----
 
 namespace {
-bool AcceptVoiceResult(bool command, int confidence) {
+bool AcceptVoiceResult(bool command, int confidence, BugCommand action = BugCommand::None, bool open = false, bool grammar = false) {
+    // Saving an already open report is safe even when a short, accented "stop" scores low.
+    // Only the explicit command grammar gets this exception, never incidental dictation or a new start.
+    if (open && grammar && action == BugCommand::Stop) return true;
     return !command || confidence != SP_LOW_CONFIDENCE;
 }
 double VoiceRetrySeconds(unsigned failures) {
@@ -714,6 +717,13 @@ ATHER_TEST(bug_voice_policy_is_identical_for_files_and_microphones) {
     CHECK(AcceptVoiceResult(true, SP_NORMAL_CONFIDENCE));
     CHECK(AcceptVoiceResult(true, SP_HIGH_CONFIDENCE));
     CHECK(AcceptVoiceResult(false, SP_LOW_CONFIDENCE));
+}
+
+ATHER_TEST(bug_voice_stop_can_save_an_open_report_at_low_confidence) {
+    CHECK(AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, true, true));
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, false, true));
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Start, true, true));
+    CHECK(!AcceptVoiceResult(true, SP_LOW_CONFIDENCE, BugCommand::Stop, true, false));
 }
 
 ATHER_TEST(bug_voice_retry_is_bounded_without_busy_looping) {
@@ -818,6 +828,9 @@ public:
         for (const wchar_t* phrase : {L"bug", L"stop", L"bug start", L"bug stop", L"bug cancel"})
             if (SUCCEEDED(hr)) hr = cmd_->AddWordTransition(top, nullptr, phrase, L" ", SPWT_LEXICAL, 1.0f, nullptr);
         if (SUCCEEDED(hr)) hr = cmd_->Commit(0);
+        ComPtr<ISpRecoGrammar2> commands2;
+        if (SUCCEEDED(hr) && SUCCEEDED(cmd_.As(&commands2)))
+            commands2->SetRulePriority(L"BugCommand", 0, 1);  // commands win over simultaneous dictation
         // Auto-pause: after a command the engine waits until dictation is switched to match, so the words right after
         // "bug start" are dictated, not lost.
         if (SUCCEEDED(hr)) autoPause_ = SUCCEEDED(cmd_->SetRuleState(nullptr, nullptr, SPRS_ACTIVE_WITH_AUTO_PAUSE));
@@ -892,12 +905,12 @@ public:
                     CoTaskMemFree(ph);
                     // File tests and microphone commands deliberately use the same policy.
                     // Dictation may also contain a stop/start phrase; it must not bypass the guard.
-                    const bool command = h.command || FindBugCommand(h.words, 0, nullptr) != BugCommand::None;
-                    h.accepted = AcceptVoiceResult(command, h.confidence);
+                    const BugCommand action = FindBugCommand(h.words, 0, nullptr);
+                    const bool command = h.command || action != BugCommand::None;
+                    h.accepted = AcceptVoiceResult(command, h.confidence, action, dictation_, h.command);
                     const bool unsure = !h.accepted;
-                    if (h.command && !unsure) {
-                        const BugCommand c = FindBugCommand(h.words, 0, nullptr);
-                        if (c != BugCommand::None) SetDictation(c == BugCommand::Start);
+                    if (!unsure && action != BugCommand::None) {
+                        SetDictation(action == BugCommand::Start);
                     }
                     out->push_back(std::move(h));  // rejected words still explain why no command ran
                 }

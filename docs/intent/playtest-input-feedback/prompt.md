@@ -1,6 +1,6 @@
 # Playtest input feedback
 
-- Rev: 3
+- Rev: 4
 - Status: active
 - Area: Recording
 - Base: a686c12
@@ -12,6 +12,8 @@ Make controller presses visible in recorded video and make local voice bug comma
 Rev 2 also covers diagnosing and fixing all eight remaining native self-test failures (clipboard integrations and video playback loop), with the full test suite as the acceptance gate. Preserve actual clipboard/file/decoded-frame assertions; do not skip or weaken failures to obtain a green result.
 
 Rev 3 makes the Windows voice commands shorter: say "bug" to start and "stop" to save. Update the grammar, command parsing, HUD, tray/settings text and Windows guide. Keep the existing hotkey and "bug cancel" command. Existing longer commands remain accepted for compatibility, while all visible Windows instructions teach the new short commands. macOS behavior is outside this Windows change.
+
+Rev 4 addresses the owner's report that "bug" opens but "stop" does not save, and controller buttons remain unlit. Show an explicit live microphone signal indicator and controller connection/input feedback on screen, including idle/disconnected states. Enlarge the controller in recordings by 50%, subject to small-frame bounds. The owner uses an Xbox controller over USB and Bluetooth with Steam Input enabled. Preserve local recognition and record honest hardware validation limits.
 
 ## Design
 
@@ -29,6 +31,9 @@ Keep the native Windows implementation and existing hotkey workflow. Poll connec
 | A6 | Instructions, limitations and actual validation are documented | review |
 | A7 | Clipboard integrations and selected-clip playback loop pass together with the entire native suite | gate: test.bat |
 | A8 | Windows accepts spoken "bug" and "stop", preserves the first description word, and displays the short command instructions | gate: test.bat |
+| A9 | An open report accepts a low-confidence explicit stop command, without allowing low-confidence starts or incidental dictation | gate: test.bat |
+| A10 | On-screen input HUD distinguishes mic level, recognizing speech, controller disconnected/connected/receiving/idle; old heard text does not hide new speech | gate: test.bat; snapshot |
+| A11 | Recorded controller is 50% larger at normal frame sizes and real alternate input is retained when another reader returns neutral | gate: test.bat; decoded MP4 |
 
 ## Boundaries
 

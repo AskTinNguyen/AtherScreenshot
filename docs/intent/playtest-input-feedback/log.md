@@ -25,3 +25,10 @@ The explicit installation request authorizes gracefully stopping the old running
 ## 2026-11-21 — intent amendment, rev 3
 
 > Tôi muốn sửa lệnh Bug start và Bug stop, đổi thành Bug và stop thôi cho ngắn gọn
+
+## 2026-11-23 — intent amendment, rev 4
+
+> Tôi nói Bug thì được kích hoạt, nhưng nói stop thì không save bug, có vẻ không ghi nhận được. Cần indicator micro overlay để biết được tín hiệu đang được nhận.
+> Controller input cũng không được highlight, cũng cần indicator trên màn hình biết được controller đang được connected và nhận input, scale controller image overlay trên video lên 50% nữa
+
+Owner clarified: Xbox controller, USB and sometimes Bluetooth; support both. Steam Input is enabled.

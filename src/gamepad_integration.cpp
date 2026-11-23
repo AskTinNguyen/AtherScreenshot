@@ -123,6 +123,32 @@ ATHER_TEST(gamepad_poller_uses_active_second_controller_instead_of_idle_first) {
     CHECK(WaitPad(poller, [](const PadState& s) { return s.connected && (s.buttons & XINPUT_GAMEPAD_A); }));
 }
 
+ATHER_TEST(gamepad_background_neutral_reader_does_not_hide_real_input) {
+    ResetInput();
+    Input(0);
+    XINPUT_GAMEPAD pressed{}; pressed.wButtons = XINPUT_GAMEPAD_A;
+    Input(1, pressed);
+    // Same device/slot in two API backends: modern connected-but-neutral, legacy supplies A.
+    const auto alternate = +[](DWORD slot, XINPUT_STATE* state) -> DWORD {
+        return SimulatedXInput(slot == 0 ? 1 : slot, state);
+    };
+    XINPUT_STATE state{};
+    CHECK(ReadBackgroundPadState(0, &state, SimulatedXInput, alternate) == ERROR_SUCCESS);
+    CHECK((state.Gamepad.wButtons & XINPUT_GAMEPAD_A) != 0);
+    CHECK(ReadBackgroundPadState(0, &state, alternate, SimulatedXInput) == ERROR_SUCCESS);
+    CHECK((state.Gamepad.wButtons & XINPUT_GAMEPAD_A) != 0);
+    CHECK(ReadBackgroundPadState(3, &state, SimulatedXInput, alternate) == ERROR_DEVICE_NOT_CONNECTED);
+    CHECK(state.Gamepad.wButtons == 0);
+    CHECK(ReadBackgroundPadState(1, &state, SimulatedXInput, nullptr) == ERROR_SUCCESS);
+    CHECK(state.Gamepad.wButtons == XINPUT_GAMEPAD_A);
+    Input(0, pressed);
+    const auto conflicting = +[](DWORD, XINPUT_STATE* state) -> DWORD {
+        *state = {}; state->Gamepad.wButtons = XINPUT_GAMEPAD_B; return ERROR_SUCCESS;
+    };
+    CHECK(ReadBackgroundPadState(0, &state, SimulatedXInput, conflicting) == ERROR_SUCCESS);
+    CHECK(state.Gamepad.wButtons == XINPUT_GAMEPAD_A);  // never replace active primary data
+}
+
 ATHER_TEST(gamepad_poller_short_tap_remains_readable_after_first_frame) {
     ResetInput();
     Input(0);

@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <format>
 
 namespace Gdiplus {
 using std::max;
@@ -71,6 +72,51 @@ void RoundRect(gp::GraphicsPath& p, float x, float y, float w, float h, float r)
 
 }  // namespace
 
+bool PadHasInput(const PadState& s) {
+    return s.connected && (s.buttons || s.lt > 0 || s.rt > 0 || s.lx || s.ly || s.rx || s.ry);
+}
+
+std::wstring PadInputText(const PadState& s) {
+    std::wstring text;
+    const auto add = [&](const std::wstring& name) { text += (text.empty() ? L"" : L" + ") + name; };
+    for (auto [bit, name] : {std::pair<int, const wchar_t*>{XINPUT_GAMEPAD_A, L"A"},
+         {XINPUT_GAMEPAD_B, L"B"}, {XINPUT_GAMEPAD_X, L"X"}, {XINPUT_GAMEPAD_Y, L"Y"},
+         {XINPUT_GAMEPAD_DPAD_UP, L"Up"}, {XINPUT_GAMEPAD_DPAD_DOWN, L"Down"},
+         {XINPUT_GAMEPAD_DPAD_LEFT, L"Left"}, {XINPUT_GAMEPAD_DPAD_RIGHT, L"Right"},
+         {XINPUT_GAMEPAD_LEFT_SHOULDER, L"LB"}, {XINPUT_GAMEPAD_RIGHT_SHOULDER, L"RB"},
+         {XINPUT_GAMEPAD_LEFT_THUMB, L"LS"}, {XINPUT_GAMEPAD_RIGHT_THUMB, L"RS"},
+         {XINPUT_GAMEPAD_START, L"Menu"}, {XINPUT_GAMEPAD_BACK, L"View"}})
+        if (s.buttons & bit) add(name);
+    if (s.lt > 0) add(std::format(L"LT {:.0f}%", s.lt * 100));
+    if (s.rt > 0) add(std::format(L"RT {:.0f}%", s.rt * 100));
+    if (s.lx || s.ly) add(L"Left stick");
+    if (s.rx || s.ry) add(L"Right stick");
+    return text;
+}
+
+DWORD ReadBackgroundPadState(DWORD slot, XINPUT_STATE* state,
+                            GamepadPoller::StateReader primary, GamepadPoller::StateReader alternate) {
+    const DWORD result = primary(slot, state);
+    if (result == ERROR_SUCCESS && PadHasInput(FromXInput(state->Gamepad))) return result;
+    XINPUT_STATE other{};
+    if (alternate && alternate(slot, &other) == ERROR_SUCCESS &&
+        (result != ERROR_SUCCESS || PadHasInput(FromXInput(other.Gamepad)))) {
+        *state = other;
+        return ERROR_SUCCESS;
+    }
+    if (result != ERROR_SUCCESS) *state = {};
+    return result;
+}
+
+namespace {
+DWORD WINAPI NativeBackgroundXInput(DWORD slot, XINPUT_STATE* state) {
+    // Both DLLs are Windows components; never load a game-local proxy DLL.
+    static const HMODULE legacy = LoadLibraryExW(L"xinput9_1_0.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static const auto reader = legacy ? reinterpret_cast<GamepadPoller::StateReader>(GetProcAddress(legacy, "XInputGetState")) : nullptr;
+    return ReadBackgroundPadState(slot, state, XInputGetState, reader);
+}
+}
+
 PadCorner ParsePadCorner(const std::wstring& s) {
     if (_wcsicmp(s.c_str(), L"topleft") == 0) return PadCorner::TopLeft;
     if (_wcsicmp(s.c_str(), L"topright") == 0) return PadCorner::TopRight;
@@ -111,6 +157,7 @@ void PadLatch::Feed(const PadState& s) {
 PadState PadLatch::Take() {
     PadState out = held_;
     out.connected = cur_.connected;
+    out.slot = cur_.slot;
     if (minVisibleMs_ && out.connected) {
         const ULONGLONG now = GetTickCount64();
         for (int i = 0; i < 16; ++i)
@@ -129,7 +176,7 @@ void PadLatch::DiscardHistory() {
     ltPeak_ = rtPeak_ = 0;
 }
 
-GamepadPoller::GamepadPoller(StateReader reader) : reader_(reader ? reader : XInputGetState), thread_([this] { Run(); }) {}
+GamepadPoller::GamepadPoller(StateReader reader) : reader_(reader ? reader : NativeBackgroundXInput), thread_([this] { Run(); }) {}
 
 GamepadPoller::~GamepadPoller() {
     stop_ = true;
@@ -174,6 +221,7 @@ void GamepadPoller::Run() {
             }
             const PadState& p = previous[i];
             PadState& n = states[i] = FromXInput(x.Gamepad);
+            n.slot = (int)i;
             // Ownership changes only on a press or a deliberate analog movement, not on release,
             // packet-number churn, dead-zone noise or small stick drift on an idle controller.
             auto& ref = analogReference[i];
@@ -221,8 +269,8 @@ void GamepadPoller::Run() {
 }
 
 PadLayout GamepadLayout(int frameW, int frameH, PadCorner corner, float dpi) {
-    // About 220 px wide on a 100% screen, but never more than a third of the frame across or half of it down.
-    const float w = std::min({220 * dpi, frameW * 0.33f, frameH * 0.5f * kBoxW / kBoxH});
+    // 50% larger (330 px at 100% DPI), capped for small recordings.
+    const float w = std::min({330 * dpi, frameW * 0.33f, frameH * 0.5f * kBoxW / kBoxH});
     const float u = w / kBoxW, h = kBoxH * u;
     const float m = std::min(16 * dpi, std::min(frameW, frameH) * 0.03f);
     PadLayout l;
@@ -593,7 +641,7 @@ ATHER_TEST(gamepad_stick_dead_zone_and_layout) {
     CHECK_EQ(ParsePadCorner(L"TopLeft"), PadCorner::TopLeft);
     CHECK_EQ(ParsePadCorner(L"nonsense"), PadCorner::BottomRight);
     const PadLayout big = GamepadLayout(1920, 1080, PadCorner::BottomRight, 1);
-    CHECK_NEAR(big.u * 240, 220, 0.01);
+    CHECK_NEAR(big.u * 240, 330, 0.01);
     CHECK(big.x + 240 * big.u <= 1920 && big.y + kBoxH * big.u <= 1080 && big.x > 1500 && big.y > 800);
     const PadLayout tiny = GamepadLayout(300, 120, PadCorner::TopLeft, 2);  // never covers most of a small frame
     CHECK(tiny.u * 240 <= 100 && tiny.u * kBoxH <= 60.01 && tiny.x < 10 && tiny.y < 10);

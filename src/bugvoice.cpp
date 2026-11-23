@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <format>
 #include <mutex>
+#include <memory>
+#include "output.h"
 
 namespace ather {
 BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
     BugVoiceLabels l;
-    l.visible = s.phase != BugVoicePhase::Off || s.bugOpen || s.saving;
+    l.visible = s.phase != BugVoicePhase::Off || s.bugOpen || s.saving || s.controllerEnabled;
     if (!l.visible) return l;
     const std::wstring key = s.hotkey.empty() ? L"the Bug report shortcut" : s.hotkey;
     switch (s.phase) {
@@ -33,7 +35,7 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
             case BugVoicePhase::Starting: l.title = L"VOICE STARTING"; break;
             case BugVoicePhase::Reconnecting: l.title = L"VOICE RECONNECTING"; break;
             case BugVoicePhase::Unavailable: l.title = L"VOICE UNAVAILABLE"; break;
-            default: l.title = L"BUG VOICE READY"; break;
+            default: l.title = s.phase == BugVoicePhase::Off ? L"CONTROLLER INPUT" : L"BUG VOICE READY"; break;
         }
         l.action = L"Start a bug: " + key;
     }
@@ -42,7 +44,22 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
     if (s.phase == BugVoicePhase::Off) l.input = L"Microphone: not listening";
     if (s.phase == BugVoicePhase::Listening && s.levelAt > 0 && now - s.levelAt <= 0.8)
         l.meter = std::clamp(s.audioLevel, 0, 100);
-    if (!s.lastHeard.empty()) {
+    l.microphoneSignal = s.phase == BugVoicePhase::Listening
+        ? (l.meter > 0 ? std::format(L"MIC LIVE  {}%", l.meter) : L"MIC quiet · 0%")
+        : L"MIC not listening";
+    if (s.controllerEnabled) {
+        l.controllerConnection = s.controller.connected
+            ? std::format(L"CONTROLLER connected · Xbox / XInput slot {}", s.controller.slot + 1)
+            : L"CONTROLLER not connected · Waiting for Xbox / XInput";
+        if (!s.controller.connected) l.controllerInput = L"Check USB / Bluetooth or Steam Input visibility";
+        else if (PadHasInput(s.controller)) l.controllerInput = L"Receiving: " + PadInputText(s.controller);
+        else if (s.controllerInputAt > 0) l.controllerInput = std::format(L"Idle · Last input {:.0f}s ago", std::max(0.0, now - s.controllerInputAt));
+        else l.controllerInput = L"Connected · No input received yet · Press a button";
+    }
+    if (s.phase == BugVoicePhase::Listening && s.speech && now - s.signalAt < 2 && !s.rejected) {
+        l.activity = L"Recognizing speech…";
+        if (!s.lastHeard.empty()) l.activity += L" · Last heard: “" + s.lastHeard + L"”";
+    } else if (!s.lastHeard.empty()) {
         l.activity = (s.rejected ? L"Not accepted: “" : L"Heard: “") + s.lastHeard + L"”";
         if (s.rejected) l.activity += L" · Repeat command or use " + key;
     } else if (s.phase == BugVoicePhase::Listening) {
@@ -56,10 +73,13 @@ BugVoiceLabels DescribeBugVoice(const BugVoiceStatus& s, double now) {
 
 namespace {
 constexpr wchar_t kPanelClass[] = L"AtherBugVoicePanel";
-constexpr int kPanelWidth = 420, kPanelHeight = 212;
+constexpr int kPanelWidth = 420, kPanelHeight = 300;
 std::mutex statusMutex;
 BugVoiceStatus status;
 HWND panel = nullptr;
+std::unique_ptr<GamepadPoller> controllerMonitor;
+double lastControllerInput = 0;
+int lastControllerSlot = -1;
 
 void PaintPanel(HDC dc, const BugVoiceStatus& s, double now) {
     const auto l = DescribeBugVoice(s, now);
@@ -78,10 +98,18 @@ void PaintPanel(HDC dc, const BugVoiceStatus& s, double now) {
     text(l.title, {16, 12, 404, 40}, 21, accent);
     text(l.detail, {16, 44, 404, 80}, 13, theme::kText, true);
     text(l.input, {16, 82, 404, 102}, 12, theme::kMuted);
-    FillSolid(dc, {16, 108, 404, 114}, theme::kBgRaised);
-    if (l.meter) FillSolid(dc, {16, 108, 16 + 388 * l.meter / 100, 114}, theme::kAccent);
-    text(l.activity, {16, 125, 404, 171}, 13, theme::kTextDim, true);
-    text(l.action, {16, 183, 404, 204}, 13, theme::kText);
+    text(l.microphoneSignal, {16, 105, 404, 124}, 14, l.meter ? RGB(96, 230, 150) : theme::kMuted);
+    FillSolid(dc, {16, 128, 404, 136}, theme::kBgRaised);
+    if (l.meter) FillSolid(dc, {16, 128, 16 + 388 * l.meter / 100, 136}, RGB(96, 230, 150));
+    text(l.activity, {16, 145, 404, 186}, 13, theme::kTextDim, true);
+    text(l.action, {16, 190, 404, 211}, 13, theme::kText);
+    if (s.controllerEnabled) {
+        FillSolid(dc, {16, 220, 404, 221}, theme::kBgRaised);
+        text(l.controllerConnection, {16, 231, 404, 253}, 13,
+             s.controller.connected ? RGB(96, 230, 150) : RGB(255, 180, 96));
+        text(l.controllerInput, {16, 259, 404, 293}, 13,
+             PadHasInput(s.controller) ? RGB(96, 230, 150) : theme::kTextDim, true);
+    }
 }
 
 LRESULT CALLBACK PanelProc(HWND h, UINT message, WPARAM w, LPARAM l) {
@@ -89,7 +117,9 @@ LRESULT CALLBACK PanelProc(HWND h, UINT message, WPARAM w, LPARAM l) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_NCHITTEST: return HTTRANSPARENT;
         case WM_ERASEBKGND: return 1;
-        case WM_TIMER: InvalidateRect(h, nullptr, FALSE); return 0;
+        case WM_TIMER:
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            InvalidateRect(h, nullptr, FALSE); return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(h, &ps);
@@ -111,7 +141,24 @@ LRESULT CALLBACK PanelProc(HWND h, UINT message, WPARAM w, LPARAM l) {
 
 BugVoiceStatus CurrentBugVoiceStatus() {
     std::lock_guard lock(statusMutex);
-    return status;
+    auto current = status;
+    current.controllerEnabled = controllerMonitor != nullptr;
+    if (controllerMonitor) {
+        current.controller = controllerMonitor->Take();
+        if (!current.controller.connected || current.controller.slot != lastControllerSlot) lastControllerInput = 0;
+        lastControllerSlot = current.controller.slot;
+        if (PadHasInput(current.controller)) lastControllerInput = GetTickCount64() / 1000.0;
+        current.controllerInputAt = lastControllerInput;
+    }
+    return current;
+}
+void ConfigureGamepadIndicator(bool enabled) {
+    {
+        std::lock_guard lock(statusMutex);
+        if (enabled && !controllerMonitor) controllerMonitor = std::make_unique<GamepadPoller>();
+        else if (!enabled) { controllerMonitor.reset(); lastControllerInput = 0; lastControllerSlot = -1; }
+    }
+    UpdateBugVoiceStatus(CurrentBugVoiceStatus());
 }
 void HideBugVoicePanel() {
     if (panel) {
@@ -125,7 +172,7 @@ void UpdateBugVoiceStatus(const BugVoiceStatus& s) {
         std::lock_guard lock(statusMutex);
         status = s;
     }
-    if (!DescribeBugVoice(s, GetTickCount64() / 1000.0).visible) {
+    if (!DescribeBugVoice(CurrentBugVoiceStatus(), GetTickCount64() / 1000.0).visible) {
         HideBugVoicePanel();
         return;
     }
@@ -150,7 +197,7 @@ void UpdateBugVoiceStatus(const BugVoiceStatus& s) {
         const int width = Px(scale, kPanelWidth), height = Px(scale, kPanelHeight);
         SetWindowPos(panel, HWND_TOPMOST, work.right - width - Px(scale, 16), work.top + Px(scale, 16),
                      width, height, SWP_NOACTIVATE);
-        SetTimer(panel, 1, 200, nullptr);
+        SetTimer(panel, 1, 80, nullptr);
         ShowWindow(panel, SW_SHOWNOACTIVATE);
     }
     InvalidateRect(panel, nullptr, FALSE);
@@ -182,6 +229,8 @@ ATHER_TEST(bug_voice_status_explains_silence_and_rejections) {
     s.audioLevel = 70; s.levelAt = s.signalAt = 100;
     CHECK(DescribeBugVoice(s, 100).meter == 70);
     CHECK(DescribeBugVoice(s, 102).meter == 0);
+    s.lastHeard = L"bug"; s.speech = true; s.signalAt = 102;
+    CHECK(DescribeBugVoice(s, 102).activity.find(L"Recognizing speech") != std::wstring::npos);
     s.lastHeard = L"bug start"; s.heardAt = 100; s.rejected = true;
     l = DescribeBugVoice(s, 102);
     CHECK(l.activity.find(L"bug start") != std::wstring::npos);
@@ -210,6 +259,36 @@ ATHER_TEST(bug_voice_status_keeps_open_bug_and_failures_visible) {
     s.phase = BugVoicePhase::Off; s.saving = true;
     CHECK(DescribeBugVoice(s, 166).visible);
     CHECK(DescribeBugVoice(s, 166).input == L"Microphone: not listening");
+}
+
+ATHER_TEST(bug_voice_input_indicators_distinguish_connection_signal_and_idle) {
+    BugVoiceStatus s;
+    s.controllerEnabled = true;
+    auto l = DescribeBugVoice(s, 100);
+    CHECK(l.visible);
+    CHECK(l.controllerConnection.find(L"not connected") != std::wstring::npos);
+    s.controller.connected = true; s.controller.slot = 1;
+    l = DescribeBugVoice(s, 100);
+    CHECK(l.controllerConnection.find(L"2") != std::wstring::npos);
+    CHECK(l.controllerInput.find(L"No input received") != std::wstring::npos);
+    s.controller.buttons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
+    s.controllerInputAt = 100;
+    l = DescribeBugVoice(s, 100);
+    CHECK(l.controllerInput.find(L"A + B") != std::wstring::npos);
+    s.controller.buttons = 0;
+    CHECK(DescribeBugVoice(s, 102).controllerInput.find(L"2s") != std::wstring::npos);
+    s.phase = BugVoicePhase::Listening; s.levelAt = 102; s.audioLevel = 63;
+    CHECK(DescribeBugVoice(s, 102).microphoneSignal.find(L"63%") != std::wstring::npos);
+    CHECK(DescribeBugVoice(s, 104).microphoneSignal.find(L"quiet") != std::wstring::npos);
+    wchar_t artifacts[32768]{};
+    if (GetEnvironmentVariableW(L"ATHER_INPUT_HUD_DEMO_DIR", artifacts, (DWORD)std::size(artifacts))) {
+        s.bugOpen = true; s.bugStarted = 90; s.hotkey = L"Ctrl+Alt+B";
+        s.controller.buttons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
+        s.speech = true; s.signalAt = 102; s.lastHeard = L"bug";
+        SavePng(*BugVoicePanelSnapshot(s, 102), std::wstring(artifacts) + L"\\input-hud-live.png");
+        s.controller = {}; s.audioLevel = 0;
+        SavePng(*BugVoicePanelSnapshot(s, 112), std::wstring(artifacts) + L"\\input-hud-disconnected.png");
+    }
 }
 
 ATHER_TEST(bug_voice_panel_preserves_focus_and_uses_production_painter) {
@@ -252,6 +331,21 @@ ATHER_TEST(bug_voice_panel_preserves_focus_and_uses_production_painter) {
     testPanel = panel;
     UpdateBugVoiceStatus({});
     CHECK(!IsWindow(testPanel));
+    CHECK(panel == nullptr);
+}
+
+ATHER_TEST(bug_voice_controller_indicator_stays_visible_with_voice_off) {
+    UpdateBugVoiceStatus({});
+    const HWND foreground = GetForegroundWindow();
+    ConfigureGamepadIndicator(true);
+    CHECK(panel && IsWindowVisible(panel));
+    CHECK(CurrentBugVoiceStatus().controllerEnabled);
+    CHECK(DescribeBugVoice(CurrentBugVoiceStatus(), GetTickCount64() / 1000.0).microphoneSignal == L"MIC not listening");
+    UpdateBugVoiceStatus({});  // a voice-off update must not dismiss the controller indicator
+    CHECK(panel && IsWindowVisible(panel));
+    CHECK(GetForegroundWindow() == foreground);
+    ConfigureGamepadIndicator(false);
+    CHECK(!CurrentBugVoiceStatus().controllerEnabled);
     CHECK(panel == nullptr);
 }
 }  // namespace ather

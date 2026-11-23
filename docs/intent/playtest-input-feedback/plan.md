@@ -27,3 +27,15 @@ Final validation supersedes the earlier blocked result: after the owner's clarif
 2. Accept "bug" / "stop", preserve command spans and description words, and update visible Windows instructions. Retain longer aliases and "bug cancel".
 3. Run focused release voice/parser checks and the full release suite, recording any recurring clipboard access denial without weakening assertions.
 4. Under the owner's existing authorization, update the installed executable, verify its hash and running path, and update draft PR #25 into main. Preserve settings/data; leave unmerged and unpublished.
+
+## Rev 4 — observable live input and stop reliability (2026-11-23)
+
+Design: keep one click-through, capture-excluded input HUD. Show an explicit live/quiet mic percentage above its meter and prioritize current speech over stale heard text. Extend the HUD with controller slot, disconnected/connected status, active control names and elapsed time since input. Monitor when Show game controller is enabled, including before recording. The recorder and monitor use separate pollers so the HUD cannot consume a recorded tap. Enlarge the recorded pad from 220 to 330 DPI-scaled pixels while retaining small-frame bounds.
+
+Voice: allow low-confidence stop only from the command grammar while a report is open; retain start/dictation confidence protections. Give the command rule priority over dictation and synchronize dictation for accepted embedded commands too. Do not treat a synthetic pass as proof of the owner's mic/accent.
+
+Controller: compare primary XInput and the system legacy XInput reader when the primary is neutral/unavailable. Prefer actual activity, preserve primary activity, never invent button data, and retain native disconnected status. This is a mitigation for neutral background input; Steam Input can still hide devices from external apps, so keep the diagnostic status visible and document physical limits.
+
+Validation: observe RED for low-confidence stop, stale speech feedback, size, input indicators and background-neutral fallback; run focused GREEN and decoded MP4 checks, inspect HUD snapshots, run full release suite, then update the authorized local install and draft PR with exact results.
+
+Outcome: final release executable passes the complete suite (`183 tests, 2984 checks, 0 failed`, exit 0, no skips). Synthetic input/HUD evidence was inspected; exact tested executable installed and restarted with matching hash. Earlier transient clipboard comparison failure and its unchanged focused/full recovery remain documented. Stop controller monitoring before quit-time save callbacks. Leave draft PR #25 into main unmerged; physical controller/Steam Input and microphone/accent verification remain manual limits.

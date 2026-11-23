@@ -20,6 +20,7 @@ using std::min;
 
 #include "agent.h"
 #include "bugreport.h"
+#include "bugvoice.h"
 #include "capture.h"
 #include "compress.h"
 #include "editor.h"
@@ -492,6 +493,7 @@ void ShowHotkeyErrors() {
 }
 
 void ApplyEditorDefaults() {
+    ConfigureGamepadIndicator(g_settings.showGamepad);
     SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile, g_settings.editorTray});
     SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
     SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
@@ -1087,7 +1089,10 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdToggleMic: Toggle(g_settings.microphone, L"Recording", L"RecordMicrophone", L"Microphone"); break;
         case CmdToggleClicks: Toggle(g_settings.showClicks, L"Recording", L"ShowClicks", L"Show clicks"); break;
         case CmdToggleKeys: Toggle(g_settings.showKeys, L"Recording", L"ShowKeys", L"Show keystrokes"); break;
-        case CmdToggleGamepad: Toggle(g_settings.showGamepad, L"Recording", L"ShowGamepad", L"Show game controller"); break;
+        case CmdToggleGamepad:
+            Toggle(g_settings.showGamepad, L"Recording", L"ShowGamepad", L"Show game controller");
+            ConfigureGamepadIndicator(g_settings.showGamepad);
+            break;
         case CmdEditLast:
             if (g_last) OpenEditor(g_last);
             else if (auto recent = RecentCaptures(g_settings.CapturesFolder(), 1); !recent.empty())
@@ -1884,6 +1889,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     mcp::StopHttp();
     StopQuickPrompts();
+    ConfigureGamepadIndicator(false);
     StopBugReports();
     // Let an in-flight recording finalize so the file isn't left truncated, and let video exports finish
     // (their completion registers the saved file with the library). Work posted back meanwhile still runs:

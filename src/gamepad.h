@@ -14,6 +14,7 @@ namespace ather {
 
 struct PadState {
     bool connected = false;
+    int slot = -1;
     WORD buttons = 0;              // XINPUT_GAMEPAD_* bits
     float lx = 0, ly = 0, rx = 0, ry = 0;  // sticks, -1…1, y up, dead zone removed
     float lt = 0, rt = 0;          // triggers, 0…1
@@ -56,6 +57,12 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
+
+// Prefer real activity over a neutral connected result from another Windows XInput version.
+DWORD ReadBackgroundPadState(DWORD slot, XINPUT_STATE* state,
+                             GamepadPoller::StateReader primary, GamepadPoller::StateReader alternate);
+bool PadHasInput(const PadState& state);
+std::wstring PadInputText(const PadState& state);
 
 // Where the overlay goes: (x, y) is the top-left of its 240 × 172 design box, `u` pixels per design unit.
 struct PadLayout {
