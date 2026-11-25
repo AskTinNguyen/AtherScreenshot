@@ -507,6 +507,7 @@ void StartRecordingTool(const Json& args, Reply reply) {
     o.cursor = args["include_cursor"].Bool(s.recordCursor);
     o.systemAudio = args["system_audio"].Bool(s.systemAudio);
     o.microphone = args["microphone"].Bool(s.microphone);
+    o.microphoneGainDb = (float)s.microphoneGainDb;
     o.gpuCapture = s.gpuCapture;
     o.showClicks = args["show_clicks"].Bool(s.showClicks);
     o.showKeys = args["show_keys"].Bool(s.showKeys);

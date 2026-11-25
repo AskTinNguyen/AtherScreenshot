@@ -8,22 +8,23 @@
 
 namespace ather {
 
-// Bug reports for playtests (README "Bug reports"). "Bug start" … "bug stop", said (Settings › Bug reports, opt-in) or
+// Bug reports for playtests (README "Bug reports"). "Bug" … "done", said (Settings › Bug reports, opt-in) or
 // with the BugReport shortcut, make one folder, <captures>\Bugs\<yyyy-MM-dd HH-mm-ss> <first words>\, holding:
-//   bug.png         the screenshot from "bug start" with what was said burnt in as a bar along the bottom
+//   bug.png         the screenshot from "bug" with what was said burnt in as a bar along the bottom
 //   screenshot.png  the same screenshot as it was
 //   voice.wav       what the microphone heard in between (with voice commands on)
 //   logs\…          the game's logs ([Bugs] LogPaths)
 //   bug.md, bug.json
-//   clip.mp4        with a recording running: from 10 s before "bug start" to "bug stop", the words as captions. Cut once
+//   clip.mp4        with a recording running: from 10 s before "bug" to "done", the words as captions. Cut once
 //                   the recording stops (its file can't be read before); the bug is also an Issue note on the recording.
 // Mac: macos/Sources/AtherScreenshot/BugReport.swift.
 
 // ---- the bug logic: timed events in, what happened out (no microphone, screen or clock of its own) ----
 
 enum class BugCommand { None, Start, Stop, Cancel };
-// The first "bug start", "bug stop" or "bug cancel" in words[from…] (case and punctuation ignored), and the index of its "bug".
-BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at);
+// First "bug", "done" or "bug cancel" (case/punctuation ignored); longer start/stop aliases also work.
+// at is the first command word; after is the first description word after the whole command.
+BugCommand FindBugCommand(const std::vector<CaptionWord>& words, size_t from, size_t* at, size_t* after = nullptr);
 
 double BugClock();  // seconds, steady: the bug logic's times
 
@@ -32,7 +33,7 @@ struct Bug {
     double start = 0, stop = 0;      // BugClock()
     bool autoStopped = false;        // left open for BugTracker::kMaxSeconds
     std::vector<CaptionWord> words;  // what was said between start and stop
-    // The MP4 recording that ran at "bug start", in its own time (pauses left out). recording 0: none.
+    // The MP4 recording that ran at "bug", in its own time (pauses left out). recording 0: none.
     uint64_t recording = 0;
     double recStart = 0, recStop = 0;
     std::vector<CaptionWord> recWords;  // `words` on the recording's time
@@ -109,7 +110,7 @@ struct BugBundle {
     Bug bug;
     std::wstring id;                 // for tools (bug.json)
     double wallStart = 0;            // seconds since 1970
-    std::wstring app, window;        // the foreground app at "bug start"
+    std::wstring app, window;        // the foreground app at "bug"
     RECT area{};                     // the screenshot's area on screen
     std::shared_future<BitmapPtr> screenshot;
     std::wstring folder;
@@ -147,6 +148,7 @@ struct BugReportOptions {
     int logMaxMB = 20;        // [Bugs] LogMaxMB
     bool cursor = false;      // the mouse cursor in the screenshot
     std::wstring hotkey;      // the BugReport shortcut, for the notifications
+    float microphoneGainDb = 0;
 };
 struct BugReportHost {
     HWND owner = nullptr;                                // the clipboard's
@@ -159,6 +161,7 @@ void ToggleBugReport();     // the shortcut and the palette
 bool CopyLastBugReport();   // bug.png, clip.mp4, bug.md and up to 10 logs on the clipboard as files
 void OpenBugReportsFolder();
 bool BugVoiceListening();
+void RestartBugVoiceListening();  // retries the configured local listener; never turns voice on implicitly
 bool BugReportsBusy();      // bundles or clips still being written (quitting waits for them)
 void StopBugReports();      // quitting: stops listening
 // The recording `recording` (a RecordingId()) ended: clips for its bugs. The recorder calls it; tests too.

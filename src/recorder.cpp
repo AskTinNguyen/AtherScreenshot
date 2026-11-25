@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "audio.h"
+#include "bugvoice.h"
 #include "capture.h"
 #include "inputviz.h"
 #include "media.h"
@@ -160,6 +161,7 @@ struct Session {
     bool scaled = false;
     std::thread thread;
     std::atomic<bool> stop{false}, discard{false};
+    std::atomic<bool> resetPadHistory{false};
     RecClock clock;
     std::function<void(const RecordResult&)> done;
 };
@@ -181,7 +183,7 @@ void Run(Session* s) {
     // Frame source: GPU (Windows.Graphics.Capture) when possible, GDI BitBlt as the fallback.
     std::unique_ptr<WgcSource> wgc;
     std::wstring srcErr;
-    if (s->opt.window || (s->opt.gpuCapture && !s->scaled && WgcSource::Supported())) {
+    if (!s->opt.frameSource && (s->opt.window || (s->opt.gpuCapture && !s->scaled && WgcSource::Supported()))) {
         wgc = std::make_unique<WgcSource>();
         bool ok = s->opt.window ? wgc->StartWindow(s->opt.window, s->outW, s->outH, s->opt.cursor, &srcErr)
                                 : wgc->StartRegion(r, s->outW, s->outH, s->opt.cursor, &srcErr);
@@ -197,7 +199,7 @@ void Run(Session* s) {
     bool withAudio = false;
     if (SUCCEEDED(hr) && s->opt.format == RecordFormat::Mp4 && (s->opt.systemAudio || s->opt.microphone)) {
         std::wstring aerr;
-        withAudio = audio.Open(s->opt.systemAudio, s->opt.microphone, &aerr, &res.warning);
+        withAudio = audio.Open(s->opt.systemAudio, s->opt.microphone, &aerr, &res.warning, s->opt.microphoneGainDb);
         if (!withAudio) res.warning += aerr;
     }
 
@@ -214,7 +216,7 @@ void Run(Session* s) {
         const size_t bytes = (size_t)s->outW * s->outH * 4;
         const bool viz = s->opt.showClicks || s->opt.showKeys || s->opt.showGamepad;
         std::unique_ptr<GamepadPoller> pad;
-        if (s->opt.showGamepad) pad = std::make_unique<GamepadPoller>();
+        if (s->opt.showGamepad) pad = std::make_unique<GamepadPoller>(s->opt.gamepadReader);
         HDC screen = GetDC(nullptr);
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
@@ -234,9 +236,12 @@ void Run(Session* s) {
                     stopReason = L"The window was closed.";
                     break;
                 }
-                if (pad && s->clock.Paused()) pad->Take();  // presses during a pause don't pile up into the next frame
-                if (!s->clock.Paused()) {
-                    if (wgc) {
+                const bool paused = s->clock.Paused();
+                if (pad && (paused || s->resetPadHistory.exchange(false))) pad->DiscardHistory();
+                if (!paused) {
+                    if (s->opt.frameSource) {
+                        s->opt.frameSource(*raw);
+                    } else if (wgc) {
                         wgc->Grab(raw->Bits());  // no new frame = screen unchanged, reuse the previous one
                     } else {
                         if (s->scaled)
@@ -565,6 +570,7 @@ void BeginCapture() {
         DwmFlush();  // make sure the countdown is off screen before the first frame
     }
     g_state = State::Recording;
+    SetInputHudRecording(true);
     StartInputViz(g_session->opt.showClicks, g_session->opt.showKeys);
     g_session->thread = std::thread(Run, g_session);
 }
@@ -606,6 +612,7 @@ bool StartRecording(const RecordOptions& opt, std::function<void(const RecordRes
         }
     }
     s->done = [done](const RecordResult& r) {
+        SetInputHudRecording(false);
         DestroyChrome();
         StopInputViz();
         if (done) done(r);
@@ -641,13 +648,19 @@ void StopRecording(bool discard) {
     g_session->discard = discard;
     g_session->stop = true;
     g_state = State::Finalizing;
+    SetInputHudRecording(false);
     StopInputViz();
     DestroyChrome();
 }
 
 void TogglePauseRecording() {
     if (!g_session || g_state != State::Recording) return;
-    if (g_session->clock.Paused()) g_session->clock.Resume();
+    if (g_session->clock.Paused()) {
+        // A short pause may end before the last tap's visibility hold expires. Resume from the
+        // current physical state, rather than drawing presses that happened only during the pause.
+        g_session->resetPadHistory = true;
+        g_session->clock.Resume();
+    }
     else g_session->clock.Pause();
     if (g_border) InvalidateRect(g_border, nullptr, FALSE);
     if (g_bar) InvalidateRect(g_bar, nullptr, FALSE);

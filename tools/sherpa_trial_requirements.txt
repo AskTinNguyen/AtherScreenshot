@@ -1,0 +1,5 @@
+# Optional experiment only. Not part of the native app build/install.
+sherpa-onnx==2.0.3
+sentencepiece==0.2.3
+sounddevice==0.5.6
+numpy==2.4.1

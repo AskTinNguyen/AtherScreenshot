@@ -9,8 +9,10 @@
 #include <cwctype>
 
 #include "logo.h"
+#include "bugreport.h"
 #include "output.h"
 #include "settings.h"
+#include "selftest.h"
 #include "toast.h"
 
 using Microsoft::WRL::ComPtr;
@@ -173,10 +175,12 @@ void Window::Build() {
     add(Kind::Number, L"Recording", L"CountdownSeconds", L"Countdown", L"Seconds before recording starts (0 = none)", L"3", 0, 10);
     add(Kind::Toggle, L"Recording", L"RecordSystemAudio", L"Record system audio", L"What you hear, into the MP4", L"1");
     add(Kind::Toggle, L"Recording", L"RecordMicrophone", L"Record microphone", L"Default input device, mixed in", L"0");
+    add(Kind::Number, L"Recording", L"MicrophoneGainDb", L"Microphone gain (dB)",
+        L"Narration and bug voice.wav; 0 = unchanged, +6 ≈ 2×. Soft limiter on boosted mic peaks; SAPI input unchanged", L"0", 0, 20);
     add(Kind::Toggle, L"Recording", L"RecordCursor", L"Record mouse cursor", L"", L"1");
     add(Kind::Toggle, L"Recording", L"ShowClicks", L"Show clicks", L"Ripples where you click", L"1");
     add(Kind::Toggle, L"Recording", L"ShowKeys", L"Show keystrokes", L"Careful: also shows passwords you type", L"0");
-    add(Kind::Toggle, L"Recording", L"ShowGamepad", L"Show game controller", L"Buttons and sticks in a corner, while a controller is connected", L"0");
+    add(Kind::Toggle, L"Recording", L"ShowGamepad", L"Show game controller", L"Larger controller in video; live connection and input indicator on screen", L"0");
     {
         Row* r = add(Kind::Choice, L"Recording", L"GamepadCorner", L"Controller corner", L"Where the controller goes in the video", L"bottomright");
         r->choices = {{L"bottomright", L"Bottom right"}, {L"bottomleft", L"Bottom left"}, {L"topright", L"Top right"}, {L"topleft", L"Top left"}};
@@ -185,11 +189,17 @@ void Window::Build() {
     add(Kind::Toggle, L"Recording", L"GpuCapture", L"GPU capture", L"Windows.Graphics.Capture; off = classic GDI", L"1");
 
     header(L"Bug reports");
-    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug start” / “bug stop”",
-        L"Then describe the bug and say “bug stop”. Keeps the microphone open; nothing leaves this PC", L"0");
+    add(Kind::Toggle, L"Bugs", L"VoiceCommands", L"Listen for “bug” / “done”",
+        L"Local English commands. Shows microphone level, heard speech and a persistent bug badge", L"0");
+    {
+        Row* r = add(Kind::Action, L"Bugs", L"RestartVoice", L"Retry bug voice input",
+                     L"After changing Windows default microphone; listening must already be enabled", L"");
+        r->get = [] { return std::wstring(L"Restart listener"); };
+        r->set = [](const std::wstring&) { RestartBugVoiceListening(); };
+    }
     add(Kind::Text, L"Bugs", L"LogPaths", L"Game log paths",
         L"Separate with ;  e.g. %LOCALAPPDATA%\\MyGame\\Saved\\Logs\\*.log", L"");
-    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug start”", L"Seconds of the recording before the bug", L"10", 0, 120);
+    add(Kind::Number, L"Bugs", L"PreRollSeconds", L"Clip starts before “bug”", L"Seconds of the recording before the bug", L"10", 0, 120);
     add(Kind::Number, L"Bugs", L"LogMaxMB", L"Largest log copied", L"MB; a bigger log keeps only its end", L"20", 1, 1024);
 
     header(L"Scrolling capture & editor");
@@ -807,7 +817,7 @@ void ShowSettingsWindow(const SettingsUiHost& host) {
     if (g_win) {
         g_win->host = host;
         g_win->Load();
-        if (IsIconic(g_win->hwnd)) ShowWindow(g_win->hwnd, SW_RESTORE);
+        ShowWindow(g_win->hwnd, IsIconic(g_win->hwnd) ? SW_RESTORE : SW_SHOW);
         ForceForeground(g_win->hwnd);
         InvalidateRect(g_win->hwnd, nullptr, FALSE);
         return;
@@ -847,6 +857,33 @@ void ShowSettingsWindow(const SettingsUiHost& host) {
     DwmSetWindowAttribute(W->hwnd, DWMWA_CAPTION_COLOR, &cap, sizeof(cap));
     SetTimer(W->hwnd, 1, 530, nullptr);
     ShowWithoutFlash(W->hwnd, true);
+    // A hidden launcher can supply SW_HIDE for the process's first ShowWindow call.
+    // Settings is an explicit user action, so make sure that first-show override did not hide it.
+    if (!IsWindowVisible(W->hwnd)) {
+        ShowWindow(W->hwnd, SW_SHOW);
+        ForceForeground(W->hwnd);
+    }
+}
+
+ATHER_TEST(settings_reopens_a_hidden_window) {
+    Settings settings;
+    SettingsUiHost host;
+    host.settings = &settings;
+    ShowSettingsWindow(host);
+    CHECK(g_win && IsWindow(g_win->hwnd));
+    CHECK(g_win && IsWindowVisible(g_win->hwnd));
+    if (!g_win) return;
+    HWND window = g_win->hwnd;
+    ShowWindow(window, SW_HIDE);
+    CHECK(!IsWindowVisible(window));
+    ShowSettingsWindow(host);
+    CHECK(g_win && g_win->hwnd == window);
+    CHECK(IsWindowVisible(window));
+    DestroyWindow(window);
+    CHECK(!g_win);
+    ShowSettingsWindow(host);
+    CHECK(g_win && IsWindowVisible(g_win->hwnd));
+    if (g_win) DestroyWindow(g_win->hwnd);
 }
 
 }  // namespace ather

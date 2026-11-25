@@ -14,10 +14,13 @@ struct RecordOptions {
     bool cursor = true;
     bool systemAudio = false;  // MP4 only
     bool microphone = false;   // MP4 only
+    float microphoneGainDb = 0;  // microphone only, 0..20 dB; system audio is unchanged
     bool gpuCapture = true;    // Windows.Graphics.Capture when possible, GDI otherwise
     bool showClicks = false;
     bool showKeys = false;
     bool showGamepad = false;  // a game controller in a corner while one is connected
+    GamepadPoller::StateReader gamepadReader = nullptr;  // null = native XInput; injectable for simulated-input tests
+    std::function<void(Bitmap&)> frameSource;  // empty = screen/window capture; deterministic source for integration tests
     PadCorner gamepadCorner = PadCorner::BottomRight;
     float gamepadOpacity = 1;  // 0…1
     int countdownSeconds = 0;

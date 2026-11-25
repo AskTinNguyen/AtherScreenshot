@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "common.h"
+#include <xinput.h>
 
 namespace ather {
 
@@ -13,6 +14,7 @@ namespace ather {
 
 struct PadState {
     bool connected = false;
+    int slot = -1;
     WORD buttons = 0;              // XINPUT_GAMEPAD_* bits
     float lx = 0, ly = 0, rx = 0, ry = 0;  // sticks, -1…1, y up, dead zone removed
     float lt = 0, rt = 0;          // triggers, 0…1
@@ -21,30 +23,46 @@ struct PadState {
 enum class PadCorner { TopLeft, TopRight, BottomLeft, BottomRight };
 PadCorner ParsePadCorner(const std::wstring& s);  // "topleft"… (any case); bottom right otherwise
 
-// Holds every press seen between two frames, so a tap shorter than a frame still shows in one.
+// Holds every press seen between frames; recordings also keep buttons/triggers readable for a minimum time.
 class PadLatch {
 public:
+    explicit PadLatch(DWORD minVisibleMs = 0) : minVisibleMs_(minVisibleMs) {}
     void Feed(const PadState& s);
     PadState Take();  // what to draw now; then starts over from the current state
+    void DiscardHistory();  // keep live controls, discard between-frame presses and visibility holds
 
 private:
     PadState cur_, held_;
+    DWORD minVisibleMs_;
+    ULONGLONG buttonUntil_[16]{};
+    ULONGLONG ltUntil_ = 0, rtUntil_ = 0;
+    float ltPeak_ = 0, rtPeak_ = 0;
 };
 
-// Polls the first connected controller about 250 times a second on its own thread.
+// Polls connected controllers about 250 times a second and follows the most recently used one.
 class GamepadPoller {
 public:
-    GamepadPoller();
+    // Optional native reader lets integration tests drive the same polling/conversion path without a driver.
+    using StateReader = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    explicit GamepadPoller(StateReader reader = nullptr);
     ~GamepadPoller();
     PadState Take();
+    void DiscardHistory();  // used at pause/resume boundaries
 
 private:
     void Run();
+    StateReader reader_;
     std::mutex m_;
-    PadLatch latch_;
+    PadLatch latch_{120};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
+
+// Prefer real activity over a neutral connected result from another Windows XInput version.
+DWORD ReadBackgroundPadState(DWORD slot, XINPUT_STATE* state,
+                             GamepadPoller::StateReader primary, GamepadPoller::StateReader alternate);
+bool PadHasInput(const PadState& state);
+std::wstring PadInputText(const PadState& state);
 
 // Where the overlay goes: (x, y) is the top-left of its 240 × 172 design box, `u` pixels per design unit.
 struct PadLayout {

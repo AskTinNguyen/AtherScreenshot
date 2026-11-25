@@ -20,6 +20,7 @@ using std::min;
 
 #include "agent.h"
 #include "bugreport.h"
+#include "bugvoice.h"
 #include "capture.h"
 #include "compress.h"
 #include "editor.h"
@@ -119,6 +120,7 @@ enum Cmd : int {
     CmdBugReport,
     CmdCopyLastBug,
     CmdOpenBugsFolder,
+    CmdRestartBugVoice,
     CmdInsertQuickPrompt,
     CmdOpenQuickPrompts,
     CmdNewQuickPrompt,
@@ -151,6 +153,7 @@ const CmdDef kCmds[] = {
     {CmdBugReport, L"BugReport", L"Bug report: start / stop", L"bug issue playtest report voice clip logs game qa", 0xEBE8, L"Ctrl+Alt+B", true},
     {CmdCopyLastBug, L"CopyLastBugReport", L"Copy last bug report", L"bug clipboard paste slack files clip logs", 0xE8C8, L"", false},
     {CmdOpenBugsFolder, L"OpenBugReportsFolder", L"Open bug reports folder", L"bug explorer directory files bundles", 0xE838, L"", false},
+    {CmdRestartBugVoice, L"RestartBugVoice", L"Restart bug voice listener", L"bug microphone voice speech retry reconnect input", 0xE72C, L"", false},
     {CmdInsertQuickPrompt, L"InsertQuickPrompt", L"Insert QuickPrompt…", L"prompt snippet phrase text expand template paste ai agent claude chatgpt", 0xE8BD, L"Ctrl+Alt+Space", false},
     {CmdOpenQuickPrompts, L"OpenQuickPrompts", L"QuickPrompts…", L"prompt snippet phrase text expansion library triggers manage edit team", 0xE8BD, L"", false},
     {CmdNewQuickPrompt, L"NewQuickPrompt", L"New QuickPrompt…", L"prompt snippet phrase text expansion add create trigger", 0xE710, L"", false},
@@ -490,6 +493,7 @@ void ShowHotkeyErrors() {
 }
 
 void ApplyEditorDefaults() {
+    ConfigureGamepadIndicator(g_settings.showGamepad);
     SetEditorDefaults({g_settings.CapturesFolder(), g_iconBig, g_settings.styledExport, g_settings.saveToFile, g_settings.editorTray});
     SetVideoEditorOptions(g_settings.CapturesFolder(), g_iconBig);
     SetVideoEditorAuthor(g_settings.noteAuthor, [](const std::wstring& name) {
@@ -509,7 +513,7 @@ void ApplyEditorDefaults() {
     ApplyAgents();  // start or stop the MCP server to match
     ApplyQuickPrompts();
     ConfigureBugReports({g_settings.CapturesFolder(), g_settings.bugVoice, g_settings.bugLogPaths, g_settings.bugPreRollSeconds,
-                         g_settings.bugLogMaxMB, g_settings.captureCursor, g_settings.Hotkey(L"BugReport")},
+                         g_settings.bugLogMaxMB, g_settings.captureCursor, g_settings.Hotkey(L"BugReport"), (float)g_settings.microphoneGainDb},
                         {g_hwnd, [](const std::wstring& path) { OpenPath(path); }, [] { UpdateTrayTip(); }});
 }
 
@@ -758,6 +762,7 @@ void BeginRecording(RecordFormat fmt, const RECT& rect, HWND window, const std::
     o.cursor = g_settings.recordCursor;
     o.systemAudio = g_settings.systemAudio;
     o.microphone = g_settings.microphone;
+    o.microphoneGainDb = (float)g_settings.microphoneGainDb;
     o.gpuCapture = g_settings.gpuCapture;
     o.showClicks = g_settings.showClicks;
     o.showKeys = g_settings.showKeys;
@@ -1085,7 +1090,10 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdToggleMic: Toggle(g_settings.microphone, L"Recording", L"RecordMicrophone", L"Microphone"); break;
         case CmdToggleClicks: Toggle(g_settings.showClicks, L"Recording", L"ShowClicks", L"Show clicks"); break;
         case CmdToggleKeys: Toggle(g_settings.showKeys, L"Recording", L"ShowKeys", L"Show keystrokes"); break;
-        case CmdToggleGamepad: Toggle(g_settings.showGamepad, L"Recording", L"ShowGamepad", L"Show game controller"); break;
+        case CmdToggleGamepad:
+            Toggle(g_settings.showGamepad, L"Recording", L"ShowGamepad", L"Show game controller");
+            ConfigureGamepadIndicator(g_settings.showGamepad);
+            break;
         case CmdEditLast:
             if (g_last) OpenEditor(g_last);
             else if (auto recent = RecentCaptures(g_settings.CapturesFolder(), 1); !recent.empty())
@@ -1175,6 +1183,7 @@ void Execute(int id, bool deferCapture, bool untrusted) {
         case CmdBugReport: ToggleBugReport(); break;
         case CmdCopyLastBug: CopyLastBugReport(); break;
         case CmdOpenBugsFolder: OpenBugReportsFolder(); break;
+        case CmdRestartBugVoice: RestartBugVoiceListening(); break;
         case CmdInsertQuickPrompt: ShowQuickPromptPicker(); break;
         case CmdOpenQuickPrompts: OpenQuickPrompts(); break;
         case CmdNewQuickPrompt: OpenQuickPrompts(L"new"); break;
@@ -1554,9 +1563,9 @@ int RunAgentBridge() {
 
 // ---- tray ----
 
-std::wstring TrayTip() {  // says when the microphone is open for "bug start"
+std::wstring TrayTip() {  // says when the microphone is open for "bug"
     return std::wstring(kProductName) + L"\nCommands: " + g_settings.Hotkey(L"CommandPalette") +
-           (BugVoiceListening() ? L"\nListening for “bug start”" : L"");
+           (BugVoiceListening() ? L"\nListening for “bug”" : L"");
 }
 
 void UpdateTrayTip() {
@@ -1881,6 +1890,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     mcp::StopHttp();
     StopQuickPrompts();
+    ConfigureGamepadIndicator(false);
     StopBugReports();
     // Let an in-flight recording finalize so the file isn't left truncated, and let video exports finish
     // (their completion registers the saved file with the library). Work posted back meanwhile still runs:
@@ -1980,6 +1990,14 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     s.Load(HotkeyDefs());
     CHECK(s.Hotkey(L"BugReport") == L"Ctrl+Shift+F9" && s.bugVoice && s.bugLogPaths == L"%TEMP%\\Game\\*.log");
     CHECK(s.bugPreRollSeconds == 120 && s.bugLogMaxMB == 5);  // clamped
+    CHECK(s.microphoneGainDb == 0);
+    s.WriteString(L"Recording", L"MicrophoneGainDb", L"6");
+    s.Load(HotkeyDefs());
+    CHECK(s.microphoneGainDb == 6);
+    s.WriteString(L"Recording", L"MicrophoneGainDb", L"999");
+    s.Load(HotkeyDefs());
+    CHECK(s.microphoneGainDb == 20);
+    s.WriteString(L"Recording", L"MicrophoneGainDb", L"0");
     s.WriteString(L"Hotkeys", L"BugReport", L"Ctrl+Alt+B");
     s.WriteBool(L"Bugs", L"VoiceCommands", false);
     s.WriteString(L"Bugs", L"LogPaths", L"");
@@ -1994,7 +2012,7 @@ ATHER_TEST(bug_report_settings_shortcut_and_palette) {
     std::vector<std::wstring> shown;
     const BitmapPtr img = SettingsSnapshot(h, L"bug", &shown);
     CHECK(img);
-    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug start” / “bug stop”", L"Game log paths", L"Clip starts before “bug start”",
+    for (const wchar_t* row : {L"Bug reports", L"Listen for “bug” / “done”", L"Game log paths", L"Clip starts before “bug”",
                                L"Largest log copied", L"Shortcuts", L"Bug report: start / stop", L"Copy last bug report", L"Open bug reports folder"})
         CHECK(std::find(shown.begin(), shown.end(), row) != shown.end());
     wchar_t out[MAX_PATH];
