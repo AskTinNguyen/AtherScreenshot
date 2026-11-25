@@ -71,3 +71,9 @@ The owner waited for the explicit BẮT ĐẦU message and then confirmed:
 An earlier trial is excluded from recognition scoring because the owner clarified:
 
 > làm lại nha, tôi đang focus việc khác, giờ thử lại được
+
+## Rev 8 owner report
+
+> Hiện Bug start đang được trigger randomly, làm ơn fix
+
+The installed log showed accepted standalone Bug command results at confidence 0/1 while the owner reported no intentional starts. Existing SAPI confidence did not prevent the false positive. Owner-authorized fix: live-only two-utterance Bug confirmation; hotkey and open-report finish commands remain immediate.

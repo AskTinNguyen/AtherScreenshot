@@ -701,6 +701,15 @@ void FinishBugClip(BugBundle& b, const RecordResult& r, double preRoll) {
 // ---- voice: SAPI commands and dictation, and the microphone for voice.wav ----
 
 namespace {
+constexpr double kVoiceStartConfirmSeconds = 2.5;
+
+bool ConfirmVoiceStart(double now, double* pendingAt) {
+    if (!pendingAt) return false;
+    const bool confirmed = *pendingAt > 0 && now - *pendingAt <= kVoiceStartConfirmSeconds;
+    *pendingAt = confirmed ? 0 : now;
+    return confirmed;
+}
+
 bool AcceptVoiceResult(bool command, int confidence, BugCommand action = BugCommand::None, bool open = false, bool grammar = false,
                        bool standalone = false) {
     // Saving an already open report is safe even when a short, accented "stop" scores low.
@@ -738,6 +747,17 @@ ATHER_TEST(bug_voice_policy_is_identical_for_files_and_microphones) {
     CHECK(AcceptVoiceResult(true, SP_NORMAL_CONFIDENCE));
     CHECK(AcceptVoiceResult(true, SP_HIGH_CONFIDENCE));
     CHECK(AcceptVoiceResult(false, SP_LOW_CONFIDENCE));
+}
+
+ATHER_TEST(bug_voice_start_requires_a_short_confirmation) {
+    double pending = 0;
+    CHECK(!ConfirmVoiceStart(10, &pending));
+    CHECK_NEAR(pending, 10, 0.001);
+    CHECK(ConfirmVoiceStart(12, &pending));
+    CHECK_NEAR(pending, 0, 0.001);
+    CHECK(!ConfirmVoiceStart(20, &pending));
+    CHECK(!ConfirmVoiceStart(23, &pending));
+    CHECK_NEAR(pending, 23, 0.001);
 }
 
 ATHER_TEST(bug_voice_stop_can_save_an_open_report_at_low_confidence) {
@@ -1059,6 +1079,7 @@ struct BugApp {
     std::map<uint64_t, StartInfo> starts;  // by bug id
     std::unique_ptr<Listener> listener;
     bool listening = false, dictationWanted = false;
+    double voiceStartPendingAt = 0;
     BugVoiceStatus voiceStatus;
     uint64_t listenerGeneration = 0;
     unsigned voiceFailures = 0;
@@ -1329,7 +1350,23 @@ void OnHeard(Listener* l, uint64_t generation, const std::vector<VoiceCommands::
         a.voiceStatus.rejected = !h.accepted;
         a.voiceStatus.heardAt = BugClock();
         a.voiceStatus.speech = false;
-        if (h.accepted) Handle(a.tracker.Heard(h.words));
+        if (h.accepted) {
+            size_t at = 0, after = 0;
+            const BugCommand action = FindBugCommand(h.words, 0, &at, &after);
+            const bool standaloneStart = action == BugCommand::Start && at == 0 && after == h.words.size();
+            if (a.tracker.IsOpen()) a.voiceStartPendingAt = 0;
+            // File-backed recognizer fixtures are deterministic and already represent an explicit
+            // command sequence. Only live microphone starts need the anti-false-positive confirmation.
+            if (standaloneStart && !a.tracker.IsOpen() && g_testVoiceInput.empty()) {
+                if (!ConfirmVoiceStart(BugClock(), &a.voiceStartPendingAt)) {
+                    a.voiceStatus.message = L"Say “bug” again to confirm";
+                    PublishVoiceStatus();
+                    continue;
+                }
+            }
+            if (action != BugCommand::Start) a.voiceStartPendingAt = 0;
+            Handle(a.tracker.Heard(h.words));
+        }
     }
     PublishVoiceStatus();
 }

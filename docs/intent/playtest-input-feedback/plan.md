@@ -65,3 +65,7 @@ Trial implementation plan (sequential, no agents):
 - [x] Run the same engine on the owner's existing local voice.wav samples; report detections without printing descriptions or changing recordings.
 - [x] Run a bounded, announced live dry run on the VR P10 mic, reporting only keyword events, peak signal, CPU timing and dropped blocks. No background service or endless recording.
 - [x] Record exact results and a usable local replay launcher. Decision: do not integrate these tested models into the native backend; real microphone samples did not pass. Include code/docs only in the existing draft PR update.
+
+## Rev 8 — false-start guard
+
+Owner reports Bug starts randomly. Add a live-only two utterance confirmation within 2.5 seconds for standalone Bug; show the first confirmation hint, clear pending state whenever a report is open or another command arrives, and preserve the immediate hotkey path. Keep Done/Stop single utterance. Validate with RED log evidence, focused Release tests, install and PR update. Do not claim full-suite green while the known QuickPrompts integration failure remains.
