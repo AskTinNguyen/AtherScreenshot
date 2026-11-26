@@ -7,10 +7,10 @@
         "notes": "Pen strokes in the video editor can now be scaled (corners) and turned (handle above) right after you draw them."
     },
     "macos": {
-        "version": "0.0.2.14",
+        "version": "0.0.2.15",
         "url": "https://github.com/AskTinNguyen/AtherScreenshot/releases/download/v0.0.2/AtherScreenshot-0.0.2-macOS.zip",
-        "sha256": "bc126e5055570214ea7cb7ad719a1b4d4c4c4aee2a165b354176e10207ac6ac3",
-        "size": 5046986,
-        "notes": "AI agents connect more safely: the --mcp bridge never sends the agent token, links can't turn agents on, and you're told whenever an agent is at work."
+        "sha256": "4183c46f8b922ecd017865fb183cf032568dbaf06ec9623d7ab0bd4366709af4",
+        "size": 6154624,
+        "notes": "Meetings: record a call's sound (\u2303\u2325M), get a transcript of who said what made on your Mac, and edit the audio by editing the text \u2014 remove filler words and long pauses, then export clean audio and notes."
     }
 }

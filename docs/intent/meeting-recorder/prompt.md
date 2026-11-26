@@ -1,7 +1,7 @@
 # Meeting Recorder: Record a Meeting's Sound, Edit It Like a Document, Get a Clean Transcript, Notes and Outputs (Mac)
 
 - Rev: 2
-- Status: active
+- Status: completed
 - Area: macOS
 - Owner: AskTinNguyen
 - Skill: `none`
@@ -101,3 +101,4 @@ The orchestrator's calls on the owner's behalf (L-1). Each is explained in DECIS
 
 - rev 1 (2026-11-26): started from L-1.
 - rev 2 (2026-11-26): audio editing and clean-up for agents and outputs (L-2): D10–D14, A9–A12.
+- completed (2026-11-26): PR #26 merged to main (98606da); Mac build 0.0.2.15 published to the v0.0.2 release.

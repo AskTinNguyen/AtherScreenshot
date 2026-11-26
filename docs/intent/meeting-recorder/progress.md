@@ -2,9 +2,9 @@
 
 - Working under rev: 2
 - Worker: the orchestrator session itself (the owner was away; one agent did the work and a separate reviewer agent checked it)
-- Current step: release (Mac build 0.0.2.15)
+- Current step: done
 - Next step: none
-- PR: see the merge commit on main (opened and merged by this session, per L-1)
+- PR: https://github.com/AskTinNguyen/AtherScreenshot/pull/26 (squash-merged as 98606da)
 
 ## Acceptance
 
@@ -56,3 +56,5 @@
 - Apple Intelligence reported "still getting ready" (`modelNotReady`) on this Mac during testing, so a live summary couldn't be produced here. The parsing and the map-reduce prompts are tested; the button explains why when the model isn't available.
 - The microphone path (AVCaptureSession) wasn't exercised live, because that would have meant answering a macOS permission prompt for the owner. The capture code mirrors the system-audio path, which was exercised live.
 - The legacy speech path (macOS 14–15, SFSpeechRecognizer in 55 s pieces) wasn't run on this macOS 27 Mac.
+
+- S11: `UPDATE_NOTES=… ./build.sh publish` → "Published the Mac side of v0.0.2 (build 0.0.2.15)". The release's latest.json: macos 0.0.2.15, size 6154624, sha256 4183c46f…09af4 (matches `shasum` of the zip), windows still 0.0.2.13. Binary `lipo -archs`: x86_64 arm64.
