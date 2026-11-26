@@ -15,7 +15,12 @@ final class MeetingHUD {
     private var timer: Timer?
     static let size = NSSize(width: 404, height: 46)
 
-    init(recorder: MeetingRecorder) {
+    convenience init(recorder: MeetingRecorder) {
+        self.init(recorder: recorder, others: recorder.options.others, you: recorder.options.you)
+    }
+
+    // `recorder` nil: a still picture of the bar (snapshots), filled in with preview(…).
+    init(recorder: MeetingRecorder?, others: Bool, you: Bool) {
         self.recorder = recorder
         let vis = Geo.mouseScreen.visibleFrame
         let s = MeetingHUD.size
@@ -28,8 +33,9 @@ final class MeetingHUD {
         excludeFromCapture(panel)
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        panel.contentView = makeView(others: recorder.options.others, you: recorder.options.you)
+        panel.contentView = makeView(others: others, you: you)
         panel.orderFrontRegardless()
+        guard recorder != nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
             guard let self else { return }
@@ -83,17 +89,30 @@ final class MeetingHUD {
                                         meter(meterYou, "mic.fill", "You (microphone)", on: you), NSView(), markButton, markCount, pauseButton, stop, discard])
         stack.spacing = 10
         stack.setCustomSpacing(2, after: markButton)
+        stack.alignment = .centerY
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
-        stack.frame = v.bounds
-        stack.autoresizingMask = [.width, .height]
+        stack.translatesAutoresizingMaskIntoConstraints = false
         dot.widthAnchor.constraint(equalToConstant: 10).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 10).isActive = true
         time.widthAnchor.constraint(greaterThanOrEqualToConstant: 54).isActive = true
         v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: v.leadingAnchor), stack.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: v.topAnchor), stack.bottomAnchor.constraint(equalTo: v.bottomAnchor),
+        ])
         return v
     }
 
     func started() { update() }
+
+    var view: NSView? { panel.contentView }
+
+    func preview(elapsed: Double, others: Float, you: Float, markers: Int) {
+        time.stringValue = MeetingFormat.clock(elapsed)
+        meterOthers.level = others
+        meterYou.level = you
+        markCount.stringValue = markers > 0 ? "\(markers)" : ""
+    }
 
     private var lastSecond = -1
     private func tick() {

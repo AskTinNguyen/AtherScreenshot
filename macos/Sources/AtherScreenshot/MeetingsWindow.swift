@@ -47,6 +47,7 @@ final class MeetingsModel: ObservableObject {
     private var redo: [[MeetingCut]] = []
     private var spans: [MeetingEdit.Span] = []
     private var notesWork: DispatchWorkItem?
+    private var loadGen = 0
     var peaksProvider: (URL) -> [Float] = { Waveform.peaks($0) }
 
     init(store: MeetingStore = .shared) {
@@ -82,10 +83,11 @@ final class MeetingsModel: ObservableObject {
         peaks = []
         guard let m = meeting else { player.replaceCurrentItem(with: nil); return }
         player.replaceCurrentItem(with: FileManager.default.fileExists(atPath: m.audioURL.path) ? AVPlayerItem(url: m.audioURL) : nil)
-        let url = m.audioURL, id = m.id, provider = peaksProvider
+        loadGen += 1
+        let url = m.audioURL, gen = loadGen, provider = peaksProvider
         DispatchQueue.global(qos: .userInitiated).async {
             let p = provider(url)
-            DispatchQueue.main.async { if self.selectedID == id { self.peaks = p } }
+            DispatchQueue.main.async { if self.loadGen == gen { self.peaks = p } }  // a slower, older load never wins
         }
     }
 
@@ -589,16 +591,18 @@ struct MeetingsEmpty: View {
 }
 
 struct AccentButton: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label.font(.system(size: 12.5, weight: .semibold)).padding(.horizontal, 13).padding(.vertical, 7)
+        configuration.label.saturation(enabled ? 1 : 0).opacity(enabled ? 1 : 0.4).font(.system(size: 12.5, weight: .semibold)).padding(.horizontal, 13).padding(.vertical, 7)
             .foregroundColor(col(Theme.onAccent)).background(RoundedRectangle(cornerRadius: 7).fill(col(Theme.accent)))
             .opacity(configuration.isPressed ? 0.75 : 1)
     }
 }
 
 struct QuietButton: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label.font(.system(size: 12.5, weight: .medium)).padding(.horizontal, 11).padding(.vertical, 6)
+        configuration.label.opacity(enabled ? 1 : 0.4).font(.system(size: 12.5, weight: .medium)).padding(.horizontal, 11).padding(.vertical, 6)
             .foregroundColor(col(Theme.text)).background(RoundedRectangle(cornerRadius: 7).fill(col(Theme.raised)))
             .overlay(RoundedRectangle(cornerRadius: 7).stroke(col(Theme.border), lineWidth: 1))
             .opacity(configuration.isPressed ? 0.75 : 1)
@@ -612,6 +616,7 @@ struct MeetingDetail: View {
     let meeting: Meeting
     let busy: Bool
     @State private var title = ""
+    @State private var editingTitle = false
     @FocusState private var titleFocused: Bool
 
     var body: some View {
@@ -632,18 +637,25 @@ struct MeetingDetail: View {
             statusBar
         }
         .onAppear { title = meeting.title }
-        .onChange(of: meeting.id) { _, _ in title = meeting.title }
-        .onChange(of: meeting.title) { _, t in if !titleFocused { title = t } }
+        .onChange(of: meeting.id) { _, _ in title = meeting.title; editingTitle = false }
     }
 
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                TextField("Title", text: $title)
-                    .textFieldStyle(.plain).font(.system(size: 22, weight: .bold)).foregroundColor(col(Theme.text))
-                    .focused($titleFocused)
-                    .onSubmit { m.rename(title) }
-                    .onChange(of: titleFocused) { _, f in if !f { m.rename(title) } }
+                if editingTitle {
+                    TextField("Title", text: $title)
+                        .textFieldStyle(.plain).font(.system(size: 22, weight: .bold)).foregroundColor(col(Theme.text))
+                        .focused($titleFocused)
+                        .onAppear { titleFocused = true }
+                        .onSubmit { m.rename(title); editingTitle = false }
+                        .onExitCommand { title = meeting.title; editingTitle = false }
+                        .onChange(of: titleFocused) { _, f in if !f && editingTitle { m.rename(title); editingTitle = false } }
+                } else {
+                    Text(meeting.title).font(.system(size: 22, weight: .bold)).foregroundColor(col(Theme.text)).lineLimit(1)
+                        .onTapGesture { title = meeting.title; editingTitle = true }
+                        .help("Click to rename")
+                }
                 HStack(spacing: 8) {
                     Text(MeetingFormat.dateTime.string(from: meeting.created))
                     dot

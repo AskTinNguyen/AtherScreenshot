@@ -200,7 +200,7 @@ enum MeetingAI {
         for raw in text.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             let upper = line.uppercased().replacingOccurrences(of: "*", with: "").replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces)
-            if upper.hasPrefix("SUMMARY") { section = "s"; let rest = line.split(separator: ":", maxSplits: 1).dropFirst().joined(); if !rest.trimmingCharacters(in: .whitespaces).isEmpty { overview.append(rest.trimmingCharacters(in: .whitespaces)) }; continue }
+            if upper.hasPrefix("SUMMARY") { section = "s"; let rest = line.split(separator: ":", maxSplits: 1).dropFirst().joined().trimmingCharacters(in: CharacterSet(charactersIn: "* ")); if !rest.isEmpty { overview.append(rest) }; continue }
             if upper.hasPrefix("KEY POINTS") { section = "k"; continue }
             if upper.hasPrefix("DECISIONS") { section = "d"; continue }
             if upper.hasPrefix("ACTION ITEMS") { section = "a"; continue }
@@ -296,25 +296,26 @@ final class MeetingPipeline {
                 failure = error.localizedDescription
             }
             let lines = MeetingTranscript.merge(me: me, others: others)
+            let (fail, eng, loc) = (failure, engine, locale)
             await MainActor.run {
                 MeetingStore.shared.update(id) {
-                    if let failure {
+                    if let failure = fail {
                         $0.transcript = .failed
                         $0.transcriptError = failure
                     } else {
                         $0.transcript = .done
                         $0.lines = lines
-                        $0.transcriptEngine = engine
-                        $0.language = locale
+                        $0.transcriptEngine = eng
+                        $0.language = loc
                         $0.cuts.removeAll { $0.reason != .manual && $0.reason != .trim }  // clean-up is redone on the new words
                     }
                 }
             }
-            if failure == nil, wantSummary, !lines.isEmpty, MeetingAI.available { await summarizeNow(id) }
+            if fail == nil, wantSummary, !lines.isEmpty, MeetingAI.available { await summarizeNow(id) }
             await MainActor.run {
                 self.running.remove(id)
                 MeetingStore.shared.busy.remove(id)
-                if let failure { Toast.shared.show("Couldn't transcribe the meeting", failure, ms: 7000) { MeetingsWindow.show(select: id) } }
+                if let failure = fail { Toast.shared.show("Couldn't transcribe the meeting", failure, ms: 7000) { MeetingsWindow.show(select: id) } }
             }
         }
     }
