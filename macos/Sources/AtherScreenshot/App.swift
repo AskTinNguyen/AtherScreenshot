@@ -140,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UpdateController.shared.start()
         QuickPromptsMac.shared.start()
         MeetingDetector.shared.apply()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { MeetingPipeline.shared.resumePending() }
 
         if afterUpdate {
             Toast.shared.show("Updated to Ather Screenshot \(AppDelegate.version)", "Your settings, captures and gallery are just as you left them.", ms: 6000)

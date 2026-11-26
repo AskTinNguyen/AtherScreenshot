@@ -24,8 +24,8 @@ Requires Xcode (or the Command Line Tools). The version comes from `../src/versi
 
 - **Screen & System Audio Recording** (required): macOS asks on first capture. Ad-hoc builds get a new signature on every rebuild, so macOS may ask again after rebuilding. Sign with a stable identity to avoid that.
 - **Accessibility**: only for scrolling capture (it posts scroll events), for showing keystrokes in recordings, and for QuickPrompts (spotting triggers and pasting).
-- **Microphone**: only when "Record microphone" is on (macOS 15 or later), or for bug reports' voice commands.
-- **Speech Recognition**: for Auto captions, and for bug reports' voice commands when you turn them on.
+- **Microphone**: for meeting recordings ("Record me"), when "Record microphone" is on for screen recordings (macOS 15 or later), or for bug reports' voice commands.
+- **Speech Recognition**: for meeting transcripts on macOS 14–15 (macOS 26 and later transcribe without asking), for Auto captions, and for bug reports' voice commands when you turn them on.
 
 ## Default shortcuts
 
@@ -44,6 +44,7 @@ macOS reserves ⌘⇧3/4/5, so the defaults use ⌃⌥:
 | ⌃⌥H | Capture history |
 | ⌃⌥5 / ⌃⌥G | Record MP4 / GIF (press again to stop) |
 | ⌃⌥B | Bug report: start / stop |
+| ⌃⌥M / ⌃⌥⇧M | Record meeting audio: start / stop, mark a moment |
 | ⌃⌥P | Insert a QuickPrompt (⌃⌥Space is macOS's keyboard switch) |
 
 All shortcuts can be changed in Settings. Settings live in UserDefaults (`com.ather.screenshot`) under the same key names as `settings.ini`, so `defaults write com.ather.screenshot Uploader s3` works.
@@ -94,6 +95,10 @@ Opening an MP4 (from the gallery, the "Video saved" notification, or Open recent
 - **Join videos:** Add ▾ › Video clip… (⌘O) or drop videos on the editor to add them after the selected clip. Any shape works: each clip is fitted into the first video's frame with black bars. With two or more clips a clip lane appears above the thumbnails: click selects a clip, drag reorders it, and drag a selected clip's edge to trim it. The clip row offers Split at playhead (S), Earlier, Later and Remove. Captions and markup stay on their footage when clips move, split or go.
 
 Space plays, ⌘L loops, G guides, ←/→ step a frame (⇧ a second), S splits, ⌫ takes a clip to the bin, ⇧-drag or ⇧I/⇧O mark a range, ⌘C copies it (or the selected clip, or the frame), ⌘⇧C copies the frame, ⌫ deletes the selected item, ⌘Z undoes, Esc cancels a drag, then clears the range.
+
+## Meetings
+
+⌃⌥M records a call's sound: system audio (everyone else; ScreenCaptureKit, audio only, optionally one app) and the microphone (you; AVCaptureSession, any input) as two AAC tracks that start at the same host time, mixed at Stop into `meeting.m4a`. Then each track is transcribed on the Mac (`SpeechTranscriber` on macOS 26+, else on-device `SFSpeechRecognizer` in 55 s pieces), merged into lines per speaker with echo removed, and summarized by the on-device Apple Intelligence model when available (`FoundationModels`, weak-linked). The Meetings window plays it, shows the transcript as an editor (click a word, ⇧-click, ⌫ cuts; Clean up removes fillers, repeats and long pauses; Play the edit skips cuts) and exports `edited.m4a` (10 ms fades, optional Enhance) and transcripts. Cuts are a list in `meeting.json`; the audio files are never changed. `transcript.json` is rewritten with every save for agents. Code: `Meeting.swift` (model, store, transcript lines, exports, waveform), `MeetingRecorder.swift`, `MeetingTranscribe.swift` (speech, AI, pipeline), `MeetingEdit.swift` (cuts, clean-up, export, Enhance, transcript.json), `MeetingsWindow.swift`, `MeetingHUD.swift`, `MeetingDetector.swift` (call detection, settings rows), `MeetingAgent.swift` (MCP tools). Decisions: `docs/intent/meeting-recorder/DECISIONS.md`.
 
 ## Bug reports
 

@@ -106,6 +106,29 @@ final class MeetingSnapshotTests: XCTestCase {
         w.window.close()
     }
 
+    // A meeting recorded by the real app (end-to-end check): ATHER_E2E_MEETING=<its folder>. Its real audio, waveform,
+    // transcript and cuts, drawn by the Meetings window.
+    func testRealRecording() throws {
+        guard out != nil, let dir = ProcessInfo.processInfo.environment["ATHER_E2E_MEETING"] else { throw XCTSkip("needs ATHER_E2E_MEETING") }
+        let m = try XCTUnwrap(MeetingStore.read(URL(fileURLWithPath: dir)))
+        let store = MeetingStore()
+        store.loadIfNeeded()   // first, so the scan of the store's own folder doesn't drop this one
+        store.save(m)
+        let model = MeetingsModel(store: store)
+        model.selectedID = nil
+        model.selectedID = m.id
+        let w = MeetingsWindow(model: model, register: false)
+        w.window.setContentSize(NSSize(width: 1180, height: 700))
+        w.window.orderFront(nil)
+        wait(1.5)
+        XCTAssertFalse(model.peaks.isEmpty, "the real recording's waveform")
+        model.seek(12.6)
+        model.status = "Recorded by the app from system audio, transcribed on this Mac, cleaned up by an AI agent over MCP"
+        wait(0.6)
+        snap(w.window.contentView!, "e2e-real-meeting")
+        w.window.close()
+    }
+
     func testMeetingsEmpty() throws {
         try XCTSkipIf(out == nil)
         let store = MeetingStore()

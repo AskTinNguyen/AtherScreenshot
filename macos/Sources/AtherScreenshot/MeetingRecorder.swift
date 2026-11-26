@@ -153,6 +153,7 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
         }
     }
 
+    @MainActor
     private func startSystemAudio() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else { throw MeetingEdit.Failure.failed("No display.") }
@@ -186,6 +187,7 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
         meeting.hasOthers = true
     }
 
+    @MainActor
     private func startMicrophone() throws {
         let device = options.micID.isEmpty ? AVCaptureDevice.default(for: .audio) : (AVCaptureDevice(uniqueID: options.micID) ?? AVCaptureDevice.default(for: .audio))
         guard let device else { throw MeetingEdit.Failure.failed("No microphone found.") }
@@ -372,6 +374,7 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
         }
     }
 
+    @MainActor
     private func save(duration: TimeInterval, note: String?) async {
         let fm = FileManager.default
         meeting.duration = duration

@@ -274,6 +274,11 @@ final class MeetingPipeline {
     static let shared = MeetingPipeline()
     private var running: Set<UUID> = []
 
+    // Meetings whose transcript was cut short (the app quit or crashed) are transcribed again at launch.
+    func resumePending() {
+        for m in MeetingStore.shared.meetings where m.transcript == .pending || m.transcript == .running { process(m.id) }
+    }
+
     func process(_ id: UUID, summarize: Bool? = nil) {
         guard !running.contains(id), let m = MeetingStore.shared.meeting(id) else { return }
         running.insert(id)

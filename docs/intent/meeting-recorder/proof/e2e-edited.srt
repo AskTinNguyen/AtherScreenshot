@@ -1,0 +1,11 @@
+1
+00:00:00,340 --> 00:00:01,660
+Others: Good afternoon, everyone.
+
+2
+00:00:02,440 --> 00:00:06,880
+Others: Thanks for joining the launch review, though the main topic today is the pricing page.
+
+3
+00:00:07,440 --> 00:00:13,080
+Others: Right. We agreed to ship the new pricing on Monday. And Lynn will send the press kit by Friday.
