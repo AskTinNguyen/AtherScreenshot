@@ -180,6 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Finish an active recording and pending writes before quitting, so nothing is lost.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         UpdateController.shared.quitting = true  // a download finishing now must not install or relaunch
+        MeetingsWindow.shared?.model.flushNotes()
         Agent.stop()
         BugReports.shared.stop()
         QuickPromptsMac.shared.stop()
@@ -188,22 +189,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Library.shared.flush()
         }
         MeetingDetector.shared.stop()
-        // A meeting being recorded is saved before quitting (and a screen recording with it, below).
-        if let m = MeetingRecorder.current {
-            guard m.hasAudio else { m.stop(); return quitAfterRecording(sender, finishWrites) }
+        // A meeting being recorded (or still being saved) is finished before quitting, then a screen recording if one runs too.
+        if let m = MeetingRecorder.current, m.phase != .starting {
             Toast.shared.show("Saving the meeting…", "Quitting when it's done")
             var replied = false
-            let finish = {
+            let reply = {
                 guard !replied else { return }
                 replied = true
-                if Recorder.current != nil { Recorder.current?.stop(); finishWrites(); sender.reply(toApplicationShouldTerminate: true) }
-                else { finishWrites(); sender.reply(toApplicationShouldTerminate: true) }
+                finishWrites()
+                sender.reply(toApplicationShouldTerminate: true)
             }
-            MeetingRecorder.onFinished.append { DispatchQueue.main.async { finish() } }
-            m.stop()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 25) { finish() }
+            let afterMeeting = {
+                if let r = Recorder.current, r.hasFootage {
+                    Recorder.onFinished.append { DispatchQueue.main.async { reply() } }
+                    r.stop()
+                } else {
+                    Recorder.current?.stop()
+                    reply()
+                }
+            }
+            MeetingRecorder.onFinished.append { DispatchQueue.main.async { afterMeeting() } }
+            m.stop()  // nothing more to do while it's already saving
+            // Never hang a logout. A meeting cut off here keeps its tracks and meeting.json; its mix is redone at launch.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { reply() }
             return .terminateLater
         }
+        MeetingRecorder.current?.stop()  // still starting: nothing recorded yet
         return quitAfterRecording(sender, finishWrites)
     }
 

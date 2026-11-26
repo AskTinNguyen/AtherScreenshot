@@ -14,7 +14,8 @@ enum MeetingEdit {
     static func merged(_ cuts: [MeetingCut]) -> [Span] {
         var out: [Span] = []
         for c in cuts.filter({ $0.end > $0.start }).sorted(by: { $0.start < $1.start }) {
-            if let last = out.last, c.start <= last.end + 0.0005 { out[out.count - 1].end = max(last.end, c.end) } else { out.append((c.start, c.end)) }
+            // A kept sliver under 30 ms between two cuts would overlap its fades: the cuts become one.
+            if let last = out.last, c.start <= last.end + 0.03 { out[out.count - 1].end = max(last.end, c.end) } else { out.append((c.start, c.end)) }
         }
         return out
     }
@@ -206,7 +207,7 @@ enum MeetingEdit {
         }
         if doPauses {
             removeCuts(&m, reason: .pause)
-            let levels = rms ?? MeetingEdit.rms(m.audioURL)
+            let levels = rms ?? MeetingEdit.rms(m.playableURL)
             let c = pauseCuts(rms: levels, window: 0.02, minPause: minPause, keep: keep).filter { $0.end <= m.duration + 0.05 }
             r.pauses = c.count; m.cuts += c
         }

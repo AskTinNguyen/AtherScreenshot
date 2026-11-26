@@ -120,7 +120,7 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
                 }
                 if wantYou {
                     do { try startMicrophone() } catch {
-                        if others == nil { throw error }
+                        if !meeting.hasOthers { throw error }
                         notices.append("Your microphone isn't recorded: \(error.localizedDescription)")
                     }
                 }
@@ -180,9 +180,15 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
         let w = try TrackWriter(url: tmpFolder.appendingPathComponent("tracks/others.m4a"), channels: 2)
         queue.sync { others = w }
         let st = SCStream(filter: filter, configuration: cfg, delegate: self)
-        try st.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)  // frames are dropped; avoids log noise
-        try await st.startCapture()
+        do {
+            try st.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+            try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)  // frames are dropped; avoids log noise
+            try await st.startCapture()
+        } catch {
+            queue.sync { others = nil }
+            w.cancel()
+            throw error
+        }
         stream = st
         meeting.hasOthers = true
     }
@@ -208,6 +214,48 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
         session = s
         meeting.hasYou = true
         meeting.micName = device.localizedName
+        watchMicrophone(s, device)
+    }
+
+    // A headset unplugged, AirPods taken out, or the session failing: carry on with the default microphone on the same
+    // track (samples are on host time, so it stays in line), and say so.
+    private var micObservers: [NSObjectProtocol] = []
+    @MainActor
+    private func watchMicrophone(_ s: AVCaptureSession, _ device: AVCaptureDevice) {
+        micObservers.forEach(NotificationCenter.default.removeObserver)
+        let nc = NotificationCenter.default
+        micObservers = [
+            nc.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: device, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.switchMicrophone("\(device.localizedName) was disconnected") }
+            },
+            nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: s, queue: .main) { [weak self] n in
+                let e = (n.userInfo?[AVCaptureSessionErrorKey] as? Error)?.localizedDescription ?? "the microphone stopped"
+                Task { @MainActor in self?.switchMicrophone(e) }
+            },
+        ]
+    }
+
+    @MainActor
+    private func switchMicrophone(_ why: String) {
+        guard phase == .recording, let old = session else { return }
+        old.stopRunning()
+        let device = AVCaptureDevice.default(for: .audio)
+        guard let device, let input = try? AVCaptureDeviceInput(device: device) else {
+            notices.append("Your microphone stopped: \(why).")
+            return Toast.shared.show("Your microphone stopped", "\(why). Others are still recorded.", ms: 7000)
+        }
+        let s = AVCaptureSession()
+        let out = AVCaptureAudioDataOutput()
+        out.audioSettings = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 1,
+                             AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsNonInterleaved: false]
+        out.setSampleBufferDelegate(self, queue: queue)
+        if s.canAddInput(input) { s.addInput(input) }
+        if s.canAddOutput(out) { s.addOutput(out) }
+        s.startRunning()
+        queue.sync { session = s }
+        watchMicrophone(s, device)
+        notices.append("Switched to \(device.localizedName): \(why).")
+        Toast.shared.show("Now recording you on \(device.localizedName)", why, ms: 6000)
     }
 
     // MARK: samples (on `queue`)
@@ -381,22 +429,18 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
         meeting.hasOthers = meeting.hasOthers && fm.fileExists(atPath: tmpFolder.appendingPathComponent("tracks/others.m4a").path)
         meeting.hasYou = meeting.hasYou && fm.fileExists(atPath: tmpFolder.appendingPathComponent("tracks/you.m4a").path)
         guard meeting.hasOthers || meeting.hasYou else { return abort("Nothing was recorded.") }
-        do {
-            try await MeetingRecorder.mix(meeting.tracks.map(meeting.trackURL), to: meeting.audioURL)
-        } catch {
-            return abort("Couldn't save the meeting: \(error.localizedDescription)")
-        }
+        // The finished tracks get their real folder and meeting.json first, so whatever happens next (a failed mix, the
+        // app quitting) they're listed, and the mix is retried at the next launch.
         let store = MeetingStore.shared
         let dst = store.uniqueFolder(store.folderName(created: meeting.created, title: meeting.title))
-        do {
-            try fm.moveItem(at: tmpFolder, to: dst)
-            meeting.folder = dst
-        } catch {
-            meeting.folder = tmpFolder  // still saved, just under the hidden name
-        }
+        if (try? fm.moveItem(at: tmpFolder, to: dst)) != nil { meeting.folder = dst }
         meeting.transcript = options.transcribe ? .pending : .none
-        store.save(meeting)
+        let wrote = store.save(meeting)
+        var mixError: String?
+        do { try await MeetingRecorder.mixTracks(meeting) } catch { mixError = error.localizedDescription }
+        if !wrote { store.save(meeting) }
         let saved = meeting
+        if let mixError { Toast.shared.show("The meeting's tracks are saved, but not mixed", mixError, ms: 8000) }
         finishedCleanup()
         let outcome = Outcome(meeting: saved, error: nil)
         onFinish?(outcome)
@@ -425,6 +469,8 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
     }
 
     private func finishedCleanup() {
+        micObservers.forEach(NotificationCenter.default.removeObserver)
+        micObservers = []
         hud?.close()
         hud = nil
         stream = nil
@@ -437,6 +483,15 @@ final class MeetingRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptu
     }
 
     // MARK: mixing
+
+    // meeting.m4a from the meeting's tracks, written beside it first so a cut-off mix never leaves a broken file.
+    static func mixTracks(_ m: Meeting) async throws {
+        let tmp = m.folder.appendingPathComponent(".mixing.m4a")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try await mix(m.tracks.map(m.trackURL).filter { FileManager.default.fileExists(atPath: $0.path) }, to: tmp)
+        try? FileManager.default.removeItem(at: m.audioURL)
+        try FileManager.default.moveItem(at: tmp, to: m.audioURL)
+    }
 
     // All tracks played together into one AAC file (or the one track, re-encoded the same way).
     static func mix(_ tracks: [URL], to out: URL) async throws {

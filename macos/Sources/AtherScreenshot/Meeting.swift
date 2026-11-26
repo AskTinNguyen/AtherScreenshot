@@ -123,6 +123,11 @@ struct Meeting: Codable, Identifiable, Hashable {
     var jsonURL: URL { folder.appendingPathComponent("meeting.json") }
     var markdownURL: URL { folder.appendingPathComponent("transcript.md") }
     var agentURL: URL { folder.appendingPathComponent("transcript.json") }
+    // meeting.m4a, or (before it's mixed) the first track there is.
+    var playableURL: URL {
+        if FileManager.default.fileExists(atPath: audioURL.path) { return audioURL }
+        return tracks.map(trackURL).first { FileManager.default.fileExists(atPath: $0.path) } ?? audioURL
+    }
     var editedAudioURL: URL { folder.appendingPathComponent("edited.m4a") }
     func trackURL(_ s: Speaker) -> URL { folder.appendingPathComponent("tracks/\(s == .me ? "you" : "others").m4a") }
     var tracks: [Speaker] { (hasOthers ? [Speaker.others] : []) + (hasYou ? [.me] : []) }
@@ -387,6 +392,11 @@ final class MeetingStore: ObservableObject {
     }
 
     func meeting(_ id: UUID) -> Meeting? { meetings.first { $0.id == id } }
+
+    // Tells views a meeting's files changed (e.g. meeting.m4a was mixed after the fact).
+    func reloadOne(_ id: UUID) {
+        NotificationCenter.default.post(name: MeetingStore.changed, object: self, userInfo: ["id": id])
+    }
 
     func update(_ id: UUID, _ change: (inout Meeting) -> Void) {
         guard var m = meeting(id) ?? meetings.first(where: { $0.id == id }) else { return }

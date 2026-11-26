@@ -117,6 +117,7 @@ enum MeetingTools {
     @MainActor
     static func stop(_ a: JSON) async throws -> JSON {
         guard let r = MeetingRecorder.current else { throw MCP.failed("No meeting is being recorded.") }
+        guard r.phase != .starting else { throw MCP.failed("The meeting recording is still starting; call stop_meeting_recording again in a moment.") }
         let discard = MCP.bool(a["discard"]) ?? false
         let outcome: MeetingRecorder.Outcome = await withCheckedContinuation { k in
             var done = false
@@ -180,7 +181,12 @@ enum MeetingTools {
 
     @MainActor
     static func edit(_ a: JSON) async throws -> JSON {
-        var m = try find(a)
+        let found = try find(a)
+        let doPauses = MCP.bool(a["shorten_pauses"]) ?? false
+        let url = found.playableURL
+        let levels: [Float] = doPauses ? await Task.detached { MeetingEdit.rms(url) }.value : []
+        // The latest copy, after the await: the transcript or a rename may have landed meanwhile.
+        guard var m = MeetingStore.shared.meeting(found.id) else { throw MCP.failed("That meeting is gone.") }
         guard m.transcript == .done || (MCP.bool(a["shorten_pauses"]) ?? false) || a["cut"] != nil || a["restore"] != nil || a["restore_all"] != nil else {
             throw MCP.failed("This meeting has no transcript yet (\(m.transcript.rawValue)); fillers and repeats need one.")
         }
@@ -190,9 +196,6 @@ enum MeetingTools {
         for (s, e) in parseSpans(a["cut"]) { MeetingEdit.cut(&m, s, e) }
         let ids = Set(MCP.strings(a["cut_lines"]))
         for l in m.lines where ids.contains(l.id.uuidString) { MeetingEdit.cut(&m, l.start, l.end) }
-        let doPauses = MCP.bool(a["shorten_pauses"]) ?? false
-        let url = m.audioURL
-        let levels: [Float] = doPauses ? await Task.detached { MeetingEdit.rms(url) }.value : []
         let r = MeetingEdit.cleanUp(&m, fillers: MCP.bool(a["remove_fillers"]) ?? false, repeats: MCP.bool(a["remove_repeats"]) ?? false,
                                     pauses: doPauses, minPause: MCP.num(a["min_pause"]) ?? 1.0, rms: levels)
         MeetingStore.shared.save(m)
@@ -207,7 +210,7 @@ enum MeetingTools {
         let m = try find(a)
         var files: JSON = [:]
         if MCP.bool(a["audio"]) ?? true {
-            try await MeetingEdit.exportAudio(source: m.audioURL, duration: m.duration, cuts: m.cuts,
+            try await MeetingEdit.exportAudio(source: m.playableURL, duration: m.duration, cuts: m.cuts,
                                               enhance: MCP.bool(a["enhance"]) ?? Settings.shared.bool("MeetingEnhance"), to: m.editedAudioURL)
             files["audio"] = m.editedAudioURL.path
         }

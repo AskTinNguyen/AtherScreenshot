@@ -266,6 +266,53 @@ final class MeetingEditTests: XCTestCase {
         }
     }
 
+    func testSliversBetweenCutsAreMerged() {
+        var m = Meeting()
+        m.duration = 10
+        MeetingEdit.cut(&m, 1, 2)
+        MeetingEdit.cut(&m, 2.01, 3)   // a 10 ms sliver would overlap the fades at both joins
+        XCTAssertEqual(MeetingEdit.merged(m.cuts).count, 1)
+        XCTAssertEqual(MeetingEdit.kept(duration: 10, MeetingEdit.merged(m.cuts)).count, 2)
+    }
+
+    @MainActor
+    func testNotesGoToTheMeetingTheyWereTypedIn() throws {
+        let store = MeetingStore()
+        store.loadIfNeeded()
+        var a = MeetingTests.sampleMeeting(folder: store.root.appendingPathComponent("notes-a-\(UUID().uuidString)")); a.title = "A"
+        var b = MeetingTests.sampleMeeting(folder: store.root.appendingPathComponent("notes-b-\(UUID().uuidString)")); b.title = "B"
+        b.notes = "B's own notes"
+        store.save(a); store.save(b)
+        defer { try? FileManager.default.removeItem(at: a.folder); try? FileManager.default.removeItem(at: b.folder) }
+        let model = MeetingsModel(store: store)
+        model.selectedID = a.id
+        model.setNotes("typed in A")
+        model.selectedID = b.id        // switched before the save timer fired
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+        XCTAssertEqual(store.meeting(a.id)?.notes, "typed in A")
+        XCTAssertEqual(store.meeting(b.id)?.notes, "B's own notes")
+        XCTAssertEqual(MeetingStore.read(a.folder)?.notes, "typed in A")
+    }
+
+    @MainActor
+    func testUnmixedMeetingPlaysItsTrackAndIsMixedAtLaunch() async throws {
+        let store = MeetingStore.shared
+        store.loadIfNeeded()
+        var m = MeetingTests.sampleMeeting(folder: store.root.appendingPathComponent("unmixed-\(UUID().uuidString)"))
+        m.hasYou = false
+        m.transcript = .done
+        try FileManager.default.createDirectory(at: m.folder.appendingPathComponent("tracks"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: try MeetingTests.audio([(2, 0.3)], channels: 2), to: m.trackURL(.others))
+        store.save(m)
+        defer { store.delete(m.id) }
+        XCTAssertEqual(m.playableURL, m.trackURL(.others), "before the mix, the track plays")
+        MeetingPipeline.shared.resumePending()
+        for _ in 0..<40 where !FileManager.default.fileExists(atPath: m.audioURL.path) { try await Task.sleep(nanoseconds: 100_000_000) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: m.audioURL.path))
+        XCTAssertEqual(m.playableURL, m.audioURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: m.folder.appendingPathComponent(".mixing.m4a").path))
+    }
+
     @MainActor
     func testAgentToolsEditAndExport() async throws {
         let store = MeetingStore.shared

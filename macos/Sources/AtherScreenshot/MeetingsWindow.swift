@@ -58,8 +58,9 @@ final class MeetingsModel: ObservableObject {
             guard let self, let id = n.userInfo?["id"] as? UUID, id == self.selectedID else { return }
             self.refresh()
         }.store(in: &subs)
-        NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime).receive(on: RunLoop.main).sink { [weak self] _ in
-            self?.playing = false
+        NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime).receive(on: RunLoop.main).sink { [weak self] n in
+            guard let self, (n.object as? AVPlayerItem) === self.player.currentItem else { return }  // not another player's
+            self.playing = false
         }.store(in: &subs)
         selectedID = store.meetings.first?.id
         if selectedID != nil { load() }
@@ -72,6 +73,7 @@ final class MeetingsModel: ObservableObject {
     // MARK: loading
 
     private func load() {
+        flushNotes()
         player.pause()
         playing = false
         time = 0
@@ -82,9 +84,10 @@ final class MeetingsModel: ObservableObject {
         rebuild()
         peaks = []
         guard let m = meeting else { player.replaceCurrentItem(with: nil); return }
-        player.replaceCurrentItem(with: FileManager.default.fileExists(atPath: m.audioURL.path) ? AVPlayerItem(url: m.audioURL) : nil)
+        let play = m.playableURL
+        player.replaceCurrentItem(with: FileManager.default.fileExists(atPath: play.path) ? AVPlayerItem(url: play) : nil)
         loadGen += 1
-        let url = m.audioURL, gen = loadGen, provider = peaksProvider
+        let url = play, gen = loadGen, provider = peaksProvider
         DispatchQueue.global(qos: .userInitiated).async {
             let p = provider(url)
             DispatchQueue.main.async { if self.loadGen == gen { self.peaks = p } }  // a slower, older load never wins
@@ -94,7 +97,7 @@ final class MeetingsModel: ObservableObject {
     // The meeting changed on disk or in the store (transcript arrived, renamed…): keep the player going.
     private func refresh() {
         guard let id = selectedID, let m = store.meeting(id) else { meeting = nil; rebuild(); return }
-        let audioChanged = m.audioURL != meeting?.audioURL
+        let audioChanged = m.playableURL != meeting?.playableURL
         meeting = m
         rebuild()
         if audioChanged { load() }
@@ -241,11 +244,12 @@ final class MeetingsModel: ObservableObject {
     func cleanUp(fillers: Bool, repeats: Bool, pauses: Bool) {
         guard let m0 = meeting else { return }
         working = "Cleaning up…"
-        let url = m0.audioURL
+        let url = m0.playableURL
         DispatchQueue.global(qos: .userInitiated).async {
             let levels = pauses ? MeetingEdit.rms(url) : []
             DispatchQueue.main.async {
                 self.working = ""
+                guard self.selectedID == m0.id else { return }  // another meeting was picked meanwhile: these levels aren't its
                 var result = MeetingEdit.CleanupResult()
                 self.edit("") { m in result = MeetingEdit.cleanUp(&m, fillers: fillers, repeats: repeats, pauses: pauses, rms: levels) }
                 var parts: [String] = []
@@ -266,12 +270,18 @@ final class MeetingsModel: ObservableObject {
         m.notes = text
         meeting = m
         notesWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in
-            guard let self, let id = self.selectedID else { return }
-            self.store.update(id) { $0.notes = text }
-        }
+        let id = m.id  // the meeting typed in, even if another is selected by the time this runs
+        let w = DispatchWorkItem { [weak self] in self?.store.update(id) { $0.notes = text } }
         notesWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+    }
+
+    // Saves notes still waiting for their timer (before switching meetings or closing).
+    func flushNotes() {
+        guard let w = notesWork, !w.isCancelled else { return }
+        notesWork = nil
+        w.perform()
+        w.cancel()
     }
 
     func setSpeakerName(_ s: Speaker, _ name: String) {
@@ -324,7 +334,7 @@ final class MeetingsModel: ObservableObject {
         let out = m.editedAudioURL
         Task { @MainActor in
             do {
-                try await MeetingEdit.exportAudio(source: m.audioURL, duration: m.duration, cuts: m.cuts, enhance: enhance, to: out)
+                try await MeetingEdit.exportAudio(source: m.playableURL, duration: m.duration, cuts: m.cuts, enhance: enhance, to: out)
                 if let id = selectedID { try? store.export(store.meeting(id) ?? m, as: .markdown, edited: true, to: m.folder.appendingPathComponent("edited.md")) }
                 working = ""
                 status = "Saved edited.m4a (\(MeetingFormat.clock(MeetingEdit.editedDuration(m))))"
@@ -447,6 +457,7 @@ final class MeetingsWindow: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        model.flushNotes()
         model.player.pause()
         if MeetingsWindow.shared === self { MeetingsWindow.shared = nil }
     }

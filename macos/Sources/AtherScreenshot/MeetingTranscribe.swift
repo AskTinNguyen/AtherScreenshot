@@ -276,7 +276,22 @@ final class MeetingPipeline {
 
     // Meetings whose transcript was cut short (the app quit or crashed) are transcribed again at launch.
     func resumePending() {
-        for m in MeetingStore.shared.meetings where m.transcript == .pending || m.transcript == .running { process(m.id) }
+        // A recording that never got going (quit while starting) leaves an empty hidden folder: tidy it away.
+        let fm = FileManager.default
+        for d in (try? fm.contentsOfDirectory(at: MeetingStore.shared.root, includingPropertiesForKeys: nil)) ?? [] where d.lastPathComponent.hasPrefix(".recording-") {
+            let files = (fm.enumerator(at: d, includingPropertiesForKeys: [.fileSizeKey])?.allObjects as? [URL]) ?? []
+            let sizes = files.compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }
+            if sizes.allSatisfy({ $0 < 4096 }), MeetingRecorder.current == nil { try? fm.removeItem(at: d) }
+        }
+        for m in MeetingStore.shared.meetings {
+            // The app quit while mixing: mix again from the tracks.
+            if !m.imported, !FileManager.default.fileExists(atPath: m.audioURL.path), !m.tracks.isEmpty {
+                Task { @MainActor in
+                    if (try? await MeetingRecorder.mixTracks(m)) != nil { MeetingStore.shared.reloadOne(m.id) }
+                }
+            }
+            if m.transcript == .pending || m.transcript == .running { process(m.id) }
+        }
     }
 
     func process(_ id: UUID, summarize: Bool? = nil) {
@@ -291,7 +306,9 @@ final class MeetingPipeline {
             var engine = "", locale = "", failure: String?
             do {
                 for s in m.tracks {
-                    let url = FileManager.default.fileExists(atPath: m.trackURL(s).path) ? m.trackURL(s) : m.audioURL
+                    // Looked up again for each track: a rename meanwhile moves the folder.
+                    let cur = await MainActor.run { MeetingStore.shared.meeting(id) } ?? m
+                    let url = FileManager.default.fileExists(atPath: cur.trackURL(s).path) ? cur.trackURL(s) : cur.playableURL
                     let r = try await MeetingSpeech.transcribe(url, language: language)
                     if s == .me { me = r.words } else { others = r.words }
                     engine = r.engine
