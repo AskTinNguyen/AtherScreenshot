@@ -50,6 +50,7 @@ Checksums: [macOS](https://github.com/AskTinNguyen/AtherScreenshot/releases/down
 | 🧩 **Compose** | Drop screenshots into screenshots, extend the canvas for notes, and make collages in one key |
 | 🎥 **Record** | MP4 with system audio and mic, or GIF; follows a window; shows clicks, keystrokes and your game controller |
 | 🎬 **Edit video** | Trim, crop, speed, join several videos, auto captions, callouts, emoji, blur, zoom and title cards, with animations (fade, pop, slide, typewriter); any video, not just your recordings |
+| 🎙️ **Meetings** (Mac) | Record a call's sound (Zoom, Meet, Teams, Slack…): everyone else and you on separate tracks. A transcript that says who spoke, marked moments, and a summary with action items, all made on your Mac. Edit the audio by editing the text: cut words, remove filler words and long pauses, export clean audio and notes ([how](#meetings-mac)) |
 | 🐞 **Bug reports** | Say "bug start", describe the bug, say "bug stop": one folder with the screenshot and what you said on it, a clip of the recording, your narration and the game's logs ([how](#bug-reports)) |
 | 🔍 **Review video** | Step 60 fps recordings frame by frame, leave notes on exact frames, and save a review video with the notes in it for another team (Windows) |
 | 📋 **Copy a clip** | Mark part of a video and press `Ctrl+C` (`⌘C`): it's saved as an MP4 and put on the clipboard, ready to paste into Slack. Or copy the frame on screen as a picture |
@@ -76,6 +77,7 @@ OCR, tags and search run on your computer. Upload is off until you set it up. Au
 | Capture gallery | `⌃⌥H` | `Ctrl+Alt+H` |
 | Record MP4 / GIF (press again to stop) | `⌃⌥5` / `⌃⌥G` | `Shift+PrintScreen` / `Ctrl+Alt+PrintScreen` |
 | Bug report: start / stop | `⌃⌥B` | `Ctrl+Alt+B` |
+| Record meeting audio: start / stop / mark a moment | `⌃⌥M` / `⌃⌥⇧M` | (Mac only) |
 | Insert a QuickPrompt (pick from the list) | `⌃⌥P` | `Ctrl+Alt+Space` |
 
 macOS reserves `⌘⇧3/4/5`, so the Mac defaults use `⌃⌥`. In the gallery and editors, `Ctrl` on Windows replaces `⌘` on the Mac.
@@ -167,6 +169,35 @@ Select a region, or use "Record a window", which follows one window wherever it 
 - **Click and keystroke overlay:** click ripples (`ShowClicks`) and a keystroke pill (`ShowKeys`, off by default because it would show anything you type, including passwords).
 - **Game controller overlay:** with "Show game controller" on (`ShowGamepad`), a connected Xbox-style (XInput) controller is drawn in a corner of the video, like OBS's Input Overlay: a white controller whose sticks move, triggers fill and buttons light up as you use them. Pick the corner with `GamepadCorner` and how visible it is with "Controller opacity" (`GamepadOpacity`, 10–100%). Nothing is drawn while no controller is connected. PlayStation controllers show up when Steam Input or DS4Windows presents them as XInput.
 - When a recording finishes, the file is copied to the clipboard so you can paste it into chats.
+
+### Meetings (Mac)
+
+Record a meeting's sound, then read, clean up and share it. Everything happens on your Mac: nothing is uploaded.
+
+- **Record:** press `⌃⌥M` during a call (or "Record meeting audio" in the menu bar or palette), and again to stop.
+  - **Others:** what the call plays (system audio), from all apps or only one (Settings › Meetings › Others' sound from).
+  - **You:** your microphone, any input you pick.
+  - **The bar:** a small floating bar shows the time and a level meter for each source, with Mark (`⌃⌥⇧M`), Pause, Stop and Discard. It never appears in screenshots or recordings.
+  - **Calls:** when Zoom, Teams, Slack, FaceTime, Webex, Discord or a browser starts using the microphone, a notification offers to record (Settings › Meetings › Offer to record when a call starts). When the call ends, it offers to stop.
+  - **Consent:** let people know you're recording; many places require it.
+- **What you get** (`<captures>/Meetings/<date time> <title>/`):
+  - `meeting.m4a`: both sources mixed, to share.
+  - `tracks/others.m4a` and `tracks/you.m4a`: one source each.
+  - `transcript.md`: notes with the summary, action items, marked moments and the transcript.
+  - `transcript.json`: the same for AI agents, word by word.
+- **Transcript:** made on the Mac after you stop (macOS 26+: Apple's long-form speech recognizer; earlier: on-device recognition). Each line says who spoke: **You** (microphone) or **Others** (system audio); rename either per meeting. A line your microphone only picked up from the speakers is dropped as echo.
+- **Summary** (Apple Intelligence, macOS 26+): a summary, key points, decisions and action items, written by the on-device model. **Create** writes a follow-up email, show notes, key quotes or highlights.
+- **Meetings window** (menu bar › Meetings…): every meeting, searchable through titles, notes and transcripts. The selected one shows its waveform with cuts and markers (click to jump), the player (±15 s, 0.75–2×), the transcript, the summary and your notes.
+- **Edit the audio by editing the text:**
+  - Click a word to play from it, ⇧-click to select a stretch, and `⌫` cuts it (struck through); `⌫` on cut words brings them back. `⌘Z` undoes.
+  - **Clean up:** remove filler words (um, uh…), repeated words ("the the") and long pauses (over 1 s become 0.4 s).
+  - **Trim:** cut the start or end at the playhead.
+  - **Play the edit:** the player skips what you cut, so you hear the result. The recordings themselves are never changed.
+- **Export:**
+  - **Edited audio:** `edited.m4a`, joined with short fades. **Enhance** adds a rumble filter, gentle compression and even loudness.
+  - **Transcript:** Markdown, text, SRT or JSON, with the cuts left out and re-timed, or in full.
+- **Any audio:** "Open audio to edit…", or drop a file on the Meetings window: podcasts, voice memos or a video's sound get the same transcript, clean-up and export.
+- **AI agents:** `start_meeting_recording`, `stop_meeting_recording`, `add_meeting_marker`, `list_meetings`, `get_meeting`, `edit_meeting`, `export_meeting`, `transcribe_meeting` and `import_audio` (see [AI agents](#ai-agents-mcp)).
 
 ### Bug reports
 
@@ -398,7 +429,7 @@ AI agents such as Claude Code and Codex can drive Ather Screenshot through the [
    `--mcp` is a stdio MCP server that passes everything to the running app, and starts it if it isn't running. Clients that connect to a URL can use `http://127.0.0.1:47821/mcp` with the `Authorization: Bearer …` header the copied setup includes.
 3. Ask, e.g. *"Record the game window while you play the first level, mark every bug you see, then review the recording and list the bugs with timestamps."*
 
-The tools: `get_status`, `list_windows`, `take_screenshot`, `start_recording`, `add_marker`, `pause_recording`, `stop_recording`, `get_video_frames`, `get_capture`, `read_text`, `list_captures`, `tag_capture`, `configure`, `open_in_editor`, `upload_capture`, `list_quick_prompts` (your QuickPrompts, read-only) and `run_command` (any palette command). Screenshots and recordings are saved in your captures folder and gallery as usual, with the tags and comments the agent gives them; markers are saved as review notes next to the video (`<video>.notes.json`), which the Windows video editor shows on their frames. All of it is in [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
+The tools: meetings (Mac): `start_meeting_recording`, `stop_meeting_recording`, `add_meeting_marker`, `list_meetings`, `get_meeting`, `edit_meeting`, `export_meeting`, `transcribe_meeting`, `import_audio`. Screen and gallery: `get_status`, `list_windows`, `take_screenshot`, `start_recording`, `add_marker`, `pause_recording`, `stop_recording`, `get_video_frames`, `get_capture`, `read_text`, `list_captures`, `tag_capture`, `configure`, `open_in_editor`, `upload_capture`, `list_quick_prompts` (your QuickPrompts, read-only) and `run_command` (any palette command). Screenshots and recordings are saved in your captures folder and gallery as usual, with the tags and comments the agent gives them; markers are saved as review notes next to the video (`<video>.notes.json`), which the Windows video editor shows on their frames. All of it is in [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
 
 **Privacy:** the server listens on 127.0.0.1 only and needs the private token in your settings folder (`agent-token`, readable only by you), so web pages and other computers can't reach it. It refuses requests from web pages even on this computer. A notification shows when an agent connects. Agents can see your screen and, through `upload_capture`, send files with the uploader you've set up, so allow only agents you trust.
 
@@ -434,6 +465,7 @@ How the Windows app differs from the Mac app:
   - On the Mac, a trigger that is also one of your macOS Text Replacements is left to macOS (it would otherwise be replaced twice); the QuickPrompts window says so, and the picker still pastes it.
   - On the Mac, triggers are ignored while an input method such as Vietnamese Telex is selected, because the keys pressed aren't the text that appears: switch to ABC/U.S. to type a trigger, or use the picker (`⌃⌥P`).
   - The Mac marks the pasted prompt as transient so clipboard managers skip it; Windows keeps it out of clipboard history. Mac full-screen apps (Safari, Xcode…) still expand; only full-screen games are skipped. Excluded apps take bundle ids or app names (`.exe` endings are ignored, so a list shared with Windows works).
+- **Meetings:** on the Mac only for now (build 0.0.2.15).
 - **Updates:** Windows swaps the exe; the Mac swaps the app bundle, and only from the Applications folder (not from the disk image).
 
 ## Build from source

@@ -25,6 +25,8 @@ final class Settings: ObservableObject {
             "S3SecretKey": "", "S3PublicUrl": "",
             "CompressVideoMB": Compress.defaultVideoMB, "CompressPictureMB": Compress.defaultPictureMB,   // the last "under N MB" used
             "VoiceCommands": false, "LogPaths": "", "PreRollSeconds": 10, "LogMaxMB": 20, "CloudVietnamese": false,  // bug reports
+            "MeetingSystemAudio": true, "MeetingMicrophone": true, "MeetingApp": "", "MeetingMicDevice": "",  // meetings
+            "MeetingTranscribe": true, "MeetingLanguage": "", "MeetingSummarize": true, "MeetingDetect": true, "MeetingEnhance": true,
             "ExpandAsYouType": true, "WelcomeShown": false, "SkipFullscreen": true, "ExcludedApps": "", "TeamFile": "",  // QuickPrompts
         ]
         for c in kCmds { m["Hotkey." + c.cmd.rawValue] = c.hotkey }

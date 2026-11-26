@@ -10,6 +10,11 @@ enum Cmd: String, CaseIterable {
     case recordWindow = "RecordWindow"
     case pauseRecording = "PauseRecording"
     case bugReport = "BugReport"
+    case recordMeeting = "RecordMeeting"
+    case markMeeting = "MarkMeetingMoment"
+    case pauseMeeting = "PauseMeeting"
+    case meetings = "Meetings"
+    case openAudio = "OpenAudioToEdit"
     case copyLastBug = "CopyLastBugReport"
     case openBugsFolder = "OpenBugReportsFolder"
     case ruler = "ScreenRuler"
@@ -80,6 +85,11 @@ let kCmds: [CmdDef] = [
     CmdDef(cmd: .recordWindow, title: "Record a window (follows it)", keywords: "video mp4 app track follow", icon: "macwindow.badge.plus", hotkey: "", capture: true),
     CmdDef(cmd: .pauseRecording, title: "Pause / resume recording", keywords: "break hold continue", icon: "pause.circle", hotkey: "", capture: false),
     CmdDef(cmd: .bugReport, title: "Bug report: start / stop", keywords: "bug issue playtest report voice clip logs game qa", icon: "ladybug", hotkey: "Ctrl+Alt+B", capture: true),
+    CmdDef(cmd: .recordMeeting, title: "Record meeting audio: start / stop", keywords: "meeting call zoom teams meet slack facetime audio sound voice podcast transcript notes minutes record", icon: "waveform.circle", hotkey: "Ctrl+Alt+M", capture: false),
+    CmdDef(cmd: .markMeeting, title: "Mark this moment in the meeting", keywords: "meeting marker flag bookmark important highlight", icon: "flag", hotkey: "Ctrl+Alt+Shift+M", capture: false),
+    CmdDef(cmd: .pauseMeeting, title: "Pause / resume meeting recording", keywords: "meeting break hold continue audio", icon: "pause.circle", hotkey: "", capture: false),
+    CmdDef(cmd: .meetings, title: "Meetings (recordings, transcripts, audio editor)", keywords: "meeting call transcript notes summary audio edit podcast library list play", icon: "waveform", hotkey: "", capture: false),
+    CmdDef(cmd: .openAudio, title: "Open audio to edit…", keywords: "audio podcast voice memo m4a mp3 wav edit transcribe clean filler words import", icon: "waveform.badge.plus", hotkey: "", capture: false),
     CmdDef(cmd: .copyLastBug, title: "Copy last bug report", keywords: "bug clipboard paste slack files clip logs", icon: "doc.on.doc", hotkey: "", capture: false),
     CmdDef(cmd: .openBugsFolder, title: "Open bug reports folder", keywords: "bug finder directory files bundles", icon: "folder", hotkey: "", capture: false),
     CmdDef(cmd: .ruler, title: "Screen ruler", keywords: "measure pixels distance size length angle", icon: "ruler", hotkey: "", capture: true),
@@ -137,5 +147,6 @@ let kCliNames: [String: Cmd] = [
     "region": .region, "fullscreen": .fullscreen, "monitor": .monitor, "window": .window, "last": .lastRegion,
     "scroll": .scrolling, "ruler": .ruler, "ocr": .ocr, "color": .colorPicker, "record": .recordVideo,
     "gif": .recordGif, "recordwindow": .recordWindow, "stop": .stopRecording, "pause": .pauseRecording,
+    "meeting": .recordMeeting, "mark": .markMeeting, "meetings": .meetings,
     "history": .history, "palette": .palette, "folder": .openFolder, "settings": .settings, "quit": .quit,
 ]

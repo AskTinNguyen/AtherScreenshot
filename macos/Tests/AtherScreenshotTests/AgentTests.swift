@@ -174,10 +174,13 @@ final class AgentTests: XCTestCase {
         }
     }
 
-    // The same tools as the Windows app, each with a valid object schema.
+    // The same tools as the Windows app, then the Mac-only meeting tools, each with a valid object schema.
     func testToolsMatchWindows() {
         let tools = Agent.tools()
-        XCTAssertEqual(tools.map(\.name), ["get_status", "list_windows", "take_screenshot", "start_recording", "stop_recording", "pause_recording",
+        let meetings = ["start_meeting_recording", "stop_meeting_recording", "add_meeting_marker", "list_meetings", "get_meeting",
+                        "edit_meeting", "export_meeting", "transcribe_meeting", "import_audio"]
+        XCTAssertEqual(Array(tools.map(\.name).suffix(meetings.count)), meetings)
+        XCTAssertEqual(Array(tools.map(\.name).dropLast(meetings.count)), ["get_status", "list_windows", "take_screenshot", "start_recording", "stop_recording", "pause_recording",
                                            "add_marker", "list_captures", "get_capture", "get_video_frames", "read_text", "tag_capture",
                                            "configure", "open_in_editor", "upload_capture", "list_quick_prompts", "run_command"])
         for t in tools {

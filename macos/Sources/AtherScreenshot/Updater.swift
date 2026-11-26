@@ -337,7 +337,7 @@ final class UpdateController {
     // The update restarts the app, so it waits until nothing is in progress, and asks before closing pins
     // (they live only on screen).
     func blocked() -> Bool {
-        if Recorder.isActive { Toast.shared.show("Finish the recording first", "Then update from the menu bar."); return true }
+        if Recorder.isActive || MeetingRecorder.isActive { Toast.shared.show("Finish the recording first", "Then update from the menu bar."); return true }
         if Overlay.active != nil || ScrollCapture.active != nil { Toast.shared.show("Finish the capture first", "Then update from the menu bar."); return true }
         if !Editor.instances.isEmpty || !VideoEditor.instances.isEmpty {
             Toast.shared.show("Close the editors first", "Updating restarts Ather Screenshot. Save and close the editors, then update from the menu bar.", ms: 6000)

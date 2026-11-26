@@ -10,7 +10,24 @@
 - **Updates:** from 0.0.2 on, the Mac app updates itself too ("Check for updates…" in the menu bar or the palette). Run it from Applications, not from the disk image.
 - **Controllers:** on the Mac, Xbox, PlayStation and MFi controllers work directly.
 
-## What's new in this update (build 0.0.2.14): safer connections for AI agents
+## What's new in this update (Mac, build 0.0.2.15): Meetings, a meeting recorder and audio editor
+
+Record a call's sound, get a transcript that says who spoke, and edit the audio by editing the text. Everything happens on
+your Mac; nothing is uploaded. The Mac app is at build 0.0.2.15; Windows stays at build 0.0.2.13.
+
+- **Record a meeting:** press **⌃⌥M** during a Zoom, Meet, Teams, Slack or FaceTime call, and again to stop. Everyone else (system audio, from all apps or only the call's app) and you (your microphone) are recorded on separate tracks. A small floating bar shows the time and a level meter for each, with Mark (**⌃⌥⇧M**), Pause, Stop and Discard.
+- **It offers when a call starts:** when a meeting app starts using the microphone, a notification asks "Record this meeting?", and when the call ends it offers to stop. Turn it off in Settings › Meetings.
+- **Transcript with who spoke:** after you stop, the meeting is transcribed on your Mac, each line marked **You** or **Others** with its time. Lines your microphone only picked up from the speakers are dropped as echo.
+- **Summary and outputs:** with Apple Intelligence (macOS 26 or later), a summary, key points, decisions and action items are written on your Mac; **Create** writes a follow-up email, show notes, key quotes or highlights.
+- **Meetings window** (menu bar › Meetings…): search every meeting by title, notes or what was said; play it with its waveform and marked moments; read the transcript, summary and your notes.
+- **Edit the audio by editing the text:** click a word to play from it, ⇧-click to select, and ⌫ cuts it. **Clean up** removes filler words (um, uh…), repeated words and long pauses in one click. **Play the edit** skips what you cut. Your recording is never changed.
+- **Export:** the edited audio (`edited.m4a`, with **Enhance** for even, clearer sound) and the transcript as Markdown, text, subtitles (SRT) or JSON.
+- **Any audio:** "Open audio to edit…" (or drop a file on the Meetings window) brings in podcasts, voice memos or a video's sound for the same transcript, clean-up and export.
+- **For AI agents:** each meeting keeps a `transcript.json` with every word's time, and new tools let agents record meetings, read transcripts, clean up and cut the audio, and export it (`start_meeting_recording`, `get_meeting`, `edit_meeting`, `export_meeting`, `import_audio` and more).
+- **Files:** each meeting is a folder in `Meetings` in your captures: `meeting.m4a` (to share), one track per source, `transcript.md` and `transcript.json`.
+- **Consent:** let people know you're recording; in many places it's required.
+
+## Earlier update (Mac, build 0.0.2.14): safer connections for AI agents
 
 AI agents (MCP) connect more safely, and nothing changes in how you set them up. The Mac app is at build 0.0.2.14;
 Windows stays at build 0.0.2.13 until its 0.0.2.14 is published.

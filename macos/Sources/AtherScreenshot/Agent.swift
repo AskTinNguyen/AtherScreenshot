@@ -901,10 +901,10 @@ enum Agent {
             tool("run_command", "Run a palette command",
                  "Runs any command from the command palette, like pressing its shortcut. Commands that select a region wait for the person at the computer. Commands:" + commandList,
                  schema(["command": ["type": "string", "enum": commands.map(\.cmd.rawValue)]], required: ["command"]), sync(runCommand)),
-        ]
+        ] + MeetingTools.tools()
     }
 
-    static let instructions = "Ather Screenshot is a screenshot and screen-recording app running on this computer. Use it to see the screen and to record what happens, e.g. while playtesting a game: take_screenshot to look (and keep tagged evidence), start_recording / add_marker / stop_recording for gameplay sessions, get_video_frames to review a recording, read_text to read on-screen text, list_captures to find earlier captures. Coordinates are screen points; get_status lists the displays. Everything is saved in the user's captures folder and gallery."
+    static let instructions = "Ather Screenshot is a screenshot and screen-recording app running on this computer. Use it to see the screen and to record what happens, e.g. while playtesting a game: take_screenshot to look (and keep tagged evidence), start_recording / add_marker / stop_recording for gameplay sessions, get_video_frames to review a recording, read_text to read on-screen text, list_captures to find earlier captures. For calls: start_meeting_recording / stop_meeting_recording record a meeting's sound, get_meeting reads its transcript (who said what, with times), edit_meeting cleans it up and cuts it, export_meeting writes the edited audio and transcript; import_audio brings in any audio file. Coordinates are screen points; get_status lists the displays. Everything is saved in the user's captures folder and gallery."
 }
 
 // Review notes the app adds to a video's sidecar ("<video>.notes.json", the Windows video editor's format) by itself: AI
