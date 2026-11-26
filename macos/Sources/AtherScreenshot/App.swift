@@ -103,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.applicationIconImage = Logo.appIcon
         DispatchQueue.global(qos: .utility).async { VideoReverse.prune(keep: [], maxAge: 86400) }   // reversed clips from earlier days
         Library.shared.loadIfNeeded()
+        MeetingStore.shared.loadIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = Logo.menuBarIcon
         statusItem.button?.toolTip = kProductName
@@ -114,6 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.onChange = { [weak self] key in
             if key.hasPrefix("Hotkey.") { self?.registerHotkeys() }
             if key == "AllowAgents" || key == "AgentPort" { Agent.apply() }
+            if key == "MeetingDetect" { MeetingDetector.shared.apply() }
+            if key == "SaveFolder" { MeetingStore.shared.reload() }
             if ["ExpandAsYouType", "SkipFullscreen", "ExcludedApps", "TeamFile"].contains(key) { QuickPromptsMac.shared.apply() }
             if ["VoiceCommands", "LogPaths", "PreRollSeconds", "LogMaxMB", "CloudVietnamese", "SaveFolder", "CaptureCursor", "Hotkey.BugReport"].contains(key) {
                 BugReports.shared.configure(.fromSettings())
@@ -136,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Agent.apply()
         UpdateController.shared.start()
         QuickPromptsMac.shared.start()
+        MeetingDetector.shared.apply()
 
         if afterUpdate {
             Toast.shared.show("Updated to Ather Screenshot \(AppDelegate.version)", "Your settings, captures and gallery are just as you left them.", ms: 6000)
@@ -182,6 +186,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Output.waitForPendingSaves(timeout: 5)  // first: their completions may schedule library saves
             Library.shared.flush()
         }
+        MeetingDetector.shared.stop()
+        // A meeting being recorded is saved before quitting (and a screen recording with it, below).
+        if let m = MeetingRecorder.current {
+            guard m.hasAudio else { m.stop(); return quitAfterRecording(sender, finishWrites) }
+            Toast.shared.show("Saving the meeting…", "Quitting when it's done")
+            var replied = false
+            let finish = {
+                guard !replied else { return }
+                replied = true
+                if Recorder.current != nil { Recorder.current?.stop(); finishWrites(); sender.reply(toApplicationShouldTerminate: true) }
+                else { finishWrites(); sender.reply(toApplicationShouldTerminate: true) }
+            }
+            MeetingRecorder.onFinished.append { DispatchQueue.main.async { finish() } }
+            m.stop()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 25) { finish() }
+            return .terminateLater
+        }
+        return quitAfterRecording(sender, finishWrites)
+    }
+
+    private func quitAfterRecording(_ sender: NSApplication, _ finishWrites: @escaping () -> Void) -> NSApplication.TerminateReply {
         guard let r = Recorder.current, r.hasFootage else {
             Recorder.current?.stop()  // countdown or still starting: nothing recorded yet, just cancel
             finishWrites()
@@ -297,6 +322,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         for c in [Cmd.recordVideo, .recordGif, .recordWindow] { add(c) }
         add(.bugReport, BugReports.shared.isOpen ? "Bug report: stop" : nil)
+        menu.addItem(.separator())
+        if let m = MeetingRecorder.current {
+            add(.recordMeeting, "Stop meeting recording (\(MeetingFormat.clock(m.elapsed)))")
+            add(.markMeeting)
+            add(.pauseMeeting, m.isPaused ? "Resume meeting recording" : "Pause meeting recording")
+        } else {
+            add(.recordMeeting, "Record meeting audio")
+        }
+        add(.meetings, "Meetings…")
         if BugReports.shared.listening {
             let i = NSMenuItem(title: "Listening for “bug start”", action: nil, keyEquivalent: "")
             i.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
@@ -415,6 +449,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if Recorder.isActive { Recorder.current?.stop() } else if ScrollCapture.active != nil { ScrollCapture.cancel() } else { Toast.shared.show("Not recording") }
         case .pauseRecording: Recorder.current?.togglePause()
         case .bugReport: BugReports.shared.toggle()
+        case .recordMeeting: toggleMeeting()
+        case .markMeeting:
+            if let m = MeetingRecorder.current, let mk = m.mark() { Toast.shared.show("Marked \(MeetingFormat.clock(mk.time))", mk.label, ms: 1500) }
+            else { Toast.shared.show("No meeting is being recorded", "\(Hotkey.display(s.hotkey(.recordMeeting))) starts one.") }
+        case .pauseMeeting: MeetingRecorder.current?.togglePause()
+        case .meetings: MeetingsWindow.show()
+        case .openAudio: MeetingsWindow.openAudio()
         case .copyLastBug: BugReports.shared.copyLast(to: .general)
         case .openBugsFolder: BugReports.shared.openFolder()
         case .checkUpdates: UpdateController.shared.check(manual: true)
@@ -636,8 +677,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func toggleMeeting() {
+        if let m = MeetingRecorder.current { m.stop(); return }
+        MeetingRecorder.start()
+    }
+
     func recordingChanged() {
-        statusItem.button?.contentTintColor = Recorder.isActive ? .systemRed : nil
+        statusItem.button?.contentTintColor = Recorder.isActive || MeetingRecorder.isActive ? .systemRed : nil
     }
 
     // Keeps "last capture" commands pointing at the right file after a rename or trash elsewhere.

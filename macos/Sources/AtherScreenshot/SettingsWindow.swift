@@ -68,6 +68,18 @@ private let rows: [Row] = {
         Row(key: "LogMaxMB", title: "Largest log copied (a bigger one keeps its end)", section: "Bug reports", keywords: "size logs", kind: .number(1...1024, 1, "MB")),
         Row(key: "CloudVietnamese", title: "Transcribe Vietnamese with Apple's servers: at “bug stop”, the narration (voice.wav) is written down on this Mac when it can, and sent to Apple only when it can't",
             section: "Bug reports", keywords: "vietnamese tiếng việt vi-VN cloud server speech dictation", kind: .toggle),
+        Row(key: "MeetingSystemAudio", title: "Record everyone else (system audio)", section: "Meetings", keywords: "meeting call zoom teams sound others", kind: .toggle),
+        Row(key: "MeetingApp", title: "Others' sound from", section: "Meetings", keywords: "meeting app zoom teams chrome filter only", kind: .custom("meetingApp"), shownWhen: "MeetingSystemAudio"),
+        Row(key: "MeetingMicrophone", title: "Record me (microphone)", section: "Meetings", keywords: "meeting mic voice", kind: .toggle),
+        Row(key: "MeetingMicDevice", title: "Microphone", section: "Meetings", keywords: "meeting input device headset airpods", kind: .custom("meetingMic"), shownWhen: "MeetingMicrophone"),
+        Row(key: "MeetingTranscribe", title: "Transcribe after recording (on this Mac; nothing is sent anywhere)", section: "Meetings", keywords: "meeting transcript speech text words", kind: .toggle),
+        Row(key: "MeetingLanguage", title: "Transcript language", section: "Meetings", keywords: "meeting locale language vietnamese english",
+            kind: .choice(MeetingSettings.languages), shownWhen: "MeetingTranscribe"),
+        Row(key: "MeetingSummarize", title: "Summarize with Apple Intelligence (on this Mac): summary, decisions, action items", section: "Meetings",
+            keywords: "meeting ai summary notes action items apple intelligence", kind: .toggle),
+        Row(key: "MeetingEnhance", title: "Enhance exported audio (rumble filter, compression, even loudness)", section: "Meetings", keywords: "meeting audio edit export podcast clean loudness", kind: .toggle),
+        Row(key: "MeetingDetect", title: "Offer to record when a call starts (Zoom, Teams, Meet, Slack… using the microphone)", section: "Meetings",
+            keywords: "meeting detect call automatic notify", kind: .toggle),
         Row(key: "AllowAgents", title: "Allow AI agents (MCP): Claude Code, Codex and other agents on this Mac can take screenshots, record and search the gallery",
             section: "AI agents", keywords: "mcp claude codex agent automation llm", kind: .toggle),
         Row(key: "AgentPort", title: "Agent port (127.0.0.1 only)", section: "AI agents", keywords: "mcp", kind: .number(1024...65535, 1, ""), shownWhen: "AllowAgents"),
@@ -99,7 +111,7 @@ private let rows: [Row] = {
     return r
 }()
 
-private let sections = ["General", "Capture", "Recording", "Bug reports", "Editor", "Gallery", "Upload", "AI agents", "QuickPrompts", "Updates", "Shortcuts"]
+private let sections = ["General", "Capture", "Recording", "Meetings", "Bug reports", "Editor", "Gallery", "Upload", "AI agents", "QuickPrompts", "Updates", "Shortcuts"]
 
 struct SettingsView: View {
     @ObservedObject var s = Settings.shared
@@ -201,7 +213,7 @@ struct SettingsView: View {
                 login = SMAppService.mainApp.status == .enabled
             })).tint(Color(nsColor: Theme.accent))
         case .custom(let id):
-            QuickPromptsSettingsRow(id: id)
+            if id.hasPrefix("meeting") { MeetingSettingsRow(id: id, title: row.title) } else { QuickPromptsSettingsRow(id: id) }
         case .hotkey(let cmd):
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
